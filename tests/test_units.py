@@ -494,5 +494,65 @@ _d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
 check("non-positive position_pct -> prose fallback", (_d, _src), (50.0, "parsed"))
 
 
+# ================= PHASE 5: LIMIT ENTRIES + PROTECTIVE STOPS =================
+
+# --- pure pricing (Python owns the numbers; model only seeds the stop) ---
+check("marketable limit adds slippage", signals.marketable_limit_price(100.0, 0.3), 100.3)
+check("marketable limit None on bad quote", signals.marketable_limit_price(0, 0.3), None)
+check("whole shares floors", signals.whole_shares_for_dollars(100, 30.0), 3)
+check("whole shares 0 when budget < 1 share", signals.whole_shares_for_dollars(25, 196.0), 0)
+check("whole shares 0 on bad price", signals.whole_shares_for_dollars(100, 0), 0)
+check("stop default from pct (8% below 100)", signals.resolve_stop_price(100.0, None, 8.0), 92.0)
+check("stop uses model seed when in band", signals.resolve_stop_price(100.0, 95.0, 8.0), 95.0)
+check("stop model too tight -> clamped to near (98)", signals.resolve_stop_price(100.0, 99.5, 8.0), 98.0)
+check("stop model too wide -> clamped to far (84)", signals.resolve_stop_price(100.0, 50.0, 8.0), 84.0)
+check("stop None on bad fill", signals.resolve_stop_price(0, 90, 8.0), None)
+check_true("stop is strictly below fill", signals.resolve_stop_price(100.0, None, 8.0) < 100.0)
+
+
+def make_order_config(order_block):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+         "watchlist": ["AAPL"],
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
+                  "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
+         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+    if order_block is not None:
+        d["order"] = order_block
+    return load_config(_write_config(d))
+
+
+# --- config: order types + protective stop ---
+check("buy_type market default", make_order_config(None).buy_type, "market")
+check("buy_type limit ok", make_order_config({"buy_type": "limit"}).buy_type, "limit")
+check_raises("bad buy_type raises", lambda: make_order_config({"buy_type": "stop"}), ConfigError)
+check("protective stop defaults off", make_order_config(None).protective_stop_enabled, False)
+_oc = make_order_config({"protective_stop": {"enabled": True, "stop_pct": 8.0}})
+check("protective stop parsed",
+      (_oc.protective_stop_enabled, _oc.protective_stop_pct, _oc.protective_stop_tif), (True, 8.0, "gtc"))
+check_raises("stop_pct out of (0,100) raises",
+             lambda: make_order_config({"protective_stop": {"enabled": True, "stop_pct": 150}}), ConfigError)
+
+# --- ledger: order-lifecycle columns + protective-stop tracking ---
+_oled = _tmp_ledger()
+ODAY = "2026-05-30"
+_oled.reserve_order("entry1", ODAY, "AAPL", side="buy", type="limit", dollar_amount=None,
+                    quantity=2, now_iso="t", order_kind="entry", limit_price=196.5)
+_o = _oled.get_order("entry1")
+check("order limit_price stored", _o["limit_price"], 196.5)
+check("order_kind stored", _o["order_kind"], "entry")
+check("order default state reserved", _o["state"], "reserved")
+_oled.reserve_order("stop1", ODAY, "AAPL", side="sell", type="stop_market", dollar_amount=None,
+                    quantity=2, now_iso="t", order_kind="protective_stop", stop_price=180.0,
+                    parent_ref_id="entry1")
+check("no open stops while merely reserved", _oled.open_protective_stops("AAPL"), [])
+_oled.set_order_state("stop1", "stop_placed")
+_stops = _oled.open_protective_stops("AAPL")
+check("open stop found once placed", [s["ref_id"] for s in _stops], ["stop1"])
+check("open stop carries parent + price",
+      (_stops[0]["parent_ref_id"], _stops[0]["stop_price"]), ("entry1", 180.0))
+_oled.set_order_state("stop1", "cancelled")
+check("cancelled stop no longer open", _oled.open_protective_stops("AAPL"), [])
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

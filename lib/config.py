@@ -74,6 +74,11 @@ class Config:
     sell_mode: str
     time_in_force: str
     market_hours: str
+    # Phase 5: limit entries + protective GTC stops (Python-owned prices).
+    limit_slippage_pct: float
+    protective_stop_enabled: bool
+    protective_stop_pct: float
+    protective_stop_tif: str
     act_after_open_minutes: int
     analyze_timeout_sec: int
     # Multi-run / cadence (intraday mode only; the master switch gates the path).
@@ -164,6 +169,24 @@ def load_config(path) -> Config:
     order = d.get("order", {}) or {}
     loop = d.get("loop", {}) or {}
 
+    # Order types (Phase 5). buy_type 'limit' uses a marketable limit at the live
+    # quote + slippage and WHOLE shares (limit orders can't be fractional). The
+    # protective stop price is always Python-clamped; the model only seeds it.
+    buy_type = str(order.get("buy_type", "market")).strip().lower()
+    if buy_type not in ("market", "limit"):
+        raise ConfigError("config.yaml: order.buy_type must be 'market' or 'limit'")
+    limit_slippage_pct = float(order.get("limit_slippage_pct", 0.3) or 0.0)
+    if limit_slippage_pct < 0:
+        raise ConfigError("config.yaml: order.limit_slippage_pct must be >= 0")
+    pstop = order.get("protective_stop", {}) or {}
+    protective_stop_enabled = pstop.get("enabled", False) is True
+    protective_stop_pct = float(pstop.get("stop_pct", 8.0) or 0.0)
+    if protective_stop_enabled and not (0 < protective_stop_pct < 100):
+        raise ConfigError(
+            "config.yaml: order.protective_stop.stop_pct must be in (0, 100) when enabled"
+        )
+    protective_stop_tif = str(pstop.get("time_in_force", "gtc")).strip().lower()
+
     # Multi-run / cadence. Master switch fails SAFE OFF (only an explicit True
     # enables intraday). Cadence bounds must be ordered floor <= open-ceiling <=
     # ceiling so the Python clamp can never invert.
@@ -243,10 +266,14 @@ def load_config(path) -> Config:
         risk=risk,
         chat_model=chat_model,
         reasoner_model=reasoner_model,
-        buy_type=str(order.get("buy_type", "market")),
+        buy_type=buy_type,
         sell_mode=str(order.get("sell_mode", "close_position")),
         time_in_force=str(order.get("time_in_force", "gfd")),
         market_hours=str(order.get("market_hours", "regular_hours")),
+        limit_slippage_pct=limit_slippage_pct,
+        protective_stop_enabled=protective_stop_enabled,
+        protective_stop_pct=protective_stop_pct,
+        protective_stop_tif=protective_stop_tif,
         act_after_open_minutes=int(loop.get("act_after_open_minutes", 5)),
         analyze_timeout_sec=int(loop.get("analyze_timeout_sec", 900)),
         intraday_enabled=intraday_enabled,

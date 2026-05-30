@@ -309,21 +309,52 @@ def cmd_plan(args) -> dict:
                 decision.update(status="skipped", intent="buy", detail="sized_to_zero")
                 result["decisions"].append(decision)
                 continue
-            remaining_daily_cap -= dollars
-            ref_id = None
-            if not cfg.dry_run:
-                ref_id = led.new_ref_id()
-                led.reserve_order(ref_id, day, ticker, side="buy", type=cfg.buy_type,
-                                  dollar_amount=dollars, quantity=None, now_iso=now_iso)
-            result["orders"].append({
-                "ticker": ticker, "signal": signal, "intent": "buy",
-                "ref_id": ref_id, "side": "buy", "type": cfg.buy_type,
-                "dollar_amount": dollars, "quantity": None,
-                "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
-                "sizing_source": src,
-            })
-            decision.update(status="order", intent="buy", dollar_amount=dollars)
-            result["decisions"].append(decision)
+            if cfg.buy_type == "limit":
+                # Marketable limit at the live quote + slippage; WHOLE shares only
+                # (limit orders can't be fractional), so a sub-one-share budget skips.
+                limit_price = signals.marketable_limit_price(quote, cfg.limit_slippage_pct)
+                shares = signals.whole_shares_for_dollars(dollars, limit_price)
+                if not limit_price or shares < 1:
+                    detail = "limit_needs_live_quote" if not limit_price else "budget_below_one_share"
+                    led.record_action(day, ticker, signal=signal, intent="buy",
+                                      status="skipped", detail=detail, now_iso=now_iso)
+                    decision.update(status="skipped", intent="buy", detail=detail)
+                    result["decisions"].append(decision)
+                    continue
+                spend = round(shares * limit_price, 2)
+                remaining_daily_cap -= spend
+                ref_id = None
+                if not cfg.dry_run:
+                    ref_id = led.new_ref_id()
+                    led.reserve_order(ref_id, day, ticker, side="buy", type="limit",
+                                      dollar_amount=None, quantity=shares, now_iso=now_iso,
+                                      order_kind="entry", limit_price=limit_price)
+                result["orders"].append({
+                    "ticker": ticker, "signal": signal, "intent": "buy",
+                    "ref_id": ref_id, "side": "buy", "type": "limit",
+                    "dollar_amount": None, "quantity": shares, "limit_price": limit_price,
+                    "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                    "sizing_source": src, "order_kind": "entry",
+                })
+                decision.update(status="order", intent="buy", quantity=shares, limit_price=limit_price)
+                result["decisions"].append(decision)
+            else:
+                remaining_daily_cap -= dollars
+                ref_id = None
+                if not cfg.dry_run:
+                    ref_id = led.new_ref_id()
+                    led.reserve_order(ref_id, day, ticker, side="buy", type="market",
+                                      dollar_amount=dollars, quantity=None, now_iso=now_iso,
+                                      order_kind="entry")
+                result["orders"].append({
+                    "ticker": ticker, "signal": signal, "intent": "buy",
+                    "ref_id": ref_id, "side": "buy", "type": "market",
+                    "dollar_amount": dollars, "quantity": None,
+                    "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                    "sizing_source": src, "order_kind": "entry",
+                })
+                decision.update(status="order", intent="buy", dollar_amount=dollars)
+                result["decisions"].append(decision)
 
         elif intent == "sell":
             qty = signals.resolve_sell_quantity(held_qty, frac)
@@ -333,16 +364,23 @@ def cmd_plan(args) -> dict:
                 decision.update(status="skipped", intent="sell", detail="nothing_to_sell")
                 result["decisions"].append(decision)
                 continue
+            # Any resting GTC protective stop MUST be cancelled before selling, or
+            # the stop is left orphaned/oversized. The orchestrator cancels these
+            # ref_ids first, then places the sell (and re-protects the remainder on
+            # a trim via STEP 5e).
+            cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
             ref_id = None
             if not cfg.dry_run:
                 ref_id = led.new_ref_id()
                 led.reserve_order(ref_id, day, ticker, side="sell", type="market",
-                                  dollar_amount=None, quantity=qty, now_iso=now_iso)
+                                  dollar_amount=None, quantity=qty, now_iso=now_iso,
+                                  order_kind="exit")
             result["orders"].append({
                 "ticker": ticker, "signal": signal, "intent": "sell",
                 "ref_id": ref_id, "side": "sell", "type": "market",
                 "dollar_amount": None, "quantity": qty,
                 "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                "order_kind": "exit", "cancel_ref_ids": cancel_ref_ids,
             })
             decision.update(status="order", intent="sell", quantity=qty)
             result["decisions"].append(decision)
@@ -368,6 +406,17 @@ def cmd_commit(args) -> dict:
     if ref_id:
         led.finalize_order(ref_id, d.get("broker_order_id"),
                            json.dumps(d.get("result_json", {})))
+        # Advance the order's lifecycle state. A protective stop that was placed (or
+        # simulated in dry-run) becomes 'stop_placed' so open_protective_stops finds
+        # it for later cancel-on-sell; entries/exits become 'filled'.
+        order = led.get_order(ref_id)
+        kind = (order or {}).get("order_kind", "entry")
+        state_map = {"placed": "filled", "dry_run": "filled", "cancelled": "cancelled",
+                     "blocked_guardrail": "unfilled", "error": "unfilled"}
+        st = state_map.get(d["status"], d["status"])
+        if kind == "protective_stop" and d["status"] in ("placed", "dry_run"):
+            st = "stop_placed"
+        led.set_order_state(ref_id, st)
     ticker = str(d["ticker"]).upper()
     led.record_action(
         day, ticker,
@@ -523,6 +572,45 @@ def cmd_report_commit(args) -> dict:
     return {"ok": True, "date": args.date, "kind": args.kind, "hash": args.content_hash}
 
 
+# --- protective stop (Phase 5) -----------------------------------------------
+# After an entry FILLS, the orchestrator calls this with the fill price + qty; we
+# return a Python-clamped gtc stop_market sell to place (the model's stop_loss only
+# seeds the price). Also used after a TRIM to re-protect the remaining shares. The
+# returned stop is reserved (ref_id) and tracked so it can be cancelled before any
+# later sell. Returns {"stop": null} when stops are disabled or inputs are unusable.
+
+def cmd_protect(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    day = market.trading_day_et()
+    now_iso = market.now_et().isoformat()
+    d = json.loads(Path(args.input).read_text(encoding="utf-8"))
+
+    if not cfg.protective_stop_enabled:
+        return {"ok": True, "stop": None, "reason": "protective_stop_disabled"}
+
+    ticker = str(d.get("ticker", "")).upper()
+    fill_price = _to_float(d.get("fill_price"))
+    fill_qty = _to_float(d.get("fill_qty"))
+    stop_price = signals.resolve_stop_price(
+        fill_price, _to_float(d.get("model_stop_loss")), cfg.protective_stop_pct)
+    if not ticker or not fill_qty or fill_qty <= 0 or stop_price is None:
+        return {"ok": True, "stop": None, "reason": "no_stop (need ticker, fill qty, valid price)"}
+
+    ref_id = None
+    if not cfg.dry_run:
+        ref_id = led.new_ref_id()
+        led.reserve_order(ref_id, day, ticker, side="sell", type="stop_market",
+                          dollar_amount=None, quantity=fill_qty, now_iso=now_iso,
+                          order_kind="protective_stop", stop_price=stop_price,
+                          parent_ref_id=d.get("ref_id"), state="reserved")
+    return {"ok": True, "stop": {
+        "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
+        "quantity": fill_qty, "stop_price": stop_price,
+        "time_in_force": cfg.protective_stop_tif, "market_hours": "regular_hours",
+        "order_kind": "protective_stop", "parent_ref_id": d.get("ref_id"),
+    }}
+
+
 # --- decision-memory outcome resolution --------------------------------------
 # Grounds the memory scorecard in REAL market data: the orchestrator passes a
 # snapshot (current quote + position market value/cost basis + any realized P&L)
@@ -628,6 +716,8 @@ def main(argv) -> int:
     p_rc.add_argument("--recipients", default="")
     p_reflect = sub.add_parser("reflect")
     p_reflect.add_argument("--input", required=True)
+    p_protect = sub.add_parser("protect")
+    p_protect.add_argument("--input", required=True)
     sub.add_parser("prune")
     args = ap.parse_args(argv)
 
@@ -644,6 +734,8 @@ def main(argv) -> int:
             out = cmd_report_commit(args)
         elif args.cmd == "reflect":
             out = cmd_reflect(args)
+        elif args.cmd == "protect":
+            out = cmd_protect(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         else:  # unreachable

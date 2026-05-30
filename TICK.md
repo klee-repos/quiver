@@ -94,10 +94,16 @@ For EACH order object (do them one at a time):
 5a. `get_equity_tradability(account_number, [ticker])`. If not tradable / halted →
     commit it as blocked (see 5d with `status:"blocked_guardrail"`) and continue.
 
-5b. `review_equity_order(...)` with the order's fields:
-    - account_number, symbol=`ticker`, side, type
-    - for a **buy**: `dollar_amount` (string), `market_hours`, `time_in_force`
-    - for a **sell**: `quantity` (string), `market_hours`, `time_in_force`
+5b. If the order has a non-empty `cancel_ref_ids` (a sell with resting protective
+    stops): FIRST `cancel_equity_order` each one and commit each as cancelled
+    (`{"ref_id":<stop ref_id>,"ticker":...,"signal":...,"intent":"sell","status":"cancelled"}`
+    → `tick.py commit`) so the ledger marks the stop gone. Only then place the sell.
+
+    `review_equity_order(...)` with the order's fields by `type`:
+    - **market buy**: `dollar_amount` (string)
+    - **limit buy**: `type:"limit"`, `quantity` (string, whole shares), `limit_price` (string)
+    - **sell**: `quantity` (string), `type:"market"`
+    plus `account_number`, `symbol=ticker`, `side`, `market_hours`, `time_in_force` on all.
     If review returns ANY blocking alert (insufficient buying power, PDT, halt,
     market closed, etc.) → do NOT place. Commit as `blocked_guardrail` (5d) with the
     alert text in `detail`, and continue.
@@ -121,6 +127,20 @@ For EACH order object (do them one at a time):
     ```
     ~/dev/quiver/.venv/bin/python tick.py commit --input state/tmp/commit.json
     ```
+
+5e. **Protective stop — only after a BUY actually fills** (`status:"placed"`, and only
+    if `order.protective_stop.enabled`). With the fill price + filled quantity from the
+    broker response, write `state/tmp/protect_input.json`:
+    ```json
+    {"ticker":"AAPL","ref_id":"<entry ref_id>","fill_price":<avg fill>,
+     "fill_qty":<filled shares>,"model_stop_loss":<analysis stop_loss or omit>}
+    ```
+    Run `tick.py protect --input state/tmp/protect_input.json`. If `stop` is non-null,
+    place it with `place_equity_order` (`type:"stop_market"`, `stop_price`, `quantity`,
+    `time_in_force:"gtc"`, its `ref_id`), then commit it (`status:"placed"`, that `ref_id`)
+    so the ledger marks it `stop_placed`. If `stop` is null (disabled / dry-run / unusable)
+    → skip. After a TRIM sell, call `protect` again for the REMAINING shares. Never leave a
+    position with an orphaned or oversized stop.
 
 ## STEP 6 — Reconcile unfinalized orders (only if preflight reported any)
 
@@ -225,6 +245,8 @@ End the tick.
   cooldown + a daily action cap + an on-change gate. Never place a ticker that isn't
   in `orders`.
 - Never exceed any dollar cap — tick.py already clamps; never hand-edit amounts.
+- Never hand-edit a `limit_price` or `stop_price` — tick.py decides and clamps them
+  (the model only seeds the stop). Place exactly what `orders` / `protect` return.
 - Never short — tick.py never emits a short; never place one yourself.
 - Never place if `review_equity_order` returned a blocking alert.
 - Never invent a new `ref_id` for an order that might already be sent — reconcile via

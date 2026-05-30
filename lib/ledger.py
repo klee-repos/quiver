@@ -50,7 +50,13 @@ CREATE TABLE IF NOT EXISTS orders (
     submitted_at    TEXT,
     broker_order_id TEXT,
     result_json     TEXT,
-    finalized       INTEGER NOT NULL DEFAULT 0
+    finalized       INTEGER NOT NULL DEFAULT 0,
+    -- Phase 5 order-lifecycle columns (also back-filled on old dbs via _migrate).
+    order_kind      TEXT DEFAULT 'entry',      -- entry | protective_stop | exit
+    limit_price     REAL,
+    stop_price      REAL,
+    parent_ref_id   TEXT,                        -- links a protective stop to its entry
+    state           TEXT DEFAULT 'reserved'      -- reserved|filled|partial|unfilled|cancelled|stop_placed|triggered
 );
 CREATE TABLE IF NOT EXISTS notifications (
     trade_date   TEXT NOT NULL,
@@ -147,6 +153,26 @@ class Ledger:
     def ensure_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            self._migrate_orders(c)
+
+    @staticmethod
+    def _migrate_orders(c) -> None:
+        """Back-fill Phase 5 lifecycle columns on an orders table created earlier.
+
+        SQLite has no 'ADD COLUMN IF NOT EXISTS', so we diff PRAGMA table_info and
+        add only what's missing. Idempotent and safe on a fresh db (CREATE already
+        made them) or an old one (this adds them)."""
+        existing = {row[1] for row in c.execute("PRAGMA table_info(orders)").fetchall()}
+        additions = {
+            "order_kind": "TEXT DEFAULT 'entry'",
+            "limit_price": "REAL",
+            "stop_price": "REAL",
+            "parent_ref_id": "TEXT",
+            "state": "TEXT DEFAULT 'reserved'",
+        }
+        for col, decl in additions.items():
+            if col not in existing:
+                c.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
 
     # --- daily baseline / halt ------------------------------------------------
 
@@ -395,15 +421,43 @@ class Ledger:
     def reserve_order(
         self, ref_id: str, trade_date: str, ticker: str, *, side: str, type: str,
         dollar_amount: Optional[float], quantity: Optional[float], now_iso: str,
+        order_kind: str = "entry", limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None, parent_ref_id: Optional[str] = None,
+        state: str = "reserved",
     ) -> None:
-        """Persist the order row BEFORE calling the broker (crash safety)."""
+        """Persist the order row BEFORE calling the broker (crash safety).
+
+        Phase 5 fields (order_kind/limit_price/stop_price/parent_ref_id/state)
+        default to a plain reserved market entry, so existing callers are unchanged.
+        """
         with self._conn() as c:
             c.execute(
                 "INSERT OR IGNORE INTO orders "
-                "(ref_id, trade_date, ticker, side, type, dollar_amount, quantity, submitted_at) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (ref_id, trade_date, ticker, side, type, dollar_amount, quantity, now_iso),
+                "(ref_id, trade_date, ticker, side, type, dollar_amount, quantity, "
+                "submitted_at, order_kind, limit_price, stop_price, parent_ref_id, state) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ref_id, trade_date, ticker, side, type, dollar_amount, quantity, now_iso,
+                 order_kind, limit_price, stop_price, parent_ref_id, state),
             )
+
+    def get_order(self, ref_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM orders WHERE ref_id=?", (ref_id,)).fetchone()
+            return dict(row) if row else None
+
+    def set_order_state(self, ref_id: str, state: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE orders SET state=? WHERE ref_id=?", (state, ref_id))
+
+    def open_protective_stops(self, ticker: str) -> list:
+        """Resting (GTC) protective stops for a ticker — must be cancelled before a
+        sell to avoid an orphaned/oversized stop. Not date-scoped (stops are GTC)."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM orders WHERE ticker=? AND order_kind='protective_stop' "
+                "AND state='stop_placed'",
+                (ticker,),
+            ).fetchall()]
 
     def finalize_order(self, ref_id: str, broker_order_id: Optional[str], result_json: str) -> None:
         with self._conn() as c:

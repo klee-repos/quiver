@@ -165,3 +165,48 @@ def clamp_review_minutes(next_review_hours, floor_min: float, ceiling_min: float
     if minutes is None or minutes <= 0:
         return float(ceiling_min)
     return float(max(floor_min, min(minutes, ceiling_min)))
+
+
+# --- Phase 5: limit-entry + protective-stop pricing (pure) ------------------
+# Prices are decided HERE in Python. The model's entry_price/stop_loss are only
+# seeds/hints; these functions own the actual numbers sent to the broker.
+
+def marketable_limit_price(quote: Optional[float], slippage_pct: float) -> Optional[float]:
+    """A buy limit set slightly ABOVE the live quote: fills fast, but caps slippage.
+
+    None when the quote is missing/non-positive (caller then skips the limit order).
+    """
+    if not quote or quote <= 0:
+        return None
+    return round(quote * (1.0 + slippage_pct / 100.0), 2)
+
+
+def whole_shares_for_dollars(dollars: float, limit_price: Optional[float]) -> int:
+    """Whole shares affordable for ``dollars`` at ``limit_price`` (FLOORED).
+
+    Limit orders can't be fractional, so a sub-one-share budget yields 0 (skip) —
+    the key constraint that makes limit entries impractical for tiny accounts.
+    """
+    if not limit_price or limit_price <= 0 or dollars <= 0:
+        return 0
+    return int(dollars // limit_price)
+
+
+def resolve_stop_price(fill_price, model_stop_loss, stop_pct) -> Optional[float]:
+    """Protective stop price below ``fill_price``.
+
+    The model's ``stop_loss`` only SEEDS the choice; Python clamps the distance to
+    a safe band around the configured ``stop_pct`` (between 0.25x and 2x that
+    distance below fill). Returns a price strictly below fill, or None if unusable.
+    """
+    if not fill_price or fill_price <= 0 or stop_pct <= 0:
+        return None
+    default_stop = fill_price * (1.0 - stop_pct / 100.0)
+    far = fill_price * (1.0 - min(stop_pct * 2.0, 90.0) / 100.0)    # lowest allowed price
+    near = fill_price * (1.0 - max(stop_pct * 0.25, 0.1) / 100.0)   # highest allowed price
+    if model_stop_loss and 0 < model_stop_loss < fill_price:
+        stop = min(near, max(far, model_stop_loss))
+    else:
+        stop = default_stop
+    stop = round(stop, 2)
+    return stop if 0 < stop < fill_price else None
