@@ -329,5 +329,64 @@ check("archive enabled with bucket ok",
       make_storage_config({"archive": {"enabled": True, "backend": "s3", "bucket": "bk"}}).storage.archive_bucket, "bk")
 
 
+# ============================ DECISION MEMORY ===============================
+from lib import memory  # noqa: E402
+
+# --- directional_return (pure) ---
+check("dir return up", memory.directional_return(100.0, 110.0), 0.1)
+check("dir return down", round(memory.directional_return(100.0, 90.0), 4), -0.1)
+check("dir return None price_now -> None", memory.directional_return(100.0, None), None)
+check("dir return zero decision price -> None", memory.directional_return(0.0, 100.0), None)
+check("dir return None decision price -> None", memory.directional_return(None, 100.0), None)
+
+# --- is_hit (directional correctness; Hold ungradeable) ---
+check("buy up = hit", memory.is_hit("Buy", 0.02), True)
+check("buy down = miss", memory.is_hit("Buy", -0.02), False)
+check("overweight up = hit", memory.is_hit("Overweight", 0.01), True)
+check("sell down = hit", memory.is_hit("Sell", -0.03), True)
+check("underweight up = miss", memory.is_hit("Underweight", 0.03), False)
+check("hold is ungradeable", memory.is_hit("Hold", 0.05), None)
+check("none-return ungradeable", memory.is_hit("Buy", None), None)
+
+# --- build_scorecard (pure) ---
+check("empty scorecard -> ''", memory.build_scorecard("AAPL", []), "")
+_rows = [
+    {"trade_date": "2026-05-28", "signal": "Buy", "directional_return": 0.012, "holding_days": 5,
+     "realized_pnl": None, "rationale": "Services growth strong."},
+    {"trade_date": "2026-05-21", "signal": "Sell", "directional_return": -0.03, "holding_days": 5,
+     "realized_pnl": 1.5, "rationale": "Overbought."},
+    {"trade_date": "2026-05-14", "signal": "Buy", "directional_return": None, "holding_days": None,
+     "realized_pnl": None, "rationale": "Pending one."},
+]
+_sc = memory.build_scorecard("AAPL", _rows)
+check_true("scorecard names ticker + counts", "AAPL" in _sc and "3 decision(s), 2 resolved" in _sc)
+check_true("scorecard hit-rate 2/2 (buy-up + sell-down)", "2/2" in _sc)
+check_true("scorecard avg move shown", "avg move" in _sc)
+check_true("scorecard realized P&L line", "Realized P&L" in _sc and "$+1.50" in _sc)
+check_true("scorecard shows pending row", "pending" in _sc)
+
+# --- ledger decisions/outcomes round-trip + scorecard integration ---
+_mled = _tmp_ledger()
+_id1 = _mled.record_decision(trade_date="2026-05-20", ticker="AAPL",
+                             decided_at="2026-05-20T10:00:00-04:00", signal="Buy", intent="buy",
+                             entry_price=190.0, decision_price=190.0, rationale="Phased entry.")
+_id2 = _mled.record_decision(trade_date="2026-05-21", ticker="AAPL",
+                             decided_at="2026-05-21T10:00:00-04:00", signal="Hold", intent="hold",
+                             decision_price=192.0, rationale="Wait.")
+check_true("record_decision returns sequential ids", isinstance(_id1, int) and _id2 == _id1 + 1)
+check("get_decision reads back signal", _mled.get_decision(_id1)["signal"], "Buy")
+check("two pending at/before cutoff date", len(_mled.pending_outcome_decisions("2026-05-25")), 2)
+check("none pending before earliest trade_date", len(_mled.pending_outcome_decisions("2026-05-19")), 0)
+_mled.record_outcome(_id1, resolved_at="2026-05-27T10:00:00-04:00", holding_days=5,
+                     directional_return=0.02, scored_against="directional")
+check("one pending after resolving id1", len(_mled.pending_outcome_decisions("2026-05-25")), 1)
+_dw = _mled.decisions_with_outcomes("AAPL")
+check("decisions_with_outcomes newest first", [r["trade_date"] for r in _dw], ["2026-05-21", "2026-05-20"])
+check("resolved row carries directional", _dw[1]["directional_return"], 0.02)
+check("pending row directional is None", _dw[0]["directional_return"], None)
+check_true("integrated scorecard reflects 1 resolved",
+           "2 decision(s), 1 resolved" in memory.build_scorecard("AAPL", _dw))
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

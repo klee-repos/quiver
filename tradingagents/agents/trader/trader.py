@@ -25,6 +25,14 @@ def create_trader(llm):
         asset_type = state.get("asset_type", "stock")
         instrument_context = build_instrument_context(company_name, asset_type)
         investment_plan = state["investment_plan"]
+        # Quiver injects a ledger-derived scorecard (past decisions + real
+        # outcomes) so the trader can calibrate conviction/sizing against history.
+        past_context = state.get("past_context", "")
+        lessons_line = (
+            f"\n\nLessons from your prior decisions on this and related tickers, with "
+            f"their realized outcomes — use them to calibrate conviction and sizing:\n"
+            f"{past_context}\n" if past_context else ""
+        )
 
         messages = [
             {
@@ -43,7 +51,8 @@ def create_trader(llm):
                     f"plan tailored for {company_name}. {instrument_context} This plan incorporates "
                     f"insights from current technical market trends, macroeconomic indicators, and "
                     f"social media sentiment. Use this plan as a foundation for evaluating your next "
-                    f"trading decision.\n\nProposed Investment Plan: {investment_plan}\n\n"
+                    f"trading decision.\n\nProposed Investment Plan: {investment_plan}\n"
+                    f"{lessons_line}\n"
                     f"Leverage these insights to make an informed and strategic decision."
                 ),
             },

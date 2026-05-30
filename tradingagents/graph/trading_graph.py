@@ -292,7 +292,8 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(self, company_name, trade_date, asset_type: str = "stock",
+                  past_context_override: Optional[str] = None):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -304,8 +305,10 @@ class TradingAgentsGraph:
         """
         self.ticker = company_name
 
-        # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
+        # Quiver owns decision memory + outcome resolution in its SQLite ledger
+        # (tick.py reflect), grounded in REAL fills/quotes — so the framework's
+        # yfinance-scored markdown reflection is intentionally NOT run here.
+        # (Was: self._resolve_pending_entries(company_name).)
 
         # Recompile with a checkpointer if the user opted in.
         if self.config.get("checkpoint_enabled"):
@@ -326,17 +329,21 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            return self._run_graph(company_name, trade_date, asset_type=asset_type,
+                                   past_context_override=past_context_override)
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
-        """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM.
-        past_context = self.memory_log.get_past_context(company_name)
+    def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
+                   past_context_override: Optional[str] = None):
+        """Execute the graph and write the resulting state to disk."""
+        # Inject Quiver's ledger-derived scorecard (passed in by analyze.py via
+        # past_context_override). The framework's own markdown memory is no longer
+        # the source — see propagate(). Empty string when there's no history.
+        past_context = past_context_override or ""
         init_agent_state = self.propagator.create_initial_state(
             company_name, trade_date, asset_type=asset_type, past_context=past_context
         )
@@ -369,12 +376,10 @@ class TradingAgentsGraph:
         # Log state to disk.
         self._log_state(trade_date, final_state)
 
-        # Store decision for deferred reflection on the next same-ticker run.
-        self.memory_log.store_decision(
-            ticker=company_name,
-            trade_date=trade_date,
-            final_trade_decision=final_state["final_trade_decision"],
-        )
+        # Decision persistence + outcome reflection are owned by Quiver's
+        # SQLite ledger (tick.py plan/commit/reflect), grounded in REAL fills and
+        # quotes — not the framework's yfinance-scored markdown log.
+        # (Was: self.memory_log.store_decision(ticker, trade_date, final_trade_decision).)
 
         # Clear checkpoint on successful completion to avoid stale state.
         if self.config.get("checkpoint_enabled"):

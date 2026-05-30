@@ -124,7 +124,7 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
     path.write_text(json.dumps(safe, indent=2, default=str), encoding="utf-8")
 
 
-def run_analysis(ticker: str, date: str, cfg) -> dict:
+def run_analysis(ticker: str, date: str, cfg, past_context: str = "") -> dict:
     from lib.ds_config import build_deepseek_config
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -138,7 +138,7 @@ def run_analysis(ticker: str, date: str, cfg) -> dict:
         sink = _Tee(sys.stderr, reasoning_log)
         with contextlib.redirect_stdout(sink):
             graph = TradingAgentsGraph(config=ta_cfg)
-            final_state, signal = graph.propagate(ticker, date)
+            final_state, signal = graph.propagate(ticker, date, past_context_override=past_context)
     finally:
         if reasoning_log is not None:
             try:
@@ -165,7 +165,17 @@ def main(argv) -> int:
 
     try:
         cfg = load_config(REPO / "config.yaml")
-        result = run_analysis(ticker, date, cfg)
+        # Best-effort decision memory: a ledger-derived scorecard of past calls +
+        # their real outcomes, injected into the analysis as past_context. Read-only
+        # and never fatal — a memory hiccup must not block a fresh analysis.
+        past_context = ""
+        try:
+            from lib.ledger import Ledger
+            from lib.memory import scorecard
+            past_context = scorecard(Ledger(STATE / "ledger.db"), ticker)
+        except Exception:  # noqa: BLE001 — memory is best-effort, never blocks analysis
+            past_context = ""
+        result = run_analysis(ticker, date, cfg, past_context)
     except Exception as e:  # noqa: BLE001 — wrapper must never crash silently
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({"ticker": ticker, "signal": "ERROR", "error": str(e), "schema": 1}))

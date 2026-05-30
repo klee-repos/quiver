@@ -60,6 +60,37 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (trade_date, kind)
 );
+-- Decision memory (ground of record for the scorecard). One row per analysis
+-- decision; `outcomes` links 1:1 once the call is old enough to score. Columns
+-- run_id / position_pct / next_review_hours / decision_price are filled by later
+-- phases (multi-run, structured sizing, RH quotes) and are NULL until then.
+CREATE TABLE IF NOT EXISTS decisions (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date        TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    run_id            TEXT,
+    decided_at        TEXT NOT NULL,
+    signal            TEXT,
+    intent            TEXT,
+    position_pct      REAL,
+    entry_price       REAL,
+    stop_loss         REAL,
+    next_review_hours REAL,
+    decision_price    REAL,
+    rationale         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_ticker ON decisions(ticker, decided_at);
+CREATE TABLE IF NOT EXISTS outcomes (
+    decision_id        INTEGER PRIMARY KEY,    -- 1:1 with decisions.id
+    resolved_at        TEXT NOT NULL,
+    holding_days       INTEGER,
+    directional_return REAL,                   -- (price_now - decision_price)/decision_price
+    benchmark_return   REAL,
+    alpha              REAL,
+    realized_pnl       REAL,                    -- position-level (broker basis); NULL in dry-run
+    unrealized_pnl     REAL,
+    scored_against     TEXT                     -- 'directional' | 'both'
+);
 """
 
 
@@ -195,6 +226,74 @@ class Ledger:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM orders WHERE trade_date=? ORDER BY submitted_at",
                 (trade_date,),
+            ).fetchall()]
+
+    # --- decision memory (ground of record for the scorecard) ----------------
+
+    def record_decision(
+        self, *, trade_date: str, ticker: str, decided_at: str,
+        signal: Optional[str], intent: Optional[str],
+        position_pct: Optional[float] = None, entry_price: Optional[float] = None,
+        stop_loss: Optional[float] = None, next_review_hours: Optional[float] = None,
+        decision_price: Optional[float] = None, rationale: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> int:
+        """Persist one analysis decision; returns its id (the outcome FK)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO decisions (trade_date, ticker, run_id, decided_at, signal, "
+                "intent, position_pct, entry_price, stop_loss, next_review_hours, "
+                "decision_price, rationale) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (trade_date, ticker, run_id, decided_at, signal, intent, position_pct,
+                 entry_price, stop_loss, next_review_hours, decision_price, rationale),
+            )
+            rid = cur.lastrowid
+            if rid is None:  # never happens after a successful INSERT, but be explicit
+                raise RuntimeError("decisions INSERT did not return a row id")
+            return int(rid)
+
+    def get_decision(self, decision_id: int) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
+            return dict(row) if row else None
+
+    def pending_outcome_decisions(self, resolve_on_or_before_date: str) -> list:
+        """Decisions with no outcome yet whose trade_date is old enough to score.
+
+        Date (not timestamp) comparison so it's robust across DST. The orchestrator
+        fetches quotes/positions for these and feeds them to ``reflect``.
+        """
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT d.* FROM decisions d LEFT JOIN outcomes o ON o.decision_id = d.id "
+                "WHERE o.decision_id IS NULL AND d.trade_date <= ? ORDER BY d.decided_at",
+                (resolve_on_or_before_date,),
+            ).fetchall()]
+
+    def record_outcome(
+        self, decision_id: int, *, resolved_at: str, holding_days: Optional[int] = None,
+        directional_return: Optional[float] = None, benchmark_return: Optional[float] = None,
+        alpha: Optional[float] = None, realized_pnl: Optional[float] = None,
+        unrealized_pnl: Optional[float] = None, scored_against: str = "directional",
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO outcomes (decision_id, resolved_at, holding_days, "
+                "directional_return, benchmark_return, alpha, realized_pnl, unrealized_pnl, "
+                "scored_against) VALUES (?,?,?,?,?,?,?,?,?)",
+                (decision_id, resolved_at, holding_days, directional_return, benchmark_return,
+                 alpha, realized_pnl, unrealized_pnl, scored_against),
+            )
+
+    def decisions_with_outcomes(self, ticker: str, limit: int = 8) -> list:
+        """Recent decisions for a ticker joined to their outcomes, newest first."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT d.*, o.directional_return, o.alpha, o.holding_days, o.realized_pnl, "
+                "o.unrealized_pnl, o.scored_against FROM decisions d "
+                "LEFT JOIN outcomes o ON o.decision_id = d.id "
+                "WHERE d.ticker = ? ORDER BY d.decided_at DESC, d.id DESC LIMIT ?",
+                (ticker, limit),
             ).fetchall()]
 
     # --- order idempotency ----------------------------------------------------

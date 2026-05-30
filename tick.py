@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ from lib import market  # noqa: E402
 from lib import notify  # noqa: E402
 from lib import signals  # noqa: E402
 from lib import storage  # noqa: E402
+from lib import memory  # noqa: E402
 
 LEDGER_DB = REPO / "state" / "ledger.db"
 ANALYZE_LOGS = REPO / "state" / "analyze_logs"
@@ -56,10 +58,29 @@ def _cfg_and_ledger():
     return cfg, led
 
 
+def _to_float(v):
+    """Best-effort float coercion (handles None / strings / blanks) -> float|None."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def cmd_preflight(_args) -> dict:
     cfg, led = _cfg_and_ledger()
     day = market.trading_day_et()
     now = market.now_et().isoformat()
+
+    # Decisions old enough to score but not yet resolved. The orchestrator fetches
+    # quotes/positions for these and feeds `tick.py reflect` (memory grounding).
+    cutoff = (market.now_et().date() - timedelta(days=memory.HOLDING_DAYS)).isoformat()
+    pending_outcomes = [
+        {"decision_id": d["id"], "ticker": d["ticker"],
+         "trade_date": d["trade_date"], "decision_price": d["decision_price"]}
+        for d in led.pending_outcome_decisions(cutoff)
+    ]
 
     out = {
         "proceed": False,
@@ -69,6 +90,7 @@ def cmd_preflight(_args) -> dict:
         "trading_day": day,
         "now_iso": now,
         "pending": [],
+        "pending_outcomes": pending_outcomes,
         "unfinalized": led.unfinalized_orders(day),
         "risk": {
             "max_dollars_per_trade": cfg.risk.max_dollars_per_trade,
@@ -163,6 +185,22 @@ def cmd_plan(args) -> dict:
         has_position = held_qty > 0
 
         intent, frac = signals.plan_action(signal, has_position)
+
+        # Persist the analysis decision to the ledger — the ground of record for
+        # the memory scorecard. Recorded for EVERY valid signal (incl. hold/skip),
+        # since directional grading applies to those too. decision_price comes
+        # from a live RH quote when present (Phase 4), else the model's entry_price.
+        led.record_decision(
+            trade_date=day, ticker=ticker, decided_at=now_iso,
+            signal=signal, intent=intent,
+            position_pct=_to_float(a.get("position_pct")),
+            entry_price=_to_float(a.get("entry_price")),
+            stop_loss=_to_float(a.get("stop_loss")),
+            next_review_hours=_to_float(a.get("next_review_hours")),
+            decision_price=_to_float(a.get("decision_price")) or _to_float(a.get("entry_price")),
+            rationale=a.get("rationale_summary"),
+            run_id=data.get("run_id"),
+        )
 
         if intent in ("hold", "skip"):
             detail = "hold" if intent == "hold" else "no-position (long-only, no short)"
@@ -385,6 +423,71 @@ def cmd_report_commit(args) -> dict:
     return {"ok": True, "date": args.date, "kind": args.kind, "hash": args.content_hash}
 
 
+# --- decision-memory outcome resolution --------------------------------------
+# Grounds the memory scorecard in REAL market data: the orchestrator passes a
+# snapshot (current quote + position market value/cost basis + any realized P&L)
+# for each decision preflight flagged as pending_outcomes; Python computes the
+# directional return (decision_price -> price_now) and position-level P&L and
+# writes the outcome row. tick.py stays offline — all market data is passed in.
+#
+# `reflect` input JSON:
+#   {"resolutions": [
+#       {"decision_id": 12, "price_now": 196.4,
+#        "position_market_value": 48.0, "position_cost_basis": 50.0,   # optional
+#        "realized_pnl": 0.0, "benchmark_return": 0.004}               # optional
+#   ]}
+
+def cmd_reflect(args) -> dict:
+    led = Ledger(LEDGER_DB)
+    now_iso = market.now_et().isoformat()
+    today = market.now_et().date()
+    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    resolutions = data.get("resolutions", []) or []
+
+    results = []
+    for r in resolutions:
+        did = r.get("decision_id")
+        dec = led.get_decision(did) if did is not None else None
+        if not dec:
+            results.append({"decision_id": did, "status": "unknown_decision"})
+            continue
+
+        price_now = _to_float(r.get("price_now"))
+        dret = memory.directional_return(_to_float(dec.get("decision_price")), price_now)
+        mv = _to_float(r.get("position_market_value"))
+        basis = _to_float(r.get("position_cost_basis"))
+        unrealized = (mv - basis) if (mv is not None and basis is not None) else None
+        realized = _to_float(r.get("realized_pnl"))
+
+        if dret is None and unrealized is None and realized is None:
+            # Nothing to score yet (no usable price, no position) — leave pending.
+            results.append({"decision_id": did, "status": "nothing_to_score"})
+            continue
+
+        try:
+            td = datetime.strptime(dec["trade_date"], "%Y-%m-%d").date()
+            holding_days = (today - td).days
+        except Exception:  # noqa: BLE001
+            holding_days = None
+        bench = _to_float(r.get("benchmark_return"))
+        alpha = (dret - bench) if (dret is not None and bench is not None) else None
+        scored = "both" if (unrealized is not None or realized is not None) else "directional"
+
+        led.record_outcome(
+            did, resolved_at=now_iso, holding_days=holding_days,
+            directional_return=dret, benchmark_return=bench, alpha=alpha,
+            realized_pnl=realized, unrealized_pnl=unrealized, scored_against=scored,
+        )
+        results.append({"decision_id": did, "status": "resolved",
+                        "directional_return": dret, "scored_against": scored})
+
+    return {
+        "ok": True,
+        "resolved": sum(1 for x in results if x["status"] == "resolved"),
+        "results": results,
+    }
+
+
 # --- storage retention -------------------------------------------------------
 # Best-effort housekeeping: age out bulky reconstructable artifacts past the
 # retention window, optionally offloading first (S3 backend deferred). Like the
@@ -423,6 +526,8 @@ def main(argv) -> int:
     p_rc.add_argument("--kind", default="digest")
     p_rc.add_argument("--hash", required=True, dest="content_hash")
     p_rc.add_argument("--recipients", default="")
+    p_reflect = sub.add_parser("reflect")
+    p_reflect.add_argument("--input", required=True)
     sub.add_parser("prune")
     args = ap.parse_args(argv)
 
@@ -437,6 +542,8 @@ def main(argv) -> int:
             out = cmd_report(args)
         elif args.cmd == "report-commit":
             out = cmd_report_commit(args)
+        elif args.cmd == "reflect":
+            out = cmd_reflect(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         else:  # unreachable
