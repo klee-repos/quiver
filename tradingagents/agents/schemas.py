@@ -136,6 +136,15 @@ class TraderProposal(BaseModel):
         default=None,
         description="Optional sizing guidance, e.g. '5% of portfolio'.",
     )
+    position_pct: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional structured sizing: the percent of total portfolio equity to "
+            "allocate to this position, as a plain number (e.g. 5 means 5%). Prefer "
+            "filling this over (or in addition to) the prose position_sizing — the "
+            "execution layer reads this number directly and still clamps it to its caps."
+        ),
+    )
 
 
 def render_trader_proposal(proposal: TraderProposal) -> str:
@@ -156,6 +165,8 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
         parts.extend(["", f"**Stop Loss**: {proposal.stop_loss}"])
     if proposal.position_sizing:
         parts.extend(["", f"**Position Sizing**: {proposal.position_sizing}"])
+    if proposal.position_pct is not None:
+        parts.extend(["", f"**Position Pct**: {proposal.position_pct}"])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",

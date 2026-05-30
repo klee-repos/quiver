@@ -73,15 +73,22 @@ def resolve_buy_dollars(
     buffer: float,
     room_under_ticker_cap: float,
     fallback: float = 100.0,
+    position_pct: Optional[float] = None,
 ) -> Tuple[float, str]:
     """Resolve a clamped USD buy amount. Returns (dollars, sizing_source).
 
-    Final amount = min(model size or conservative fallback, per-trade ceiling,
-    remaining daily deploy cap, buying_power - buffer, room under per-ticker
-    cap). Always >= 0; a non-positive result means "skip".
+    Sizing source preference: the model's STRUCTURED ``position_pct`` (% of equity)
+    wins when present; otherwise the prose ``position_sizing`` is parsed; otherwise
+    a conservative fallback. Final amount = min(that size, per-trade ceiling,
+    remaining daily deploy cap, buying_power - buffer, room under per-ticker cap).
+    Always >= 0; a non-positive result means "skip". Never fails open to a large size.
     """
-    base = parse_sizing_to_dollars(position_sizing, baseline_equity)
-    source = "parsed"
+    if position_pct is not None and position_pct > 0:
+        base = position_pct / 100.0 * baseline_equity
+        source = "structured"
+    else:
+        base = parse_sizing_to_dollars(position_sizing, baseline_equity)
+        source = "parsed"
     if base is None or base <= 0:
         base = min(ceiling, fallback)
         source = "fallback"

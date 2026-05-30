@@ -171,6 +171,9 @@ def cmd_plan(args) -> dict:
     buying_power = float(data.get("buying_power", 0.0))
     positions = data.get("positions", {}) or {}
     analyses = data.get("analyses", []) or []
+    # Live Robinhood quotes {TICKER: last_price} the orchestrator fetched this wake.
+    # Used as the one price source for sizing/decision_price (and Phase 5 limit/stop).
+    quotes = data.get("quotes", {}) or {}
 
     baseline = led.get_or_create_baseline(day, equity, now_iso)
     drop_pct = (equity - baseline.baseline_equity) / baseline.baseline_equity * 100.0
@@ -219,6 +222,11 @@ def cmd_plan(args) -> dict:
         held_qty = float(pos.get("quantity", 0) or 0)
         held_mv = float(pos.get("market_value", 0) or 0)
         has_position = held_qty > 0
+        quote = _to_float(quotes.get(ticker))
+        # Prefer a live quote * held shares for the per-ticker room check if the
+        # broker didn't report a market value (keeps the cap honest on fresh data).
+        if held_mv == 0 and quote and held_qty:
+            held_mv = quote * held_qty
 
         intent, frac = signals.plan_action(signal, has_position)
 
@@ -233,7 +241,7 @@ def cmd_plan(args) -> dict:
             entry_price=_to_float(a.get("entry_price")),
             stop_loss=_to_float(a.get("stop_loss")),
             next_review_hours=_to_float(a.get("next_review_hours")),
-            decision_price=_to_float(a.get("decision_price")) or _to_float(a.get("entry_price")),
+            decision_price=quote or _to_float(a.get("decision_price")) or _to_float(a.get("entry_price")),
             rationale=a.get("rationale_summary"),
             run_id=run_id,
         )
@@ -292,6 +300,7 @@ def cmd_plan(args) -> dict:
                 buying_power=buying_power,
                 buffer=cfg.risk.min_buying_power_buffer,
                 room_under_ticker_cap=room,
+                position_pct=_to_float(a.get("position_pct")),
             )
             if dollars <= 0:
                 led.record_action(day, ticker, signal=signal, intent="buy",

@@ -91,6 +91,7 @@ def parse_trader_plan(plan_text: str) -> dict:
         "entry_price": grab_float("Entry Price"),
         "stop_loss": grab_float("Stop Loss"),
         "position_sizing": grab("Position Sizing"),
+        "position_pct": grab_float("Position Pct"),
     }
 
 
@@ -110,6 +111,7 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         "signal": signal,  # deterministic: Buy/Overweight/Hold/Underweight/Sell
         "action": plan["action"],
         "position_sizing": plan["position_sizing"],
+        "position_pct": plan["position_pct"],   # structured sizing (% of equity); preferred over prose
         "entry_price": plan["entry_price"],
         "stop_loss": plan["stop_loss"],
         # Model-proposed re-check cadence (hours); Python clamps it. Optional.

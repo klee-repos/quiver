@@ -43,6 +43,9 @@ Call the Robinhood MCP with the `account_number` from preflight:
      trade on stale auth). Recovery: a human re-runs `/mcp` to re-authenticate.
 2. `get_equity_positions(account_number)` → for each held ticker record
    `{quantity, market_value}`.
+3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>])`
+   → record each ticker's latest price as `{TICKER: last_price}`. This is the single
+   price source Python uses for sizing, decision-price capture, and outcome scoring.
 
 ## STEP 3 — Analyze each pending ticker (DeepSeek, slow)
 
@@ -63,9 +66,12 @@ Write a file `state/tmp/plan_input.json` containing:
   "buying_power": <from get_portfolio>,
   "now_iso": "<preflight now_iso>",
   "positions": { "AAPL": {"quantity": 3, "market_value": 600.0}, ... },
+  "quotes": { "AAPL": 196.4, ... },
   "analyses": [ <each analyze.py JSON from STEP 3> ]
 }
 ```
+(`quotes` is the STEP 2.3 map. Omit a ticker only if its quote was unavailable —
+Python falls back to the model's entry_price for that ticker's decision price.)
 Run:
 ```
 ~/dev/quiver/.venv/bin/python tick.py plan --input state/tmp/plan_input.json

@@ -470,5 +470,29 @@ check_raises("analysis cap <= 0 raises",
              lambda: make_loop_config(risk_extra={"max_analyses_per_ticker_per_day": 0}), ConfigError)
 
 
+# ===================== STRUCTURED SIZING via position_pct (D6) ==============
+# Structured position_pct (% of equity) takes precedence over prose, tagged 'structured'.
+_d, _src = signals.resolve_buy_dollars("ignored prose", 1000, 1.0, ceiling=500,
+                                       remaining_daily_cap=500, buying_power=900, buffer=0,
+                                       room_under_ticker_cap=900, position_pct=10)
+check("structured pct used (10% of 1000)", (_d, _src), (100.0, "structured"))
+_d, _ = signals.resolve_buy_dollars(None, 1000, 1.0, ceiling=50,
+                                    remaining_daily_cap=500, buying_power=900, buffer=0,
+                                    room_under_ticker_cap=900, position_pct=20)
+check("structured pct still clamped by ceiling", _d, 50.0)
+_d, _ = signals.resolve_buy_dollars(None, 1000, 0.5, ceiling=500,
+                                    remaining_daily_cap=500, buying_power=900, buffer=0,
+                                    room_under_ticker_cap=900, position_pct=10)
+check("structured pct * overweight tilt", _d, 50.0)
+_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
+                                       remaining_daily_cap=500, buying_power=900, buffer=0,
+                                       room_under_ticker_cap=900, position_pct=None)
+check("prose path unchanged when no position_pct", (_d, _src), (50.0, "parsed"))
+_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
+                                       remaining_daily_cap=500, buying_power=900, buffer=0,
+                                       room_under_ticker_cap=900, position_pct=0)
+check("non-positive position_pct -> prose fallback", (_d, _src), (50.0, "parsed"))
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
