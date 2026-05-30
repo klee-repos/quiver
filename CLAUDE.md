@@ -32,10 +32,13 @@ Built and validated end-to-end; in **dry-run**, pending one live session.
 - ✅ Account wired: `XXXXXXXX` ("Agentic", `agentic_allowed=true`), **$100** buying power.
   Caps in `config.yaml` are sized for $100 ($25/trade, $75/day, 5% daily-loss halt) — bump
   them proportionally if the account is funded with more.
-- ⏳ Next: run one **live dry-run tick** during market hours, then flip `config.yaml: dry_run`
-  to `false` on a fresh trading day. See README "How to run".
-- Known: Reddit sentiment fetch returns `403` (unauth scraping) and degrades gracefully;
-  the other analysts + StockTwits still run.
+- ✅ Live path validated off-hours: a real `analyze.py AAPL` (de-vendored stack) → `plan`
+  (dry-run) → digest emailed via Resend, **0 orders**. ⏳ Next: one **market-hours**,
+  preflight-gated tick, then flip `config.yaml: dry_run` to `false` on a fresh day.
+- Data / keys: prices, indicators, fundamentals, and news all use **yfinance (no API key)**;
+  StockTwits is keyless. `ALPHA_VANTAGE_API_KEY` is an optional alternate vendor, **unused by
+  default**. The only required key is `DEEPSEEK_API_KEY`. Reddit sentiment returns `403` (unauth
+  scraping) and degrades gracefully — the other analysts + StockTwits still run.
 
 ## Commands
 

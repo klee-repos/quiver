@@ -25,7 +25,8 @@ Built and validated end-to-end; running in **dry-run** pending one live session.
 | ✅ Account | `••••7171` ("Agentic", `agentic_allowed=true`), **$100** buying power |
 | ✅ Guardrails | sized for $100: $25/trade, $75/day cap, 5% daily-loss halt |
 | ✅ Capabilities | owned framework · ledger-grounded memory · optional intraday cadence · optional limit/stop orders (risky paths OFF by default) |
-| ⏳ Pending | one **live dry-run tick** during market hours → then flip `dry_run: false` |
+| ✅ Live path | one full dry-run pass validated off-hours: live `analyze.py` → `plan` → digest emailed, **0 orders** |
+| ⏳ Pending | one **market-hours**, preflight-gated tick → then flip `dry_run: false` |
 
 > The dry-run gate needs an open market, so the first live tick happens on the
 > next trading session.
@@ -158,6 +159,11 @@ that registration (not in `.env`/`config.yaml`). Off until you enable it. To tur
 Always use `.venv/bin/python` — deps live in the venv, not the global pyenv.
 
 ## Notes
+- **Data sources / API keys:** prices, technical indicators, fundamentals, and company
+  news all come from **yfinance — no API key required** (the `data_vendors` default), and
+  StockTwits is keyless too. `ALPHA_VANTAGE_API_KEY` is only for the *optional alternate*
+  vendor and is **not used by default** — a blank key degrades nothing. The only required
+  key is `DEEPSEEK_API_KEY`.
 - **Reddit sentiment** returns `403 Blocked` (unauthenticated scraping). It
   degrades gracefully — the other three analysts and StockTwits still run.
   Optional to fix later with Reddit API credentials.
