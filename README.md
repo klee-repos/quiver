@@ -1,13 +1,17 @@
 # Quiver
 
-Autonomous stock bot — once a day by default, optionally several times a day at a
-model-paced, Python-clamped cadence. **TradingAgents** (multi-agent LLM, owned
-in-tree under `tradingagents/`) runs on **DeepSeek** to produce a Buy/Sell/Hold
-signal per ticker; **Claude Code** (orchestrator, holding the Robinhood MCP)
-executes the trades. All risk guardrails, sizing, dedup, cadence, and idempotency
-are deterministic Python (`tick.py`) — never the orchestrator's judgment. It also
-keeps a **decision memory** (past calls + real outcomes) grounded in the ledger and
-fed back into each analysis.
+An autonomous trading desk tuned to **Robinhood's agentic trading platform** —
+trading once a day by default, optionally several times a day at a model-paced,
+Python-clamped cadence. A multi-agent LLM (running on **DeepSeek**, owned in-tree
+under `tradingagents/`) produces a Buy/Sell/Hold signal per ticker; **Claude Code**
+(orchestrator, holding the Robinhood MCP) executes the trades. All risk guardrails,
+sizing, dedup, cadence, and idempotency are deterministic Python (`tick.py`) — never
+the orchestrator's judgment. It also keeps a **decision memory** (past calls + real
+outcomes) grounded in the ledger and fed back into each analysis.
+
+> The multi-agent framework under `tradingagents/` is an owned, vendored fork of
+> [TradingAgents](https://github.com/TauricResearch/TradingAgents), de-vendored and
+> pruned to a DeepSeek-only signal path — provenance in `tradingagents/UPSTREAM.md`.
 
 > ⚠️ **Real money, fully autonomous.** Currently in `dry_run` (paper). It can
 > lose money. This is not investment advice.
@@ -22,7 +26,7 @@ Built and validated end-to-end; running in **dry-run** pending one live session.
 | ✅ Decision path | `analyze.py AAPL` ran a full DeepSeek analysis → valid signal |
 | ✅ Plan / kill-switch / preflight drills | pass (offline) |
 | ✅ Models | `deepseek-v4-flash` (quick) + `deepseek-v4-pro` (deep) confirmed live |
-| ✅ Account | `••••7171` ("Agentic", `agentic_allowed=true`), **$100** buying power |
+| ✅ Account | an `agentic_allowed=true` "Agentic" account (set via `RH_ACCOUNT_NUMBER` in `.env`), **~$100** buying power |
 | ✅ Guardrails | sized for $100: $25/trade, $75/day cap, 5% daily-loss halt |
 | ✅ Capabilities | owned framework · ledger-grounded memory · optional intraday cadence · optional limit/stop orders (risky paths OFF by default) |
 | ✅ Live path | one full dry-run pass validated off-hours: live `analyze.py` → `plan` → digest emailed, **0 orders** |
@@ -85,7 +89,7 @@ Current values (sized for the $100 account — bump proportionally when funded):
 
 | Key | Value | Meaning |
 |---|---|---|
-| `account_number` | `XXXXXXXX` | the agentic-allowed Robinhood account |
+| `RH_ACCOUNT_NUMBER` (in `.env`) | — | the agentic_allowed Robinhood account — per-user secret, **not** in `config.yaml` |
 | `dry_run` | `true` | paper mode; review only, never place |
 | `watchlist` | `AAPL, MSFT, NVDA` | tickers analyzed each day (cost scales with size) |
 | `risk.max_dollars_per_trade` | `25` | hard per-trade ceiling |
@@ -178,4 +182,4 @@ Always use `.venv/bin/python` — deps live in the venv, not the global pyenv.
 - `config.yaml` — account, mode, watchlist, caps, order types, models, loop timing + intraday/cadence, storage, `notify` (email).
 - `state/ledger.db` — dedup + idempotency + daily P&L baseline + **decision memory** (`decisions`/`outcomes`) + intraday action history + digest markers (survives restart).
 - `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored; tracked, pruned; `UPSTREAM.md` provenance + Apache-2.0 `LICENSE`). Editable install via root `pyproject.toml`.
-- `.env` — `DEEPSEEK_API_KEY` only (gitignored, `chmod 600`). MCP keys (Robinhood, Resend) live in your Claude config, not here.
+- `.env` — per-user secrets (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`, `RH_ACCOUNT_NUMBER`, `NOTIFY_TO`. `config.yaml` carries none of these. MCP keys (Robinhood, Resend) live in your Claude config, not here.

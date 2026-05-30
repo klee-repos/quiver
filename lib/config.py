@@ -7,6 +7,7 @@ orchestrator stops instead of trading on a bad config.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -131,14 +132,27 @@ def load_config(path) -> Config:
         raise ConfigError(f"config.yaml not found at {p}")
     d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
+    # Per-user/secret values are NOT committed: they come from .env (gitignored),
+    # alongside DEEPSEEK_API_KEY. Load it here so every entrypoint (tick.py,
+    # analyze.py) sees the same values via load_config. Missing python-dotenv or
+    # a missing .env is fine — the vars may already be set in the real environment.
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(p.resolve().parent / ".env")
+    except Exception:
+        pass
+
     # FAIL SAFE: anything other than an explicit False keeps us in paper mode.
     dry_run = d.get("dry_run", True) is not False
 
-    account = str(_require(d, "account_number")).strip()
-    if account == _PLACEHOLDER_ACCOUNT:
+    # account_number lives in .env (RH_ACCOUNT_NUMBER); config.yaml may still carry
+    # it as a fallback for local use, but the committed file ships without it.
+    account = (os.environ.get("RH_ACCOUNT_NUMBER") or str(d.get("account_number", "") or "")).strip()
+    if not account or account == _PLACEHOLDER_ACCOUNT:
         raise ConfigError(
-            "config.yaml: account_number is still the placeholder "
-            f"'{_PLACEHOLDER_ACCOUNT}'. Set your agentic_allowed account number."
+            "account_number is not set. Put RH_ACCOUNT_NUMBER=<your agentic_allowed "
+            "Robinhood account number> in .env (it must NOT be committed)."
         )
 
     watchlist = _require(d, "watchlist")
@@ -207,9 +221,15 @@ def load_config(path) -> Config:
     # disabled block never blocks a trading tick.
     notify_d = d.get("notify", {}) or {}
     notify_enabled = notify_d.get("enabled", False) is True
-    to_raw = notify_d.get("to", []) or []
-    if isinstance(to_raw, str):
-        to_raw = [to_raw]
+    # Recipients live in .env (NOTIFY_TO, comma-separated) so the committed config
+    # carries no personal address; fall back to config.yaml's notify.to if unset.
+    to_env = os.environ.get("NOTIFY_TO", "").strip()
+    if to_env:
+        to_raw = to_env.split(",")
+    else:
+        to_raw = notify_d.get("to", []) or []
+        if isinstance(to_raw, str):
+            to_raw = [to_raw]
     to = [str(x).strip() for x in to_raw if str(x).strip()]
     from_addr = str(notify_d.get("from", "") or "").strip()
     subject_prefix = str(notify_d.get("subject_prefix", "[Quiver]") or "[Quiver]").strip()

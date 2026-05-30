@@ -29,7 +29,7 @@ Built and validated end-to-end; in **dry-run**, pending one live session.
   `protective_stop`) ship **OFF by default** — the default behavior is the validated once-a-day
   market-order path.
 - ✅ Models live: `deepseek-v4-flash` (quick/analysts) + `deepseek-v4-pro` (deep/debates).
-- ✅ Account wired: `XXXXXXXX` ("Agentic", `agentic_allowed=true`), **$100** buying power.
+- ✅ Account wired: an `agentic_allowed=true` "Agentic" account (number set via `RH_ACCOUNT_NUMBER` in `.env`, not committed), **~$100** buying power.
   Caps in `config.yaml` are sized for $100 ($25/trade, $75/day, 5% daily-loss halt) — bump
   them proportionally if the account is funded with more.
 - ✅ Live path validated off-hours: a real `analyze.py AAPL` (de-vendored stack) → `plan`
@@ -229,5 +229,7 @@ ledger rollups — all offline.
 - `state/` — `ledger.db`, `tmp/` (plan_input/commit/reflect/protect/report scratch),
   `analyze_logs/`, `memory/`, framework `results`/`cache`. Gitignored.
 - `logs/` — `orchestrator.log` (one line per tick) + `reasoning/` (teed live thinking). Gitignored.
-- `.env` — `DEEPSEEK_API_KEY` only (gitignored, `chmod 600`). MCP credentials (Robinhood, Resend)
-  live in the operator's Claude config (`claude mcp add`), NOT in this repo — same for both MCPs.
+- `.env` — per-user/secret values (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`,
+  `RH_ACCOUNT_NUMBER` (the agentic_allowed account), and `NOTIFY_TO` (digest recipients,
+  comma-separated). `config.yaml` is committed and carries none of these. MCP credentials
+  (Robinhood, Resend) live in the operator's Claude config (`claude mcp add`), NOT in this repo.

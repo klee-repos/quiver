@@ -3,13 +3,15 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Quiver's owned fork of TradingAgents. Distribution name kept as
-# "tradingagents" so the `import tradingagents` path is unchanged across the repo
-# (analyze.py, lib/ds_config.py). This is vendored-and-owned source, not the
-# upstream PyPI package — see tradingagents/UPSTREAM.md for provenance.
-name = "tradingagents"
+# Quiver — the autonomous trading desk this repo builds. The distribution is
+# named "quiver"; the bundled multi-agent framework keeps its own import path
+# (the `tradingagents/` directory — directory name, not distribution name, is
+# what `import tradingagents` resolves), so renaming this field touches no
+# imports. That framework is an owned, vendored fork — provenance in README.md
+# and tradingagents/UPSTREAM.md, not here.
+name = "quiver"
 version = "0.2.5"
-description = "TradingAgents (Quiver fork): multi-agent LLM trading framework, DeepSeek-only"
+description = "Quiver — an autonomous trading desk that executes a multi-agent LLM signal on Robinhood's agentic trading platform"
 requires-python = ">=3.10"
 # Pared to what the kept DeepSeek signal path actually imports. Dropped from
 # upstream: backtrader, redis, parsel, questionary, rich, typer,

@@ -1,15 +1,18 @@
 schema: 1
 
 # --- Account ---------------------------------------------------------------
-# MUST be an agentic_allowed=true Robinhood account. Get it by calling
-# get_accounts in the Claude Code session (setup step). Placeholder fails fast.
-account_number: "XXXXXXXX"
+# The account number is a per-user value and is NOT committed: set
+# RH_ACCOUNT_NUMBER in .env (gitignored, next to DEEPSEEK_API_KEY). It MUST be an
+# agentic_allowed=true Robinhood account — get it by calling get_accounts in the
+# Claude Code session. Missing -> load fails fast.
 
 # --- Mode ------------------------------------------------------------------
 # START in dry_run. The orchestrator will call review_equity_order but NEVER
 # place_equity_order. Flip to false only after a clean dry-run validation.
 dry_run: true
-kill_switch_file: "~/dev/quiver/KILL"
+# Relative to the repo root (where tick.py runs). `touch KILL` halts the next
+# tick; `rm KILL` resumes. Use an absolute path if you run from elsewhere.
+kill_switch_file: "KILL"
 
 # --- Universe --------------------------------------------------------------
 # Keep small at first: LLM cost + runtime scale linearly with the watchlist.
@@ -18,15 +21,15 @@ watchlist: ["AAPL", "MSFT", "NVDA"]
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
 # Sized for the ~$100 Agentic account. Bump these if you fund it with more.
 risk:
-  max_dollars_per_trade: 25           # hard per-trade ceiling
-  daily_loss_halt_pct: 5.0            # equity drop >= this vs today's baseline -> halt + KILL
-  daily_capital_deploy_cap: 75        # max total $ of BUYS across all tickers per day
+  max_dollars_per_trade: 100           # hard per-trade ceiling
+  daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
+  daily_capital_deploy_cap: 1000        # max total $ of BUYS across all tickers per day
   max_open_position_per_ticker: 50    # max $ market value held in any one ticker
   min_buying_power_buffer: 5          # never spend below this much remaining buying power
   # Intraday-only caps (ignored when loop.intraday_enabled is false). max_actions
   # bounds repeat TRADES/ticker/day; max_analyses is the LLM-cost circuit breaker.
-  max_actions_per_ticker_per_day: 3
-  max_analyses_per_ticker_per_day: 6
+  max_actions_per_ticker_per_day: 10
+  max_analyses_per_ticker_per_day: 10
 
 # --- Order defaults --------------------------------------------------------
 order:
@@ -74,7 +77,8 @@ loop:
 # Fails SAFE: stays OFF unless enabled is exactly `true`.
 notify:
   enabled: true
-  to: ["you@example.com"]              # set to your inbox before enabling
+  # Recipients are per-user and NOT committed: set NOTIFY_TO in .env
+  # (comma-separated for multiple). Required when enabled is true.
   from: ""                              # blank -> the Resend MCP's own SENDER_EMAIL_ADDRESS is used
   subject_prefix: "[Quiver]"
 
