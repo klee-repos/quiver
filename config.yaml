@@ -1,0 +1,58 @@
+schema: 1
+
+# --- Account ---------------------------------------------------------------
+# MUST be an agentic_allowed=true Robinhood account. Get it by calling
+# get_accounts in the Claude Code session (setup step). Placeholder fails fast.
+account_number: "XXXXXXXX"
+
+# --- Mode ------------------------------------------------------------------
+# START in dry_run. The orchestrator will call review_equity_order but NEVER
+# place_equity_order. Flip to false only after a clean dry-run validation.
+dry_run: true
+kill_switch_file: "~/dev/quiver/KILL"
+
+# --- Universe --------------------------------------------------------------
+# Keep small at first: LLM cost + runtime scale linearly with the watchlist.
+watchlist: ["AAPL", "MSFT", "NVDA"]
+
+# --- Risk guardrails (coded backstops around the model's own sizing) -------
+# Sized for the ~$100 Agentic account. Bump these if you fund it with more.
+risk:
+  max_dollars_per_trade: 25           # hard per-trade ceiling
+  daily_loss_halt_pct: 5.0            # equity drop >= this vs today's baseline -> halt + KILL
+  daily_capital_deploy_cap: 75        # max total $ of BUYS across all tickers per day
+  max_open_position_per_ticker: 50    # max $ market value held in any one ticker
+  min_buying_power_buffer: 5          # never spend below this much remaining buying power
+
+# --- Order defaults --------------------------------------------------------
+order:
+  buy_type: "market"                  # dollar_amount requires type=market
+  sell_mode: "close_position"
+  time_in_force: "gfd"
+  market_hours: "regular_hours"       # fractional/dollar orders only fill in RTH
+
+# --- Models (DeepSeek) -----------------------------------------------------
+# quick_think (chat/flash) does the analyst TOOL CALLS -> must support function
+# calling. deep_think (reasoner/pro) does the debates/judgment. Verify current
+# IDs at setup via: curl https://api.deepseek.com/v1/models -H "Authorization: Bearer $DEEPSEEK_API_KEY"
+deepseek:
+  chat_model: "deepseek-v4-flash"
+  reasoner_model: "deepseek-v4-pro"
+
+# --- Loop timing -----------------------------------------------------------
+loop:
+  act_after_open_minutes: 5           # wait N min after the open before acting
+  analyze_timeout_sec: 900            # per-ticker analyze.py subprocess timeout
+
+# --- Notifications (email digest of each run) ------------------------------
+# Python (tick.py report) BUILDS the email + decides if it's new; the
+# orchestrator SENDS it via the Resend MCP. The MCP is registered in YOUR
+# Claude config (`claude mcp add resend ...`), exactly like the Robinhood MCP —
+# it is NOT shipped in this repo, and the RESEND_API_KEY + sender live in that
+# MCP registration, not here. See README "Email digest" to enable.
+# Fails SAFE: stays OFF unless enabled is exactly `true`.
+notify:
+  enabled: true
+  to: ["you@example.com"]              # set to your inbox before enabling
+  from: ""                              # blank -> the Resend MCP's own SENDER_EMAIL_ADDRESS is used
+  subject_prefix: "[Quiver]"

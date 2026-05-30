@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Quiver's owned fork of TradingAgents. Distribution name kept as
+# "tradingagents" so the `import tradingagents` path is unchanged across the repo
+# (analyze.py, lib/ds_config.py). This is vendored-and-owned source, not the
+# upstream PyPI package — see tradingagents/UPSTREAM.md for provenance.
+name = "tradingagents"
+version = "0.2.5"
+description = "TradingAgents (Quiver fork): multi-agent LLM trading framework, DeepSeek-only"
+requires-python = ">=3.10"
+# Pared to what the kept DeepSeek signal path actually imports. Dropped from
+# upstream: backtrader, redis, parsel, questionary, rich, typer,
+# langchain-anthropic, langchain-google-genai, langchain-experimental
+# (no import of any of these survives in the kept package — verified by grep).
+dependencies = [
+    "langchain-core>=0.3.81",
+    "langchain-openai>=0.3.23",
+    "langgraph>=0.4.8",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "pandas>=2.3.0",
+    "yfinance>=0.2.63",
+    "stockstats>=0.6.5",
+    "requests>=2.32.4",
+    "pytz>=2025.2",
+    "typing-extensions>=4.14.0",
+    "tqdm>=4.67.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tradingagents*"]
