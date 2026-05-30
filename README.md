@@ -1,10 +1,13 @@
 # Quiver
 
-Autonomous once-daily stock bot. **TradingAgents** (multi-agent LLM) runs on
-**DeepSeek** to produce a daily Buy/Sell/Hold signal per ticker; **Claude Code**
-(orchestrator, holding the Robinhood MCP) executes the trades. All risk
-guardrails, dedup, and idempotency are deterministic Python (`tick.py`) — never
-the orchestrator's judgment.
+Autonomous stock bot — once a day by default, optionally several times a day at a
+model-paced, Python-clamped cadence. **TradingAgents** (multi-agent LLM, owned
+in-tree under `tradingagents/`) runs on **DeepSeek** to produce a Buy/Sell/Hold
+signal per ticker; **Claude Code** (orchestrator, holding the Robinhood MCP)
+executes the trades. All risk guardrails, sizing, dedup, cadence, and idempotency
+are deterministic Python (`tick.py`) — never the orchestrator's judgment. It also
+keeps a **decision memory** (past calls + real outcomes) grounded in the ledger and
+fed back into each analysis.
 
 > ⚠️ **Real money, fully autonomous.** Currently in `dry_run` (paper). It can
 > lose money. This is not investment advice.
@@ -15,12 +18,13 @@ Built and validated end-to-end; running in **dry-run** pending one live session.
 
 | | |
 |---|---|
-| ✅ Unit tests | 26/26 pass (`tests/test_units.py`) |
+| ✅ Unit tests | 169/169 pass (`tests/test_units.py`) |
 | ✅ Decision path | `analyze.py AAPL` ran a full DeepSeek analysis → valid signal |
 | ✅ Plan / kill-switch / preflight drills | pass (offline) |
 | ✅ Models | `deepseek-v4-flash` (quick) + `deepseek-v4-pro` (deep) confirmed live |
 | ✅ Account | `••••7171` ("Agentic", `agentic_allowed=true`), **$100** buying power |
 | ✅ Guardrails | sized for $100: $25/trade, $75/day cap, 5% daily-loss halt |
+| ✅ Capabilities | owned framework · ledger-grounded memory · optional intraday cadence · optional limit/stop orders (risky paths OFF by default) |
 | ⏳ Pending | one **live dry-run tick** during market hours → then flip `dry_run: false` |
 
 > The dry-run gate needs an open market, so the first live tick happens on the
@@ -90,6 +94,17 @@ Current values (sized for the $100 account — bump proportionally when funded):
 | `risk.min_buying_power_buffer` | `5` | never spend below this much |
 | `deepseek.chat_model` | `deepseek-v4-flash` | analyst tool-calls (must support function calling) |
 | `deepseek.reasoner_model` | `deepseek-v4-pro` | debates / judgment |
+| `loop.intraday_enabled` | `false` | **OFF = classic once-a-day.** `true` = model-paced multi-run (see below) |
+| `loop.per_ticker_cooldown_min` / `review_floor_min` / `review_ceiling_open_min` / `review_ceiling_min` | `60 / 30 / 120 / 1440` | intraday cooldown + cadence clamp bounds (minutes) |
+| `risk.max_actions_per_ticker_per_day` / `max_analyses_per_ticker_per_day` | `3 / 6` | intraday trade cap + LLM-cost (analysis) cap |
+| `order.buy_type` | `market` | `limit` = marketable-limit, whole-share entries (Python-priced) |
+| `order.protective_stop.enabled` / `stop_pct` | `false / 8.0` | post-fill GTC stop, Python-clamped (model only seeds) |
+| `storage.retention_days` | `30` | age out logs/transcripts; `archive` (S3) deferred, off |
+
+**Intraday & advanced orders are opt-in.** With everything at defaults the bot behaves exactly as the
+validated once-a-day, market-order path. `loop.intraday_enabled: true` lets the model recommend when to
+look next (Python clamps it and bounds repeat trades); `order.buy_type: limit` and `protective_stop`
+add price-protected entries + resting stops — enable these only after a live dry-run validation.
 
 ## Controls
 - **Kill switch:** `touch KILL` halts all trading next tick; `rm KILL` resumes.
@@ -150,11 +165,11 @@ Always use `.venv/bin/python` — deps live in the venv, not the global pyenv.
   The analysis uses **zero** Claude Code quota (only the thin orchestration does).
 
 ## Layout
-- `analyze.py` — decision wrapper (ticker → one JSON line; full audit dump; tees live thinking to `logs/reasoning/`).
-- `tick.py` — `preflight` / `plan` / `commit` (the deterministic brain) + `report` / `report-commit` (build + dedup the email digest).
-- `lib/` — `config`, `market` (XNYS hours), `ledger` (sqlite), `signals` (pure), `ds_config`, `notify` (pure digest renderer).
+- `analyze.py` — decision wrapper (ticker → one JSON line; injects the memory scorecard; full audit dump; tees live thinking to `logs/reasoning/`).
+- `tick.py` — `preflight` / `plan` / `commit` (the deterministic brain) + `reflect` (memory outcomes) / `protect` (post-fill stop) / `report` / `report-commit` / `prune`.
+- `lib/` — `config`, `market` (XNYS hours), `ledger` (sqlite), `signals` (pure), `ds_config`, `notify` (pure digest renderer), `memory` (pure scorecard), `storage` (retention/archiver).
 - `TICK.md` — the exact per-tick runbook the orchestrator follows.
-- `config.yaml` — account, mode, watchlist, caps, models, loop timing, `notify` (email).
-- `state/ledger.db` — dedup + idempotency + daily P&L baseline + digest-sent markers (survives restart).
-- `vendor/TradingAgents` — the vendored framework (gitignored; re-cloned via setup).
+- `config.yaml` — account, mode, watchlist, caps, order types, models, loop timing + intraday/cadence, storage, `notify` (email).
+- `state/ledger.db` — dedup + idempotency + daily P&L baseline + **decision memory** (`decisions`/`outcomes`) + intraday action history + digest markers (survives restart).
+- `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored; tracked, pruned; `UPSTREAM.md` provenance + Apache-2.0 `LICENSE`). Editable install via root `pyproject.toml`.
 - `.env` — `DEEPSEEK_API_KEY` only (gitignored, `chmod 600`). MCP keys (Robinhood, Resend) live in your Claude config, not here.
