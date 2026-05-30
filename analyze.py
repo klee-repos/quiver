@@ -94,6 +94,12 @@ def parse_trader_plan(plan_text: str) -> dict:
     }
 
 
+def parse_pm_field_float(decision_text: str, label: str):
+    """Pull a numeric '**Label**: value' field out of the PM decision markdown."""
+    m = re.search(rf"\*\*{re.escape(label)}\*\*:\s*(-?\d+(?:\.\d+)?)", decision_text)
+    return float(m.group(1)) if m else None
+
+
 def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
     plan_text = str(final_state.get("trader_investment_plan") or "")
     plan = parse_trader_plan(plan_text)
@@ -106,6 +112,8 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         "position_sizing": plan["position_sizing"],
         "entry_price": plan["entry_price"],
         "stop_loss": plan["stop_loss"],
+        # Model-proposed re-check cadence (hours); Python clamps it. Optional.
+        "next_review_hours": parse_pm_field_float(final_decision, "Next Review Hours"),
         "rationale_summary": summary,
         "schema": 1,
     }

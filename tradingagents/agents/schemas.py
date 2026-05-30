@@ -204,6 +204,15 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+    next_review_hours: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional: in how many HOURS should this ticker be re-analyzed? Use a "
+            "smaller value for fast-moving or high-conviction setups that need close "
+            "watching, a larger value for stable theses. This is a re-check cadence "
+            "(distinct from the holding horizon); the system clamps it to a safe range."
+        ),
+    )
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:
@@ -225,4 +234,6 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
         parts.extend(["", f"**Price Target**: {decision.price_target}"])
     if decision.time_horizon:
         parts.extend(["", f"**Time Horizon**: {decision.time_horizon}"])
+    if decision.next_review_hours is not None:
+        parts.extend(["", f"**Next Review Hours**: {decision.next_review_hours}"])
     return "\n".join(parts)

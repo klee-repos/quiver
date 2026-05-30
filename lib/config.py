@@ -23,6 +23,11 @@ class RiskConfig:
     daily_capital_deploy_cap: float
     max_open_position_per_ticker: float
     min_buying_power_buffer: float
+    # Intraday-only caps (default 1 == classic once-a-day behavior). max_actions
+    # bounds repeat TRADES per ticker/day; max_analyses is the LLM-cost circuit
+    # breaker bounding repeat ANALYSES per ticker/day.
+    max_actions_per_ticker_per_day: int
+    max_analyses_per_ticker_per_day: int
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,12 @@ class Config:
     market_hours: str
     act_after_open_minutes: int
     analyze_timeout_sec: int
+    # Multi-run / cadence (intraday mode only; the master switch gates the path).
+    intraday_enabled: bool
+    per_ticker_cooldown_min: int
+    review_floor_min: int
+    review_ceiling_open_min: int
+    review_ceiling_min: int
     notify: NotifyConfig
     storage: StorageConfig
     raw: dict
@@ -92,6 +103,18 @@ def _pos_num(d: dict, key: str) -> float:
         v = float(v)
     except (TypeError, ValueError):
         raise ConfigError(f"config.yaml: '{key}' must be a number, got {v!r}")
+    if v <= 0:
+        raise ConfigError(f"config.yaml: '{key}' must be > 0, got {v}")
+    return v
+
+
+def _pos_int(d: dict, key: str, default: int) -> int:
+    """Positive integer with a default (used for loop/cadence + intraday caps)."""
+    v = d.get(key, default)
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        raise ConfigError(f"config.yaml: '{key}' must be an integer, got {v!r}")
     if v <= 0:
         raise ConfigError(f"config.yaml: '{key}' must be > 0, got {v}")
     return v
@@ -125,6 +148,8 @@ def load_config(path) -> Config:
         daily_capital_deploy_cap=_pos_num(risk_d, "daily_capital_deploy_cap"),
         max_open_position_per_ticker=_pos_num(risk_d, "max_open_position_per_ticker"),
         min_buying_power_buffer=float(risk_d.get("min_buying_power_buffer", 0) or 0),
+        max_actions_per_ticker_per_day=_pos_int(risk_d, "max_actions_per_ticker_per_day", 1),
+        max_analyses_per_ticker_per_day=_pos_int(risk_d, "max_analyses_per_ticker_per_day", 1),
     )
 
     ds = d.get("deepseek", {}) or {}
@@ -138,6 +163,21 @@ def load_config(path) -> Config:
 
     order = d.get("order", {}) or {}
     loop = d.get("loop", {}) or {}
+
+    # Multi-run / cadence. Master switch fails SAFE OFF (only an explicit True
+    # enables intraday). Cadence bounds must be ordered floor <= open-ceiling <=
+    # ceiling so the Python clamp can never invert.
+    intraday_enabled = loop.get("intraday_enabled", False) is True
+    per_ticker_cooldown_min = _pos_int(loop, "per_ticker_cooldown_min", 60)
+    review_floor_min = _pos_int(loop, "review_floor_min", 30)
+    review_ceiling_open_min = _pos_int(loop, "review_ceiling_open_min", 120)
+    review_ceiling_min = _pos_int(loop, "review_ceiling_min", 1440)
+    if not (review_floor_min <= review_ceiling_open_min <= review_ceiling_min):
+        raise ConfigError(
+            "config.yaml: loop cadence bounds must satisfy review_floor_min <= "
+            "review_ceiling_open_min <= review_ceiling_min "
+            f"(got {review_floor_min}, {review_ceiling_open_min}, {review_ceiling_min})"
+        )
 
     # Notifications: fail SAFE — absent block or anything but an explicit True
     # keeps email OFF. Only validate addresses when the user opts in, so a
@@ -209,6 +249,11 @@ def load_config(path) -> Config:
         market_hours=str(order.get("market_hours", "regular_hours")),
         act_after_open_minutes=int(loop.get("act_after_open_minutes", 5)),
         analyze_timeout_sec=int(loop.get("analyze_timeout_sec", 900)),
+        intraday_enabled=intraday_enabled,
+        per_ticker_cooldown_min=per_ticker_cooldown_min,
+        review_floor_min=review_floor_min,
+        review_ceiling_open_min=review_ceiling_open_min,
+        review_ceiling_min=review_ceiling_min,
         notify=notify,
         storage=storage,
         raw=d,

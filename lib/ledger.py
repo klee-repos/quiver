@@ -91,6 +91,32 @@ CREATE TABLE IF NOT EXISTS outcomes (
     unrealized_pnl     REAL,
     scored_against     TEXT                     -- 'directional' | 'both'
 );
+-- Append-only action event log (intraday multi-run). Feeds the cooldown,
+-- per-ticker action count, and on-change gate. `ticker_action` stays the
+-- per-(date,ticker) LATEST snapshot used by the digest; this is the history.
+CREATE TABLE IF NOT EXISTS actions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date    TEXT NOT NULL,
+    ticker        TEXT NOT NULL,
+    run_id        TEXT,
+    ts            TEXT NOT NULL,
+    signal        TEXT,
+    intent        TEXT,
+    status        TEXT,
+    detail        TEXT,
+    dollar_amount REAL
+);
+CREATE INDEX IF NOT EXISTS idx_actions_ticker ON actions(trade_date, ticker, ts);
+-- Per-ticker cadence state: when the ticker is next due for re-analysis and how
+-- many analyses it has had today (the LLM-cost budget). Reset implicitly per day
+-- (the date is part of the key).
+CREATE TABLE IF NOT EXISTS ticker_schedule (
+    trade_date     TEXT NOT NULL,
+    ticker         TEXT NOT NULL,
+    next_due_ts    TEXT,
+    analyses_today INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (trade_date, ticker)
+);
 """
 
 
@@ -295,6 +321,71 @@ class Ledger:
                 "WHERE d.ticker = ? ORDER BY d.decided_at DESC, d.id DESC LIMIT ?",
                 (ticker, limit),
             ).fetchall()]
+
+    # --- intraday multi-run: action events + per-ticker cadence schedule ------
+    # A "completed trade" (what cooldown / action-cap / on-change gate on) is an
+    # event with intent buy|sell that actually went through or was simulated:
+    # status placed|dry_run. Blocked/error attempts are logged but don't count.
+
+    _TRADE_FILTER = "intent IN ('buy','sell') AND status IN ('placed','dry_run')"
+
+    def record_event(
+        self, *, trade_date: str, ticker: str, ts: str, signal: Optional[str],
+        intent: Optional[str], status: Optional[str], detail: Optional[str] = None,
+        dollar_amount: Optional[float] = None, run_id: Optional[str] = None,
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO actions (trade_date, ticker, run_id, ts, signal, intent, "
+                "status, detail, dollar_amount) VALUES (?,?,?,?,?,?,?,?,?)",
+                (trade_date, ticker, run_id, ts, signal, intent, status, detail, dollar_amount),
+            )
+
+    def last_trade_action(self, trade_date: str, ticker: str) -> Optional[dict]:
+        """Most recent COMPLETED trade event for the ticker today (cooldown/on-change)."""
+        with self._conn() as c:
+            row = c.execute(
+                f"SELECT * FROM actions WHERE trade_date=? AND ticker=? AND {self._TRADE_FILTER} "
+                "ORDER BY ts DESC, id DESC LIMIT 1",
+                (trade_date, ticker),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def trade_actions_today(self, trade_date: str, ticker: str) -> int:
+        """Count of COMPLETED trades for the ticker today (the action cap)."""
+        with self._conn() as c:
+            row = c.execute(
+                f"SELECT COUNT(*) AS n FROM actions WHERE trade_date=? AND ticker=? "
+                f"AND {self._TRADE_FILTER}",
+                (trade_date, ticker),
+            ).fetchone()
+            return int(row["n"] or 0)
+
+    def get_schedule(self, trade_date: str, ticker: str) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM ticker_schedule WHERE trade_date=? AND ticker=?",
+                (trade_date, ticker),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def bump_analysis(self, trade_date: str, ticker: str, *, next_due_ts: Optional[str]) -> int:
+        """Record that the ticker was analyzed: increment analyses_today, set next due.
+
+        Returns the new analyses_today. Upsert keyed by (trade_date, ticker).
+        """
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO ticker_schedule (trade_date, ticker, next_due_ts, analyses_today) "
+                "VALUES (?,?,?,1) ON CONFLICT(trade_date, ticker) DO UPDATE SET "
+                "next_due_ts=excluded.next_due_ts, analyses_today=analyses_today+1",
+                (trade_date, ticker, next_due_ts),
+            )
+            row = c.execute(
+                "SELECT analyses_today FROM ticker_schedule WHERE trade_date=? AND ticker=?",
+                (trade_date, ticker),
+            ).fetchone()
+            return int(row["analyses_today"]) if row else 0
 
     # --- order idempotency ----------------------------------------------------
 

@@ -388,5 +388,87 @@ check_true("integrated scorecard reflects 1 resolved",
            "2 decision(s), 1 resolved" in memory.build_scorecard("AAPL", _dw))
 
 
+# ======================= MULTI-RUN + MODEL-DRIVEN CADENCE ===================
+
+# --- pure gates ---
+check("cooldown ok when no prior action", signals.cooldown_ok(None, "2026-05-30T10:00:00-04:00", 60), True)
+check("cooldown blocks within window",
+      signals.cooldown_ok("2026-05-30T10:00:00-04:00", "2026-05-30T10:30:00-04:00", 60), False)
+check("cooldown ok after window",
+      signals.cooldown_ok("2026-05-30T10:00:00-04:00", "2026-05-30T11:05:00-04:00", 60), True)
+check("cooldown bad timestamp fails open", signals.cooldown_ok("garbage", "also-bad", 60), True)
+check("action cap allows under", signals.within_action_cap(2, 3), True)
+check("action cap blocks at limit", signals.within_action_cap(3, 3), False)
+check("material change: no prior -> True", signals.is_material_change("Buy", "buy", None, None), True)
+check("material change: identical -> False", signals.is_material_change("Buy", "buy", "Buy", "buy"), False)
+check("material change: diff signal -> True", signals.is_material_change("Sell", "sell", "Buy", "buy"), True)
+
+# --- clamp_review_minutes (Python owns the bound) ---
+check("clamp below floor -> floor", signals.clamp_review_minutes(0.1, 30, 120), 30.0)   # 6min -> 30
+check("clamp above ceiling -> ceiling", signals.clamp_review_minutes(10, 30, 120), 120.0)  # 600 -> 120
+check("clamp within -> exact", signals.clamp_review_minutes(1, 30, 120), 60.0)
+check("clamp None -> ceiling", signals.clamp_review_minutes(None, 30, 120), 120.0)
+check("clamp non-positive -> ceiling", signals.clamp_review_minutes(0, 30, 120), 120.0)
+check("clamp respects a looser (closed) ceiling", signals.clamp_review_minutes(10, 30, 1440), 600.0)
+
+# --- ledger: action events + per-ticker schedule ---
+_rled = _tmp_ledger()
+RDAY = "2026-05-30"
+_rled.record_event(trade_date=RDAY, ticker="AAPL", ts="2026-05-30T10:00:00-04:00",
+                   signal="Buy", intent="buy", status="dry_run", run_id="r1")
+_rled.record_event(trade_date=RDAY, ticker="AAPL", ts="2026-05-30T11:00:00-04:00",
+                   signal="Buy", intent="buy", status="blocked_guardrail", run_id="r2")  # not completed
+check("trade_actions_today counts completed trades only", _rled.trade_actions_today(RDAY, "AAPL"), 1)
+_last = _rled.last_trade_action(RDAY, "AAPL")
+check("last_trade_action is the completed one",
+      (_last["status"], _last["ts"]), ("dry_run", "2026-05-30T10:00:00-04:00"))
+check("trade_actions_today isolates ticker", _rled.trade_actions_today(RDAY, "MSFT"), 0)
+check("no schedule initially", _rled.get_schedule(RDAY, "AAPL"), None)
+check("bump_analysis sets count 1", _rled.bump_analysis(RDAY, "AAPL", next_due_ts="2026-05-30T12:00:00-04:00"), 1)
+check("bump_analysis increments", _rled.bump_analysis(RDAY, "AAPL", next_due_ts="2026-05-30T13:00:00-04:00"), 2)
+_sched = _rled.get_schedule(RDAY, "AAPL")
+check("schedule next_due updated", _sched["next_due_ts"], "2026-05-30T13:00:00-04:00")
+check("schedule analyses_today", _sched["analyses_today"], 2)
+
+# --- REGRESSION: ticker_action snapshot stays latest-per-ticker (digest unbroken) ---
+_rled.record_action(RDAY, "AAPL", signal="Buy", intent="buy", status="dry_run", detail="1", now_iso="t1")
+_rled.record_action(RDAY, "AAPL", signal="Sell", intent="sell", status="dry_run", detail="2", now_iso="t2")
+check("day_actions = one latest row per ticker (digest regression)",
+      [(a["ticker"], a["signal"]) for a in _rled.day_actions(RDAY)], [("AAPL", "Sell")])
+
+
+def make_loop_config(loop_block=None, risk_extra=None):
+    d = {
+        "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+        "watchlist": ["AAPL"],
+        "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "min_buying_power_buffer": 5},
+        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+    }
+    if loop_block is not None:
+        d["loop"] = loop_block
+    if risk_extra:
+        d["risk"].update(risk_extra)
+    return load_config(_write_config(d))
+
+
+# --- config: intraday + cadence parsing/validation (default = classic) ---
+check("intraday defaults OFF (classic once-a-day)", make_loop_config().intraday_enabled, False)
+check("intraday enabled only on exact True", make_loop_config({"intraday_enabled": True}).intraday_enabled, True)
+check("intraday string 'yes' -> OFF (fail-safe)", make_loop_config({"intraday_enabled": "yes"}).intraday_enabled, False)
+_lc = make_loop_config()
+check("cadence defaults", (_lc.review_floor_min, _lc.review_ceiling_open_min, _lc.review_ceiling_min), (30, 120, 1440))
+check_raises("inverted cadence bounds raise",
+             lambda: make_loop_config({"review_floor_min": 200, "review_ceiling_open_min": 100}), ConfigError)
+check_raises("cooldown <= 0 raises", lambda: make_loop_config({"per_ticker_cooldown_min": 0}), ConfigError)
+check("intraday caps default to 1 (== once-a-day)",
+      (_lc.risk.max_actions_per_ticker_per_day, _lc.risk.max_analyses_per_ticker_per_day), (1, 1))
+check("action cap parsed",
+      make_loop_config(risk_extra={"max_actions_per_ticker_per_day": 4}).risk.max_actions_per_ticker_per_day, 4)
+check_raises("analysis cap <= 0 raises",
+             lambda: make_loop_config(risk_extra={"max_analyses_per_ticker_per_day": 0}), ConfigError)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

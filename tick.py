@@ -86,6 +86,7 @@ def cmd_preflight(_args) -> dict:
         "proceed": False,
         "reason": None,
         "dry_run": cfg.dry_run,
+        "intraday": cfg.intraday_enabled,
         "account_number": cfg.account_number,
         "trading_day": day,
         "now_iso": now,
@@ -120,10 +121,35 @@ def cmd_preflight(_args) -> dict:
         out["reason"] = f"too_early (minutes_since_open={mso})"
         return out
 
-    pending = [t for t in cfg.watchlist if not led.already_acted(day, t)]
+    if cfg.intraday_enabled:
+        # Per-ticker eligibility: a ticker is due when its cadence timer has
+        # elapsed AND it's under the daily analysis budget. Cheap-skip the rest
+        # so a wake only re-analyzes what actually needs it.
+        now_dt = market.now_et()
+        max_an = cfg.risk.max_analyses_per_ticker_per_day
+
+        def _due(t: str) -> bool:
+            sched = led.get_schedule(day, t)
+            if sched and int(sched["analyses_today"] or 0) >= max_an:
+                return False
+            nd = sched["next_due_ts"] if sched else None
+            if not nd:
+                return True
+            try:
+                return datetime.fromisoformat(nd) <= now_dt
+            except (TypeError, ValueError):
+                return True
+
+        pending = [t for t in cfg.watchlist if _due(t)]
+        no_pending = "no_tickers_due_yet (cooldown/cadence/analysis-budget)"
+    else:
+        # Classic once-a-day path: at most one action per ticker per day.
+        pending = [t for t in cfg.watchlist if not led.already_acted(day, t)]
+        no_pending = "all_watchlist_tickers_already_acted_today"
+
     out["pending"] = pending
     if not pending:
-        out["reason"] = "all_watchlist_tickers_already_acted_today"
+        out["reason"] = no_pending
         return out
 
     out["proceed"] = True
@@ -136,6 +162,11 @@ def cmd_plan(args) -> dict:
     day = market.trading_day_et()
     data = json.loads(Path(args.input).read_text(encoding="utf-8"))
     now_iso = data.get("now_iso") or market.now_et().isoformat()
+    try:
+        now_dt = datetime.fromisoformat(now_iso)
+    except (TypeError, ValueError):
+        now_dt = market.now_et()
+    run_id = data.get("run_id") or led.new_ref_id()
     equity = float(data["equity"])
     buying_power = float(data.get("buying_power", 0.0))
     positions = data.get("positions", {}) or {}
@@ -147,13 +178,18 @@ def cmd_plan(args) -> dict:
     result = {
         "halt": False,
         "write_kill": False,
+        "run_id": run_id,
+        "intraday": cfg.intraday_enabled,
         "baseline_equity": baseline.baseline_equity,
         "equity": equity,
         "drop_pct": round(drop_pct, 3),
         "dry_run": cfg.dry_run,
         "orders": [],
         "decisions": [],
+        "next_review_minutes": None,    # earliest clamped re-look (intraday); orchestrator sleeps this
+        "next_wake_iso": None,
     }
+    review_minutes: list = []           # per-analyzed-ticker clamped cadence (intraday)
 
     # Daily-loss kill-switch: breach -> halt the whole day, signal KILL write.
     if drop_pct <= -cfg.risk.daily_loss_halt_pct:
@@ -199,8 +235,22 @@ def cmd_plan(args) -> dict:
             next_review_hours=_to_float(a.get("next_review_hours")),
             decision_price=_to_float(a.get("decision_price")) or _to_float(a.get("entry_price")),
             rationale=a.get("rationale_summary"),
-            run_id=data.get("run_id"),
+            run_id=run_id,
         )
+
+        # Cadence (intraday only): schedule this ticker's next look and count the
+        # analysis against its daily budget. The model proposes next_review_hours;
+        # Python clamps it (tighter ceiling while the market is open) and snaps the
+        # wake out of any closed-market gap. Done for every analyzed ticker.
+        if cfg.intraday_enabled:
+            open_now = market.is_regular_session_open(now_dt)
+            ceiling = cfg.review_ceiling_open_min if open_now else cfg.review_ceiling_min
+            minutes = signals.clamp_review_minutes(
+                a.get("next_review_hours"), cfg.review_floor_min, ceiling)
+            next_due = market.next_market_time_et(
+                now_dt + timedelta(minutes=minutes)).isoformat()
+            led.bump_analysis(day, ticker, next_due_ts=next_due)
+            review_minutes.append(minutes)
 
         if intent in ("hold", "skip"):
             detail = "hold" if intent == "hold" else "no-position (long-only, no short)"
@@ -209,6 +259,29 @@ def cmd_plan(args) -> dict:
             decision.update(status="skipped", intent=intent, detail=detail)
             result["decisions"].append(decision)
             continue
+
+        # Intraday repeat-trade backstop (buy/sell only): the daily $ caps already
+        # bound exposure; these stop churn within a day — too many trades, too soon
+        # after the last one, or an identical repeat of the last action.
+        if cfg.intraday_enabled:
+            last = led.last_trade_action(day, ticker)
+            gate = None
+            if not signals.within_action_cap(
+                led.trade_actions_today(day, ticker), cfg.risk.max_actions_per_ticker_per_day):
+                gate = "max_actions_reached"
+            elif not signals.cooldown_ok(
+                last["ts"] if last else None, now_iso, cfg.per_ticker_cooldown_min):
+                gate = "cooldown"
+            elif not signals.is_material_change(
+                signal, intent,
+                last["signal"] if last else None, last["intent"] if last else None):
+                gate = "unchanged_since_last_action"
+            if gate:
+                led.record_action(day, ticker, signal=signal, intent=intent,
+                                  status="skipped", detail=gate, now_iso=now_iso)
+                decision.update(status="skipped", intent=intent, detail=gate)
+                result["decisions"].append(decision)
+                continue
 
         if intent == "buy":
             room = max(0.0, cfg.risk.max_open_position_per_ticker - held_mv)
@@ -265,6 +338,14 @@ def cmd_plan(args) -> dict:
             decision.update(status="order", intent="sell", quantity=qty)
             result["decisions"].append(decision)
 
+    # Loop cadence: wake at the soonest re-look the model asked for (clamped),
+    # snapped to market hours. The orchestrator schedules the next tick at this.
+    if review_minutes:
+        soonest = min(review_minutes)
+        result["next_review_minutes"] = round(soonest, 1)
+        result["next_wake_iso"] = market.next_market_time_et(
+            now_dt + timedelta(minutes=soonest)).isoformat()
+
     return result
 
 
@@ -278,12 +359,22 @@ def cmd_commit(args) -> dict:
     if ref_id:
         led.finalize_order(ref_id, d.get("broker_order_id"),
                            json.dumps(d.get("result_json", {})))
+    ticker = str(d["ticker"]).upper()
     led.record_action(
-        day, str(d["ticker"]).upper(),
+        day, ticker,
         signal=d.get("signal", ""), intent=d.get("intent", ""),
         status=d["status"], detail=str(d.get("detail", "")), now_iso=now_iso,
     )
-    return {"ok": True, "ticker": d["ticker"], "status": d["status"]}
+    # Append to the action event log (cooldown / action-cap / on-change history).
+    # The gates count only completed trades (intent buy|sell, status placed|dry_run);
+    # blocked/error attempts are logged but don't start a cooldown or burn the cap.
+    led.record_event(
+        trade_date=day, ticker=ticker, run_id=d.get("run_id"), ts=now_iso,
+        signal=d.get("signal", ""), intent=d.get("intent", ""),
+        status=d["status"], detail=str(d.get("detail", "")),
+        dollar_amount=_to_float(d.get("dollar_amount")),
+    )
+    return {"ok": True, "ticker": ticker, "status": d["status"]}
 
 
 # --- email digest ------------------------------------------------------------

@@ -23,6 +23,10 @@ risk:
   daily_capital_deploy_cap: 75        # max total $ of BUYS across all tickers per day
   max_open_position_per_ticker: 50    # max $ market value held in any one ticker
   min_buying_power_buffer: 5          # never spend below this much remaining buying power
+  # Intraday-only caps (ignored when loop.intraday_enabled is false). max_actions
+  # bounds repeat TRADES/ticker/day; max_analyses is the LLM-cost circuit breaker.
+  max_actions_per_ticker_per_day: 3
+  max_analyses_per_ticker_per_day: 6
 
 # --- Order defaults --------------------------------------------------------
 order:
@@ -43,6 +47,15 @@ deepseek:
 loop:
   act_after_open_minutes: 5           # wait N min after the open before acting
   analyze_timeout_sec: 900            # per-ticker analyze.py subprocess timeout
+  # --- Multi-run / model-driven cadence -------------------------------------
+  # OFF by default == today's exact once-a-day path (one analysis, one action per
+  # ticker/day; the multi-run + cadence code stays dormant). Flip true (globally,
+  # or just for a volatile day) to let the model pace re-checks within Python bounds.
+  intraday_enabled: false
+  per_ticker_cooldown_min: 60         # min minutes between repeat trades on a ticker
+  review_floor_min: 30                # never re-analyze a ticker sooner than this
+  review_ceiling_open_min: 120        # while market OPEN, never wait longer than this
+  review_ceiling_min: 1440            # after close, may wait up to this (next session)
 
 # --- Notifications (email digest of each run) ------------------------------
 # Python (tick.py report) BUILDS the email + decides if it's new; the

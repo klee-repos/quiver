@@ -12,6 +12,7 @@ A Sell/Underweight with no existing position is a no-op (never opens a short).
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Optional, Tuple
 
 VALID_SIGNALS = {"Buy", "Overweight", "Hold", "Underweight", "Sell"}
@@ -105,3 +106,55 @@ def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:
     """
     qty = max(0.0, min(held_qty, held_qty * sell_fraction))
     return round(qty, 6)
+
+
+# --- multi-run gates + cadence clamp (pure; intraday mode only) --------------
+# These gate REPEAT trades on the same ticker within a day and bound how soon we
+# re-look. They are deterministic and unit-tested; tick.py feeds them ledger
+# facts (last action, today's counts) and config thresholds.
+
+def cooldown_ok(last_action_iso: Optional[str], now_iso: str, cooldown_min: float) -> bool:
+    """True if enough time has elapsed since the last action (or there was none).
+
+    Unparseable timestamps fail OPEN (return True) rather than wedging the bot on
+    a bad clock value — the daily $ caps and action cap still bound exposure.
+    """
+    if not last_action_iso:
+        return True
+    try:
+        elapsed_min = (datetime.fromisoformat(now_iso)
+                       - datetime.fromisoformat(last_action_iso)).total_seconds() / 60.0
+    except (TypeError, ValueError):
+        return True
+    return elapsed_min >= cooldown_min
+
+
+def within_action_cap(actions_today: int, max_actions: int) -> bool:
+    """True if another action on this ticker is allowed today."""
+    return actions_today < max_actions
+
+
+def is_material_change(cur_signal, cur_intent, last_signal, last_intent) -> bool:
+    """True if this decision differs from the last one (so it's worth acting again).
+
+    No prior decision -> material. Otherwise a repeat of the same (signal, intent)
+    is NOT material — the on-change gate suppresses churn from identical calls.
+    """
+    if last_signal is None and last_intent is None:
+        return True
+    return (cur_signal, cur_intent) != (last_signal, last_intent)
+
+
+def clamp_review_minutes(next_review_hours, floor_min: float, ceiling_min: float) -> float:
+    """Clamp a model-proposed re-check delay (hours) into [floor_min, ceiling_min] minutes.
+
+    None / non-positive / unparseable -> the ceiling (re-check at the far, least
+    aggressive end of the safe window). Python always owns this bound, never the model.
+    """
+    try:
+        minutes = float(next_review_hours) * 60.0 if next_review_hours is not None else None
+    except (TypeError, ValueError):
+        minutes = None
+    if minutes is None or minutes <= 0:
+        return float(ceiling_min)
+    return float(max(floor_min, min(minutes, ceiling_min)))

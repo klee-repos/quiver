@@ -25,8 +25,13 @@ Parse the JSON.
   (Common no-op reasons: `market_closed`, `too_early`, `kill_switch_present`,
   `daily_halt_flag_set`, `all_watchlist_tickers_already_acted_today`.)
 - If `unfinalized` is non-empty → see STEP 6 (reconcile) BEFORE anything else.
-- Otherwise note: `account_number`, `dry_run`, `trading_day`, `pending` (tickers),
-  `risk`, `order`.
+- Otherwise note: `account_number`, `dry_run`, `intraday`, `trading_day`,
+  `pending` (tickers to analyze this wake), `pending_outcomes`, `risk`, `order`.
+- `intraday` reflects `loop.intraday_enabled`. When `false`, `pending` is the
+  classic "not yet acted today" set (≤1 action/ticker/day). When `true`, `pending`
+  is only the tickers whose cadence timer elapsed and that are under the daily
+  analysis budget — analyze only those.
+- `pending_outcomes` lists past decisions old enough to score → see STEP 6b.
 
 ## STEP 2 — Broker snapshot (MCP, read-only)
 
@@ -71,7 +76,10 @@ Parse the JSON:
   the **digest procedure** (STEP 7b) with `kind:"halt"` (include the plan JSON as `plan`),
   and **STOP**.
 - `orders` is the explicit list to execute. `decisions` are the holds/skips/errors
-  already recorded — just log them. If `orders` is empty → log and **STOP** (nothing to do).
+  already recorded — just log them. If `orders` is empty → no trades to place, but
+  STILL run STEP 6b (reflect) and STEP 7 (close-out, incl. cadence) before ending.
+- `next_review_minutes` / `next_wake_iso` (intraday only): the Python-clamped,
+  market-snapped delay until the next wake — used in STEP 7 to schedule the next tick.
 
 ## STEP 5 — Execute each order in `orders`
 
@@ -115,6 +123,28 @@ and look for one matching its `ref_id`. If it already exists at the broker → c
 `status:"placed"` with that broker id. If it does NOT exist and the market is open and
 `dry_run` is false → re-place with the SAME `ref_id`, then commit. If unsure → commit
 `status:"error"` detail `"needs manual review"` and do NOT re-place. Then continue the tick.
+
+## STEP 6b — Resolve decision outcomes (memory; best-effort)
+
+Only if STEP 1 reported a non-empty `pending_outcomes`. For each entry, you already
+have its `ticker`; gather the current data you fetched in STEP 2 (and fetch
+`get_equity_quotes` for any pending-outcome ticker not in this wake's snapshot):
+- `price_now` = the ticker's latest quote price.
+- `position_market_value` + `position_cost_basis` from `get_equity_positions` IF the
+  ticker is currently held (else omit — directional-only scoring).
+
+Write `state/tmp/reflect_input.json`:
+```json
+{"resolutions": [
+  {"decision_id": <id>, "price_now": <quote>,
+   "position_market_value": <or omit>, "position_cost_basis": <or omit>}
+]}
+```
+Run (best-effort — a reflect error is NOT a tick error; log `REFLECT_SKIPPED <error>`):
+```
+~/dev/quiver/.venv/bin/python tick.py reflect --input state/tmp/reflect_input.json
+```
+This grounds the memory scorecard in real outcomes. It never affects trading.
 
 ## STEP 7 — Close out
 
@@ -171,13 +201,23 @@ configured retention window (decision state lives in the ledger, not these files
 If it errors → log `PRUNE_SKIPPED <error>` and end the tick normally; it is
 housekeeping only and never affects trading.
 
+7d. **Schedule the next wake (cadence).**
+- If `intraday` is false (classic mode): the kept-open `/loop` already wakes on its
+  fixed interval — nothing to do here.
+- If `intraday` is true: schedule the next tick at the plan's `next_review_minutes`
+  (the Python-clamped, market-aware delay). Use EXACTLY that value — never invent
+  your own interval. If it's null (no tickers analyzed this wake), fall back to the
+  loop's default interval.
+
 End the tick.
 
 ---
 
 ## ABSOLUTE RULES
-- One order max per ticker per day — enforced by tick.py's ledger; never place a
-  ticker that isn't in this tick's `orders` list.
+- Only act on tickers in this tick's `orders` list. tick.py's ledger enforces the
+  frequency limit — classic mode: ≤1 action/ticker/day; intraday mode: a per-ticker
+  cooldown + a daily action cap + an on-change gate. Never place a ticker that isn't
+  in `orders`.
 - Never exceed any dollar cap — tick.py already clamps; never hand-edit amounts.
 - Never short — tick.py never emits a short; never place one yourself.
 - Never place if `review_equity_order` returned a blocking alert.

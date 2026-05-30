@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
@@ -65,6 +65,32 @@ def minutes_since_open(now: datetime | None = None):
     if open_t is None or close_t is None or now < open_t or now >= close_t:
         return None
     return (now - open_t).total_seconds() / 60.0
+
+
+def next_market_time_et(after: datetime, lookahead_days: int = 10):
+    """Earliest instant >= ``after`` at which the regular session is open.
+
+    If ``after`` already falls inside a session, returns ``after`` unchanged;
+    otherwise returns the next session's open (holiday/half-day aware via XNYS).
+    Used to snap a model-proposed re-check time forward out of closed periods so
+    the bot never schedules a wake into a market gap. Returns ``after`` as a safe
+    fallback if no session is found within ``lookahead_days`` (shouldn't happen).
+    """
+    import pandas_market_calendars as mcal
+
+    after = after.astimezone(ET)
+    cal = mcal.get_calendar("XNYS")
+    start = after.strftime("%Y-%m-%d")
+    end = (after + timedelta(days=lookahead_days)).strftime("%Y-%m-%d")
+    sched = cal.schedule(start_date=start, end_date=end)
+    for _, row in sched.iterrows():
+        open_t = row["market_open"].tz_convert(ET)
+        close_t = row["market_close"].tz_convert(ET)
+        if after < open_t:
+            return open_t
+        if open_t <= after < close_t:
+            return after
+    return after
 
 
 def status() -> dict:
