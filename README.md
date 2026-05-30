@@ -20,8 +20,8 @@ Claude Code just pulls the arrows from the quiver and lets them fly.
 ---
 
 > [!WARNING]
-> **Quiver trades real money, fully autonomously.** It is currently in `dry_run` (paper)
-> mode. It can and will lose money. Nothing here is investment advice. Read the whole
+> **Quiver trades real money, fully autonomously.** It ships in `dry_run` (paper) mode by
+> default. It can and will lose money. Nothing here is investment advice. Read the whole
 > README — especially **[Controls](#-controls)** — before flipping the live switch.
 
 ---
@@ -90,31 +90,6 @@ per-ticker cooldown, a daily action cap, and an on-change gate.
 
 ---
 
-## Status
-
-<div align="center">
-
-**`2026-05-30` — built and validated end-to-end · running in dry-run · pending one live session**
-
-</div>
-
-| | |
-|---|---|
-| ✅ **Unit tests** | 169/169 pass (`tests/test_units.py`, offline) |
-| ✅ **Decision path** | `analyze.py AAPL` ran a full DeepSeek analysis → valid signal |
-| ✅ **Drills** | plan / kill-switch / preflight all pass offline |
-| ✅ **Models** | `deepseek-v4-flash` (quick) + `deepseek-v4-pro` (deep) live |
-| ✅ **Account** | an `agentic_allowed` Robinhood account (set via `.env`), ~$100 buying power |
-| ✅ **Guardrails** | sized for $100: $25/trade · $75/day · 5% daily-loss halt |
-| ✅ **Capabilities** | owned framework · ledger-grounded memory · optional intraday cadence · optional limit/stop orders *(risky paths OFF by default)* |
-| ✅ **Live path** | one full dry-run pass off-hours: live `analyze.py` → `plan` → digest emailed, **0 orders** |
-| ⏳ **Pending** | one **market-hours**, preflight-gated tick → then flip `dry_run: false` |
-
-> The dry-run gate needs an open market, so the first live tick happens on the next
-> trading session.
-
----
-
 ## Quick start
 
 ### 1 · Start the loop (a kept-open session)
@@ -158,7 +133,8 @@ The next tick trades for real — sized by the model, clamped by `risk:`.
 
 ## Configuration (`config.yaml`)
 
-Values below are sized for the ~$100 account — bump them proportionally when funded.
+Defaults are deliberately conservative — sized for a small account. Scale the dollar caps
+proportionally to your own buying power.
 
 | Key | Value | Meaning |
 |---|---|---|
