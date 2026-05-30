@@ -36,9 +36,18 @@ from lib.ledger import Ledger  # noqa: E402
 from lib import market  # noqa: E402
 from lib import notify  # noqa: E402
 from lib import signals  # noqa: E402
+from lib import storage  # noqa: E402
 
 LEDGER_DB = REPO / "state" / "ledger.db"
 ANALYZE_LOGS = REPO / "state" / "analyze_logs"
+# Bulky, reconstructable artifacts the retention sweep ages out (state of record
+# is the ledger, never these). Kept here so `prune` and any future caller agree.
+PRUNE_TARGETS = [
+    REPO / "logs" / "reasoning",
+    REPO / "state" / "analyze_logs",
+    REPO / "state" / "results",
+    REPO / "state" / "cache",
+]
 
 
 def _cfg_and_ledger():
@@ -376,6 +385,29 @@ def cmd_report_commit(args) -> dict:
     return {"ok": True, "date": args.date, "kind": args.kind, "hash": args.content_hash}
 
 
+# --- storage retention -------------------------------------------------------
+# Best-effort housekeeping: age out bulky reconstructable artifacts past the
+# retention window, optionally offloading first (S3 backend deferred). Like the
+# digest, this is observability only and must NEVER abort or alter a trading
+# tick — prune_dir/get_archiver never raise.
+
+def cmd_prune(_args) -> dict:
+    cfg = load_config(REPO / "config.yaml")
+    arch = storage.get_archiver(cfg.storage)
+    summaries = [
+        storage.prune_dir(t, cfg.storage.retention_days, archiver=arch)
+        for t in PRUNE_TARGETS
+    ]
+    return {
+        "ok": True,
+        "retention_days": cfg.storage.retention_days,
+        "archive_enabled": cfg.storage.archive_enabled,
+        "pruned_total": sum(s["pruned"] for s in summaries),
+        "archived_total": sum(s["archived"] for s in summaries),
+        "dirs": summaries,
+    }
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -391,6 +423,7 @@ def main(argv) -> int:
     p_rc.add_argument("--kind", default="digest")
     p_rc.add_argument("--hash", required=True, dest="content_hash")
     p_rc.add_argument("--recipients", default="")
+    sub.add_parser("prune")
     args = ap.parse_args(argv)
 
     try:
@@ -404,6 +437,8 @@ def main(argv) -> int:
             out = cmd_report(args)
         elif args.cmd == "report-commit":
             out = cmd_report_commit(args)
+        elif args.cmd == "prune":
+            out = cmd_prune(args)
         else:  # unreachable
             raise SystemExit(2)
     except Exception as e:  # noqa: BLE001

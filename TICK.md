@@ -161,6 +161,16 @@ Run:
     domain) → log `EMAIL_FAILED <error>` and continue. Do NOT `report-commit` — it will
     retry on the next substantive tick.
 
+7c. **Prune old artifacts (best-effort — never abort the tick).**
+Run:
+```
+~/dev/quiver/.venv/bin/python tick.py prune
+```
+This ages out reasoning transcripts / analysis dumps / framework cache past the
+configured retention window (decision state lives in the ledger, not these files).
+If it errors → log `PRUNE_SKIPPED <error>` and end the tick normally; it is
+housekeeping only and never affects trading.
+
 End the tick.
 
 ---

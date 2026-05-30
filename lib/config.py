@@ -42,6 +42,21 @@ class NotifyConfig:
 
 
 @dataclass(frozen=True)
+class StorageConfig:
+    """Retention + optional offload for bulky run artifacts (observability only).
+
+    ``retention_days <= 0`` disables pruning (keep everything). The S3 archive
+    backend is deferred; ``archive_enabled`` defaults False and, even if set,
+    degrades safely to local-only pruning until a backend exists.
+    """
+    retention_days: int
+    archive_enabled: bool
+    archive_backend: str
+    archive_bucket: str
+    archive_prefix: str
+
+
+@dataclass(frozen=True)
 class Config:
     account_number: str
     dry_run: bool
@@ -57,6 +72,7 @@ class Config:
     act_after_open_minutes: int
     analyze_timeout_sec: int
     notify: NotifyConfig
+    storage: StorageConfig
     raw: dict
 
 
@@ -152,6 +168,33 @@ def load_config(path) -> Config:
         enabled=notify_enabled, to=to, from_addr=from_addr, subject_prefix=subject_prefix,
     )
 
+    # Storage retention + optional archival. Observability housekeeping only;
+    # fails SAFE — bad values raise here rather than letting a runaway log tree
+    # or a misconfigured offload surprise us later. retention_days<=0 disables.
+    storage_d = d.get("storage", {}) or {}
+    try:
+        retention_days = int(storage_d.get("retention_days", 30))
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: storage.retention_days must be an integer")
+    if retention_days < 0:
+        raise ConfigError("config.yaml: storage.retention_days must be >= 0 (0 disables pruning)")
+    archive_d = storage_d.get("archive", {}) or {}
+    archive_enabled = archive_d.get("enabled", False) is True
+    archive_backend = str(archive_d.get("backend", "s3") or "s3").strip()
+    archive_bucket = str(archive_d.get("bucket", "") or "").strip()
+    archive_prefix = str(archive_d.get("prefix", "") or "").strip()
+    if archive_enabled and archive_backend == "s3" and not archive_bucket:
+        raise ConfigError(
+            "config.yaml: storage.archive.bucket is required when archive.enabled is true"
+        )
+    storage = StorageConfig(
+        retention_days=retention_days,
+        archive_enabled=archive_enabled,
+        archive_backend=archive_backend,
+        archive_bucket=archive_bucket,
+        archive_prefix=archive_prefix,
+    )
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -167,5 +210,6 @@ def load_config(path) -> Config:
         act_after_open_minutes=int(loop.get("act_after_open_minutes", 5)),
         analyze_timeout_sec=int(loop.get("analyze_timeout_sec", 900)),
         notify=notify,
+        storage=storage,
         raw=d,
     )

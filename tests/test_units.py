@@ -245,5 +245,89 @@ check("notify hash isolated by kind", _led.last_notified_hash(DAY, "halt"), None
 _led.mark_notified(DAY, "digest", "def456", "a@b.com", "t2")
 check("notify hash replaced when content changes", _led.last_notified_hash(DAY, "digest"), "def456")
 
+# ============================ STORAGE RETENTION =============================
+import os  # noqa: E402
+
+from lib import storage  # noqa: E402
+from lib.config import StorageConfig  # noqa: E402
+
+_NOW_TS = 1_000_000.0
+_DAY_S = 86400.0
+
+# --- select_for_prune: boundary is deterministic (only strictly-older drops) ---
+_entries = [
+    ("keep_new", _NOW_TS - 1 * _DAY_S),
+    ("at_cutoff", _NOW_TS - 7 * _DAY_S),   # exactly at the cutoff -> KEPT
+    ("drop_old", _NOW_TS - 8 * _DAY_S),
+]
+check("prune selects only strictly-older", storage.select_for_prune(_entries, 7, _NOW_TS), ["drop_old"])
+check("prune keep_days=0 disables", storage.select_for_prune(_entries, 0, _NOW_TS), [])
+check("prune keep_days<0 disables", storage.select_for_prune(_entries, -5, _NOW_TS), [])
+check("prune empty entries", storage.select_for_prune([], 7, _NOW_TS), [])
+
+# --- prune_dir: real filesystem, deterministic clock, recursive ---
+_pdir = Path(tempfile.mkdtemp())
+(_pdir / "old.log").write_text("x")
+(_pdir / "new.log").write_text("y")
+(_pdir / "sub").mkdir()
+(_pdir / "sub" / "old2.log").write_text("z")
+os.utime(_pdir / "old.log", (_NOW_TS - 10 * _DAY_S, _NOW_TS - 10 * _DAY_S))
+os.utime(_pdir / "new.log", (_NOW_TS - 1 * _DAY_S, _NOW_TS - 1 * _DAY_S))
+os.utime(_pdir / "sub" / "old2.log", (_NOW_TS - 10 * _DAY_S, _NOW_TS - 10 * _DAY_S))
+_psum = storage.prune_dir(_pdir, 7, now_ts=_NOW_TS)
+check("prune_dir scanned all (recursive)", _psum["scanned"], 3)
+check("prune_dir pruned the two old", _psum["pruned"], 2)
+check("prune_dir no archival with local", _psum["archived"], 0)
+check_true("prune_dir kept the new file", (_pdir / "new.log").exists())
+check_true("prune_dir deleted old file", not (_pdir / "old.log").exists())
+check_true("prune_dir deleted nested old file", not (_pdir / "sub" / "old2.log").exists())
+_pmiss = storage.prune_dir(_pdir / "nope", 7, now_ts=_NOW_TS)
+check("prune_dir missing dir is no-op", (_pmiss["scanned"], _pmiss["pruned"]), (0, 0))
+_pdisabled = storage.prune_dir(_pdir, 0, now_ts=_NOW_TS)
+check("prune_dir keep_days=0 prunes nothing", _pdisabled["pruned"], 0)
+
+
+def _storage_cfg(**kw):
+    base = {"archive_enabled": False, "archive_backend": "s3",
+            "archive_bucket": "", "archive_prefix": ""}
+    base.update(kw)
+    return StorageConfig(retention_days=30, **base)
+
+
+# --- get_archiver: default local; enabling the deferred S3 backend degrades to local ---
+check("default archiver is local",
+      type(storage.get_archiver(_storage_cfg())).__name__, "LocalArchiver")
+check("enabled S3 (deferred) degrades to local, never raises",
+      type(storage.get_archiver(_storage_cfg(archive_enabled=True, archive_bucket="b"))).__name__,
+      "LocalArchiver")
+
+
+# --- StorageConfig parsing + validation (fails safe) ---
+def make_storage_config(storage_block):
+    d = {
+        "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+        "watchlist": ["AAPL"],
+        "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "min_buying_power_buffer": 5},
+        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+    }
+    if storage_block is not None:
+        d["storage"] = storage_block
+    return load_config(_write_config(d))
+
+
+_sc_absent = make_storage_config(None).storage
+check("storage defaults when absent", (_sc_absent.retention_days, _sc_absent.archive_enabled), (30, False))
+check("storage retention parsed", make_storage_config({"retention_days": 7}).storage.retention_days, 7)
+check("storage retention 0 allowed (disables)", make_storage_config({"retention_days": 0}).storage.retention_days, 0)
+check_raises("negative retention raises", lambda: make_storage_config({"retention_days": -1}), ConfigError)
+check_raises("non-int retention raises", lambda: make_storage_config({"retention_days": "lots"}), ConfigError)
+check_raises("archive enabled without bucket raises",
+             lambda: make_storage_config({"archive": {"enabled": True, "backend": "s3", "bucket": ""}}), ConfigError)
+check("archive enabled with bucket ok",
+      make_storage_config({"archive": {"enabled": True, "backend": "s3", "bucket": "bk"}}).storage.archive_bucket, "bk")
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

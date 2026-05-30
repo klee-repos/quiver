@@ -56,3 +56,18 @@ notify:
   to: ["you@example.com"]              # set to your inbox before enabling
   from: ""                              # blank -> the Resend MCP's own SENDER_EMAIL_ADDRESS is used
   subject_prefix: "[Quiver]"
+
+# --- Storage retention (observability housekeeping; never blocks a tick) ---
+# Bulky run artifacts (logs/reasoning, state/analyze_logs, framework results/cache)
+# are aged out after retention_days. Decision/outcome state of record lives in the
+# SQLite ledger, so pruning these loses no trading state. The S3 archive backend is
+# DEFERRED (interface only): leave archive.enabled false — flipping it on before the
+# backend lands degrades safely to local-only pruning.
+storage:
+  retention_days: 30                    # 0 disables pruning (keep everything)
+  archive:
+    enabled: false
+    backend: "s3"
+    bucket: ""                          # required only when enabled (e.g. quiver-archive)
+    prefix: "quiver/"
+    # AWS creds come from the standard env/instance chain, NOT this repo.
