@@ -28,15 +28,16 @@ A separate helper places the orders. The AI is never allowed to touch the money 
 
 ## What is Quiver?
 
-Quiver is a stock-trading agent that puts real money to work on its own. Each day it looks at
-a short list of stocks you choose, decides whether to buy, sell, or wait, and places those
-orders with your broker — no human in the loop.
+Quiver is an automated stock-trading agent. Each day it reviews a short list of stocks you
+choose, decides whether to buy, sell, or hold each one, and places the orders through your
+broker — all on its own, with real money.
 
-That's a lot of trust to hand a machine, so Quiver is built around one rule that keeps it safe:
+To keep that safe, Quiver separates the thinking from the spending:
 
-> **The AI picks the stocks. It never decides how much money to spend — fixed code does, and only inside the limits you set.**
+> **The AI decides which stocks to trade. The code decides how much to spend — and enforces hard limits the AI can't override.**
 
-In other words: the AI advises, but it can't reach the checkbook. Here is why that matters.
+So the AI's job is to make a recommendation; it never controls the dollar amounts or the risk
+limits. That separation is the core of how Quiver works.
 
 ---
 
