@@ -13,16 +13,16 @@
 Smart AI studies each stock and picks a side. Plain, fixed rules decide how much to spend.
 A separate helper places the orders. The AI is never allowed to touch the money on its own.
 
-`real money` · `runs on its own` · `hard safety limits` · `keeps a logbook` · `usually once a day`
+`runs on its own` · `hard safety limits` · `keeps a logbook`
 
 </div>
 
 ---
 
 > [!WARNING]
-> **Quiver trades real money on its own.** It starts in "practice mode" (no real orders) until
+> **Quiver places live trades on its own.** It starts in "practice mode" (no live orders) until
 > you turn that off. It can lose money. This is not financial advice. Please read the whole
-> page — especially **[Safety controls](#-safety-controls)** — before you let it trade for real.
+> page — especially **[Safety controls](#-safety-controls)** — before you let it trade live.
 
 ---
 
@@ -142,10 +142,10 @@ sqlite3 state/ledger.db "SELECT COUNT(*) FROM orders;"                          
 tail -n 20 logs/orchestrator.log
 ```
 
-### 3 · Let it trade for real
+### 3 · Let it trade live
 
 When you're happy with how practice runs look, open `config.yaml` and change `dry_run` to
-`false`. Do this at the start of a fresh trading day. After that, the next run trades for real —
+`false`. Do this at the start of a fresh trading day. After that, the next run trades live —
 still inside every limit you set.
 
 ---
@@ -157,7 +157,7 @@ account. If you fund it with more, raise the dollar limits to match.
 
 | Setting | Example | What it means (in plain words) |
 |---|---|---|
-| `dry_run` | `true` | **Practice mode.** `true` = no real orders. Set to `false` to trade for real. |
+| `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
 | `watchlist` | `AAPL, MSFT, NVDA` | The stocks to look at each day. More stocks = a bit more cost. |
 | `max_dollars_per_trade` | `25` | The most it can spend on any single buy. |
 | `daily_capital_deploy_cap` | `75` | The most it can spend buying in one day, total. |
