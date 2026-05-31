@@ -8,255 +8,267 @@
 
 <div align="center">
 
-**An autonomous stock-trading desk that splits *thinking* from *doing* — and keeps the trigger finger in Python.**
+**A robot that buys and sells stocks for you — with the safety rules baked in.**
 
-A multi-agent LLM reasons about the market. Deterministic Python decides every dollar.
-Claude Code just pulls the arrows from the quiver and lets them fly.
+Smart AI studies each stock and picks a side. Plain, fixed rules decide how much to spend.
+A separate helper places the orders. The AI is never allowed to touch the money on its own.
 
-`real money` · `multi-agent LLM` · `deterministic guardrails` · `SQLite ledger` · `runs once a day`
+`real money` · `runs on its own` · `hard safety limits` · `keeps a logbook` · `usually once a day`
 
 </div>
 
 ---
 
 > [!WARNING]
-> **Quiver trades real money, fully autonomously.** It ships in `dry_run` (paper) mode by
-> default. It can and will lose money. Nothing here is investment advice. Read the whole
-> README — especially **[Controls](#-controls)** — before flipping the live switch.
+> **Quiver trades real money on its own.** It starts in "practice mode" (no real orders) until
+> you turn that off. It can lose money. This is not financial advice. Please read the whole
+> page — especially **[Safety controls](#-safety-controls)** — before you let it trade for real.
 
 ---
 
-## What it is
+## What is Quiver?
 
-Quiver is a small, opinionated trading bot built around one idea:
+Quiver is a small stock-trading robot. Once a day it looks at a short list of stocks you
+choose, decides whether to buy, sell, or wait, and places the orders for you. Then it goes
+back to sleep until the next day.
 
-> **Every trading decision and risk guardrail lives in deterministic Python — never in an LLM's judgment.**
+It is built around one simple rule:
 
-Three layers, with a hard wall between reasoning and execution:
+> **The AI is allowed to have an opinion. It is never allowed to spend the money.**
 
-```
-  ┌──────────────────────────────┐   thinks about the market,
-  │   🧠  tradingagents/  (LLM)   │   never touches the broker
-  │   multi-agent · DeepSeek      │   → emits a Buy/Sell/Hold signal
-  └───────────────┬──────────────┘
-                  │  signal JSON
-  ┌───────────────▼──────────────┐   decides every dollar,
-  │   ⚙️   tick.py  (pure Python) │   clamps, sizes, dedups, halts
-  │   the deterministic "brain"   │   → emits the exact orders to place
-  └───────────────┬──────────────┘
-                  │  orders
-  ┌───────────────▼──────────────┐   executes exactly what Python
-  │   🤖  Claude Code  (MCP)      │   returned, reasons about nothing
-  │   the execution orchestrator  │   → places orders via Robinhood MCP
-  └──────────────────────────────┘
-```
-
-The LLM (a multi-agent framework owned in-tree under `tradingagents/`, running on
-**DeepSeek**) produces a signal per ticker. **Claude Code** — holding the Robinhood MCP —
-is *only* the hands: it feeds broker data to Python and places exactly the orders Python
-hands back. All sizing, clamping, dedup, cadence, idempotency, and halt logic are pure
-Python in `tick.py` / `lib/`. The orchestrator never reasons about the market; the
-analysis path never sees a trading limit or the broker.
-
-Quiver also keeps a **decision memory** — past calls plus their real outcomes, grounded in
-the ledger — and feeds that scorecard back into each new analysis.
-
-> [!NOTE]
-> The framework under `tradingagents/` is an owned, in-tree fork of
-> [TradingAgents](https://github.com/TauricResearch/TradingAgents), de-vendored and pruned
-> to a DeepSeek-only signal path. Provenance in `tradingagents/UPSTREAM.md`; Apache-2.0.
+That one rule is what keeps it safe. Here is why it matters.
 
 ---
 
-## How it works — one "tick"
+## The big idea: thinking and spending are kept apart
 
-A *tick* is one full trading pass, driven by the runbook in `TICK.md`. The loop wakes
-hourly and no-ops cheaply until the market is open and a ticker is due.
+Most of the scary stories about trading bots come from letting the "smart" part also pull the
+trigger. Quiver splits that into three separate jobs, and puts a wall between them:
 
 ```
- /loop (a kept-open Claude Code session)
-   └─ each tick → follow TICK.md:
-        ├─ tick.py preflight          kill / halt / market-open / dedup gates   ⚙️ Python
-        ├─ get_portfolio / positions  read-only broker snapshot                 🤖 MCP
-        ├─ analyze.py <TICKER>        TradingAgents on DeepSeek → signal JSON    🧠 Python→LLM
-        ├─ tick.py plan               clamp + size + reserve ref_ids            ⚙️ Python
-        ├─ review / place_equity_order  execute EXACTLY what plan returned       🤖 MCP
-        └─ tick.py commit             record the outcome to the SQLite ledger   ⚙️ Python
+   🧠  THE THINKER — the AI
+   ──────────────────────────────────────────────────────────
+   A team of AI analysts reads the news, charts, and numbers.
+   It only gives an opinion: buy, sell, or wait.
+   It never sees your money or your limits.
+          │
+          ▼   "I think: BUY"
+   ⚙️  THE RULE-KEEPER — plain code
+   ──────────────────────────────────────────────────────────
+   Takes the opinion and works out the real, safe order.
+   It can never go over the limits you set. No AI guesswork.
+          │
+          ▼   "Buy $25 of AAPL"
+   🤖  THE HANDS — the helper
+   ──────────────────────────────────────────────────────────
+   Places the orders with your broker, and nothing more.
+   It just does exactly what the rule-keeper said.
 ```
 
-By default this happens **once a day**. Optionally (off by default) the model can pace its
-own re-checks intraday — Python clamps the cadence and bounds repeat trades with a
-per-ticker cooldown, a daily action cap, and an on-change gate.
+- **The thinker** is a team of AI analysts (running on a model called DeepSeek). They argue
+  it out — a bull case, a bear case, a final call — and produce one opinion per stock.
+- **The rule-keeper** is plain code. It takes that opinion and works out the real order, while
+  obeying every limit you set (how much per trade, per day, per stock). The AI never gets to
+  override these. If the math says "spend nothing," it spends nothing.
+- **The hands** just place the orders. This part can't reason about the market even if it
+  wanted to — it only carries out what the rule-keeper handed it.
+
+Quiver also keeps a **logbook** of every past pick and how it turned out (did the stock go the
+way it guessed? did it make or lose money?). It shows that report card to the AI next time, so
+the picks can get a little smarter over time.
 
 ---
 
-## Quick start
+## How one trading run works
 
-### 1 · Start the loop (a kept-open session)
+A "run" is one full pass over your stock list. Quiver wakes up, checks if it should do
+anything, and most of the time quietly goes back to sleep. Here is a full run, start to finish:
+
+```
+  Wake up (about once an hour)
+    │
+    ├─ 1. Safety check        Is the off-switch on? Did we lose too much today?
+    │                         Is the market even open? Already traded this stock today?
+    │                         → If anything looks wrong, stop here and sleep.
+    │
+    ├─ 2. Look at the account  Read your balances and prices (read-only — touches nothing).
+    │
+    ├─ 3. Think                The AI studies each stock and gives its opinion.
+    │
+    ├─ 4. Apply the rules      The rule-keeper turns each opinion into a real, safe order
+    │                         (or decides to do nothing).
+    │
+    ├─ 5. Place the orders     The hands place exactly those orders with the broker.
+    │
+    └─ 6. Write it down        Save what happened in the logbook.
+```
+
+By default this happens **once a day**. There is an optional mode where it can check a few
+times a day instead — but even then, the same safety limits apply, and it can only trade a
+stock a set number of times per day. That mode is **off** unless you turn it on.
+
+---
+
+## Getting started
+
+### 1 · Turn it on
+
+Quiver runs inside a Claude Code session that stays open. These commands start it and tell it
+to do one trading run at a time:
 
 ```bash
 cd ~/dev/quiver && caffeinate -i -s screen -S quiver
-#   → inside the screen window:   claude
-#   → confirm the Robinhood MCP (and Resend, if email is on) is connected:   /mcp
-#   → start the once-daily loop:
+#   → in the window that opens, start Claude:   claude
+#   → make sure it's connected to your broker:   /mcp
+#   → start the daily loop:
 /loop 1h Run one trading tick for the daily stock bot. Follow ~/dev/quiver/TICK.md exactly.
-#   detach the screen: Ctrl-a d        reattach later: screen -r quiver
+#   → leave it running in the background: press Ctrl-a then d
+#   → come back to it later: screen -r quiver
 ```
 
-The loop wakes hourly; a tick no-ops cheaply (config read + clock check, no LLM, no orders)
-until the market is open and the ticker hasn't been acted on today. `caffeinate -i -s`
-blocks idle/AC sleep (not lid-close — keep the lid open or stay on AC power).
+It wakes up about once an hour and does almost nothing (a quick check, no AI, no orders) until
+the market is open and a stock is due for a look. The `caffeinate` part keeps your computer
+from falling asleep while it waits — so keep the lid open or stay plugged in.
 
-### 2 · Watch the first dry-run tick
+### 2 · Watch a practice run
 
-Around 9:35 ET it should pass preflight → snapshot the account → analyze each watchlist
-ticker → call `review_equity_order` → **place nothing**. Confirm:
+Quiver starts in **practice mode**: it does everything a real run does *except* place orders.
+While the market is open, you should see it check the account, think about each stock, and then
+place nothing. You can confirm it placed nothing:
 
 ```bash
-sqlite3 state/ledger.db "SELECT trade_date,ticker,signal,intent,status FROM ticker_action;"  # status = dry_run
-sqlite3 state/ledger.db "SELECT COUNT(*) FROM orders;"                                        # 0 (nothing placed)
+sqlite3 state/ledger.db "SELECT trade_date,ticker,signal,intent,status FROM ticker_action;"  # says: dry_run
+sqlite3 state/ledger.db "SELECT COUNT(*) FROM orders;"                                        # should be 0
 tail -n 20 logs/orchestrator.log
 ```
 
-### 3 · Go live
+### 3 · Let it trade for real
 
-Set `dry_run: false` in `config.yaml`. Do it on a **fresh trading day**, or clear that
-day's rows first (otherwise dedup skips tickers already "acted" in dry-run):
-
-```bash
-.venv/bin/python -c "from lib.ledger import Ledger; print(Ledger('state/ledger.db').clear_day('YYYY-MM-DD'))"
-```
-
-The next tick trades for real — sized by the model, clamped by `risk:`.
+When you're happy with how practice runs look, open `config.yaml` and change `dry_run` to
+`false`. Do this at the start of a fresh trading day. After that, the next run trades for real —
+still inside every limit you set.
 
 ---
 
-## Configuration (`config.yaml`)
+## Settings (`config.yaml`)
 
-Defaults are deliberately conservative — sized for a small account. Scale the dollar caps
-proportionally to your own buying power.
+Everything Quiver does is set here. The starting values are small and careful — made for a tiny
+account. If you fund it with more, raise the dollar limits to match.
 
-| Key | Value | Meaning |
+| Setting | Example | What it means (in plain words) |
 |---|---|---|
-| `RH_ACCOUNT_NUMBER` *(in `.env`)* | — | the `agentic_allowed` Robinhood account — per-user secret, **not** in `config.yaml` |
-| `dry_run` | `true` | paper mode; review only, never place |
-| `watchlist` | `AAPL, MSFT, NVDA` | tickers analyzed each day (cost scales with size) |
-| `risk.max_dollars_per_trade` | `25` | hard per-trade ceiling |
-| `risk.daily_capital_deploy_cap` | `75` | max total BUY $ per day |
-| `risk.max_open_position_per_ticker` | `50` | max $ held in one ticker |
-| `risk.daily_loss_halt_pct` | `5.0` | equity drop vs day baseline → halt + `KILL` |
-| `risk.min_buying_power_buffer` | `5` | never spend below this much |
-| `deepseek.chat_model` | `deepseek-v4-flash` | analyst tool-calls (must support function calling) |
-| `deepseek.reasoner_model` | `deepseek-v4-pro` | debates / judgment |
-| `loop.intraday_enabled` | `false` | **OFF = classic once-a-day.** `true` = model-paced multi-run |
-| `loop.*_min` cadence bounds | `60 / 30 / 120 / 1440` | cooldown · floor · open-ceiling · ceiling (minutes) |
-| `risk.max_actions_/_analyses_per_ticker_per_day` | `3 / 6` | intraday trade cap + LLM-cost (analysis) cap |
-| `order.buy_type` | `market` | `limit` = marketable-limit, whole-share entries (Python-priced) |
-| `order.protective_stop.enabled` / `stop_pct` | `false / 8.0` | post-fill GTC stop, Python-clamped (model only seeds) |
-| `storage.retention_days` | `30` | age out logs/transcripts; S3 archive deferred, off |
+| `dry_run` | `true` | **Practice mode.** `true` = no real orders. Set to `false` to trade for real. |
+| `watchlist` | `AAPL, MSFT, NVDA` | The stocks to look at each day. More stocks = a bit more cost. |
+| `max_dollars_per_trade` | `25` | The most it can spend on any single buy. |
+| `daily_capital_deploy_cap` | `75` | The most it can spend buying in one day, total. |
+| `max_open_position_per_ticker` | `50` | The most it will ever hold in one stock. |
+| `daily_loss_halt_pct` | `5.0` | If you're down this much in a day, it stops everything. |
+| `min_buying_power_buffer` | `5` | Always leave at least this much cash untouched. |
+| `intraday_enabled` | `false` | `false` = trade once a day. `true` = let it check a few times a day. |
+| `buy_type` | `market` | How it buys. The other option only buys whole shares at a set price. |
+| `protective_stop` | `false` | If on, it sets an automatic "sell if it drops too far" order after a buy. |
+| `retention_days` | `30` | How long to keep old logs before cleaning them up. |
 
 > [!TIP]
-> **Intraday and advanced orders are opt-in.** At defaults, Quiver behaves exactly as the
-> validated once-a-day, market-order path. `loop.intraday_enabled: true` lets the model
-> recommend when to look next (Python clamps it and bounds repeat trades); `order.buy_type:
-> limit` and `protective_stop` add price-protected entries and resting stops. Enable any of
-> these only after a clean live dry-run validation.
+> The two "advanced" features — checking several times a day, and the fancy order types — are
+> **off by default**. With the defaults, Quiver does the simple, well-tested thing: one careful
+> buy or sell a day. Only turn the extras on after you've watched plenty of practice runs.
 
 ---
 
-## 🛑 Controls
+## 🛑 Safety controls
+
+These are the brakes. Know where they are before you start.
 
 | Control | What it does |
 |---|---|
-| **Kill switch** | `touch KILL` halts all trading next tick · `rm KILL` resumes |
-| **Daily-loss halt** | auto-fires + writes `KILL` if equity drops past `risk.daily_loss_halt_pct` vs the day's opening baseline |
-| **MCP token expiry** | a tick logging `AUTH_ERROR` means the Robinhood token expired — reattach the screen, run `/mcp` to re-auth. The bot stops rather than trading blind. Re-auth proactively (~weekly). |
+| **Off switch** | Type `touch KILL` and Quiver stops trading on its next wake-up. Type `rm KILL` to let it start again. |
+| **Daily loss limit** | If your account drops past the limit you set in a single day, Quiver halts itself *and* flips the off switch — no more trades until you check on it. |
+| **Lost connection** | If the link to your broker expires, Quiver stops instead of guessing. You reconnect by running `/mcp`. It will **never** trade on stale information. |
 
 ---
 
-## Observe a run
+## Watching it work
 
-- **Live thinking** — `logs/reasoning/<date>_<TICKER>.log`: the framework's moment-to-moment
-  agent chatter, teed as it runs. `tail -f` it during a tick.
-- **Per-ticker reasoning + reports** — `state/analyze_logs/<date>_<TICKER>.json`: full analyst
-  reports, bull/bear debate, trader plan, final decision (~48 KB).
-- **What the bot did** — `logs/orchestrator.log` + the SQLite ledger:
+You can see everything Quiver does:
+
+- **Listen in live** — `logs/reasoning/<date>_<TICKER>.log` shows the AI's thinking as it
+  happens. Run `tail -f` on it during a run to watch in real time.
+- **Read the full write-up** — `state/analyze_logs/<date>_<TICKER>.json` has the complete
+  analysis for each stock: the research, the bull-vs-bear debate, and the final call.
+- **See what it actually did** — `logs/orchestrator.log` plus its logbook:
   ```bash
   sqlite3 state/ledger.db "SELECT * FROM ticker_action ORDER BY updated_at DESC LIMIT 20;"
   sqlite3 state/ledger.db "SELECT * FROM orders        ORDER BY submitted_at DESC LIMIT 20;"
   ```
-- **Email digest (optional)** — an executive summary of each real run (per-ticker signal,
-  decision + debate conclusion, what traded, P&L vs baseline), emailed once per trading day
-  plus halt/auth-error alerts. See below to enable.
+- **Get a daily email** (optional) — a short summary of each real day: what it looked at, what
+  it decided, what it traded, and how the account did. See below to switch it on.
 
-### Email digest (Resend)
+### Daily email summary (optional)
 
-`tick.py report` (Python) builds the email and decides whether it's new; the orchestrator
-sends it via the **Resend MCP**. Strictly best-effort — a send failure just logs and the
-tick continues. The Resend MCP lives in **your own Claude config** (like the Robinhood MCP),
-**not** in this repo; the API key + sender live in that registration. Off until you enable it.
+Quiver can email you a recap after each real trading day (plus an alert if it ever halts
+itself). It's off until you turn it on, and it's totally separate from trading — if an email
+fails to send, trading carries on as normal.
 
-1. **Register the Resend MCP once** (user scope, not committed here):
+1. **Connect the email service once:**
    ```bash
    claude mcp add resend -s user \
      -e RESEND_API_KEY=re_xxxxxxxx \
      -e SENDER_EMAIL_ADDRESS=you@your-verified-domain \
      -- npx -y resend-mcp
    ```
-   Get a key at <https://resend.com/api-keys>; the sender must be a Resend-verified domain
-   (or `onboarding@resend.dev` to email only your own Resend account address). Confirm with
-   `/mcp` that **resend** is connected.
-2. **Enable it** — in `config.yaml` set `notify.enabled: true` and `notify.to: ["you@inbox"]`.
-   Leave `notify.from` blank to use the MCP's `SENDER_EMAIL_ADDRESS`, or set it to override.
-3. **Preview without sending** — run `tick.py report --input <a report_input.json>` and eyeball
-   the `subject`/`text` it prints (`should_send` stays `false` until enabled).
+   Grab a key at <https://resend.com/api-keys>. Then run `/mcp` and check that **resend** shows
+   as connected.
+2. **Switch it on:** in `config.yaml`, set `notify.enabled: true` and put your email under
+   `notify.to`.
+3. **Preview first:** you can build a sample email and read it without sending anything.
 
 ---
 
-## Commands
+## Handy commands
 
 ```bash
-.venv/bin/python tests/test_units.py        # unit tests (no network/broker)
-.venv/bin/python analyze.py AAPL            # one decision → one JSON line
-.venv/bin/python tick.py preflight          # gate check
-.venv/bin/python -m lib.market              # market-hours status (XNYS calendar)
+.venv/bin/python tests/test_units.py        # run the safety tests (no money, no internet)
+.venv/bin/python analyze.py AAPL            # ask the AI about one stock and print its opinion
+.venv/bin/python tick.py preflight          # run just the safety check
+.venv/bin/python -m lib.market              # is the market open right now?
 ```
 
-> Always use `.venv/bin/python` — deps live in the venv, not the global pyenv.
+> Always use `.venv/bin/python` — the project's tools live there.
 
 ---
 
 ## Good to know
 
-- **Data sources / API keys** — prices, technical indicators, fundamentals, and company news
-  all come from **yfinance (no API key required)**, and StockTwits is keyless.
-  `ALPHA_VANTAGE_API_KEY` is only for an *optional alternate* vendor and is unused by default.
-  **The only required key is `DEEPSEEK_API_KEY`.**
-- **Reddit sentiment** returns `403 Blocked` (unauthenticated scraping) and degrades
-  gracefully — the other three analysts and StockTwits still run. Optional to fix later with
-  Reddit API credentials.
-- **Cost** — a full run is a few cents on DeepSeek; roughly **$5–20/month at 3 tickers/day**.
-  The analysis uses **zero** Claude Code quota — only the thin orchestration does.
+- **What data does it use?** Stock prices, charts, company numbers, and news all come from a
+  free source — **no paid data key needed**. The only key you must have is one for the AI
+  (DeepSeek).
+- **What does it cost to run?** The AI is cheap — a full run is a few cents, roughly
+  **$5–20 a month** if you watch three stocks a day.
+- **One small gap:** it can't read Reddit (the site blocks it), so it just skips that and uses
+  its other sources. Nothing breaks.
 
 ---
 
-## Layout
+## What's in the box
 
-| Path | What it is |
+| File or folder | What it's for |
 |---|---|
-| `analyze.py` | decision wrapper: ticker → one JSON line (injects the memory scorecard; full audit dump; tees live thinking to `logs/reasoning/`) |
-| `tick.py` | the deterministic brain: `preflight` / `plan` / `commit` + `reflect` / `protect` / `report` / `report-commit` / `prune` |
-| `lib/` | `config` · `market` (XNYS hours) · `ledger` (SQLite) · `signals` (pure) · `ds_config` · `notify` (pure digest renderer) · `memory` (pure scorecard) · `storage` (retention/archiver) |
-| `TICK.md` | the exact per-tick runbook the orchestrator follows |
-| `config.yaml` | account · mode · watchlist · caps · order types · models · loop/cadence · storage · `notify` |
-| `state/ledger.db` | dedup + idempotency + daily P&L baseline + **decision memory** + intraday history + digest markers (survives restart) |
-| `tradingagents/` | the multi-agent framework, **owned in-tree** (de-vendored, pruned; `UPSTREAM.md` + Apache-2.0 `LICENSE`). Editable install via root `pyproject.toml` |
-| `.env` | per-user secrets (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`, `RH_ACCOUNT_NUMBER`, `NOTIFY_TO`. MCP keys live in your Claude config, not here |
+| `analyze.py` | The thinker. Give it a stock, it prints back one opinion. |
+| `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
+| `lib/` | The building blocks: market hours, the logbook, the safety rules, email, memory. |
+| `TICK.md` | The exact step-by-step the helper follows on every run. |
+| `config.yaml` | All your settings (the table above). |
+| `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
+| `tradingagents/` | The AI analyst team that powers the thinking. |
+| `.env` | Your private keys and account number. Never shared, never committed. |
 
 ---
 
 <div align="center">
 
-*Built with Python that decides, an LLM that reasons, and a robot that only ever pulls the trigger.*
+*The code decides. The AI advises. The robot only ever pulls the trigger.*
+
+<sub>The analyst team in `tradingagents/` is an open-source framework used under the Apache-2.0 license — see `tradingagents/LICENSE` and `tradingagents/UPSTREAM.md`.</sub>
 
 </div>
