@@ -8,7 +8,7 @@
 
 <div align="center">
 
-**A robot that buys and sells stocks for you — with the safety rules baked in.**
+**An agent that buys and sells stocks for you — with the safety rules baked in.**
 
 Smart AI studies each stock and picks a side. Plain, fixed rules decide how much to spend.
 A separate helper places the orders. The AI is never allowed to touch the money on its own.
@@ -28,7 +28,7 @@ A separate helper places the orders. The AI is never allowed to touch the money 
 
 ## What is Quiver?
 
-Quiver is a small stock-trading robot. Once a day it looks at a short list of stocks you
+Quiver is a small stock-trading agent. Once a day it looks at a short list of stocks you
 choose, decides whether to buy, sell, or wait, and places the orders for you. Then it goes
 back to sleep until the next day.
 
@@ -267,7 +267,7 @@ fails to send, trading carries on as normal.
 
 <div align="center">
 
-*The code decides. The AI advises. The robot only ever pulls the trigger.*
+*The code decides. The AI advises. The agent only ever pulls the trigger.*
 
 <sub>The analyst team in `tradingagents/` is an open-source framework used under the Apache-2.0 license — see `tradingagents/LICENSE` and `tradingagents/UPSTREAM.md`.</sub>
 
