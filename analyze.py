@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import re
 import sys
 import traceback
@@ -67,6 +68,44 @@ def _open_reasoning_log(ticker: str, date: str):
         return open(REASONDIR / f"{date}_{ticker}.log", "w", encoding="utf-8")
     except Exception:  # noqa: BLE001 — best-effort; fall back to stderr-only
         return None
+
+
+# HTTP/SDK libraries log a line per request; at INFO they drown out the agent
+# reasoning we actually want to see. Pin them to WARNING for the run.
+_NOISY_LOGGERS = ("httpx", "httpcore", "urllib3", "openai", "langsmith", "langchain")
+
+
+def _install_run_logging(stream) -> logging.Handler | None:
+    """Mirror all framework log records (INFO+) into ``stream`` (the reasoning tee).
+
+    Returns the attached handler (pass it to :func:`_remove_run_logging`) or None
+    if anything went wrong — logging must never break the analysis.
+    """
+    try:
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
+        root = logging.getLogger()
+        root.addHandler(handler)
+        if root.level > logging.INFO or root.level == logging.NOTSET:
+            root.setLevel(logging.INFO)
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+        return handler
+    except Exception:  # noqa: BLE001 — logging must never break analysis
+        return None
+
+
+def _remove_run_logging(handler: logging.Handler | None) -> None:
+    """Detach the run handler installed by :func:`_install_run_logging`."""
+    if handler is None:
+        return
+    try:
+        logging.getLogger().removeHandler(handler)
+        handler.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def parse_trader_plan(plan_text: str) -> dict:
@@ -134,7 +173,8 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
     path.write_text(json.dumps(safe, indent=2, default=str), encoding="utf-8")
 
 
-def run_analysis(ticker: str, date: str, cfg, past_context: str = "") -> dict:
+def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
+                 past_context_compact: str = "") -> dict:
     from lib.ds_config import build_deepseek_config
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -144,12 +184,24 @@ def run_analysis(ticker: str, date: str, cfg, past_context: str = "") -> dict:
     # watchable (`tail -f`) and durable. The tee is best-effort; stdout is never
     # touched, preserving the single-JSON-line contract.
     reasoning_log = _open_reasoning_log(ticker, date)
+    sink = _Tee(sys.stderr, reasoning_log)
+    # The framework emits most of its progress (analyst tool calls, debate turns,
+    # node transitions) via the `logging` module, which bypasses redirect_stdout.
+    # Attach a handler that mirrors EVERY log record into the same tee, so the
+    # per-ticker reasoning log is a complete record of the run — not just the
+    # stdout chatter. Noisy HTTP libs are pinned to WARNING so the signal isn't
+    # buried. Handler + level changes are reverted in `finally` (this process is
+    # short-lived, but keep it clean for the test/import paths).
+    log_handler = _install_run_logging(sink)
     try:
-        sink = _Tee(sys.stderr, reasoning_log)
         with contextlib.redirect_stdout(sink):
             graph = TradingAgentsGraph(config=ta_cfg)
-            final_state, signal = graph.propagate(ticker, date, past_context_override=past_context)
+            final_state, signal = graph.propagate(
+                ticker, date, past_context_override=past_context,
+                past_context_compact_override=past_context_compact,
+            )
     finally:
+        _remove_run_logging(log_handler)
         if reasoning_log is not None:
             try:
                 reasoning_log.close()
@@ -175,17 +227,30 @@ def main(argv) -> int:
 
     try:
         cfg = load_config(REPO / "config.yaml")
-        # Best-effort decision memory: a ledger-derived scorecard of past calls +
-        # their real outcomes, injected into the analysis as past_context. Read-only
-        # and never fatal — a memory hiccup must not block a fresh analysis.
-        past_context = ""
+        # Best-effort decision memory: the ledger-derived scorecard ENRICHED with
+        # deterministic risk/return metrics + guidance (lib/reflect_memory), injected
+        # as past_context. safe_build_context never raises and degrades enriched ->
+        # plain scorecard -> "" (D3), so a memory hiccup never blocks a fresh analysis
+        # and the agents never get LESS context than the proven scorecard. The bundle
+        # is computed ONCE here and reused for the written snapshot (D5).
+        from lib import reflect_memory
         try:
             from lib.ledger import Ledger
-            from lib.memory import scorecard
-            past_context = scorecard(Ledger(STATE / "ledger.db"), ticker)
-        except Exception:  # noqa: BLE001 — memory is best-effort, never blocks analysis
-            past_context = ""
-        result = run_analysis(ticker, date, cfg, past_context)
+            ctx = reflect_memory.safe_build_context(Ledger(STATE / "ledger.db"), ticker, cfg)
+        except Exception:  # noqa: BLE001 — even ledger-open failure must not block analysis
+            ctx = reflect_memory.ContextResult("", "", None, "empty")
+        result = run_analysis(ticker, date, cfg, ctx.full, ctx.compact)
+        # Decision-time WRITE: append this run's snapshot + refresh the metric blocks
+        # from the SAME bundle the agents saw. Best-effort; never touches stdout.
+        if ctx.bundle is not None:
+            try:
+                reflect_memory.write_decision_snapshot(
+                    ticker, date, signal=result.get("signal"),
+                    decision_price=result.get("entry_price"),
+                    bundle=ctx.bundle, base_dir=cfg.memory.dir, now_label=date,
+                )
+            except Exception:  # noqa: BLE001 — snapshot is a courtesy, never fatal
+                pass
     except Exception as e:  # noqa: BLE001 — wrapper must never crash silently
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({"ticker": ticker, "signal": "ERROR", "error": str(e), "schema": 1}))

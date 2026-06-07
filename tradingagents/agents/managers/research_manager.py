@@ -6,6 +6,7 @@ from tradingagents.agents.schemas import ResearchPlan, render_research_plan
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
+    track_record_block,
 )
 from tradingagents.agents.utils.structured import (
     bind_structured,
@@ -21,6 +22,7 @@ def create_research_manager(llm):
         history = state["investment_debate_state"].get("history", "")
 
         investment_debate_state = state["investment_debate_state"]
+        lessons_block = track_record_block(state)
 
         prompt = f"""As the Research Manager and debate facilitator, your role is to critically evaluate this round of debate and deliver a clear, actionable investment plan for the trader.
 
@@ -40,7 +42,7 @@ Commit to a clear stance whenever the debate's strongest arguments warrant one; 
 ---
 
 **Debate History:**
-{history}""" + get_language_instruction()
+{history}{lessons_block}""" + get_language_instruction()
 
         investment_plan = invoke_structured_or_freetext(
             structured_llm,

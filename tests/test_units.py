@@ -410,6 +410,12 @@ check("clamp within -> exact", signals.clamp_review_minutes(1, 30, 120), 60.0)
 check("clamp None -> ceiling", signals.clamp_review_minutes(None, 30, 120), 120.0)
 check("clamp non-positive -> ceiling", signals.clamp_review_minutes(0, 30, 120), 120.0)
 check("clamp respects a looser (closed) ceiling", signals.clamp_review_minutes(10, 30, 1440), 600.0)
+# Hard 48h backstop: neither an absurd model proposal nor a mis-set config ceiling
+# can push the next re-check past 2880 minutes.
+check("clamp model 168h -> 48h hard cap", signals.clamp_review_minutes(168, 30, 1440), 1440.0)  # config ceiling still binds first
+check("clamp huge config ceiling -> 48h hard cap", signals.clamp_review_minutes(168, 30, 100000), 2880.0)
+check("clamp None with huge ceiling -> 48h hard cap", signals.clamp_review_minutes(None, 30, 100000), 2880.0)
+check("HARD_REVIEW_CEILING_MIN is 48h", signals.HARD_REVIEW_CEILING_MIN, 2880)
 
 # --- ledger: action events + per-ticker schedule ---
 _rled = _tmp_ledger()
@@ -552,6 +558,330 @@ check("open stop carries parent + price",
       (_stops[0]["parent_ref_id"], _stops[0]["stop_price"]), ("entry1", 180.0))
 _oled.set_order_state("stop1", "cancelled")
 check("cancelled stop no longer open", _oled.open_protective_stops("AAPL"), [])
+
+
+# ===================== RISK METRICS (lib/risk.py, pure) =====================
+from lib import risk  # noqa: E402
+
+# --- mean_stdev: small-N guards + ddof=1 hand value ---
+check("mean_stdev empty", risk.mean_stdev([]), (None, None, 0))
+_m, _s, _n = risk.mean_stdev([0.05])
+check("mean_stdev n=1 -> (mean, None, 1)", (_m, _s, _n), (0.05, None, 1))
+_m, _s, _n = risk.mean_stdev([0.10, 0.20])
+check("mean_stdev mean", round(_m, 4), 0.15)
+check("mean_stdev ddof=1 stdev", round(_s, 4), 0.0707)
+
+# --- volatility ---
+check("volatility zero-variance = 0", risk.volatility([0.1, 0.1, 0.1]).value, 0.0)
+check("volatility n<2 -> None", risk.volatility([0.1]).value, None)
+
+# --- sharpe: guards + hand value + explicit annualized field (D6) ---
+check("sharpe n<2 -> None", risk.sharpe([0.1]).value, None)
+check_true("sharpe n<2 note", "n<2" in risk.sharpe([0.1]).note)
+check("sharpe zero-variance -> None", risk.sharpe([0.1, 0.1, 0.1]).value, None)
+check_true("sharpe zero-variance note", "zero variance" in risk.sharpe([0.1, 0.1, 0.1]).note)
+_sh = risk.sharpe([0.02, -0.01, 0.03])
+check("sharpe hand value", round(_sh.value, 2), 0.64)
+check("sharpe annualized None without periods", _sh.annualized, None)
+_sha = risk.sharpe([0.02, -0.01, 0.03], periods_per_year=50)
+check_true("sharpe annualized is an explicit field", _sha.annualized is not None)
+check("sharpe annualized = value*sqrt(50)", round(_sha.annualized, 6), round(_sha.value * (50 ** 0.5), 6))
+check_true("sharpe annualized labeled ESTIMATE in render", "ESTIMATE" in _sha.render())
+
+# --- sortino: no-downside guard + hand value ---
+check("sortino all-positive -> None", risk.sortino([0.01, 0.02, 0.03]).value, None)
+check_true("sortino all-positive note", "no downside" in risk.sortino([0.01, 0.02, 0.03]).note)
+_so = risk.sortino([0.02, -0.04, 0.01])
+check("sortino hand value", round(_so.value, 4), round((-0.01 / 3) / 0.04, 4))
+
+# --- max_drawdown: both kinds + guards ---
+check("max_drawdown equity 0.25", round(risk.max_drawdown([100, 120, 90, 110], kind="equity").value, 4), 0.25)
+check("max_drawdown cumret 0.20", round(risk.max_drawdown([0.10, -0.20, 0.05], kind="cumret").value, 4), 0.20)
+check("max_drawdown empty -> None", risk.max_drawdown([], kind="equity").value, None)
+check_raises("max_drawdown bad kind raises", lambda: risk.max_drawdown([1], kind="bogus"), ValueError)
+
+# --- hit_rate: reuses is_hit, drops Hold ---
+_hr = risk.hit_rate([("Buy", 0.02), ("Sell", -0.03), ("Hold", 0.05)])
+check("hit_rate 2/2 = 1.0", _hr.value, 1.0)
+check("hit_rate n excludes Hold", _hr.n, 2)
+check("hit_rate empty -> None", risk.hit_rate([]).value, None)
+
+# --- win_loss_stats: profit factor + no-loss guard ---
+_wl = risk.win_loss_stats([0.02, -0.04, 0.01])
+check("profit_factor 0.75", round(_wl["profit_factor"].value, 4), 0.75)
+check("avg_win mean", round(_wl["avg_win"].value, 4), 0.015)
+check("avg_loss mean", round(_wl["avg_loss"].value, 4), -0.04)
+check("profit_factor None when no losses", risk.win_loss_stats([0.02, 0.01])["profit_factor"].value, None)
+check_true("profit_factor no-loss note", "no losing" in risk.win_loss_stats([0.02, 0.01])["profit_factor"].note)
+
+# --- low-confidence flag honors low_n; proof present in render ---
+check("low_confidence True when n<low_n", risk.sharpe([0.02, -0.01, 0.03], low_n=5).low_confidence, True)
+check("low_confidence False when n>=low_n", risk.sharpe([0.02, -0.01, 0.03], low_n=2).low_confidence, False)
+check_true("render shows formula + inputs (proof)", "formula:" in _sh.render() and "inputs:" in _sh.render())
+
+# --- rolling_window_trend: shrinks on thin history ---
+_tr = risk.rolling_window_trend([0.01, -0.02, 0.03, 0.01],
+                                [("Buy", 0.01), ("Buy", -0.02), ("Sell", -0.03), ("Buy", 0.01)], window=10)
+check_true("trend shrinks window on thin history", _tr["window"] < 10 and "shrunk" in _tr["note"])
+
+# --- derive_guidance: band boundaries + insufficient + disclaimer ---
+_TH = risk.GuidanceThresholds(low_confidence_min_n=2, hit_rate_elevated=0.6, hit_rate_reduced=0.4,
+                              sharpe_elevated=0.5, sharpe_reduced=0.0)
+
+
+def _gmetrics(hv, hn, sv, sn):
+    return {"hit_rate": risk.Metric("hit_rate", hv, hn, "f", "i", unit="pct"),
+            "sharpe": risk.Metric("sharpe", sv, sn, "f", "i")}
+
+
+check_true("guidance INSUFFICIENT below min_n",
+           "INSUFFICIENT DATA" in risk.derive_guidance("AAPL", _gmetrics(0.5, 1, 0.3, 1), _TH).text)
+check_true("guidance ELEVATED at boundary",
+           "ELEVATED" in risk.derive_guidance("AAPL", _gmetrics(0.60, 5, 0.50, 5), _TH).tier)
+check_true("guidance REDUCED at boundary",
+           "REDUCED" in risk.derive_guidance("AAPL", _gmetrics(0.40, 5, 0.30, 5), _TH).tier)
+check_true("guidance NORMAL in-band",
+           "NORMAL" in risk.derive_guidance("AAPL", _gmetrics(0.50, 5, 0.30, 5), _TH).tier)
+check_true("guidance always carries sizing disclaimer",
+           "does NOT change position sizing" in risk.derive_guidance("AAPL", _gmetrics(0.5, 5, 0.3, 5), _TH).text)
+
+# --- ledger read-only return series (oldest-first, non-null filter) ---
+_sled = _tmp_ledger()
+_sd1 = _sled.record_decision(trade_date="2026-05-20", ticker="AAPL",
+                             decided_at="2026-05-20T10:00:00-04:00", signal="Buy", intent="buy",
+                             decision_price=100.0)
+_sd2 = _sled.record_decision(trade_date="2026-05-22", ticker="AAPL",
+                             decided_at="2026-05-22T10:00:00-04:00", signal="Sell", intent="sell",
+                             decision_price=110.0)
+_sled.record_decision(trade_date="2026-05-21", ticker="MSFT",
+                      decided_at="2026-05-21T10:00:00-04:00", signal="Buy", intent="buy",
+                      decision_price=200.0)  # left unresolved -> excluded from series
+_sled.record_outcome(_sd1, resolved_at="2026-05-27T10:00:00-04:00", directional_return=0.05)
+_sled.record_outcome(_sd2, resolved_at="2026-05-28T10:00:00-04:00", directional_return=-0.02)
+# _sd3 left unresolved -> excluded from the return series (non-null filter)
+check("ticker_return_series oldest-first + non-null",
+      [round(r["directional_return"], 4) for r in _sled.ticker_return_series("AAPL")], [0.05, -0.02])
+check("ticker_return_series isolates ticker", len(_sled.ticker_return_series("MSFT")), 0)
+check("all_return_series oldest-first across tickers (unresolved excluded)",
+      [r["ticker"] for r in _sled.all_return_series()], ["AAPL", "AAPL"])
+check("all_tickers_with_decisions distinct + sorted", _sled.all_tickers_with_decisions(), ["AAPL", "MSFT"])
+_sled.get_or_create_baseline("2026-05-20", 100.0, "2026-05-20T09:30:00-04:00")
+_sled.get_or_create_baseline("2026-05-21", 102.0, "2026-05-21T09:30:00-04:00")
+check("baseline_equity_series date order",
+      [r["baseline_equity"] for r in _sled.baseline_equity_series()], [100.0, 102.0])
+
+# --- config: MemoryConfig parsing + validation (defaults ON; bad bands raise) ---
+def make_memory_config(memory_block):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+         "watchlist": ["AAPL"],
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
+                  "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
+         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+    if memory_block is not None:
+        d["memory"] = memory_block
+    return load_config(_write_config(d))
+
+
+check("memory defaults enabled (opt-out)", make_memory_config(None).memory.enabled, True)
+check("memory explicit false disables", make_memory_config({"enabled": False}).memory.enabled, False)
+_mc = make_memory_config(None).memory
+check("memory defaults (min_n, window)", (_mc.low_confidence_min_n, _mc.rolling_window), (5, 10))
+_thr = _mc.thresholds()
+check("thresholds carry conviction bands", (_thr.hit_rate_elevated, _thr.sharpe_reduced), (0.60, 0.0))
+check_true("memory dir resolved absolute", Path(_mc.dir).is_absolute())
+check_raises("inverted hit-rate band raises",
+             lambda: make_memory_config({"conviction": {"hit_rate_elevated": 0.3, "hit_rate_reduced": 0.5}}),
+             ConfigError)
+check_raises("inverted sharpe band raises",
+             lambda: make_memory_config({"conviction": {"sharpe_elevated": 0.1, "sharpe_reduced": 0.5}}),
+             ConfigError)
+check_raises("low_confidence_min_n <= 0 raises",
+             lambda: make_memory_config({"low_confidence_min_n": 0}), ConfigError)
+check_raises("hit-rate threshold out of [0,1] raises",
+             lambda: make_memory_config({"conviction": {"hit_rate_elevated": 1.5}}), ConfigError)
+
+
+# ================= REFLECTIVE MEMORY (lib/reflect_memory.py) ================
+from lib import reflect_memory as rmem  # noqa: E402
+
+_memcfg = make_memory_config({"low_confidence_min_n": 2, "rolling_window": 2}).memory
+_rmled = _tmp_ledger()
+
+
+def _seed(led, ticker, date, signal, dprice, ret=None):
+    did = led.record_decision(trade_date=date, ticker=ticker, decided_at=date + "T10:00:00-04:00",
+                              signal=signal, intent=("buy" if signal in ("Buy", "Overweight") else "sell"),
+                              decision_price=dprice)
+    if ret is not None:
+        led.record_outcome(did, resolved_at=date + "T15:00:00-04:00", holding_days=5,
+                           directional_return=ret)
+    return did
+
+
+_seed(_rmled, "AAPL", "2026-05-18", "Buy", 100.0, 0.04)
+_seed(_rmled, "AAPL", "2026-05-19", "Sell", 104.0, -0.02)
+_seed(_rmled, "AAPL", "2026-05-20", "Buy", 102.0, 0.01)
+_seed(_rmled, "TSLA", "2026-05-20", "Buy", 200.0, 0.03)
+
+_bundle = rmem.build_metric_bundle(_rmled, "AAPL", _memcfg)
+check_true("bundle has ticker + portfolio parts", "ticker" in _bundle and "portfolio" in _bundle)
+_block = rmem.render_metric_block(_bundle["ticker"])
+check_true("metric block shows proof (formula+inputs)", "formula:" in _block and "inputs:" in _block)
+check_true("metric block shows guidance + sizing disclaimer",
+           "GUIDANCE" in _block and "does NOT change position sizing" in _block)
+
+_tmpdir = Path(tempfile.mkdtemp())
+rmem.write_decision_snapshot("AAPL", "2026-05-21", signal="Underweight", decision_price=101.0,
+                             bundle=_bundle, base_dir=_tmpdir, now_label="2026-05-21T10:00")
+_apath = _tmpdir / "tickers" / "AAPL.md"
+check_true("ticker file written", _apath.exists())
+_txt = _apath.read_text()
+check_true("D5 parity: rendered block matches file exactly", _block in _txt)
+check("one SNAP block after first write", _txt.count("<!-- SNAP date="), 1)
+rmem.write_decision_snapshot("AAPL", "2026-05-21", signal="Hold", decision_price=101.5,
+                             bundle=_bundle, base_dir=_tmpdir, now_label="2026-05-21T11:00")
+_txt2 = _apath.read_text()
+check("idempotent: same-date write stays one SNAP", _txt2.count("<!-- SNAP date=2026-05-21"), 1)
+check_true("idempotent: latest content wins", "decision_price=101.5" in _txt2)
+rmem.write_decision_snapshot("AAPL", "2026-05-22", signal="Buy", decision_price=103.0,
+                             bundle=_bundle, base_dir=_tmpdir)
+_txt3 = _apath.read_text()
+check("two SNAP blocks after new date", _txt3.count("<!-- SNAP date="), 2)
+check_true("newest snapshot first", _txt3.index("2026-05-22") < _txt3.index("2026-05-21"))
+check_true("no leftover .tmp file", not (_tmpdir / "tickers" / "AAPL.md.tmp").exists())
+
+_seed(_rmled, "AAPL", "2026-05-25", "Buy", 105.0, 0.05)
+_summary = rmem.update_after_outcome(_rmled, {"AAPL"}, _memcfg, _tmpdir, now_label="2026-05-30T16:00")
+check("update reports AAPL updated", _summary["tickers_updated"], ["AAPL"])
+check_true("update wrote portfolio.md", (_tmpdir / "portfolio.md").exists())
+_txt4 = _apath.read_text()
+check_true("resolved-outcomes table present", "Resolved outcomes" in _txt4)
+check_true("update preserved snapshot history",
+           "<!-- SNAP date=2026-05-22" in _txt4 and "<!-- SNAP date=2026-05-21" in _txt4)
+
+_tmpdir2 = Path(tempfile.mkdtemp())
+_rb = rmem.rebuild_all(_rmled, _memcfg, _tmpdir2)
+check("rebuild covers all tickers", sorted(_rb["tickers_rebuilt"]), ["AAPL", "TSLA"])
+check_true("rebuild wrote AAPL + TSLA + portfolio",
+           (_tmpdir2 / "tickers" / "AAPL.md").exists() and (_tmpdir2 / "tickers" / "TSLA.md").exists()
+           and (_tmpdir2 / "portfolio.md").exists())
+
+# READ path + ordered fallback (D3)
+_cfg_full = make_memory_config({"low_confidence_min_n": 2})
+_ctx = rmem.safe_build_context(_rmled, "AAPL", _cfg_full)
+check("safe_build_context source enriched", _ctx.source, "enriched")
+check_true("full context >= compact (more recent decisions)", len(_ctx.full) >= len(_ctx.compact))
+check_true("enriched context carries the per-ticker block", "deterministic risk/return" in _ctx.full)
+check_true("bundle returned for snapshot reuse", _ctx.bundle is not None)
+
+# D3 CRITICAL regression: builder failure -> falls back to scorecard, NOT empty
+_orig_build = rmem.build_metric_bundle
+
+
+def _boom(*a, **k):
+    raise RuntimeError("forced failure")
+
+
+rmem.build_metric_bundle = _boom
+_ctx_fb = rmem.safe_build_context(_rmled, "AAPL", _cfg_full)
+check("D3 fallback source = scorecard", _ctx_fb.source, "scorecard")
+check_true("D3 fallback still returns the proven scorecard (not empty)",
+           "AAPL" in _ctx_fb.full and _ctx_fb.full != "")
+check("D3 fallback bundle is None", _ctx_fb.bundle, None)
+
+_orig_sc = memory.scorecard
+
+
+def _boom2(*a, **k):
+    raise RuntimeError("forced")
+
+
+memory.scorecard = _boom2
+_ctx_empty = rmem.safe_build_context(_rmled, "AAPL", _cfg_full)
+check("D3 both-fail source = empty", _ctx_empty.source, "empty")
+check("D3 both-fail returns ''", _ctx_empty.full, "")
+rmem.build_metric_bundle = _orig_build
+memory.scorecard = _orig_sc
+
+_cfg_off = make_memory_config({"enabled": False})
+_ctx_off = rmem.safe_build_context(_rmled, "AAPL", _cfg_off)
+check("disabled -> source scorecard", _ctx_off.source, "scorecard")
+check("disabled -> no bundle", _ctx_off.bundle, None)
+
+_ctx_e = rmem.safe_build_context(_tmp_ledger(), "ZZZZ", _cfg_full)
+check_true("empty-ledger safe_build_context never raises", isinstance(_ctx_e.full, str))
+
+
+# --- boundary invariant: the sizing path never imports the analysis-only modules ---
+import lib.signals as _sigmod  # noqa: E402
+_sigsrc = Path(_sigmod.__file__).read_text(encoding="utf-8")
+check_true("signals.py never imports risk/reflect_memory (use-case-1/2 wall)",
+           "import risk" not in _sigsrc and "reflect_memory" not in _sigsrc)
+
+
+# --- D7: offline stub-LLM prompt injection (block present iff context) ---
+from tradingagents.agents.researchers.bull_researcher import create_bull_researcher  # noqa: E402
+from tradingagents.agents.researchers.bear_researcher import create_bear_researcher  # noqa: E402
+from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator  # noqa: E402
+from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator  # noqa: E402
+from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator  # noqa: E402
+
+
+class _RecLLM:
+    """Records the prompt it was handed; returns a canned response (no network)."""
+    def __init__(self):
+        self.prompt = None
+
+    def invoke(self, prompt):
+        self.prompt = prompt
+        return type("_R", (), {"content": "ok"})()
+
+
+def _node_state(ctx):
+    debate = {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}
+    risk_state = {"history": "", "aggressive_history": "", "conservative_history": "",
+                  "neutral_history": "", "current_aggressive_response": "",
+                  "current_conservative_response": "", "current_neutral_response": "",
+                  "count": 0, "latest_speaker": ""}
+    return {
+        "investment_debate_state": debate, "risk_debate_state": risk_state,
+        "market_report": "m", "sentiment_report": "s", "news_report": "n", "fundamentals_report": "f",
+        "asset_type": "stock", "trader_investment_plan": "BUY plan", "company_of_interest": "AAPL",
+        "past_context_compact": ctx, "past_context": ctx,
+    }
+
+
+_MARKER = "Deterministic track-record context"
+for _name, _factory in {"bull": create_bull_researcher, "bear": create_bear_researcher,
+                        "aggressive": create_aggressive_debator,
+                        "conservative": create_conservative_debator,
+                        "neutral": create_neutral_debator}.items():
+    _llm = _RecLLM()
+    _factory(_llm)(_node_state("PROOF-CONTEXT-XYZ"))
+    check_true(f"D7 {_name}: block injected when context present",
+               _MARKER in _llm.prompt and "PROOF-CONTEXT-XYZ" in _llm.prompt)
+    _llm2 = _RecLLM()
+    _factory(_llm2)(_node_state(""))
+    check_true(f"D7 {_name}: no block when context empty", _MARKER not in _llm2.prompt)
+
+import tradingagents.agents.managers.research_manager as _rmmod  # noqa: E402
+check_true("D7 research_manager wires track_record_block",
+           "track_record_block(state)" in Path(_rmmod.__file__).read_text(encoding="utf-8"))
+
+
+# --- T1: digest renders account-equity risk line; content_hash excludes it ---
+_m_ar = copy.deepcopy(MODEL)
+_base_hash = notify.digest_hash(_m_ar)
+_m_ar["account_risk"] = {"drawdown_pct": 12.5, "drawdown_proof": "peak-to-trough on equity levels",
+                         "sharpe": 0.42, "sharpe_n": 7}
+_dg_ar = notify.build_digest(_m_ar)
+check_true("digest text shows account-risk line", "Account risk: max drawdown 12.5%" in _dg_ar["text"])
+check_true("digest html shows account-risk line", "Account risk" in _dg_ar["html"])
+check_true("account-risk Sharpe shown with N", "daily Sharpe 0.42 (N=7)" in _dg_ar["text"])
+check("account_risk excluded from content_hash (no spurious re-sends)",
+      notify.digest_hash(_m_ar), _base_hash)
+check_true("digest with no account_risk omits the line",
+           "Account risk" not in notify.build_digest(MODEL)["text"])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

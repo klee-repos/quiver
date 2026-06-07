@@ -21,6 +21,7 @@ class Propagator:
         trade_date: str,
         asset_type: str = "stock",
         past_context: str = "",
+        past_context_compact: str = "",
     ) -> Dict[str, Any]:
         """Create the initial state for the agent graph."""
         return {
@@ -29,6 +30,7 @@ class Propagator:
             "asset_type": asset_type,
             "trade_date": str(trade_date),
             "past_context": past_context,
+            "past_context_compact": past_context_compact,
             "investment_debate_state": InvestDebateState(
                 {
                     "bull_history": "",

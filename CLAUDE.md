@@ -119,11 +119,10 @@ follows). The phases and which layer owns each:
    builds/dedups + retention; MCP sends) — observability + housekeeping, strictly best-effort:
    a report/prune error is logged and the tick ends normally — it never blocks trading.
 
-In production this is run via a kept-open `/loop` Claude session, started inside a
-`caffeinate`+`screen` window so it survives terminal close and machine idle-sleep:
+In production this is run via a kept-open `/loop` Claude session:
 
 ```bash
-cd ~/dev/quiver && caffeinate -i -s screen -S quiver   # then launch `claude`, then /mcp
+cd ~/dev/quiver && claude   # then connect the broker: /mcp
 /loop 1h Run one trading tick for the daily stock bot. Follow ~/dev/quiver/TICK.md exactly.
 ```
 

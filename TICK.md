@@ -57,6 +57,12 @@ Collect each one-line JSON result. If a run errors / exits non-zero / prints
 `"signal":"ERROR"`, keep that JSON as-is (tick.py will record it as an error and
 skip it). NEVER invent or guess a signal.
 
+`analyze.py` automatically reads the reflective-memory context (deterministic
+risk/return metrics + guidance, with proof) into the agents AND writes a
+per-ticker decision snapshot under `state/memory/reflect/` — both best-effort,
+nothing for you to do. To inspect the math any time:
+`~/dev/quiver/.venv/bin/python tick.py memory-show --ticker <TICKER>`.
+
 ## STEP 4 — Plan the orders (deterministic)
 
 Write a file `state/tmp/plan_input.json` containing:
@@ -171,6 +177,9 @@ Run (best-effort — a reflect error is NOT a tick error; log `REFLECT_SKIPPED <
 ~/dev/quiver/.venv/bin/python tick.py reflect --input state/tmp/reflect_input.json
 ```
 This grounds the memory scorecard in real outcomes. It never affects trading.
+`reflect` also refreshes the reflective-memory metric blocks for the resolved
+tickers + `portfolio.md` (the JSON carries `memory_update`, or `memory_update_error`
+if a refresh hiccuped — either way the tick continues).
 
 ## STEP 7 — Close out
 

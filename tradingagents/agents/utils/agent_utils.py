@@ -36,6 +36,25 @@ def get_language_instruction() -> str:
     return f" Write your entire response in {lang}."
 
 
+def track_record_block(state, *, compact: bool = True) -> str:
+    """Deterministic track-record context for prompt injection.
+
+    Reads Quiver's ledger-derived risk/return scorecard (computed in Python with a
+    visible proof) from the agent state. ``compact`` picks the trimmed variant the
+    researchers + risk debators receive (vs the full one for the PM + Trader).
+    Empty string when there's no history. This is CONTEXT for the agent's reasoning
+    ONLY — it never changes position sizing (that stays in deterministic Python).
+    """
+    ctx = state.get("past_context_compact" if compact else "past_context", "") or ""
+    if not ctx:
+        return ""
+    return (
+        "\n\nDeterministic track-record context (Python-computed from the ledger; every "
+        "number shows its formula, inputs, and sample size N — this is CONTEXT for your "
+        "reasoning ONLY and does not change position sizing):\n" + ctx + "\n"
+    )
+
+
 def build_instrument_context(ticker: str, asset_type: str = "stock") -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
     instrument_label = "asset" if asset_type == "crypto" else "instrument"

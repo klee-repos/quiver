@@ -152,12 +152,22 @@ def is_material_change(cur_signal, cur_intent, last_signal, last_intent) -> bool
     return (cur_signal, cur_intent) != (last_signal, last_intent)
 
 
+# Absolute upper bound on any re-check delay, enforced in code regardless of
+# config. The model may propose an absurd cadence (e.g. 168h = 7 days) and an
+# operator may mis-set review_ceiling_min in config.yaml — this backstop
+# guarantees the bot never goes longer than 48h without re-looking at a ticker.
+HARD_REVIEW_CEILING_MIN = 48 * 60  # 2880 minutes (48 hours)
+
+
 def clamp_review_minutes(next_review_hours, floor_min: float, ceiling_min: float) -> float:
     """Clamp a model-proposed re-check delay (hours) into [floor_min, ceiling_min] minutes.
 
     None / non-positive / unparseable -> the ceiling (re-check at the far, least
     aggressive end of the safe window). Python always owns this bound, never the model.
+    The effective ceiling is additionally capped at HARD_REVIEW_CEILING_MIN (48h), a
+    code-level backstop that no config value or model proposal can exceed.
     """
+    ceiling_min = min(float(ceiling_min), float(HARD_REVIEW_CEILING_MIN))
     try:
         minutes = float(next_review_hours) * 60.0 if next_review_hours is not None else None
     except (TypeError, ValueError):

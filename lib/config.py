@@ -63,6 +63,41 @@ class StorageConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    """Reflective-memory + deterministic-risk settings (analysis CONTEXT only).
+
+    Feeds the LLM agents' reasoning; NEVER changes sizing/clamps. Unlike notify/
+    intraday (opt-in, fail-safe OFF), this defaults ON — it's read-only and
+    non-trading, and the design wants it on every run. Bad threshold ordering
+    (reduced > elevated) raises rather than silently mis-guiding.
+    """
+    enabled: bool
+    dir: str
+    risk_free_rate: float
+    low_confidence_min_n: int
+    rolling_window: int
+    periods_per_year: float
+    hit_rate_elevated: float
+    hit_rate_reduced: float
+    sharpe_elevated: float
+    sharpe_reduced: float
+
+    def thresholds(self):
+        """Build the lib.risk.GuidanceThresholds this config implies (lazy import
+        to keep config a light leaf)."""
+        from lib.risk import GuidanceThresholds
+        return GuidanceThresholds(
+            low_confidence_min_n=self.low_confidence_min_n,
+            hit_rate_elevated=self.hit_rate_elevated,
+            hit_rate_reduced=self.hit_rate_reduced,
+            sharpe_elevated=self.sharpe_elevated,
+            sharpe_reduced=self.sharpe_reduced,
+            rolling_window=self.rolling_window,
+            periods_per_year=self.periods_per_year,
+        )
+
+
+@dataclass(frozen=True)
 class Config:
     account_number: str
     dry_run: bool
@@ -90,6 +125,7 @@ class Config:
     review_ceiling_min: int
     notify: NotifyConfig
     storage: StorageConfig
+    memory: MemoryConfig
     raw: dict
 
 
@@ -278,6 +314,58 @@ def load_config(path) -> Config:
         archive_prefix=archive_prefix,
     )
 
+    # Reflective memory + deterministic risk metrics. Analysis CONTEXT only —
+    # never sizing. Defaults ON (opt-out): a missing block is fine and uses the
+    # validated defaults below. Bad threshold ordering raises here, not at runtime.
+    mem_d = d.get("memory", {}) or {}
+    memory_enabled = mem_d.get("enabled", True) is not False
+    mem_dir = str(mem_d.get("dir", "state/memory/reflect") or "state/memory/reflect").strip()
+    if not os.path.isabs(mem_dir):
+        mem_dir = str(p.resolve().parent / mem_dir)
+    try:
+        mem_rf = float(mem_d.get("risk_free_rate", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: memory.risk_free_rate must be a number")
+    if mem_rf < 0:
+        raise ConfigError("config.yaml: memory.risk_free_rate must be >= 0")
+    mem_min_n = _pos_int(mem_d, "low_confidence_min_n", 5)
+    mem_window = _pos_int(mem_d, "rolling_window", 10)
+    try:
+        mem_ppy = float(mem_d.get("periods_per_year", 50.0) or 50.0)
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: memory.periods_per_year must be a number")
+    if mem_ppy <= 0:
+        raise ConfigError("config.yaml: memory.periods_per_year must be > 0")
+    conv = mem_d.get("conviction", {}) or {}
+
+    def _conv_num(key: str, default: float) -> float:
+        try:
+            return float(conv.get(key, default))
+        except (TypeError, ValueError):
+            raise ConfigError(f"config.yaml: memory.conviction.{key} must be a number")
+
+    hit_el = _conv_num("hit_rate_elevated", 0.60)
+    hit_rd = _conv_num("hit_rate_reduced", 0.40)
+    shp_el = _conv_num("sharpe_elevated", 0.50)
+    shp_rd = _conv_num("sharpe_reduced", 0.0)
+    for nm, v in (("hit_rate_elevated", hit_el), ("hit_rate_reduced", hit_rd)):
+        if not (0.0 <= v <= 1.0):
+            raise ConfigError(f"config.yaml: memory.conviction.{nm} must be in [0, 1]")
+    if hit_rd > hit_el:
+        raise ConfigError(
+            "config.yaml: memory.conviction.hit_rate_reduced must be <= hit_rate_elevated"
+        )
+    if shp_rd > shp_el:
+        raise ConfigError(
+            "config.yaml: memory.conviction.sharpe_reduced must be <= sharpe_elevated"
+        )
+    memory = MemoryConfig(
+        enabled=memory_enabled, dir=mem_dir, risk_free_rate=mem_rf,
+        low_confidence_min_n=mem_min_n, rolling_window=mem_window, periods_per_year=mem_ppy,
+        hit_rate_elevated=hit_el, hit_rate_reduced=hit_rd,
+        sharpe_elevated=shp_el, sharpe_reduced=shp_rd,
+    )
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -303,5 +391,6 @@ def load_config(path) -> Config:
         review_ceiling_min=review_ceiling_min,
         notify=notify,
         storage=storage,
+        memory=memory,
         raw=d,
     )

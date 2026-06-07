@@ -49,6 +49,19 @@ def _fmt_pct(v) -> str:
         return "—"
 
 
+def _account_risk_line(ar: dict) -> str:
+    """One human line: account-equity max drawdown + daily Sharpe (T1).
+
+    Operator-facing context computed from the equity curve (account state) — this
+    is the digest only; the agents never see account-equity metrics.
+    """
+    dd = ar.get("drawdown_pct")
+    sh = ar.get("sharpe")
+    dd_s = f"{dd:.1f}%" if dd is not None else "—"
+    sh_s = f"{sh:.2f} (N={ar.get('sharpe_n', 0)})" if sh is not None else "—"
+    return f"Account risk: max drawdown {dd_s}, daily Sharpe {sh_s}"
+
+
 def _counts(tickers):
     nbuy = nsell = nhold = 0
     for r in tickers:
@@ -140,6 +153,9 @@ def _render_text(model: dict) -> str:
 
     eq, base, drop = model.get("equity"), model.get("baseline_equity"), model.get("drop_pct")
     lines.append(f"Equity: {_fmt_money(eq)}  (baseline {_fmt_money(base)}, {_fmt_pct(drop)})")
+    ar = model.get("account_risk") or {}
+    if ar.get("drawdown_pct") is not None or ar.get("sharpe") is not None:
+        lines.append(_account_risk_line(ar))
     if model.get("halted"):
         lines.append(f"HALT: {model.get('halt_reason') or 'daily-loss kill-switch fired'}")
     else:
@@ -194,6 +210,10 @@ def _render_html(model: dict) -> str:
     eq, base, drop = model.get("equity"), model.get("baseline_equity"), model.get("drop_pct")
     body = (f'<p style="color:#374151;margin:12px 0">Equity <b>{_esc(_fmt_money(eq))}</b> '
             f'<span style="color:#6b7280">(baseline {_esc(_fmt_money(base))}, {_esc(_fmt_pct(drop))})</span></p>')
+    ar = model.get("account_risk") or {}
+    if ar.get("drawdown_pct") is not None or ar.get("sharpe") is not None:
+        body += (f'<p style="color:#6b7280;font-size:13px;margin:-6px 0 10px">'
+                 f'{_esc(_account_risk_line(ar))}</p>')
     if model.get("halted"):
         body += (f'<div style="{css_card};border-color:#fca5a5;background:#fef2f2">'
                  f'<b>\U0001f6d1 HALT:</b> {_esc(model.get("halt_reason") or "daily-loss kill-switch fired")}</div>')

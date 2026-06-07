@@ -348,6 +348,49 @@ class Ledger:
                 (ticker, limit),
             ).fetchall()]
 
+    # --- resolved-return series (read-only; for lib/risk metrics) -------------
+    # CHRONOLOGICAL (decided_at ASC) — the inverse of decisions_with_outcomes'
+    # newest-first ordering — because the risk/trend math expects oldest->newest.
+    # Only rows with a scored directional_return; never touch broker/limits.
+
+    def ticker_return_series(self, ticker: str) -> list:
+        """Resolved directional returns for one ticker, OLDEST first."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT d.id, d.trade_date, d.signal, d.decision_price, "
+                "o.directional_return, o.holding_days, o.realized_pnl "
+                "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
+                "WHERE d.ticker = ? AND o.directional_return IS NOT NULL "
+                "ORDER BY d.decided_at ASC, d.id ASC",
+                (ticker,),
+            ).fetchall()]
+
+    def all_return_series(self) -> list:
+        """Portfolio-level: every resolved directional return across all tickers, OLDEST first."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.decision_price, "
+                "o.directional_return, o.holding_days, o.realized_pnl "
+                "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
+                "WHERE o.directional_return IS NOT NULL "
+                "ORDER BY d.decided_at ASC, d.id ASC"
+            ).fetchall()]
+
+    def all_tickers_with_decisions(self) -> list:
+        """Distinct tickers that have at least one decision (to rebuild per-ticker files)."""
+        with self._conn() as c:
+            return [r["ticker"] for r in c.execute(
+                "SELECT DISTINCT ticker FROM decisions ORDER BY ticker"
+            ).fetchall()]
+
+    def baseline_equity_series(self) -> list:
+        """Daily baseline equity curve, date order. Used ONLY by the digest path
+        (account-equity drawdown) — never by the analysis/memory path."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT trade_date, baseline_equity FROM day_baseline ORDER BY trade_date ASC"
+            ).fetchall()]
+
     # --- intraday multi-run: action events + per-ticker cadence schedule ------
     # A "completed trade" (what cooldown / action-cap / on-change gate on) is an
     # event with intent buy|sell that actually went through or was simulated:

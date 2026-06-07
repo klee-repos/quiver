@@ -118,18 +118,15 @@ Quiver runs inside a Claude Code session that stays open. These commands start i
 to do one trading run at a time:
 
 ```bash
-cd ~/dev/quiver && caffeinate -i -s screen -S quiver
-#   → in the window that opens, start Claude:   claude
-#   → make sure it's connected to your broker:   /mcp
+cd ~/dev/quiver
+claude
+#   → connect it to your broker:   /mcp
 #   → start the daily loop:
 /loop 1h Run one trading tick for the daily stock bot. Follow ~/dev/quiver/TICK.md exactly.
-#   → leave it running in the background: press Ctrl-a then d
-#   → come back to it later: screen -r quiver
 ```
 
 It wakes up about once an hour and does almost nothing (a quick check, no AI, no orders) until
-the market is open and a stock is due for a look. The `caffeinate` part keeps your computer
-from falling asleep while it waits — so keep the lid open or stay plugged in.
+the market is open and a stock is due for a look. Leave the session open while it waits.
 
 ### 2 · Watch a practice run
 

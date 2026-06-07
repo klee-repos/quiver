@@ -9,14 +9,14 @@ schema: 1
 # --- Mode ------------------------------------------------------------------
 # START in dry_run. The orchestrator will call review_equity_order but NEVER
 # place_equity_order. Flip to false only after a clean dry-run validation.
-dry_run: true
+dry_run: false
 # Relative to the repo root (where tick.py runs). `touch KILL` halts the next
 # tick; `rm KILL` resumes. Use an absolute path if you run from elsewhere.
 kill_switch_file: "KILL"
 
 # --- Universe --------------------------------------------------------------
 # Keep small at first: LLM cost + runtime scale linearly with the watchlist.
-watchlist: ["AAPL", "MSFT", "NVDA"]
+watchlist: ["CBRS", "PLTR", "AMZN", "REMX", "HOOD", "TSLA", "GOOGL"]
 
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
 # Sized for the ~$100 Agentic account. Bump these if you fund it with more.
@@ -96,3 +96,22 @@ storage:
     bucket: ""                          # required only when enabled (e.g. quiver-archive)
     prefix: "quiver/"
     # AWS creds come from the standard env/instance chain, NOT this repo.
+
+# --- Reflective memory + deterministic risk metrics ------------------------
+# Analysis CONTEXT only (use case 2): Python computes Sharpe/Sortino/vol/drawdown/
+# hit-rate from the ledger and injects them, WITH their proof (formula+inputs+N),
+# into the agents' reasoning. It NEVER feeds sizing/clamps (use case 1). Written to
+# human-readable markdown under `dir` on every run; refreshed with real outcomes at
+# reflect time. Defaults ON (opt-out): it's read-only and non-trading.
+memory:
+  enabled: true
+  dir: "state/memory/reflect"           # gitignored (under state/), prune-exempt
+  risk_free_rate: 0.0                    # per-trade rf for sharpe/sortino
+  low_confidence_min_n: 5                # N below this -> metrics flagged LOW-CONFIDENCE / guidance INSUFFICIENT
+  rolling_window: 10                     # improvement trend: last N vs prior N
+  periods_per_year: 50.0                 # annualized-Sharpe ESTIMATE only (~250 trading days / ~5d holds)
+  conviction:                            # deterministic guidance bands (reduced must be <= elevated)
+    hit_rate_elevated: 0.60
+    hit_rate_reduced: 0.40
+    sharpe_elevated: 0.50
+    sharpe_reduced: 0.0

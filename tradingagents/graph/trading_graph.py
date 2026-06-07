@@ -293,7 +293,8 @@ class TradingAgentsGraph:
             self.memory_log.batch_update_with_outcomes(updates)
 
     def propagate(self, company_name, trade_date, asset_type: str = "stock",
-                  past_context_override: Optional[str] = None):
+                  past_context_override: Optional[str] = None,
+                  past_context_compact_override: Optional[str] = None):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -330,7 +331,8 @@ class TradingAgentsGraph:
 
         try:
             return self._run_graph(company_name, trade_date, asset_type=asset_type,
-                                   past_context_override=past_context_override)
+                                   past_context_override=past_context_override,
+                                   past_context_compact_override=past_context_compact_override)
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
@@ -338,14 +340,19 @@ class TradingAgentsGraph:
                 self.graph = self.workflow.compile()
 
     def _run_graph(self, company_name, trade_date, asset_type: str = "stock",
-                   past_context_override: Optional[str] = None):
+                   past_context_override: Optional[str] = None,
+                   past_context_compact_override: Optional[str] = None):
         """Execute the graph and write the resulting state to disk."""
         # Inject Quiver's ledger-derived scorecard (passed in by analyze.py via
         # past_context_override). The framework's own markdown memory is no longer
         # the source — see propagate(). Empty string when there's no history.
+        # PM + Trader get the full context; researchers + risk debators get the
+        # compact variant (falls back to full when no compact was supplied).
         past_context = past_context_override or ""
+        past_context_compact = past_context_compact_override or past_context
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, asset_type=asset_type, past_context=past_context
+            company_name, trade_date, asset_type=asset_type,
+            past_context=past_context, past_context_compact=past_context_compact,
         )
         args = self.propagator.get_graph_args()
 

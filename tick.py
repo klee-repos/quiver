@@ -450,6 +450,27 @@ def _read_reasoning(date: str, ticker: str):
     return j.get("final_trade_decision"), j.get("investment_plan")
 
 
+def _account_risk(led) -> dict:
+    """Account-equity drawdown + daily Sharpe for the digest (T1). Equity is in
+    scope HERE (the digest path); it is deliberately NEVER read on the analysis/
+    memory path. Best-effort: returns empty fields if the series is too thin."""
+    try:
+        from lib import risk  # local: analysis-side math reused for an operator metric
+        eq = [r["baseline_equity"] for r in led.baseline_equity_series()
+              if r.get("baseline_equity") is not None]
+        dd = risk.max_drawdown(eq, kind="equity") if eq else None
+        rets = [(eq[i] - eq[i - 1]) / eq[i - 1] for i in range(1, len(eq)) if eq[i - 1]]
+        sh = risk.sharpe(rets) if rets else None
+        return {
+            "drawdown_pct": (dd.value * 100.0) if (dd and dd.value is not None) else None,
+            "drawdown_proof": dd.proof() if dd else "",
+            "sharpe": sh.value if (sh and sh.value is not None) else None,
+            "sharpe_n": sh.n if sh else 0,
+        }
+    except Exception:  # noqa: BLE001 — observability only; never break the digest
+        return {}
+
+
 def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str) -> dict:
     """Assemble the render model from committed ledger truth + the plan output.
 
@@ -531,6 +552,7 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
         "halted": halted,
         "halt_reason": halt_reason,
         "event_detail": data.get("event_detail"),
+        "account_risk": _account_risk(led),
         "tickers": [rows[t] for t in sorted(rows)],
     }
 
@@ -633,6 +655,7 @@ def cmd_reflect(args) -> dict:
     resolutions = data.get("resolutions", []) or []
 
     results = []
+    affected: set = set()
     for r in resolutions:
         did = r.get("decision_id")
         dec = led.get_decision(did) if did is not None else None
@@ -666,14 +689,27 @@ def cmd_reflect(args) -> dict:
             directional_return=dret, benchmark_return=bench, alpha=alpha,
             realized_pnl=realized, unrealized_pnl=unrealized, scored_against=scored,
         )
+        affected.add(dec.get("ticker"))
         results.append({"decision_id": did, "status": "resolved",
                         "directional_return": dret, "scored_against": scored})
 
-    return {
+    out = {
         "ok": True,
         "resolved": sum(1 for x in results if x["status"] == "resolved"),
         "results": results,
     }
+    # Best-effort: refresh the reflective-memory metric blocks for the resolved
+    # tickers + portfolio.md now that new outcomes landed. A memory error must NEVER
+    # fail the tick (reflect is best-effort) — surface it in the output instead.
+    if affected:
+        try:
+            cfg = load_config(REPO / "config.yaml")
+            from lib import reflect_memory
+            out["memory_update"] = reflect_memory.update_after_outcome(
+                led, affected, cfg.memory, cfg.memory.dir, now_label=now_iso)
+        except Exception as e:  # noqa: BLE001 — observability only, never blocks the tick
+            out["memory_update_error"] = str(e)
+    return out
 
 
 # --- storage retention -------------------------------------------------------
@@ -699,6 +735,37 @@ def cmd_prune(_args) -> dict:
     }
 
 
+# --- reflective memory: proof tool + rebuild ---------------------------------
+# Read-only/observability. memory-show prints the LIVE-recomputed risk math next
+# to the on-disk markdown so the user can confirm the file matches the formulas;
+# memory-rebuild regenerates every file from the ledger (also backfills history).
+
+def cmd_memory_show(args) -> dict:
+    cfg = load_config(REPO / "config.yaml")
+    led = Ledger(LEDGER_DB)
+    from lib import reflect_memory
+    ticker = (getattr(args, "ticker", "") or "").strip().upper()
+    out = {"ok": True, "enabled": cfg.memory.enabled, "dir": cfg.memory.dir, "ticker": ticker or None}
+    bundle = reflect_memory.build_metric_bundle(led, ticker or "PORTFOLIO", cfg.memory)
+    if ticker:
+        out["ticker_block"] = reflect_memory.render_metric_block(bundle["ticker"])
+        tpath = Path(cfg.memory.dir) / "tickers" / f"{ticker}.md"
+        out["ticker_file"] = tpath.read_text(encoding="utf-8") if tpath.exists() else None
+    out["portfolio_block"] = reflect_memory.render_metric_block(bundle["portfolio"])
+    ppath = Path(cfg.memory.dir) / "portfolio.md"
+    out["portfolio_file"] = ppath.read_text(encoding="utf-8") if ppath.exists() else None
+    return out
+
+
+def cmd_memory_rebuild(_args) -> dict:
+    cfg = load_config(REPO / "config.yaml")
+    led = Ledger(LEDGER_DB)
+    from lib import reflect_memory
+    now_iso = market.now_et().isoformat()
+    summary = reflect_memory.rebuild_all(led, cfg.memory, cfg.memory.dir, now_label=now_iso)
+    return {"ok": True, "dir": cfg.memory.dir, **summary}
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -719,6 +786,9 @@ def main(argv) -> int:
     p_protect = sub.add_parser("protect")
     p_protect.add_argument("--input", required=True)
     sub.add_parser("prune")
+    p_ms = sub.add_parser("memory-show")
+    p_ms.add_argument("--ticker", default="")
+    sub.add_parser("memory-rebuild")
     args = ap.parse_args(argv)
 
     try:
@@ -738,6 +808,10 @@ def main(argv) -> int:
             out = cmd_protect(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
+        elif args.cmd == "memory-show":
+            out = cmd_memory_show(args)
+        elif args.cmd == "memory-rebuild":
+            out = cmd_memory_rebuild(args)
         else:  # unreachable
             raise SystemExit(2)
     except Exception as e:  # noqa: BLE001
