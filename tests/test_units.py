@@ -1012,5 +1012,69 @@ check("ledger: thesis_state upsert in place", _led.get_thesis_state(_gid2)["regi
 Path(_db).unlink(missing_ok=True)
 
 
+# ============================================================================
+# Stage 1 — pure portfolio/goal math + signals target-aware clamp helpers.
+# ============================================================================
+import lib.portfolio as _pf  # noqa: E402
+import lib.goal as _goal  # noqa: E402
+
+# --- portfolio: target$/drift/intent ---
+check("pf: target$ for weight", _pf.target_dollars_for_weight(9, 100.0), 9.0)
+check("pf: target$ equity<=0 -> 0", _pf.target_dollars_for_weight(9, 0), 0.0)
+check_true("pf: drift underweight negative", _pf.weight_drift(5.0, 100.0, 9.0) < 0)
+check_true("pf: drift overweight positive", _pf.weight_drift(15.0, 100.0, 9.0) > 0)
+check("pf: needs_rebalance inside band -> False", _pf.needs_rebalance(3.0, 4.0), False)
+check("pf: needs_rebalance outside band -> True", _pf.needs_rebalance(5.0, 4.0), True)
+check("pf: needs_rebalance at boundary -> False", _pf.needs_rebalance(4.0, 4.0), False)
+check("pf: intent underweight -> buy", _pf.rebalance_intent(2.0, 100.0, 9.0, 4.0, "active")[0], "buy")
+check("pf: intent overweight -> trim", _pf.rebalance_intent(20.0, 100.0, 9.0, 4.0, "active")[0], "trim")
+check("pf: intent within band -> hold", _pf.rebalance_intent(10.0, 100.0, 9.0, 4.0, "active")[0], "hold")
+check("pf: intent exiting -> exit", _pf.rebalance_intent(10.0, 100.0, 9.0, 4.0, "exiting")[0], "exit")
+check("pf: intent unheld underweight -> buy", _pf.rebalance_intent(0.0, 100.0, 9.0, 4.0, "active")[0], "buy")
+_targets = [
+    {"ticker": "SMH", "sleeve": "Semis", "target_weight": 9, "band": 4, "status": "active", "quotable": True},
+    {"ticker": "SOL", "sleeve": "Crypto", "target_weight": 3, "band": 2, "status": "active", "quotable": False},
+    {"ticker": "SGOV", "sleeve": "Cash", "target_weight": 45, "band": 0, "status": "active", "quotable": True},
+]
+_book = {r["ticker"]: r for r in _pf.construct_target_book(_targets, {"SMH": 2.0}, 100.0, cash_sleeve_ticker="SGOV")}
+check("pf: SGOV held as cash residual", _book["SGOV"]["intent"], "cash_residual")
+check("pf: SOL skipped (unquotable)", _book["SOL"]["intent"], "skip_unquotable")
+check("pf: SMH underweight -> buy", _book["SMH"]["intent"], "buy")
+check_true("pf: SMH buy delta positive (toward target)", _book["SMH"]["delta_dollars"] > 0)
+
+# --- goal: glidepath + progress + coarse regime ---
+check("goal: glidepath elapsed0 == start", _goal.glidepath_target_value(100.0, 15, 12, 0.0), 100.0)
+check("goal: glidepath horizon == start*1.15", round(_goal.glidepath_target_value(100.0, 15, 12, 365.25), 2), 115.0)
+check("goal: glidepath mid == start*1.075", round(_goal.glidepath_target_value(100.0, 15, 12, 182.625), 4), 107.5)
+check("goal: glidepath start<=0 -> None", _goal.glidepath_target_value(0.0, 15, 12, 10.0), None)
+check("goal: glidepath bad elapsed -> None", _goal.glidepath_target_value(100.0, 15, 12, None), None)
+_gp = _goal.goal_progress(100.0, 110.0, 15, 12, "2026-01-01", "2026-07-02", benchmark_annual_pct=3.6)
+check("goal: ahead of glidepath -> AHEAD", _gp["regime"], "AHEAD")
+check_true("goal: cumulative ~ +10%", abs(_gp["cumulative_return_pct"] - 10.0) < 0.001)
+check_true("goal: alpha positive vs ~3.6% cash", _gp["alpha_vs_benchmark_pct"] > 0)
+check("goal: below glidepath -> BEHIND",
+      _goal.goal_progress(100.0, 95.0, 15, 12, "2026-01-01", "2026-12-15")["regime"], "BEHIND")
+check("goal: start<=0 -> None", _goal.goal_progress(0.0, 95.0, 15, 12, "2026-01-01", "2026-07-02"), None)
+check("goal: coarse_regime dead-band -> ON-TRACK", _goal.coarse_regime(0.5), "ON-TRACK")
+check("goal: coarse_regime None -> ON-TRACK", _goal.coarse_regime(None), "ON-TRACK")
+
+# --- signals: target-aware helpers + the BYTE-IDENTICAL clamp guarantee ---
+check("sig: room_under_target", signals.room_under_target(9.0, 2.0), 7.0)
+check("sig: room_under_target at/over -> 0", signals.room_under_target(9.0, 12.0), 0.0)
+check("sig: target sell trim (excess/quote)", signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0), 3.0)
+check("sig: target sell full_exit -> all held", signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0, full_exit=True), 10.0)
+check("sig: target sell at/under target -> 0", signals.resolve_target_sell_quantity(10.0, 5.0, 40.0, 45.0), 0.0)
+check("sig: target sell never oversells", signals.resolve_target_sell_quantity(10.0, 5.0, 1000.0, 0.0), 10.0)
+check("sig: target sell no quote -> 0", signals.resolve_target_sell_quantity(10.0, 0.0, 60.0, 45.0), 0.0)
+_buy_args = dict(position_sizing=None, baseline_equity=100.0, buy_fraction=1.0, ceiling=25.0,
+                 remaining_daily_cap=75.0, buying_power=100.0, buffer=5.0,
+                 room_under_ticker_cap=50.0, position_pct=10.0)
+check("sig: resolve_buy_dollars room=None == omitted (byte-identical)",
+      signals.resolve_buy_dollars(**_buy_args),
+      signals.resolve_buy_dollars(**_buy_args, room_under_target=None))
+check("sig: target room binds the buy (only ever reduces)",
+      signals.resolve_buy_dollars(**_buy_args, room_under_target=3.0)[0], 3.0)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

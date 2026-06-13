@@ -74,6 +74,7 @@ def resolve_buy_dollars(
     room_under_ticker_cap: float,
     fallback: float = 100.0,
     position_pct: Optional[float] = None,
+    room_under_target: Optional[float] = None,
 ) -> Tuple[float, str]:
     """Resolve a clamped USD buy amount. Returns (dollars, sizing_source).
 
@@ -81,7 +82,13 @@ def resolve_buy_dollars(
     wins when present; otherwise the prose ``position_sizing`` is parsed; otherwise
     a conservative fallback. Final amount = min(that size, per-trade ceiling,
     remaining daily deploy cap, buying_power - buffer, room under per-ticker cap).
-    Always >= 0; a non-positive result means "skip". Never fails open to a large size.
+
+    ``room_under_target`` is the strategy layer's extra clamp (Stage 3): the room
+    left before this name hits its target weight. It is folded into the SAME min()
+    when supplied, so a target can only ever REDUCE a buy, never bypass a cap. When
+    it is None (the default, and the classic non-rebalance path) the output is
+    BYTE-IDENTICAL to before — the min() args are unchanged. Always >= 0; a
+    non-positive result means "skip". Never fails open to a large size.
     """
     if position_pct is not None and position_pct > 0:
         base = position_pct / 100.0 * baseline_equity
@@ -94,13 +101,12 @@ def resolve_buy_dollars(
         source = "fallback"
     base *= buy_fraction
 
-    capped = min(
-        base,
-        ceiling,
-        remaining_daily_cap,
-        buying_power - buffer,
-        room_under_ticker_cap,
-    )
+    # The classic clamp stack. room_under_target is appended ONLY when supplied,
+    # so with it None the min() args are identical to before (byte-identical output).
+    clamps = [base, ceiling, remaining_daily_cap, buying_power - buffer, room_under_ticker_cap]
+    if room_under_target is not None:
+        clamps.append(room_under_target)
+    capped = min(clamps)
     if capped <= 0:
         return (0.0, source)
     return (round(capped, 2), source)
@@ -113,6 +119,41 @@ def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:
     """
     qty = max(0.0, min(held_qty, held_qty * sell_fraction))
     return round(qty, 6)
+
+
+def room_under_target(target_dollars: float, current_mv: float,
+                      upper_band_dollars: float = 0.0) -> float:
+    """Dollars of headroom before a holding reaches its target weight (+ band).
+
+    The strategy layer's extra buy clamp (Stage 3): max(0, target + band - current),
+    so a name already at/above target has 0 room and a target buy is suppressed.
+    Always >= 0 — never widens a buy.
+    """
+    return max(0.0, target_dollars + upper_band_dollars - current_mv)
+
+
+def resolve_target_sell_quantity(
+    held_qty: float, quote: Optional[float], current_mv: float, target_dollars: float,
+    *, full_exit: bool = False,
+) -> float:
+    """Shares to TRIM down to a target weight, or to FULLY EXIT.
+
+    full_exit -> sell all held (a removed/exiting name). Otherwise trim only the
+    EXCESS over target: shares = (current_mv - target_dollars) / quote, clamped to
+    held_qty. Returns 0 when already at/under target, the quote is missing, or
+    nothing is held — never oversells into a short (long-only).
+    """
+    if held_qty <= 0:
+        return 0.0
+    if full_exit:
+        return round(held_qty, 6)
+    if not quote or quote <= 0:
+        return 0.0
+    excess = current_mv - target_dollars
+    if excess <= 0:
+        return 0.0
+    shares = excess / quote
+    return round(max(0.0, min(held_qty, shares)), 6)
 
 
 # --- multi-run gates + cadence clamp (pure; intraday mode only) --------------
