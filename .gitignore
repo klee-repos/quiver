@@ -12,3 +12,13 @@ __pycache__/
 *.pyc
 *.egg-info/
 .gstack/
+
+# Deploy secrets / local state (only the *.example + IaC are tracked)
+deploy/runner/runner.env
+deploy/runner/mcp.json
+deploy/terraform/terraform.tfvars
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/.terraform/
+deploy/terraform/.terraform.lock.hcl
+.claude/

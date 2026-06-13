@@ -1353,5 +1353,47 @@ check("ledger: run_lock blocks a second holder while held",
 check("ledger: run_lock steals a STALE lock", _ledL.try_acquire_run_lock("h2", "2026-06-13T12:00:00", ttl_seconds=3600), True)
 
 
+# ============================================================================
+# Stage 5 — deploy harness: run-lock wrapper + order-authorization guard +
+# offline healthcheck. (The Agent-SDK supervisor + IaC are exercised by the
+# AWS e2e drills documented in docs/DEPLOY.md, not the offline suite.)
+# ============================================================================
+import lib.runlock as _runlock  # noqa: E402
+import deploy.runner.order_guard as _og  # noqa: E402
+import deploy.runner.healthcheck as _hc  # noqa: E402
+
+# run-lock context manager
+_ledRL = _tmp_ledger()
+_raised = False
+with _runlock.run_lock(_ledRL, "h1", "2026-06-13T10:00:00", ttl_seconds=3600):
+    try:
+        with _runlock.run_lock(_ledRL, "h2", "2026-06-13T10:00:30", ttl_seconds=3600):
+            pass
+    except _runlock.RunLockError:
+        _raised = True
+check("runlock: a second acquire while held raises", _raised, True)
+with _runlock.run_lock(_ledRL, "h3", "2026-06-13T11:00:00", ttl_seconds=3600):
+    pass
+check("runlock: released after exit (lock free)", _ledRL.run_lock_state(), None)
+
+# order guard: ledger-backed ref_id check (decision D5)
+_ledG = _tmp_ledger()
+_ledG.reserve_order("REF-OK", _market.trading_day_et(), "SMH", side="buy", type="market",
+                    dollar_amount=9.0, quantity=None, now_iso="t")
+check("guard: read-only tool -> allow", _og.evaluate("get_portfolio", {}, _ledG)[0], True)
+check("guard: order with a RESERVED ref_id -> allow",
+      _og.evaluate("place_equity_order", {"ref_id": "REF-OK"}, _ledG)[0], True)
+check("guard: order with an UNRESERVED ref_id -> DENY",
+      _og.evaluate("place_equity_order", {"ref_id": "REF-HALLUCINATED"}, _ledG)[0], False)
+check("guard: order with NO ref_id -> DENY", _og.evaluate("place_equity_order", {}, _ledG)[0], False)
+check("guard: mcp-prefixed order tool name handled",
+      _og.evaluate("mcp__robinhood-trading__place_equity_order", {"ref_id": "REF-OK"}, _ledG)[0], True)
+check("guard: cancel with an unreserved ref_id -> DENY",
+      _og.evaluate("cancel_equity_order", {"ref_id": "NOPE"}, _ledG)[0], False)
+
+# offline healthcheck (config + market + ledger schema + imports)
+check("healthcheck: offline self-test green", _hc.run_healthcheck()["ok"], True)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

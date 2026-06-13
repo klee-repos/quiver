@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to mcp.json at provision time. The claude CLI interpolates ${ENV} against the process env (loaded from /etc/quiver/quiver.env). VERIFY the live Robinhood MCP transport/auth before going live (decision D10): if it is an OAuth stdio server rather than a static bearer, materialize the credential into ~/.claude/.credentials.json at boot instead of the header below.",
+  "mcpServers": {
+    "robinhood-trading": {
+      "type": "http",
+      "url": "https://agent.robinhood.com/mcp/trading",
+      "headers": { "Authorization": "Bearer ${RH_OAUTH_TOKEN}" }
+    },
+    "resend": {
+      "command": "npx",
+      "args": ["-y", "resend-mcp"],
+      "env": { "RESEND_API_KEY": "${RESEND_API_KEY}" }
+    }
+  }
+}
