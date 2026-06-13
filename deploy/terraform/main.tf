@@ -140,7 +140,7 @@ resource "aws_instance" "quiver" {
     git clone "${var.repo_url}" /opt/quiver 2>/dev/null || true
     bash /opt/quiver/deploy/setup.sh
   EOF
-  tags = { Name = var.name }
+  tags      = { Name = var.name }
 }
 
 # --- EC2 auto-recovery on a system-status-check failure (decision D4) ---
