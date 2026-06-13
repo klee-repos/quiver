@@ -157,11 +157,51 @@ def cmd_preflight(_args) -> dict:
     return out
 
 
+def _load_input(args) -> dict:
+    """Read a subcommand's --input JSON, or {} when none was given."""
+    path = getattr(args, "input", None)
+    if not path:
+        return {}
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _target_room(target_weights, ticker: str, held_mv: float):
+    """room_under_target for a ticker, or None when there's no active target map.
+
+    None -> resolve_buy_dollars is byte-identical to the classic path. A real value
+    is one MORE min() clamp: a target can only ever REDUCE a buy, never bypass a cap.
+    """
+    if not target_weights:
+        return None
+    tw = target_weights.get(ticker)
+    if not tw:
+        return None
+    td = _to_float(tw.get("target_dollars"))
+    if td is None:
+        return None
+    return signals.room_under_target(td, held_mv)
+
+
 def cmd_plan(args) -> dict:
     cfg, led = _cfg_and_ledger()
-    day = market.trading_day_et()
     data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    return _run_plan(cfg, led, data)
+
+
+def _run_plan(cfg, led, data) -> dict:
+    """The deterministic plan brain (cfg/led/data injected for testability).
+
+    BYTE-IDENTICAL to the classic path unless cfg.risk.rebalance_enabled AND a
+    'target_weights' map is present in data. Then: (1) target room becomes one MORE
+    min() clamp on buys (never bypasses a cap), and (2) overweight/removed holdings
+    get a clamped trim/exit pass after the analyze loop. When the feature is off,
+    target_weights is forced to None and neither path runs (regression-tested).
+    """
+    day = market.trading_day_et()
+    data = data or {}
     now_iso = data.get("now_iso") or market.now_et().isoformat()
+    # Strategy targets are consulted ONLY when rebalance is explicitly enabled.
+    target_weights = data.get("target_weights") if cfg.risk.rebalance_enabled else None
     try:
         now_dt = datetime.fromisoformat(now_iso)
     except (TypeError, ValueError):
@@ -301,6 +341,7 @@ def cmd_plan(args) -> dict:
                 buffer=cfg.risk.min_buying_power_buffer,
                 room_under_ticker_cap=room,
                 position_pct=_to_float(a.get("position_pct")),
+                room_under_target=_target_room(target_weights, ticker, held_mv),
             )
             if dollars <= 0:
                 led.record_action(day, ticker, signal=signal, intent="buy",
@@ -385,6 +426,53 @@ def cmd_plan(args) -> dict:
             decision.update(status="order", intent="sell", quantity=qty)
             result["decisions"].append(decision)
 
+    # Rebalance trim/exit pass (Stage 3): wind overweight/removed holdings toward
+    # their target weight. Gated behind rebalance_enabled + a target_weights map
+    # (so it never runs on the classic path). Respects the daily (date,ticker)
+    # dedup and the halt, reserves a ref_id before the broker call like every
+    # other order, and cancels any resting protective stop first. Sizing is
+    # Python-clamped; the orchestrator only executes what lands in result["orders"].
+    if target_weights and not result["halt"]:
+        handled = {d.get("ticker") for d in result["decisions"]}
+        for raw_ticker, tw in target_weights.items():
+            ticker = str(raw_ticker).upper()
+            if ticker in handled or led.already_acted(day, ticker):
+                continue
+            if tw.get("intent") not in ("trim", "exit"):
+                continue
+            pos = positions.get(ticker) or {}
+            held_qty = float(pos.get("quantity", 0) or 0)
+            if held_qty <= 0:
+                continue  # nothing held to trim/exit
+            quote = _to_float(quotes.get(ticker))
+            held_mv = float(pos.get("market_value", 0) or 0)
+            if held_mv == 0 and quote and held_qty:
+                held_mv = quote * held_qty
+            full_exit = tw.get("intent") == "exit"
+            qty = signals.resolve_target_sell_quantity(
+                held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
+                full_exit=full_exit)
+            if qty <= 0:
+                continue
+            cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
+            order_kind = "rebalance_exit" if full_exit else "rebalance_trim"
+            ref_id = None
+            if not cfg.dry_run:
+                ref_id = led.new_ref_id()
+                led.reserve_order(ref_id, day, ticker, side="sell", type="market",
+                                  dollar_amount=None, quantity=qty, now_iso=now_iso,
+                                  order_kind=order_kind)
+            result["orders"].append({
+                "ticker": ticker, "signal": "REBALANCE", "intent": "sell",
+                "ref_id": ref_id, "side": "sell", "type": "market",
+                "dollar_amount": None, "quantity": qty,
+                "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                "order_kind": order_kind, "cancel_ref_ids": cancel_ref_ids,
+            })
+            result["decisions"].append({
+                "ticker": ticker, "signal": "REBALANCE", "status": "order",
+                "intent": "sell", "quantity": qty, "detail": order_kind})
+
     # Loop cadence: wake at the soonest re-look the model asked for (clamped),
     # snapped to market hours. The orchestrator schedules the next tick at this.
     if review_minutes:
@@ -394,6 +482,106 @@ def cmd_plan(args) -> dict:
             now_dt + timedelta(minutes=soonest)).isoformat()
 
     return result
+
+
+# --- strategy layer subcommands (Stage 3) -----------------------------------
+
+def cmd_strategy_set(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_strategy_set(cfg, led, _load_input(args))
+
+
+def _run_strategy_set(cfg, led, data) -> dict:
+    """Write the active goal + target book from strategy.yaml into the ledger.
+
+    STRICT: load_strategy validate-or-raise (a bad book fails loudly at setup).
+    Snapshots start_equity (from --input) + start_date (today). Supersedes any
+    prior goal and re-upserts the targets idempotently. Places NO orders."""
+    import lib.strategy as strategy
+    sc = strategy.load_strategy(cfg.strategy_path)
+    day = market.trading_day_et()
+    now_iso = data.get("now_iso") or market.now_et().isoformat()
+    equity = _to_float(data.get("equity"))
+    book = sc.book(sc.default_book)
+    gid = led.set_strategy_goal(
+        created_at=now_iso, target_return_pct=sc.goal.target_return_pct,
+        horizon_months=sc.goal.horizon_months, benchmark=sc.goal.benchmark,
+        benchmark_annual_pct=sc.goal.benchmark_annual_pct,
+        constraint_note=sc.goal.constraint, macro_thesis_version=sc.macro_thesis.version,
+        macro_thesis_json=json.dumps({"summary": sc.macro_thesis.summary,
+                                      "correlation_note": sc.macro_thesis.correlation_note}),
+        active_book=sc.default_book, as_of=sc.macro_thesis.version,
+        start_date=day, start_equity=equity)
+    for h in book.holdings:
+        led.upsert_target_holding(
+            goal_id=gid, sleeve=h.sleeve, ticker=h.ticker, target_weight=h.weight,
+            band=h.band, status="active", book=sc.default_book, quotable=h.quotable,
+            proxy_ticker=h.proxy_ticker, updated_at=now_iso)
+    return {"goal_id": gid, "active_book": sc.default_book, "holdings": len(book.holdings),
+            "start_equity": equity, "start_date": day}
+
+
+def cmd_construct(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_construct(cfg, led, _load_input(args))
+
+
+def _run_construct(cfg, led, data) -> dict:
+    """Between preflight and plan: emit the deterministic target_weights the plan
+    consumes. Reads the active goal + targets + the broker snapshot (--input:
+    equity/positions/quotes + optional macro_reading). proceed:false when there is
+    no active goal (the safe fallback -> plan runs the classic path). NO orders."""
+    import lib.strategy as strategy
+    import lib.portfolio as portfolio
+    goal = led.get_active_goal()
+    if not goal:
+        return {"proceed": False, "reason": "no active strategy goal", "target_weights": {}}
+    equity = _to_float(data.get("equity")) or 0.0
+    positions_in = data.get("positions", {}) or {}
+    positions_mv = {str(tk).upper(): (_to_float((pos or {}).get("market_value")) or 0.0)
+                    for tk, pos in positions_in.items()}
+    # The recommended book from the operator macro reading (advisory: the executable
+    # targets still come from the ledger's current book; switching to dial-up is a
+    # gated universe change, not an automatic construct-time swap).
+    book_name, book_reason = goal["active_book"], "active goal book"
+    if cfg.strategy is not None:
+        book_name, book_reason = strategy.select_active_book(cfg.strategy, data.get("macro_reading"))
+    targets = led.active_target_portfolio(goal["id"], statuses=("active", "exiting"))
+    rows = portfolio.construct_target_book(
+        targets, positions_mv, equity, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
+    target_weights = {r["ticker"]: {"intent": r["intent"], "target_dollars": r["target_dollars"],
+                                    "target_weight": r["target_weight"],
+                                    "delta_dollars": r.get("delta_dollars"),
+                                    "quotable": r["quotable"]} for r in rows}
+    return {"proceed": True, "goal_id": goal["id"], "active_book": goal["active_book"],
+            "recommended_book": book_name, "book_reason": book_reason,
+            "target_weights": target_weights}
+
+
+def cmd_goal_track(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_goal_track(cfg, led)
+
+
+def _run_goal_track(cfg, led) -> dict:
+    """Best-effort goal-progress snapshot (never stops a tick). Records a
+    goal_tracking row from the ledger equity curve + the active goal."""
+    import lib.goal as goal_mod
+    goal = led.get_active_goal()
+    if not goal:
+        return {"recorded": False, "reason": "no active goal"}
+    prog = goal_mod.compute_from_ledger(led, goal)
+    if not prog:
+        return {"recorded": False, "reason": "insufficient equity history"}
+    led.record_goal_snapshot(
+        goal_id=goal["id"], trade_date=market.trading_day_et(),
+        captured_at=market.now_et().isoformat(), portfolio_value=prog["current_equity"],
+        glidepath_target_value=prog["glidepath_target_value"],
+        cumulative_return_pct=prog["cumulative_return_pct"],
+        ahead_behind_pct=prog["ahead_behind_pct"],
+        alpha_vs_benchmark_pct=prog["alpha_vs_benchmark_pct"],
+        active_book=goal["active_book"], regime=prog["regime"])
+    return {"recorded": True, "goal_id": goal["id"], **prog}
 
 
 def cmd_commit(args) -> dict:
@@ -785,6 +973,11 @@ def main(argv) -> int:
     p_reflect.add_argument("--input", required=True)
     p_protect = sub.add_parser("protect")
     p_protect.add_argument("--input", required=True)
+    p_ss = sub.add_parser("strategy-set")
+    p_ss.add_argument("--input", required=False)
+    p_con = sub.add_parser("construct")
+    p_con.add_argument("--input", required=False)
+    sub.add_parser("goal-track")
     sub.add_parser("prune")
     p_ms = sub.add_parser("memory-show")
     p_ms.add_argument("--ticker", default="")
@@ -806,6 +999,12 @@ def main(argv) -> int:
             out = cmd_reflect(args)
         elif args.cmd == "protect":
             out = cmd_protect(args)
+        elif args.cmd == "strategy-set":
+            out = cmd_strategy_set(args)
+        elif args.cmd == "construct":
+            out = cmd_construct(args)
+        elif args.cmd == "goal-track":
+            out = cmd_goal_track(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         elif args.cmd == "memory-show":

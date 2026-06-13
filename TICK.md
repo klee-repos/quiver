@@ -63,6 +63,34 @@ per-ticker decision snapshot under `state/memory/reflect/` — both best-effort,
 nothing for you to do. To inspect the math any time:
 `~/dev/quiver/.venv/bin/python tick.py memory-show --ticker <TICKER>`.
 
+## STEP 3b — Construct the target book (deterministic; no-op on the classic path)
+
+Keeps the day's orders pointed at the 15%-goal book. A NO-OP unless the strategy
+layer is active (an active goal exists AND `config.yaml: risk.rebalance_enabled`
+is `true`). Python decides everything; you only copy JSON.
+
+Write `state/tmp/construct_input.json`:
+```json
+{
+  "equity": <from get_portfolio>,
+  "positions": { "AAPL": {"market_value": 600.0}, ... },
+  "macro_reading": { "core_pce_pct": <latest core-PCE % or null>, "fed_hike": <true|false> }
+}
+```
+`macro_reading` is OPERATOR DATA you maintain (the bot cannot fetch macro within
+the invariant); omit it / use null to hold the conservative default book. Run:
+```
+~/dev/quiver/.venv/bin/python tick.py construct --input state/tmp/construct_input.json
+```
+- `proceed: false` → no active strategy goal → SKIP this step; STEP 4 runs classic.
+- Otherwise drop the returned `target_weights` object verbatim into the STEP 4
+  `plan_input.json` under a `"target_weights"` key. Do not compute weights yourself.
+
+(One-time, off-tick: `tick.py strategy-set --input '{"equity": <equity>}'` writes the
+active goal + book from `strategy.yaml`. Best-effort `tick.py goal-track` in STEP 7
+records the day's goal-progress snapshot — a goal-track/construct error never stops
+the tick.)
+
 ## STEP 4 — Plan the orders (deterministic)
 
 Write a file `state/tmp/plan_input.json` containing:
@@ -73,11 +101,17 @@ Write a file `state/tmp/plan_input.json` containing:
   "now_iso": "<preflight now_iso>",
   "positions": { "AAPL": {"quantity": 3, "market_value": 600.0}, ... },
   "quotes": { "AAPL": 196.4, ... },
-  "analyses": [ <each analyze.py JSON from STEP 3> ]
+  "analyses": [ <each analyze.py JSON from STEP 3> ],
+  "target_weights": <STEP 3b construct output; OMIT entirely on the classic path>
 }
 ```
 (`quotes` is the STEP 2.3 map. Omit a ticker only if its quote was unavailable —
-Python falls back to the model's entry_price for that ticker's decision price.)
+Python falls back to the model's entry_price for that ticker's decision price.
+`target_weights` is consumed ONLY when `rebalance_enabled` is true; absent or with
+the flag off, `plan` is byte-identical to the validated once-a-day path. When it
+is active, a target can only REDUCE a buy or trigger a clamped `rebalance_trim`/
+`rebalance_exit` — it never bypasses the per-trade/daily/buying-power caps or the
+daily-loss halt.)
 Run:
 ```
 ~/dev/quiver/.venv/bin/python tick.py plan --input state/tmp/plan_input.json

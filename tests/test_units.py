@@ -1160,5 +1160,96 @@ check_true("analyze.py threads cfg into safe_build_context (cfg.strategy reaches
            "safe_build_context(" in _analyze_src)
 
 
+# ============================================================================
+# Stage 3 — construct/strategy-set/goal-track + target-aware _run_plan.
+# CRITICAL: _run_plan output is byte-identical when the feature is off.
+# ============================================================================
+import copy as _copy  # noqa: E402
+import tick as _tick  # noqa: E402
+import lib.market as _market  # noqa: E402
+
+
+def _cfg_rebal(enabled, strategy_path=None):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_s3",
+         "watchlist": ["SMH"],
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                  "min_buying_power_buffer": 5, "rebalance_enabled": enabled},
+         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+    if strategy_path:
+        d["strategy_path"] = strategy_path
+    return load_config(_write_config(d))
+
+
+_p_base = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+           "buying_power": 100.0, "positions": {}, "quotes": {"SMH": 50.0},
+           "analyses": [{"ticker": "SMH", "signal": "Buy", "position_pct": 50.0}]}
+_p_tw = _copy.deepcopy(_p_base)
+_p_tw["target_weights"] = {"SMH": {"intent": "buy", "target_dollars": 9.0}}
+
+# CRITICAL byte-identical regression: rebalance OFF ignores target_weights entirely
+_out_base = _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_base))
+_out_disabled = _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_tw))
+check("plan: BYTE-IDENTICAL when rebalance OFF (target_weights ignored)", _out_base, _out_disabled)
+check("plan: classic buy clamps to ceiling 25",
+      next(o for o in _out_base["orders"] if o["ticker"] == "SMH")["dollar_amount"], 25.0)
+
+# rebalance ON: a small target binds the buy (one more clamp, never widens)
+_out_on = _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_tw))
+check("plan: target room binds the buy (9 < ceiling 25)",
+      next(o for o in _out_on["orders"] if o["ticker"] == "SMH")["dollar_amount"], 9.0)
+_p_big = _copy.deepcopy(_p_base)
+_p_big["target_weights"] = {"SMH": {"intent": "buy", "target_dollars": 1000.0}}
+check("plan: target NEVER overrides the per-trade ceiling",
+      next(o for o in _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _p_big)["orders"]
+           if o["ticker"] == "SMH")["dollar_amount"], 25.0)
+
+# HALT precedence: a daily-loss-halt day -> zero orders even with target_weights
+_led_h = _tmp_ledger()
+_led_h.get_or_create_baseline(_market.trading_day_et(), 100.0, "2026-06-15T09:00:00-04:00")
+_p_halt = _copy.deepcopy(_p_tw)
+_p_halt["equity"] = 50.0
+_out_halt = _tick._run_plan(_cfg_rebal(True), _led_h, _p_halt)
+check("plan: daily-loss halt fires", _out_halt["halt"], True)
+check("plan: halt -> ZERO orders even with target_weights", _out_halt["orders"], [])
+
+# trim / exit pass (held overweight name flagged by construct)
+_p_trim = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+           "buying_power": 100.0, "positions": {"XLV": {"quantity": 2.0, "market_value": 20.0}},
+           "quotes": {"XLV": 10.0}, "analyses": [],
+           "target_weights": {"XLV": {"intent": "trim", "target_dollars": 9.0}}}
+_xlv = next(o for o in _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_trim))["orders"]
+            if o["ticker"] == "XLV")
+check("plan: rebalance trim order kind", _xlv["order_kind"], "rebalance_trim")
+check("plan: rebalance trim qty = excess/quote", _xlv["quantity"], 1.1)  # (20-9)/10
+_p_exit = _copy.deepcopy(_p_trim)
+_p_exit["target_weights"] = {"XLV": {"intent": "exit", "target_dollars": 0.0}}
+_xlv_x = next(o for o in _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _p_exit)["orders"]
+             if o["ticker"] == "XLV")
+check("plan: rebalance exit sells all held", _xlv_x["quantity"], 2.0)
+check("plan: rebalance exit order kind", _xlv_x["order_kind"], "rebalance_exit")
+check("plan: NO trim/exit when rebalance OFF",
+      _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_trim))["orders"], [])
+
+# strategy-set -> construct -> goal-track lifecycle (offline, real strategy.yaml)
+_cfg_s3 = _cfg_rebal(True, strategy_path=str(_REPO / "strategy.yaml"))
+_led_s3 = _tmp_ledger()
+_ss = _tick._run_strategy_set(_cfg_s3, _led_s3, {"equity": 100.0, "now_iso": "2026-06-13T10:00:00-04:00"})
+check_true("strategy-set: writes the core book holdings", _ss["holdings"] >= 10)
+check("strategy-set: active book is core", _ss["active_book"], "core_55_45")
+check_true("strategy-set: exactly one active goal", _led_s3.get_active_goal() is not None)
+_con = _tick._run_construct(_cfg_s3, _led_s3, {"equity": 100.0, "positions": {}, "macro_reading": None})
+check("construct: proceeds with an active goal", _con["proceed"], True)
+check("construct: SMH underweight -> buy intent", _con["target_weights"]["SMH"]["intent"], "buy")
+check("construct: SOL flagged unquotable (skipped)", _con["target_weights"]["SOL"]["intent"], "skip_unquotable")
+check("construct: SGOV held as cash residual", _con["target_weights"]["SGOV"]["intent"], "cash_residual")
+check("construct: no active goal -> proceed False",
+      _tick._run_construct(_cfg_s3, _tmp_ledger(), {"equity": 100.0})["proceed"], False)
+_led_s3.get_or_create_baseline("2026-09-01", 110.0, "2026-09-01T00:00:00-04:00")
+_gt = _tick._run_goal_track(_cfg_s3, _led_s3)
+check("goal-track: records a snapshot", _gt["recorded"], True)
+check_true("goal-track: regime present", _gt.get("regime") in ("AHEAD", "ON-TRACK", "BEHIND"))
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
