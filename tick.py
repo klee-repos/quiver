@@ -584,6 +584,84 @@ def _run_goal_track(cfg, led) -> dict:
     return {"recorded": True, "goal_id": goal["id"], **prog}
 
 
+def cmd_learn_review(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_learn_review(cfg, led, _load_input(args))
+
+
+def _run_learn_review(cfg, led, data) -> dict:
+    """Best-effort (never stops a tick): score holdings vs thesis, record proof-
+    bearing proposals (deduped), update thesis_state, expire stale proposals. The
+    risky direction is human-gated; this records, it does NOT mutate the universe
+    or place orders."""
+    import lib.learn as learn
+    import lib.goal as goal_mod
+    import lib.strategy as strategy
+    goal = led.get_active_goal()
+    if not goal or cfg.strategy is None:
+        return {"reviewed": False, "reason": "no active goal / strategy layer inactive"}
+    learning = cfg.strategy.learning
+    macro_regime = strategy.regime_label(cfg.strategy, data.get("macro_reading"))
+    progress = goal_mod.compute_from_ledger(led, goal)
+    now_iso = market.now_et().isoformat()
+    day = market.trading_day_et()
+    ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress)
+    recorded = []
+    for p in ps["all"]:
+        rid = led.record_universe_proposal(
+            goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker,
+            sleeve=p.sleeve, from_book=p.from_book, to_book=p.to_book,
+            target_weight=p.target_weight, tier=p.tier, content_hash=p.content_hash(),
+            reason=p.reason, goal_gap_pct=p.goal_gap_pct)
+        if rid:
+            recorded.append(rid)
+    regime_word = {"STAND_DOWN": "standdown", "DEPLOY": "deploy"}.get(macro_regime, "neutral")
+    led.upsert_thesis_state(goal_id=goal["id"], as_of=day, regime=regime_word,
+                            active_book=goal["active_book"], last_trigger=macro_regime,
+                            last_macro_json=json.dumps(data.get("macro_reading") or {}),
+                            updated_at=now_iso)
+    cutoff = (datetime.fromisoformat(now_iso) - timedelta(days=learning.proposal_expiry_days)).isoformat()
+    expired = led.expire_old_proposals(goal["id"], cutoff)
+    return {"reviewed": True, "macro_regime": macro_regime, "proposals": len(ps["all"]),
+            "needs_approval": len(ps["needs_approval"]), "auto_apply_eligible": len(ps["auto_apply"]),
+            "recorded_ids": recorded, "expired": expired}
+
+
+def cmd_universe_apply(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_universe_apply(cfg, led, change_id=int(args.id),
+                               approve=bool(getattr(args, "approve", False)))
+
+
+def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
+    """Apply one universe-change proposal (out-of-band, human/config gated). Places
+    NO orders — a REMOVE sets the holding to 'exiting' so the next construct->plan
+    winds it to zero via the clamped sell path. The risky direction needs --approve
+    unless its auto flag is on; the safe de-risk direction needs the derisk flag."""
+    change = led.get_universe_change(change_id)
+    if not change or change["status"] != "proposed":
+        return {"applied": False, "reason": "no such open proposal"}
+    learning = cfg.strategy.learning if cfg.strategy is not None else None
+    tier = change["tier"]
+    auto_ok = bool(learning and (
+        (tier == "derisk" and learning.auto_apply_derisk) or
+        (tier == "universe" and learning.auto_apply_universe_changes)))
+    if not approve and not auto_ok:
+        flag = "auto_apply_derisk" if tier == "derisk" else "auto_apply_universe_changes"
+        return {"applied": False, "reason": f"tier '{tier}' requires --approve ({flag} is off)",
+                "change": change}
+    now_iso = market.now_et().isoformat()
+    goal = led.get_active_goal()
+    effect = "recorded"
+    if change["kind"] == "PROPOSE_REMOVE" and change.get("ticker") and goal:
+        led.set_holding_status(goal["id"], change["ticker"], "exiting", now_iso)
+        effect = "holding set to exiting (rebalancer winds to zero; freed dollars -> cash)"
+    led.mark_universe_change(change_id, "applied", now_iso, "operator" if approve else "auto")
+    return {"applied": True, "change_id": change_id, "kind": change["kind"],
+            "ticker": change.get("ticker"), "effect": effect,
+            "via": "operator" if approve else "auto"}
+
+
 def cmd_commit(args) -> dict:
     led = Ledger(LEDGER_DB)
     day = market.trading_day_et()
@@ -978,6 +1056,11 @@ def main(argv) -> int:
     p_con = sub.add_parser("construct")
     p_con.add_argument("--input", required=False)
     sub.add_parser("goal-track")
+    p_lr = sub.add_parser("learn-review")
+    p_lr.add_argument("--input", required=False)
+    p_ua = sub.add_parser("universe-apply")
+    p_ua.add_argument("--id", required=True)
+    p_ua.add_argument("--approve", action="store_true")
     sub.add_parser("prune")
     p_ms = sub.add_parser("memory-show")
     p_ms.add_argument("--ticker", default="")
@@ -1005,6 +1088,10 @@ def main(argv) -> int:
             out = cmd_construct(args)
         elif args.cmd == "goal-track":
             out = cmd_goal_track(args)
+        elif args.cmd == "learn-review":
+            out = cmd_learn_review(args)
+        elif args.cmd == "universe-apply":
+            out = cmd_universe_apply(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         elif args.cmd == "memory-show":

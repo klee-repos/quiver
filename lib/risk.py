@@ -382,3 +382,45 @@ def derive_guidance(scope_label: str, metrics: Dict[str, Metric],
             f"reduced<={t.hit_rate_reduced * 100:.0f}%/{t.sharpe_reduced:.2f}. "
             f"NOTE: {_DISCLAIMER}.")
     return Guidance(scope=scope_label, tier=tier, text=text)
+
+
+# --- continual-learning helpers (Stage 4) -----------------------------------
+# Used by lib.learn to score holdings vs thesis against the goal gap. Same Metric
+# discipline (value + N + formula + the actual inputs). Analysis-side; never
+# imported by lib.signals.
+
+def sustained_underperformance(returns: Sequence[float], *, window: int = 8, min_n: int = 5,
+                               hit_floor: float = 0.40, mean_floor: float = 0.0) -> Metric:
+    """Rolling-window underperformance flag — NOT a single bad call.
+
+    Over the most recent ``window`` resolved decisions (a 'hit' = a positive
+    directional return), value is 1.0 iff hit_rate < hit_floor AND mean < mean_floor,
+    else 0.0. value is None (INSUFFICIENT -> caller KEEPs) when fewer than ``min_n``
+    decisions exist, so one bad week can never evict a sleeve.
+    """
+    recent = list(returns)[-window:]
+    n = len(recent)
+    if n < min_n:
+        return Metric("sustained_underperf", None, n,
+                      "1 iff hit_rate<floor AND mean<floor over last W; None when N<min_n",
+                      f"have N={n}, need >={min_n}", note="INSUFFICIENT (N<min_n)",
+                      low_confidence=True)
+    mean = sum(recent) / n
+    hit_rate = sum(1 for r in recent if r > 0) / n
+    underperforming = hit_rate < hit_floor and mean < mean_floor
+    return Metric("sustained_underperf", 1.0 if underperforming else 0.0, n,
+                  "1 iff hit_rate<floor AND mean<floor over last W (else 0)",
+                  f"hit_rate={hit_rate * 100:.0f}%, mean={mean * 100:+.1f}%, "
+                  f"floors=({hit_floor * 100:.0f}%,{mean_floor * 100:+.1f}%), W={window}")
+
+
+def contribution_vs_thesis(mean_return: Optional[float], target_weight: float) -> Metric:
+    """Signed contribution of a holding to the book = mean directional return *
+    its target weight. Positive pulls the book toward the goal; negative drags it."""
+    if mean_return is None:
+        return Metric("contribution", None, 0, "mean_return * weight/100",
+                      "mean_return=n/a", unit="signed_pct", note="no resolved outcomes")
+    contrib = mean_return * (target_weight / 100.0)
+    return Metric("contribution", contrib, 0, "mean_return * weight/100",
+                  f"mean_return={mean_return * 100:+.1f}% * weight={target_weight:.0f}%",
+                  unit="signed_pct")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -746,3 +747,75 @@ class Ledger:
                 "last_macro_json=excluded.last_macro_json, updated_at=excluded.updated_at",
                 (goal_id, as_of, regime, active_book, last_trigger, last_macro_json, updated_at),
             )
+
+    # --- universe change log (continual learning proposals; Stage 4) ----------
+
+    def record_universe_proposal(self, *, goal_id: int, proposed_at, kind, ticker, sleeve,
+                                 from_book, to_book, target_weight, tier, content_hash,
+                                 reason, goal_gap_pct) -> Optional[int]:
+        """Append a proposed change; deduped to ONE open row per (goal_id,
+        content_hash) by the partial unique index. Returns the new id, or None when
+        an identical open proposal already exists (so re-proposing every tick is a no-op)."""
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO universe_change_log (goal_id, proposed_at, kind, "
+                "ticker, sleeve, from_book, to_book, target_weight, tier, content_hash, "
+                "reason, goal_gap_pct, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'proposed')",
+                (goal_id, proposed_at, kind, ticker, sleeve, from_book, to_book,
+                 target_weight, tier, content_hash, reason, goal_gap_pct),
+            )
+            if cur.rowcount and cur.lastrowid is not None:
+                return int(cur.lastrowid)
+            return None
+
+    def pending_universe_changes(self, goal_id: int) -> list:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM universe_change_log WHERE goal_id=? AND status='proposed' "
+                "ORDER BY proposed_at ASC, id ASC", (goal_id,)).fetchall()]
+
+    def get_universe_change(self, change_id: int) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM universe_change_log WHERE id=?", (change_id,)).fetchone()
+            return dict(row) if row else None
+
+    def mark_universe_change(self, change_id: int, status: str, decided_at: str, decided_by: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE universe_change_log SET status=?, decided_at=?, decided_by=? WHERE id=?",
+                      (status, decided_at, decided_by, change_id))
+
+    def expire_old_proposals(self, goal_id: int, before_date: str) -> int:
+        with self._conn() as c:
+            cur = c.execute("UPDATE universe_change_log SET status='expired' "
+                            "WHERE goal_id=? AND status='proposed' AND proposed_at < ?",
+                            (goal_id, before_date))
+            return cur.rowcount
+
+    # --- run_lock: single-writer mutex (belt-and-suspenders; Stage 5) ---------
+
+    def try_acquire_run_lock(self, holder: str, now_iso: str, ttl_seconds: int = 3600) -> bool:
+        """Acquire the single-row run lock. Steals a STALE lock (held longer than
+        the TTL, which exceeds any real tick wall-clock). Returns True on acquire."""
+        with self._conn() as c:
+            row = c.execute("SELECT holder, acquired_at FROM run_lock WHERE id=1").fetchone()
+            if row is not None:
+                try:
+                    age = (datetime.fromisoformat(now_iso)
+                           - datetime.fromisoformat(row["acquired_at"])).total_seconds()
+                except (TypeError, ValueError):
+                    age = ttl_seconds + 1
+                if age < ttl_seconds:
+                    return False
+                c.execute("UPDATE run_lock SET holder=?, acquired_at=? WHERE id=1", (holder, now_iso))
+                return True
+            c.execute("INSERT INTO run_lock (id, holder, acquired_at) VALUES (1, ?, ?)", (holder, now_iso))
+            return True
+
+    def release_run_lock(self, holder: str) -> None:
+        with self._conn() as c:
+            c.execute("DELETE FROM run_lock WHERE id=1 AND holder=?", (holder,))
+
+    def run_lock_state(self) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM run_lock WHERE id=1").fetchone()
+            return dict(row) if row else None

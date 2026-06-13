@@ -1251,5 +1251,107 @@ check("goal-track: records a snapshot", _gt["recorded"], True)
 check_true("goal-track: regime present", _gt.get("regime") in ("AHEAD", "ON-TRACK", "BEHIND"))
 
 
+# ============================================================================
+# Stage 4 — continual learning + add/remove engine (auto-propose, human-apply).
+# ============================================================================
+import lib.universe as _uni  # noqa: E402
+import lib.learn as _learn  # noqa: E402
+import lib.risk as _risk  # noqa: E402
+
+# --- universe transitions ---
+check("uni: validate_add allow-listed+quotable", _uni.validate_add("SMH", ["SMH"], ["SMH"])[0], True)
+check("uni: validate_add off-list -> blocked", _uni.validate_add("ZZZ", ["SMH"], ["SMH"])[0], False)
+check("uni: validate_add unquotable -> blocked", _uni.validate_add("SOL", ["SOL"], ["SMH"])[0], False)
+_rows4 = [{"ticker": "SMH", "sleeve": "Semis", "target_weight": 9, "band": 4, "status": "active"},
+          {"ticker": "SGOV", "sleeve": "Cash", "target_weight": 91, "band": 0, "status": "active"}]
+_nr4, _freed4 = _uni.apply_remove(_rows4, "SMH")
+check("uni: apply_remove frees the weight", _freed4, 9.0)
+check("uni: apply_remove -> exiting", next(r for r in _nr4 if r["ticker"] == "SMH")["status"], "exiting")
+check("uni: apply_remove zeroes the weight", next(r for r in _nr4 if r["ticker"] == "SMH")["target_weight"], 0.0)
+_redist4 = _uni.redistribute_to_cash(_nr4, _freed4, "SGOV")
+check("uni: redistribute conserves freed weight to cash",
+      next(r for r in _redist4 if r["ticker"] == "SGOV")["target_weight"], 100.0)
+check("uni: validate_book ok at ~100", _uni.validate_book(_redist4)[0], True)
+check("uni: validate_book rejects bad sum",
+      _uni.validate_book([{"ticker": "X", "sleeve": "S", "target_weight": 50, "band": 1, "status": "active"}])[0], False)
+
+# --- risk learning helpers ---
+check("risk: sustained_underperf insufficient (N<min) -> None",
+      _risk.sustained_underperformance([-0.1, -0.1], min_n=5).value, None)
+check("risk: sustained_underperf flags a sustained bad run",
+      _risk.sustained_underperformance([-0.05] * 8, min_n=5).value, 1.0)
+check("risk: sustained_underperf healthy -> 0", _risk.sustained_underperformance([0.05] * 8, min_n=5).value, 0.0)
+check_true("risk: contribution_vs_thesis signed", _risk.contribution_vs_thesis(-0.1, 9.0).value < 0)
+
+# --- learn classifier + gates (use the real LearningConfig from strategy.yaml) ---
+_lc = _cfg_s3.strategy.learning
+check("learn: insufficient -> KEEP (None)",
+      _learn.classify_holding([-0.1, -0.1], 9.0, goal_behind=True, learning_cfg=_lc), None)
+check("learn: underperf + behind glidepath -> REMOVE",
+      _learn.classify_holding([-0.05] * 8, 9.0, goal_behind=True, learning_cfg=_lc).kind, "PROPOSE_REMOVE")
+check("learn: underperf + NOT behind -> FLAG",
+      _learn.classify_holding([-0.05] * 8, 9.0, goal_behind=False, learning_cfg=_lc).kind, "FLAG_UNDERPERFORM")
+check("learn: healthy -> KEEP", _learn.classify_holding([0.05] * 8, 9.0, goal_behind=True, learning_cfg=_lc), None)
+check("learn: content_hash stable across reason text",
+      _learn.Proposal("PROPOSE_REMOVE", "SMH", "Semis", "universe", "x").content_hash(),
+      _learn.Proposal("PROPOSE_REMOVE", "SMH", "Semis", "universe", "y").content_hash())
+
+# --- wall: learn.py never reaches the sizing side or the broker ---
+_learn_src = (_REPO / "lib" / "learn.py").read_text(encoding="utf-8")
+check_true("learn: never imports lib.signals",
+           "import lib.signals" not in _learn_src and "from lib.signals" not in _learn_src)
+for _ff in ("place_equity_order", "buying_power", "max_dollars_per_trade", "get_portfolio"):
+    check_true(f"learn: source never references '{_ff}'",
+               _re.search(rf"\b{_re.escape(_ff)}\b", _learn_src) is None)
+
+# --- lifecycle: build_proposals + universe-apply gating (seeded ledger) ---
+def _seed_returns(led, ticker, returns):
+    for i, r in enumerate(returns):
+        did = led.record_decision(trade_date=f"2026-01-{(i % 27) + 1:02d}", ticker=ticker,
+                                  decided_at="t", signal="Buy", intent="buy", decision_price=100.0)
+        led.record_outcome(did, resolved_at="t", holding_days=5, directional_return=r,
+                           benchmark_return=0.0, alpha=r, realized_pnl=None, unrealized_pnl=None,
+                           scored_against="directional")
+
+
+_led4 = _tmp_ledger()
+_g4 = _led4.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12, benchmark="SGOV",
+    benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v", macro_thesis_json="{}",
+    active_book="core_55_45", as_of="2026-06-13", start_date="2026-01-01", start_equity=100.0)
+for _tk4, _w4, _sl4 in [("SMH", 9, "Semis"), ("SGOV", 45, "Cash")]:
+    _led4.upsert_target_holding(goal_id=_g4, sleeve=_sl4, ticker=_tk4, target_weight=_w4,
+        band=(4 if _tk4 == "SMH" else 0), status="active", book="core_55_45",
+        quotable=True, proxy_ticker=None, updated_at="t")
+_seed_returns(_led4, "SMH", [-0.05] * 8)
+_progress4 = {"regime": "BEHIND", "ahead_behind_pct": -10.0}
+_ps4 = _learn.build_proposals(_led4, _g4, _lc, "HOLD", _progress4)
+check_true("learn: build_proposals -> SMH REMOVE (underperf+behind)",
+           any(p.kind == "PROPOSE_REMOVE" and p.ticker == "SMH" for p in _ps4["all"]))
+check("learn: REMOVE is needs-approval by default (universe tier, auto off)", len(_ps4["auto_apply"]), 0)
+check_true("learn: STAND_DOWN -> a DERISK proposal",
+           any(p.kind == "PROPOSE_DERISK" for p in _learn.build_proposals(_led4, _g4, _lc, "STAND_DOWN", _progress4)["all"]))
+_rid4 = _led4.record_universe_proposal(goal_id=_g4, proposed_at="2026-09-01T00:00:00Z",
+    kind="PROPOSE_REMOVE", ticker="SMH", sleeve="Semis", from_book=None, to_book=None,
+    target_weight=9.0, tier="universe", content_hash="hash1", reason="test", goal_gap_pct=-10.0)
+check("ledger: re-proposing the same open change is deduped (None)",
+      _led4.record_universe_proposal(goal_id=_g4, proposed_at="x", kind="PROPOSE_REMOVE", ticker="SMH",
+          sleeve="Semis", from_book=None, to_book=None, target_weight=9.0, tier="universe",
+          content_hash="hash1", reason="dup", goal_gap_pct=None), None)
+check("universe-apply: universe tier without --approve -> NOT applied",
+      _tick._run_universe_apply(_cfg_s3, _led4, change_id=_rid4, approve=False)["applied"], False)
+check("universe-apply: --approve applies",
+      _tick._run_universe_apply(_cfg_s3, _led4, change_id=_rid4, approve=True)["applied"], True)
+check("universe-apply: REMOVE set the holding to exiting (winds to zero, no order)",
+      next(r for r in _led4.active_target_portfolio(_g4, statuses=("active", "exiting"))
+           if r["ticker"] == "SMH")["status"], "exiting")
+
+# --- run_lock (Stage 5 mutex, exercised here) ---
+_ledL = _tmp_ledger()
+check("ledger: run_lock acquires when free", _ledL.try_acquire_run_lock("h1", "2026-06-13T10:00:00", ttl_seconds=3600), True)
+check("ledger: run_lock blocks a second holder while held",
+      _ledL.try_acquire_run_lock("h2", "2026-06-13T10:01:00", ttl_seconds=3600), False)
+check("ledger: run_lock steals a STALE lock", _ledL.try_acquire_run_lock("h2", "2026-06-13T12:00:00", ttl_seconds=3600), True)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
