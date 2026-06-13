@@ -1076,5 +1076,89 @@ check("sig: target room binds the buy (only ever reduces)",
       signals.resolve_buy_dollars(**_buy_args, room_under_target=3.0)[0], 3.0)
 
 
+# ============================================================================
+# Stage 2 — read-only goal/target context into the analysis path.
+# ============================================================================
+import lib.strategy_context as _sctx  # noqa: E402
+import lib.reflect_memory as _rm  # noqa: E402
+
+# Build a temp ledger with an active goal + targets + an equity baseline.
+_s2db = tempfile.mktemp(suffix=".db")
+_s2 = Ledger(_s2db)
+_s2gid = _s2.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="2026-06-13",
+    start_date="2026-01-01", start_equity=100.0)
+for _tk, _w in [("URA", 7), ("ETHA", 2)]:
+    _s2.upsert_target_holding(goal_id=_s2gid, sleeve=("Uranium/Power" if _tk == "URA" else "Crypto ETH"),
+        ticker=_tk, target_weight=_w, band=2, status="active", book="core_55_45",
+        quotable=True, proxy_ticker=None, updated_at="t")
+_s2.get_or_create_baseline("2026-07-02", 110.0, "2026-07-02T00:00:00Z")  # ahead of glidepath
+
+# build_target_context: inactive / not-in-book / present
+check("sctx: strategy_cfg None -> None", _sctx.build_target_context(_s2, "URA", None), None)
+check("sctx: ticker not in book -> None", _sctx.build_target_context(_s2, "NOPE", _sc), None)
+_tc_ura = _sctx.build_target_context(_s2, "URA", _sc)
+check("sctx: URA sleeve", _tc_ura["sleeve"], "Uranium/Power")
+check("sctx: URA tier CORE (weight 7)", _tc_ura["tier"], "CORE")
+check("sctx: URA goal regime AHEAD", _tc_ura["goal_regime"], "AHEAD")
+check("sctx: ETHA tier SATELLITE (weight 2)",
+      _sctx.build_target_context(_s2, "ETHA", _sc)["tier"], "SATELLITE")
+
+
+# render: disclaimer present, and the D2 WALL — no digit, no '$'
+def _no_digit_no_dollar(s):
+    return ("$" not in s) and not any(ch.isdigit() for ch in s)
+
+
+_full = _sctx.render_target_block(_tc_ura, compact=False)
+_compact = _sctx.render_target_block(_tc_ura, compact=True)
+check_true("sctx: full block carries the 'does NOT change sizing' disclaimer",
+           "does NOT change sizing" in _full)
+check_true("sctx: compact carries the disclaimer", "does NOT change sizing" in _compact)
+check_true("sctx: full block names the sleeve + regime", "Uranium/Power" in _full and "AHEAD" in _full)
+check_true("sctx: D2 wall — full block has NO digit and NO '$'", _no_digit_no_dollar(_full))
+check_true("sctx: D2 wall — compact block has NO digit and NO '$'", _no_digit_no_dollar(_compact))
+check("sctx: render None -> ''", _sctx.render_target_block(None), "")
+check("sctx: render '' for ticker not in book",
+      _sctx.render_target_block(_sctx.build_target_context(_s2, "NOPE", _sc)), "")
+
+# D2 wall (source): the renderer reads NO broker/limit symbols. Word-boundary
+# match so the legitimate ledger method active_target_portfolio (which contains
+# the substring "get_portfolio") is not a false positive — the code calls a
+# LEDGER method, never the broker's get_portfolio MCP tool.
+import re as _re  # noqa: E402
+_sctx_src = (_REPO / "lib" / "strategy_context.py").read_text(encoding="utf-8")
+for _forbidden in ("buying_power", "max_dollars_per_trade", "get_portfolio",
+                   "place_equity_order", "RiskConfig", "remaining_daily_cap",
+                   "get_equity_positions", "get_equity_quotes"):
+    check_true(f"sctx: source never reads '{_forbidden}' (analysis path reads no limits)",
+               _re.search(rf"\b{_re.escape(_forbidden)}\b", _sctx_src) is None)
+
+# D5: bundle['target'] is captured once and matches build_target_context
+from lib.config import MemoryConfig as _MC  # noqa: E402
+_memcfg = _MC(enabled=True, dir=tempfile.mkdtemp(), risk_free_rate=0.0, low_confidence_min_n=5,
+              rolling_window=10, periods_per_year=50.0, hit_rate_elevated=0.6, hit_rate_reduced=0.4,
+              sharpe_elevated=0.5, sharpe_reduced=0.0)
+_bundle = _rm.build_metric_bundle(_s2, "URA", _memcfg, strategy_cfg=_sc)
+check("rm: bundle['target'] captured once (D5) matches build_target_context",
+      _bundle["target"], _tc_ura)
+check("rm: bundle['target'] None when no strategy_cfg",
+      _rm.build_metric_bundle(_s2, "URA", _memcfg)["target"], None)
+
+# D3: a target-block failure degrades, never shrinks the scorecard/risk context
+_bundle_bad = dict(_bundle)
+_bundle_bad["target"] = {"tier": "CORE"}  # missing keys -> render_target_block raises -> swallowed
+_ctx = _rm.build_past_context(_bundle_bad, _s2, "URA", compact=False)
+check_true("rm: build_past_context never raises on a malformed target block",
+           isinstance(_ctx, str))
+Path(_s2db).unlink(missing_ok=True)
+
+# analyze.py needs no change: it already threads cfg into safe_build_context
+_analyze_src = (_REPO / "analyze.py").read_text(encoding="utf-8")
+check_true("analyze.py threads cfg into safe_build_context (cfg.strategy reaches the renderer)",
+           "safe_build_context(" in _analyze_src)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

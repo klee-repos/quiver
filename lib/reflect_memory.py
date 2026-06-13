@@ -96,12 +96,25 @@ def _portfolio_part(led, cfg_memory) -> dict:
     return _part("PORTFOLIO", led.all_return_series(), cfg_memory)
 
 
-def build_metric_bundle(led, ticker: str, cfg_memory) -> dict:
-    """Compute the per-ticker AND portfolio scopes ONCE (reused for inject + write)."""
+def build_metric_bundle(led, ticker: str, cfg_memory, strategy_cfg=None) -> dict:
+    """Compute the per-ticker AND portfolio scopes ONCE (reused for inject + write).
+
+    When strategy_cfg is supplied, also captures the read-only strategy/goal target
+    context under bundle['target'] ONCE (decision D5), so the written decision
+    snapshot reflects the same target the agents saw. Isolated: a target hiccup
+    leaves bundle['target']=None and never breaks the proven metric bundle."""
+    target = None
+    if strategy_cfg is not None:
+        try:
+            import lib.strategy_context as _sctx
+            target = _sctx.build_target_context(led, ticker, strategy_cfg)
+        except Exception:  # noqa: BLE001
+            target = None
     return {
         "ticker_label": ticker,
         "ticker": _ticker_part(led, ticker, cfg_memory),
         "portfolio": _portfolio_part(led, cfg_memory),
+        "target": target,
     }
 
 
@@ -193,9 +206,11 @@ def _snap_block(date: str, ticker: str, signal, decision_price, bundle: dict) ->
     tm = bundle["ticker"]["metrics"]
     hr, sh = tm["hit_rate"], tm["sharpe"]
     tier = bundle["ticker"]["guidance"].tier
+    tgt = bundle.get("target") or {}
+    goal_tok = f" | goal={tgt['goal_regime']}" if tgt.get("goal_regime") else ""
     line = (f"- {date} | signal={signal} | decision_price={decision_price} | "
             f"as-of metrics: hit_rate={hr.value_str()}(N={hr.n}), sharpe={sh.value_str()}(N={sh.n}) | "
-            f"guidance={tier}")
+            f"guidance={tier}{goal_tok}")
     return f"<!-- SNAP date={date} ticker={ticker} -->\n{line}\n<!-- /SNAP -->"
 
 
@@ -295,6 +310,16 @@ def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False)
             parts.append(render_metric_block(bundle[key]))
         except Exception:  # noqa: BLE001
             pass
+    # 4th block: the read-only strategy/goal target context (decision D2). Its own
+    # try/except, so a strategy hiccup can never shrink the proven scorecard/risk
+    # context above. '' when there is no target (ticker not in book / layer inactive).
+    try:
+        import lib.strategy_context as _sctx
+        block = _sctx.render_target_block(bundle.get("target"), compact=compact)
+        if block:
+            parts.append(block)
+    except Exception:  # noqa: BLE001
+        pass
     return "\n\n".join(p for p in parts if p)
 
 
@@ -322,7 +347,7 @@ def safe_build_context(led, ticker: str, cfg) -> ContextResult:
         sc = _safe_scorecard(led, ticker)
         return ContextResult(sc, sc, None, "scorecard" if sc else "empty")
     try:
-        bundle = build_metric_bundle(led, ticker, cfg.memory)
+        bundle = build_metric_bundle(led, ticker, cfg.memory, getattr(cfg, "strategy", None))
         full = build_past_context(bundle, led, ticker, compact=False)
         compact = build_past_context(bundle, led, ticker, compact=True)
         return ContextResult(full, compact, bundle, "enriched")
