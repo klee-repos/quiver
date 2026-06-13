@@ -29,6 +29,14 @@ class RiskConfig:
     # breaker bounding repeat ANALYSES per ticker/day.
     max_actions_per_ticker_per_day: int
     max_analyses_per_ticker_per_day: int
+    # --- Strategy-layer rebalance knobs (Stage 3) -------------------------
+    # All default to TODAY's behavior: rebalance OFF -> cmd_plan is byte-identical
+    # and the flat watchlist still drives `pending`. They only take effect once
+    # rebalance_enabled is explicitly true.
+    rebalance_enabled: bool = False
+    rebalance_drift_band_pct: float = 5.0
+    cash_sleeve_ticker: str = "SGOV"      # the residual ballast; never churned like an engine name
+    watchlist_from_strategy: bool = False
 
 
 @dataclass(frozen=True)
@@ -127,6 +135,13 @@ class Config:
     storage: StorageConfig
     memory: MemoryConfig
     raw: dict
+    # --- Strategy layer (Stage 0) ----------------------------------------
+    # strategy is Optional[lib.strategy.StrategyConfig] (typed as object to keep
+    # config a light leaf with no heavy import). It is None when strategy.yaml is
+    # absent OR garbled -> the whole strategy layer is INACTIVE and analyze.py +
+    # cmd_plan behave exactly as the validated once-a-day path.
+    strategy_path: str = "strategy.yaml"
+    strategy: object = None
 
 
 class ConfigError(ValueError):
@@ -197,6 +212,17 @@ def load_config(path) -> Config:
     watchlist = [str(t).strip().upper() for t in watchlist]
 
     risk_d = d.get("risk", {}) or {}
+    # Strategy-layer rebalance knobs. Default to TODAY's behavior so the validated
+    # path is unchanged until rebalance_enabled is explicitly true.
+    rebalance_enabled = risk_d.get("rebalance_enabled", False) is True
+    try:
+        rebalance_band = float(risk_d.get("rebalance_drift_band_pct", 5.0) or 5.0)
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: risk.rebalance_drift_band_pct must be a number")
+    if rebalance_band <= 0:
+        raise ConfigError("config.yaml: risk.rebalance_drift_band_pct must be > 0")
+    cash_sleeve_ticker = str(risk_d.get("cash_sleeve_ticker", "SGOV") or "SGOV").strip().upper()
+    watchlist_from_strategy = risk_d.get("watchlist_from_strategy", False) is True
     risk = RiskConfig(
         max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
@@ -205,6 +231,10 @@ def load_config(path) -> Config:
         min_buying_power_buffer=float(risk_d.get("min_buying_power_buffer", 0) or 0),
         max_actions_per_ticker_per_day=_pos_int(risk_d, "max_actions_per_ticker_per_day", 1),
         max_analyses_per_ticker_per_day=_pos_int(risk_d, "max_analyses_per_ticker_per_day", 1),
+        rebalance_enabled=rebalance_enabled,
+        rebalance_drift_band_pct=rebalance_band,
+        cash_sleeve_ticker=cash_sleeve_ticker,
+        watchlist_from_strategy=watchlist_from_strategy,
     )
 
     ds = d.get("deepseek", {}) or {}
@@ -366,6 +396,23 @@ def load_config(path) -> Config:
         sharpe_elevated=shp_el, sharpe_reduced=shp_rd,
     )
 
+    # Strategy layer (15%-goal macro book). OPTIONAL + FAIL-SAFE: heavy parsing
+    # lives in lib.strategy (keeps config a light leaf). An absent file -> None;
+    # a GARBLED file is caught here and ALSO degrades to None, so a malformed
+    # strategy.yaml can never crash a running tick — the layer just goes INACTIVE.
+    # (`tick.py strategy-set` and the tests call load_strategy directly to get the
+    # strict validate-or-raise behavior at setup time.)
+    strategy_path = str(d.get("strategy_path", "strategy.yaml") or "strategy.yaml")
+    if not os.path.isabs(strategy_path):
+        strategy_path = str(p.resolve().parent / strategy_path)
+    strategy_obj = None
+    if os.path.exists(strategy_path):
+        try:
+            from lib.strategy import load_strategy
+            strategy_obj = load_strategy(strategy_path)
+        except Exception:
+            strategy_obj = None
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -393,4 +440,6 @@ def load_config(path) -> Config:
         storage=storage,
         memory=memory,
         raw=d,
+        strategy_path=strategy_path,
+        strategy=strategy_obj,
     )

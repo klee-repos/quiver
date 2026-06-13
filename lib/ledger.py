@@ -123,6 +123,94 @@ CREATE TABLE IF NOT EXISTS ticker_schedule (
     analyses_today INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (trade_date, ticker)
 );
+-- ===========================================================================
+-- Strategy layer (the 15%/12mo macro book). strategy.yaml is the committed
+-- SOURCE; `tick.py strategy-set` writes these tables; `construct`/`goal-track`
+-- read them at runtime. These hold the book + goal + macro regime as state of
+-- record — NO trading limits, NO broker. Brand-new tables auto-create via the
+-- CREATE TABLE IF NOT EXISTS path (no _migrate_* helper needed — that's only
+-- for new COLUMNS on existing tables).
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS strategy_goal (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at           TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'active',   -- active|superseded
+    target_return_pct    REAL,
+    horizon_months       INTEGER,
+    benchmark            TEXT,
+    benchmark_annual_pct REAL,
+    constraint_note      TEXT,
+    macro_thesis_version TEXT,
+    macro_thesis_json    TEXT,
+    active_book          TEXT DEFAULT 'core_55_45',
+    as_of                TEXT,
+    start_date           TEXT,
+    start_equity         REAL
+);
+CREATE TABLE IF NOT EXISTS target_portfolio (
+    goal_id       INTEGER NOT NULL,
+    sleeve        TEXT,
+    ticker        TEXT NOT NULL,
+    target_weight REAL NOT NULL,
+    band          REAL DEFAULT 5.0,
+    status        TEXT NOT NULL DEFAULT 'active',   -- active|exiting|removed
+    book          TEXT DEFAULT 'core_55_45',
+    quotable      INTEGER DEFAULT 1,
+    proxy_ticker  TEXT,
+    updated_at    TEXT,
+    PRIMARY KEY (goal_id, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_target_portfolio_active ON target_portfolio(goal_id, status);
+CREATE TABLE IF NOT EXISTS goal_tracking (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id                INTEGER NOT NULL,
+    trade_date             TEXT,
+    captured_at            TEXT,
+    portfolio_value        REAL,
+    glidepath_target_value REAL,
+    cumulative_return_pct  REAL,
+    ahead_behind_pct       REAL,
+    alpha_vs_benchmark_pct REAL,
+    active_book            TEXT,
+    regime                 TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_goal_tracking_goal ON goal_tracking(goal_id, trade_date);
+CREATE TABLE IF NOT EXISTS thesis_state (
+    goal_id         INTEGER PRIMARY KEY,
+    as_of           TEXT,
+    regime          TEXT NOT NULL DEFAULT 'neutral',     -- neutral|deploy|standdown
+    active_book     TEXT DEFAULT 'core_55_45',           -- core_55_45|dial_up_63_37|derisked_cash
+    last_trigger    TEXT,
+    last_macro_json TEXT,
+    updated_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS universe_change_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id      INTEGER NOT NULL,
+    proposed_at  TEXT,
+    kind         TEXT,                                   -- add|remove|derisk|book_switch|flag
+    ticker       TEXT,
+    sleeve       TEXT,
+    from_book    TEXT,
+    to_book      TEXT,
+    target_weight REAL,
+    tier         TEXT,                                   -- soft|derisk|universe
+    content_hash TEXT NOT NULL,
+    reason       TEXT NOT NULL,
+    goal_gap_pct REAL,
+    status       TEXT NOT NULL DEFAULT 'proposed',       -- proposed|approved|applied|rejected|expired
+    decided_at   TEXT,
+    decided_by   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_universe_change_status ON universe_change_log(goal_id, status, proposed_at);
+-- Dedup OPEN proposals: at most one 'proposed' row per (goal_id, content_hash),
+-- so re-proposing the same change every tick is an INSERT OR IGNORE no-op.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_universe_open ON universe_change_log(goal_id, content_hash) WHERE status='proposed';
+CREATE TABLE IF NOT EXISTS run_lock (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),      -- single-row mutex
+    holder      TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+);
 """
 
 
@@ -540,4 +628,121 @@ class Ledger:
                 "(trade_date, kind, content_hash, recipients, sent_at) "
                 "VALUES (?,?,?,?,?)",
                 (trade_date, kind, content_hash, recipients, now_iso),
+            )
+
+    # --- strategy layer: goal, target book, goal tracking, thesis state -------
+    # Runtime state of record for the 15%-goal macro book. Written by
+    # `strategy-set` (from strategy.yaml) and read by `construct`/`goal-track`.
+    # Read-only-safe for the analysis path: no trading limits, no broker here.
+
+    def set_strategy_goal(self, *, created_at: str, target_return_pct, horizon_months,
+                          benchmark, benchmark_annual_pct, constraint_note,
+                          macro_thesis_version, macro_thesis_json, active_book,
+                          as_of, start_date, start_equity) -> int:
+        """Make exactly ONE active goal: supersede any others, then insert.
+
+        Mirrors how a halt supersedes a prior state — there is always at most one
+        status='active' row. Returns the new goal id."""
+        with self._conn() as c:
+            c.execute("UPDATE strategy_goal SET status='superseded' WHERE status='active'")
+            cur = c.execute(
+                "INSERT INTO strategy_goal (created_at, status, target_return_pct, "
+                "horizon_months, benchmark, benchmark_annual_pct, constraint_note, "
+                "macro_thesis_version, macro_thesis_json, active_book, as_of, "
+                "start_date, start_equity) VALUES (?, 'active', ?,?,?,?,?,?,?,?,?,?,?)",
+                (created_at, target_return_pct, horizon_months, benchmark,
+                 benchmark_annual_pct, constraint_note, macro_thesis_version,
+                 macro_thesis_json, active_book, as_of, start_date, start_equity),
+            )
+            rid = cur.lastrowid
+            if rid is None:  # never happens after a successful INSERT, but be explicit
+                raise RuntimeError("strategy_goal INSERT did not return a row id")
+            return int(rid)
+
+    def get_active_goal(self) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM strategy_goal WHERE status='active' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+    def set_active_book(self, goal_id: int, book: str) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE strategy_goal SET active_book=? WHERE id=?", (book, goal_id))
+
+    def upsert_target_holding(self, *, goal_id: int, sleeve, ticker, target_weight, band,
+                              status, book, quotable, proxy_ticker, updated_at) -> None:
+        """Latest-snapshot per (goal_id, ticker), like ticker_action. Idempotent
+        re-runs via ON CONFLICT DO UPDATE (same pattern as bump_analysis)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO target_portfolio (goal_id, sleeve, ticker, target_weight, "
+                "band, status, book, quotable, proxy_ticker, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(goal_id, ticker) DO UPDATE SET sleeve=excluded.sleeve, "
+                "target_weight=excluded.target_weight, band=excluded.band, "
+                "status=excluded.status, book=excluded.book, quotable=excluded.quotable, "
+                "proxy_ticker=excluded.proxy_ticker, updated_at=excluded.updated_at",
+                (goal_id, sleeve, ticker, target_weight, band, status, book,
+                 1 if quotable else 0, proxy_ticker, updated_at),
+            )
+
+    def set_holding_status(self, goal_id: int, ticker: str, status: str, updated_at: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE target_portfolio SET status=?, updated_at=? WHERE goal_id=? AND ticker=?",
+                (status, updated_at, goal_id, ticker),
+            )
+
+    def active_target_portfolio(self, goal_id: int, statuses=("active",)) -> list:
+        placeholders = ",".join("?" for _ in statuses)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                f"SELECT * FROM target_portfolio WHERE goal_id=? AND status IN ({placeholders}) "
+                "ORDER BY ticker ASC",
+                (goal_id, *statuses),
+            ).fetchall()]
+
+    def all_target_tickers(self, goal_id: int) -> list:
+        with self._conn() as c:
+            return [r["ticker"] for r in c.execute(
+                "SELECT ticker FROM target_portfolio WHERE goal_id=? ORDER BY ticker ASC",
+                (goal_id,),
+            ).fetchall()]
+
+    def record_goal_snapshot(self, *, goal_id: int, trade_date, captured_at, portfolio_value,
+                             glidepath_target_value, cumulative_return_pct, ahead_behind_pct,
+                             alpha_vs_benchmark_pct, active_book, regime) -> None:
+        """Append-only goal-progress snapshot (like the actions event log)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO goal_tracking (goal_id, trade_date, captured_at, portfolio_value, "
+                "glidepath_target_value, cumulative_return_pct, ahead_behind_pct, "
+                "alpha_vs_benchmark_pct, active_book, regime) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (goal_id, trade_date, captured_at, portfolio_value, glidepath_target_value,
+                 cumulative_return_pct, ahead_behind_pct, alpha_vs_benchmark_pct, active_book, regime),
+            )
+
+    def goal_tracking_series(self, goal_id: int) -> list:
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM goal_tracking WHERE goal_id=? ORDER BY trade_date ASC, id ASC",
+                (goal_id,),
+            ).fetchall()]
+
+    def get_thesis_state(self, goal_id: int) -> Optional[dict]:
+        with self._conn() as c:
+            row = c.execute("SELECT * FROM thesis_state WHERE goal_id=?", (goal_id,)).fetchone()
+            return dict(row) if row else None
+
+    def upsert_thesis_state(self, *, goal_id: int, as_of, regime, active_book, last_trigger,
+                            last_macro_json, updated_at) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO thesis_state (goal_id, as_of, regime, active_book, last_trigger, "
+                "last_macro_json, updated_at) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(goal_id) DO UPDATE SET as_of=excluded.as_of, regime=excluded.regime, "
+                "active_book=excluded.active_book, last_trigger=excluded.last_trigger, "
+                "last_macro_json=excluded.last_macro_json, updated_at=excluded.updated_at",
+                (goal_id, as_of, regime, active_book, last_trigger, last_macro_json, updated_at),
             )

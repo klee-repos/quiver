@@ -884,5 +884,133 @@ check_true("digest with no account_risk omits the line",
            "Account risk" not in notify.build_digest(MODEL)["text"])
 
 
+# ============================================================================
+# Stage 0 — strategy layer (strategy.yaml + lib/strategy.py) + ledger tables.
+# Pure + hermetic: the committed strategy.yaml, temp files, and a temp db only.
+# ============================================================================
+import dataclasses as _dc  # noqa: E402
+import lib.strategy as _strat  # noqa: E402
+from lib.config import RiskConfig as _RiskConfig  # noqa: E402
+
+_REPO = Path(__file__).resolve().parent.parent
+_sc = _strat.load_strategy(_REPO / "strategy.yaml")
+_base_yaml = (_REPO / "strategy.yaml").read_text(encoding="utf-8")
+
+
+def _write_tmp(text):
+    p = Path(tempfile.mktemp(suffix=".yaml"))
+    p.write_text(text, encoding="utf-8")
+    return str(p)
+
+
+# --- structure ---
+check("strategy: default book", _sc.default_book, "core_55_45")
+check("strategy: two books", sorted(_sc.books), ["core_55_45", "dial_up_63_37"])
+for _bn, _b in _sc.books.items():
+    check_true(f"strategy: {_bn} weights sum ~100",
+               abs(sum(h.weight for h in _b.holdings) - 100.0) <= 0.5)
+check_true("strategy: SOL non-quotable",
+           any(h.ticker == "SOL" and not h.quotable for h in _sc.books["core_55_45"].holdings))
+check_true("strategy: dial-up OFF by default", _sc.books["dial_up_63_37"].enabled is False)
+check_true("strategy: cash sleeve carries no band",
+           all(h.band == 0.0 for h in _sc.books["core_55_45"].holdings if h.is_cash))
+
+# --- validate-or-raise (strict; the config wrapper turns these into None) ---
+check_raises("strategy: band>=weight raises",
+             lambda: _strat.load_strategy(_write_tmp(
+                 _base_yaml.replace("weight: 9, band: 4", "weight: 9, band: 9"))),
+             _strat.StrategyError)
+check_raises("strategy: weights!=100 raises",
+             lambda: _strat.load_strategy(_write_tmp(
+                 _base_yaml.replace("ticker: SGOV, weight: 45", "ticker: SGOV, weight: 60", 1))),
+             _strat.StrategyError)
+check_raises("strategy: no default book raises",
+             lambda: _strat.load_strategy(_write_tmp(
+                 _base_yaml.replace("default: true", "default: false"))),
+             _strat.StrategyError)
+check_raises("strategy: deploy>=standdown raises",
+             lambda: _strat.load_strategy(_write_tmp(
+                 _base_yaml.replace("deploy_trigger_pce_pct: 2.5", "deploy_trigger_pce_pct: 4.0"))),
+             _strat.StrategyError)
+check_raises("strategy: ticker off allow-list raises",
+             lambda: _strat.load_strategy(_write_tmp(
+                 _base_yaml.replace("[SMH, SOXX,", "[SOXX,"))),
+             _strat.StrategyError)
+check_raises("strategy: absent file raises",
+             lambda: _strat.load_strategy("/no/such/strategy.yaml"), _strat.StrategyError)
+
+# --- deterministic book selection (truth table) ---
+check("strategy: HOLD->core", _strat.select_active_book(_sc, None)[0], "core_55_45")
+check("strategy: DEPLOY dial-OFF stays core (fail-safe)",
+      _strat.select_active_book(_sc, {"core_pce_pct": 2.3})[0], "core_55_45")
+check("strategy: STANDDOWN pce->core", _strat.select_active_book(_sc, {"core_pce_pct": 3.6})[0], "core_55_45")
+check("strategy: STANDDOWN hike->core", _strat.select_active_book(_sc, {"fed_hike": True})[0], "core_55_45")
+check("strategy: regime HOLD", _strat.regime_label(_sc, None), "HOLD")
+check("strategy: regime DEPLOY", _strat.regime_label(_sc, {"core_pce_pct": 2.3}), "DEPLOY")
+check("strategy: regime STAND_DOWN", _strat.regime_label(_sc, {"core_pce_pct": 3.6}), "STAND_DOWN")
+_dialon = _dc.replace(_sc, books={**_sc.books,
+    "dial_up_63_37": _dc.replace(_sc.books["dial_up_63_37"], enabled=True)})
+check("strategy: DEPLOY dial-ON routes to dial-up",
+      _strat.select_active_book(_dialon, {"core_pce_pct": 2.3})[0], "dial_up_63_37")
+check("strategy: sleeve_thesis known", _strat.sleeve_thesis(_sc, "smh")["sleeve"], "Semiconductors")
+check("strategy: sleeve_thesis unknown -> None", _strat.sleeve_thesis(_sc, "FOO"), None)
+
+
+# --- config fail-safe + rebalance-knob defaults ---
+def _safe_strategy(path):  # mirrors the load_config wrapper: garbled -> None
+    try:
+        return _strat.load_strategy(path)
+    except Exception:
+        return None
+
+
+check("config: garbled strategy.yaml -> None (fail-safe contract)",
+      _safe_strategy(_write_tmp("schema: 2\nnonsense: [")), None)
+_rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capital_deploy_cap=1000,
+                  max_open_position_per_ticker=50, min_buying_power_buffer=5,
+                  max_actions_per_ticker_per_day=1, max_analyses_per_ticker_per_day=1)
+check("config: RiskConfig rebalance knobs default to today's behavior",
+      (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.watchlist_from_strategy),
+      (False, "SGOV", 5.0, False))
+
+# --- ledger: the 6 new tables round-trip (temp db; fresh + existing) ---
+_db = tempfile.mktemp(suffix=".db")
+Ledger(_db)
+_led = Ledger(_db)  # re-open: idempotent auto-create on a pre-existing db
+_gid = _led.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v1",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d", start_date="d", start_equity=100.0)
+_gid2 = _led.set_strategy_goal(created_at="t2", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v2",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d", start_date="d", start_equity=100.0)
+check("ledger: exactly one active goal (newest wins)", _led.get_active_goal()["id"], _gid2)
+check_true("ledger: prior goal id differs", _gid != _gid2)
+_led.upsert_target_holding(goal_id=_gid2, sleeve="s", ticker="SMH", target_weight=9, band=4,
+    status="active", book="core_55_45", quotable=True, proxy_ticker=None, updated_at="t")
+_led.upsert_target_holding(goal_id=_gid2, sleeve="s", ticker="SMH", target_weight=10, band=4,
+    status="active", book="core_55_45", quotable=True, proxy_ticker=None, updated_at="t2")
+_led.upsert_target_holding(goal_id=_gid2, sleeve="s", ticker="SOL", target_weight=3, band=2,
+    status="active", book="core_55_45", quotable=False, proxy_ticker=None, updated_at="t")
+check("ledger: upsert idempotent (no dup row)", len(_led.active_target_portfolio(_gid2)), 2)
+check("ledger: upsert updates weight in place",
+      next(r for r in _led.active_target_portfolio(_gid2) if r["ticker"] == "SMH")["target_weight"], 10.0)
+check("ledger: non-quotable persisted (0)",
+      next(r for r in _led.active_target_portfolio(_gid2) if r["ticker"] == "SOL")["quotable"], 0)
+_led.set_holding_status(_gid2, "SMH", "exiting", "t3")
+check("ledger: exiting drops from active", len(_led.active_target_portfolio(_gid2)), 1)
+check("ledger: status filter includes exiting",
+      len(_led.active_target_portfolio(_gid2, statuses=("active", "exiting"))), 2)
+_led.record_goal_snapshot(goal_id=_gid2, trade_date="2026-06-13", captured_at="t", portfolio_value=100,
+    glidepath_target_value=100, cumulative_return_pct=0.0, ahead_behind_pct=0.0,
+    alpha_vs_benchmark_pct=0.0, active_book="core_55_45", regime="HOLD")
+check("ledger: goal_tracking series len", len(_led.goal_tracking_series(_gid2)), 1)
+_led.upsert_thesis_state(goal_id=_gid2, as_of="d", regime="neutral", active_book="core_55_45",
+    last_trigger=None, last_macro_json="{}", updated_at="t")
+_led.upsert_thesis_state(goal_id=_gid2, as_of="d2", regime="standdown", active_book="core_55_45",
+    last_trigger="hike", last_macro_json="{}", updated_at="t2")
+check("ledger: thesis_state upsert in place", _led.get_thesis_state(_gid2)["regime"], "standdown")
+Path(_db).unlink(missing_ok=True)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
