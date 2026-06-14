@@ -30,13 +30,12 @@ class RiskConfig:
     max_actions_per_ticker_per_day: int
     max_analyses_per_ticker_per_day: int
     # --- Strategy-layer rebalance knobs (Stage 3) -------------------------
-    # All default to TODAY's behavior: rebalance OFF -> cmd_plan is byte-identical
-    # and the flat watchlist still drives `pending`. They only take effect once
-    # rebalance_enabled is explicitly true.
+    # Default to TODAY's behavior: rebalance OFF -> cmd_plan is byte-identical.
+    # (The analysis universe is always the active portfolio book — see
+    # tick.py:_analysis_universe — there is no separate watchlist to drive it.)
     rebalance_enabled: bool = False
     rebalance_drift_band_pct: float = 5.0
     cash_sleeve_ticker: str = "SGOV"      # the residual ballast; never churned like an engine name
-    watchlist_from_strategy: bool = False
 
 
 @dataclass(frozen=True)
@@ -118,7 +117,6 @@ class Config:
     account_number: str
     dry_run: bool
     kill_switch_file: str
-    watchlist: List[str]
     risk: RiskConfig
     chat_model: str
     reasoner_model: str
@@ -214,10 +212,9 @@ def load_config(path) -> Config:
             "Robinhood account number> in .env (it must NOT be committed)."
         )
 
-    watchlist = _require(d, "watchlist")
-    if not isinstance(watchlist, list) or not watchlist:
-        raise ConfigError("config.yaml: 'watchlist' must be a non-empty list")
-    watchlist = [str(t).strip().upper() for t in watchlist]
+    # The trading universe is DERIVED from the active portfolio book (strategy.yaml
+    # / the ledger goal), not a hand-maintained list — see tick.py:_analysis_universe.
+    # config.yaml carries no `watchlist`.
 
     risk_d = d.get("risk", {}) or {}
     # Strategy-layer rebalance knobs. Default to TODAY's behavior so the validated
@@ -230,7 +227,6 @@ def load_config(path) -> Config:
     if rebalance_band <= 0:
         raise ConfigError("config.yaml: risk.rebalance_drift_band_pct must be > 0")
     cash_sleeve_ticker = str(risk_d.get("cash_sleeve_ticker", "SGOV") or "SGOV").strip().upper()
-    watchlist_from_strategy = risk_d.get("watchlist_from_strategy", False) is True
     risk = RiskConfig(
         max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
@@ -242,7 +238,6 @@ def load_config(path) -> Config:
         rebalance_enabled=rebalance_enabled,
         rebalance_drift_band_pct=rebalance_band,
         cash_sleeve_ticker=cash_sleeve_ticker,
-        watchlist_from_strategy=watchlist_from_strategy,
     )
 
     ds = d.get("deepseek", {}) or {}
@@ -460,7 +455,6 @@ def load_config(path) -> Config:
         account_number=account,
         dry_run=dry_run,
         kill_switch_file=str(_require(d, "kill_switch_file")),
-        watchlist=watchlist,
         risk=risk,
         chat_model=chat_model,
         reasoner_model=reasoner_model,

@@ -136,7 +136,6 @@ def make_config(notify_block=None):
         "account_number": "12345678",
         "dry_run": True,
         "kill_switch_file": "/tmp/bw_kill_test",
-        "watchlist": ["AAPL"],
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5},
@@ -413,7 +412,6 @@ check("enabled S3 (deferred) degrades to local, never raises",
 def make_storage_config(storage_block):
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
-        "watchlist": ["AAPL"],
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5},
@@ -553,7 +551,6 @@ check("day_actions = one latest row per ticker (digest regression)",
 def make_loop_config(loop_block=None, risk_extra=None):
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
-        "watchlist": ["AAPL"],
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5},
@@ -625,7 +622,6 @@ check_true("stop is strictly below fill", signals.resolve_stop_price(100.0, None
 
 def make_order_config(order_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
-         "watchlist": ["AAPL"],
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
                   "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
@@ -780,7 +776,6 @@ check("baseline_equity_series date order",
 # --- config: MemoryConfig parsing + validation (defaults ON; bad bands raise) ---
 def make_memory_config(memory_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
-         "watchlist": ["AAPL"],
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
                   "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
@@ -1077,8 +1072,8 @@ _rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capit
                   max_open_position_per_ticker=50, min_buying_power_buffer=5,
                   max_actions_per_ticker_per_day=1, max_analyses_per_ticker_per_day=1)
 check("config: RiskConfig rebalance knobs default to today's behavior",
-      (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.watchlist_from_strategy),
-      (False, "SGOV", 5.0, False))
+      (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct),
+      (False, "SGOV", 5.0))
 
 # --- ledger: the 6 new tables round-trip (temp db; fresh + existing) ---
 _db = tempfile.mktemp(suffix=".db")
@@ -1278,7 +1273,6 @@ import lib.market as _market  # noqa: E402
 
 def _cfg_rebal(enabled, strategy_path=None):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_s3",
-         "watchlist": ["SMH"],
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                   "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
                   "min_buying_power_buffer": 5, "rebalance_enabled": enabled},
@@ -1357,6 +1351,22 @@ _gt = _tick._run_goal_track(_cfg_s3, _led_s3)
 check("goal-track: records a snapshot", _gt["recorded"], True)
 check_true("goal-track: regime present", _gt.get("regime") in ("AHEAD", "ON-TRACK", "BEHIND"))
 
+# --- universe derivation: preflight's `pending` comes from the PORTFOLIO book,
+#     never a hand-maintained watchlist (cash + non-quotable filtered out) ---
+_uni_from_goal = _tick._analysis_universe(_cfg_s3, _led_s3)  # ledger has an active goal
+check_true("universe: derived from the active goal book (engine names)",
+           "SMH" in _uni_from_goal and "URA" in _uni_from_goal)
+check_true("universe: cash residual (SGOV) excluded", "SGOV" not in _uni_from_goal)
+check_true("universe: non-quotable (SOL) excluded", "SOL" not in _uni_from_goal)
+# No goal seeded yet -> falls back to strategy.yaml's default book (same names).
+_uni_fallback = _tick._analysis_universe(_cfg_s3, _tmp_ledger())
+check_true("universe: falls back to strategy.yaml book before strategy-set runs",
+           "SMH" in _uni_fallback and "SGOV" not in _uni_fallback and "SOL" not in _uni_fallback)
+# No strategy at all -> empty universe (fail-safe: no portfolio, no trades).
+_cfg_nostrat = _cfg_rebal(False, strategy_path="/nonexistent/strategy.yaml")
+check("universe: no strategy -> empty (fail-safe no-op)",
+      _tick._analysis_universe(_cfg_nostrat, _tmp_ledger()), [])
+
 
 # ============================================================================
 # Stage 4 — continual learning + add/remove engine (auto-propose, human-apply).
@@ -1381,6 +1391,23 @@ check("uni: redistribute conserves freed weight to cash",
 check("uni: validate_book ok at ~100", _uni.validate_book(_redist4)[0], True)
 check("uni: validate_book rejects bad sum",
       _uni.validate_book([{"ticker": "X", "sleeve": "S", "target_weight": 50, "band": 1, "status": "active"}])[0], False)
+
+# --- tradable_universe: the analysis universe a book implies (pure) ---
+_tu_rows = [
+    {"ticker": "smh", "sleeve": "Semis", "quotable": True, "status": "active"},
+    {"ticker": "SOL", "sleeve": "Crypto", "quotable": False, "status": "active"},
+    {"ticker": "SGOV", "sleeve": "Cash", "quotable": True, "status": "active"},
+    {"ticker": "XLV", "sleeve": "Value", "quotable": True, "status": "exiting"},
+    {"ticker": "SMH", "sleeve": "Semis", "quotable": True, "status": "active"},  # dup
+]
+check("uni: tradable_universe filters cash/unquotable/non-active/dups + uppercases, keeps order",
+      _uni.tradable_universe(_tu_rows, "SGOV"), ["SMH"])
+check("uni: tradable_universe drops cash by ticker even if sleeve differs",
+      _uni.tradable_universe([{"ticker": "SGOV", "sleeve": "Misc", "quotable": True}], "SGOV"), [])
+check("uni: tradable_universe quotable + status default permissive",
+      _uni.tradable_universe([{"ticker": "URA", "sleeve": "Uranium"}], "SGOV"), ["URA"])
+check("uni: tradable_universe empty rows -> []", _uni.tradable_universe([], "SGOV"), [])
+check("uni: tradable_universe skips blank tickers", _uni.tradable_universe([{"ticker": ""}], "SGOV"), [])
 
 # --- risk learning helpers ---
 check("risk: sustained_underperf insufficient (N<min) -> None",

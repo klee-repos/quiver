@@ -36,7 +36,7 @@ FAIL = 0
 def _cfg():
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/judge_kill",
-        "watchlist": ["SMH"], "strategy_path": str(_REPO / "strategy.yaml"),
+        "strategy_path": str(_REPO / "strategy.yaml"),
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 20.0,
                  "daily_capital_deploy_cap": 1000, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5, "rebalance_enabled": True},
@@ -104,6 +104,20 @@ def main() -> int:
         "2. Crypto exposure is the asset or an ETF WRAPPER (IBIT=BTC, ETHA=ETH) or a spot coin marked quotable:false; "
         "there must be NO crypto-treasury or miner stocks (MSTR, COIN, MARA, RIOT, CLSK, IREN).\n"
         "3. SGOV (the Cash sleeve) is present as the ballast."), book)
+
+    # 1b) Universe derivation — the tickers the bot will analyze/trade each tick
+    #     come from the PORTFOLIO book, never a hand-maintained watchlist.
+    derived_universe = T._analysis_universe(cfg, led)
+    judge("universe-derivation", (
+        "`derived_universe` is the exact set of tickers the bot will ANALYZE and potentially trade "
+        "each day. It must be DERIVED from the portfolio `book` — there is no separate watchlist:\n"
+        "1. Every ticker in derived_universe is a key of `book`.\n"
+        "2. SGOV (the Cash sleeve) is NOT in derived_universe — cash is the residual, never traded.\n"
+        "3. SOL (quotable:false) is NOT in derived_universe — the equities broker can't price it.\n"
+        "4. Every OTHER quotable non-cash book name (e.g. SMH, URA, IBIT, ETHA) IS in derived_universe.\n"
+        "5. derived_universe contains NONE of these stale hand-picked tickers (the removed watchlist): "
+        "CBRS, PLTR, AMZN, REMX, HOOD, TSLA, GOOGL."),
+        {"derived_universe": derived_universe, "book": book})
 
     # 2) Construct -------------------------------------------------------------
     con = T._run_construct(cfg, led, {"equity": 100.0, "positions": {"XLV": {"market_value": 20.0}},

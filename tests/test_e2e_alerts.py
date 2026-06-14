@@ -52,7 +52,6 @@ def _cfg(notify_block):
         os.environ.pop(_k, None)
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/alerts_kill",
-        "watchlist": ["AAPL"],
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5},

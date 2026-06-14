@@ -1,0 +1,96 @@
+# strategy.yaml — EXAMPLE. Copy to strategy.yaml (gitignored) and encode YOUR book:
+#   cp strategy.yaml.example strategy.yaml
+# strategy.yaml is your macro book + goal as DATA (not prose). It's per-user and NOT
+# committed, so your real allocations/thesis stay private. The values below are an
+# ILLUSTRATIVE template — replace the thesis, universe, and weights with your own.
+#
+# `tick.py strategy-set` writes this into the ledger (strategy_goal + target_portfolio);
+# `tick.py construct` reads the LEDGER at runtime. So: yaml = source, ledger = runtime
+# state. There is no third copy.
+#
+# Zero secrets here (like config.yaml). Fails SAFE: an absent or garbled strategy.yaml
+# leaves cfg.strategy=None -> the whole strategy layer is INACTIVE (construct returns
+# proceed:false; analyze.py + cmd_plan behave exactly as the validated once-a-day
+# path). It NEVER auto-switches to the riskier dial-up book.
+#
+# All trading/sizing/rebalance decisions still live in deterministic Python
+# (lib/strategy, lib/portfolio, lib/signals). This file only supplies the target
+# weights + macro thesis the Python brain consumes.
+schema: 1
+
+# --- The goal ---------------------------------------------------------------
+goal:
+  target_return_pct: 15            # beat +N% total return over the horizon...
+  horizon_months: 12               # ...within N months, else hold cash.
+  benchmark: "SGOV ~3.6%"          # the "do nothing" alternative we must beat
+  benchmark_annual_pct: 3.6        # linearized daily-prorated for per-decision alpha
+  constraint: "Robinhood-tradable only; crypto allowed; cash is the only ballast"
+
+# --- The macro thesis (operator DATA; the bot cannot fetch macro) -----------
+# Replace with YOUR read. The core-PCE / Fed readings are supplied by the operator
+# (macro_state) — Python selects the book deterministically from them; it never
+# reasons about macro.
+macro_thesis:
+  version: "2026-01-01"
+  summary: >
+    <Your macro thesis here.> Example: base case across sleeves ~+6%; the target is
+    only reached in a bull-tilted year; name the single catalyst that lights your
+    risk sleeves at once.
+  catalysts_to_watch:
+    - "<next FOMC + dot plot>"
+    - "<next core PCE>"
+    - "<next CPI>"
+  deploy_trigger_pce_pct: 2.5      # core PCE <= this -> DEPLOY regime (recommend dial-up)
+  standdown_trigger_pce_pct: 3.5   # core PCE >= this -> STAND DOWN (de-risk to core/cash)
+  standdown_on_hike: true          # a confirmed Fed hike also forces STAND DOWN
+  correlation_note: >
+    <Note any sleeves that are really ONE bet and fall together — they do NOT
+    diversify each other.>
+
+# --- The Robinhood-tradable universe (allow-list; add/remove gate) -----------
+# A proposed ADD must be on this list AND quotable via the equities MCP. These are
+# illustrative broad ETFs — swap in your own universe.
+rh_tradable_confirmed:
+  [QQQ, RSP, XLV, EEM, XLE, AVUV, IBIT, ETHA, SGOV]
+
+# --- The books --------------------------------------------------------------
+# core is the DEFAULT, validated active book. dial_up is OFF; ACTIVATING dial-up
+# requires flipping enabled:true (fail-safe, like dry_run). quotable:false marks a
+# holding the equities MCP can't price (e.g. spot crypto) -> construct skips it from
+# the executable book; its weight is held in cash. Weights below are ILLUSTRATIVE.
+books:
+  core_60_40:
+    default: true
+    holdings:
+      - {sleeve: "US large cap",     ticker: QQQ,  weight: 20, band: 5}
+      - {sleeve: "US equal weight",  ticker: RSP,  weight: 10, band: 4}
+      - {sleeve: "Value/Defensive",  ticker: XLV,  weight: 12, band: 4}
+      - {sleeve: "Emerging markets", ticker: EEM,  weight: 8,  band: 3}
+      - {sleeve: "Crypto BTC",       ticker: IBIT, weight: 6,  band: 3}
+      - {sleeve: "Crypto ETH",       ticker: ETHA, weight: 4,  band: 2}
+      - {sleeve: "Cash",             ticker: SGOV, weight: 40}   # residual ballast
+  dial_up:
+    enabled: false        # OFF; activating dial-up requires this flag
+    holdings:
+      - {sleeve: "US large cap",     ticker: QQQ,  weight: 32, band: 6}
+      - {sleeve: "US equal weight",  ticker: RSP,  weight: 8,  band: 3}
+      - {sleeve: "Value/Defensive",  ticker: XLV,  weight: 10, band: 4}
+      - {sleeve: "Emerging markets", ticker: EEM,  weight: 10, band: 4}
+      - {sleeve: "Crypto BTC",       ticker: IBIT, weight: 8,  band: 3}
+      - {sleeve: "Crypto ETH",       ticker: ETHA, weight: 4,  band: 2}
+      - {sleeve: "Cash",             ticker: SGOV, weight: 28}
+
+# --- Continual-learning gates (Stage 4) -------------------------------------
+# Every universe-touching gate defaults SAFE; both auto_apply_* default FALSE (the
+# investable universe stays human-gated unless explicitly opened).
+learning:
+  underperf_window: 8
+  underperf_hit_floor: 0.40
+  underperf_mean_floor: 0.0
+  min_resolved_n: 5
+  sleeve_review_min_n: 6
+  derisk_on_standdown: true
+  auto_apply_derisk: false              # safe direction; still OFF by default
+  auto_apply_universe_changes: false    # risky direction; human-gated
+  goal_gap_derisk_pct: -5.0
+  proposal_expiry_days: 5

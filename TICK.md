@@ -59,10 +59,13 @@ Parse the JSON.
 - If `proceed` is `false` → log the `reason` to `logs/orchestrator.log` and **STOP**.
   This is a normal no-op wake, NOT a failure — do NOT fire an alert.
   (Common no-op reasons: `market_closed`, `too_early`, `kill_switch_present`,
-  `daily_halt_flag_set`, `all_watchlist_tickers_already_acted_today`.)
+  `daily_halt_flag_set`, `all_portfolio_tickers_already_acted_today`,
+  `no_portfolio_universe`.)
 - If `unfinalized` is non-empty → see STEP 6 (reconcile) BEFORE anything else.
 - Otherwise note: `account_number`, `dry_run`, `intraday`, `trading_day`,
-  `pending` (tickers to analyze this wake), `pending_outcomes`, `risk`, `order`.
+  `pending` (tickers to analyze this wake — the active portfolio book's engine
+  names, derived from strategy.yaml / the ledger goal; there is no watchlist),
+  `pending_outcomes`, `risk`, `order`.
 - `intraday` reflects `loop.intraday_enabled`. When `false`, `pending` is the
   classic "not yet acted today" set (≤1 action/ticker/day). When `true`, `pending`
   is only the tickers whose cadence timer elapsed and that are under the daily

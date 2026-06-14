@@ -46,7 +46,7 @@ def ok(name, cond):
 def _cfg():
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/e2e_kill",
-        "watchlist": ["SMH", "IBIT"], "strategy_path": str(_REPO / "strategy.yaml"),
+        "strategy_path": str(_REPO / "strategy.yaml"),
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 20.0,
                  "daily_capital_deploy_cap": 1000, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5, "rebalance_enabled": True},

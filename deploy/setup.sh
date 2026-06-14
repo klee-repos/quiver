@@ -73,15 +73,27 @@ done
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
 [ -f "$QUIVER_HOME/deploy/runner/mcp.json" ] || cp "$QUIVER_HOME/deploy/runner/mcp.json.example" "$QUIVER_HOME/deploy/runner/mcp.json"
-# config.yaml is per-user + gitignored, so it is NOT in the clone. Seed it from the
-# example (SAFE: dry_run:true, generic watchlist) so the box boots; then SSH in and
-# replace it with your real watchlist/caps before flipping dry_run to false. (For a
-# fully-automated box, push your config.yaml to the host out-of-band instead.)
-if [ ! -f "$QUIVER_HOME/config.yaml" ]; then
-  cp "$QUIVER_HOME/config.yaml.example" "$QUIVER_HOME/config.yaml"
-  chown "$QUIVER_USER:$QUIVER_USER" "$QUIVER_HOME/config.yaml"
-  echo "  NOTE: seeded config.yaml from config.yaml.example (dry_run:true). Replace it with your real config before going live."
-fi
+# config.yaml + strategy.yaml are per-user + gitignored, so they are NOT in the clone.
+# Pull the REAL files from SSM if present (keeps the box reproducible from `terraform
+# apply` AND keeps your live posture / macro book private); else seed the SAFE example
+# (dry_run:true; the example book's holdings become the universe). Re-runs NEVER clobber
+# an existing file, so a manual edit on the box survives the next setup.sh.
+seed_yaml() {  # $1=SSM param name  $2=dest path  $3=example path
+  [ -f "$2" ] && return 0
+  local v
+  if v=$(aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_PREFIX/$1" \
+           --with-decryption --query Parameter.Value --output text 2>/dev/null) \
+     && [ -n "$v" ] && [ "$v" != "None" ]; then
+    printf '%s\n' "$v" > "$2"
+    echo "  $(basename "$2") <- SSM $SSM_PREFIX/$1"
+  else
+    cp "$3" "$2"
+    echo "  NOTE: $(basename "$2") seeded from $(basename "$3") (SSM $SSM_PREFIX/$1 absent) — replace before going live."
+  fi
+  chown "$QUIVER_USER:$QUIVER_USER" "$2"
+}
+seed_yaml CONFIG_YAML   "$QUIVER_HOME/config.yaml"   "$QUIVER_HOME/config.yaml.example"
+seed_yaml STRATEGY_YAML "$QUIVER_HOME/strategy.yaml" "$QUIVER_HOME/strategy.yaml.example"
 
 echo "[7/9] systemd units + timer"
 cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service

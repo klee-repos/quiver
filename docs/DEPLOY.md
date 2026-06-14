@@ -43,6 +43,15 @@ done
 # aws ssm put-parameter --name "$P/NOTIFY_ALERTS_TO" --type SecureString --value "pager@you.com" --overwrite
 # RH_OAUTH_TOKEN is set after the interactive auth in step 4; seed a placeholder for now:
 aws ssm put-parameter --name "$P/RH_OAUTH_TOKEN" --type SecureString --value "PENDING" --overwrite
+
+# Your private config + strategy book are gitignored (not in the clone). Push them to
+# SSM so the box materializes the REAL files at setup (keeps the box reproducible from
+# `terraform apply` and your live posture / macro book private). They're ~6KB, so use
+# Intelligent-Tiering (auto-upgrades past the 4KB Standard limit; ~$0.05/param/mo):
+aws ssm put-parameter --name "$P/CONFIG_YAML"   --type SecureString --tier Intelligent-Tiering --value "$(cat config.yaml)"   --overwrite
+aws ssm put-parameter --name "$P/STRATEGY_YAML" --type SecureString --tier Intelligent-Tiering --value "$(cat strategy.yaml)" --overwrite
+# If you SKIP these, the box boots SAFE from the *.example templates (dry_run:true) and
+# you replace /opt/quiver/{config,strategy}.yaml on the box before going live.
 ```
 
 ## 1b. GitHub deploy key (read-only, repo-scoped — the box clones over SSH)
@@ -95,10 +104,13 @@ sudo bash /opt/quiver/deploy/setup.sh                    # re-materializes /etc/
 On expiry you'll be paged via SNS; repeat this step.
 
 ## 5. Dry-run soak, then go live (decision D2)
-0. **Put your real `config.yaml` on the box.** `config.yaml` is gitignored, so the clone
-   doesn't include it — `setup.sh` seeds it from `config.yaml.example` (SAFE: `dry_run:
-   true`, generic watchlist). SSH in and replace `/opt/quiver/config.yaml` with your real
-   watchlist + caps (`scp` it up, or paste it), still `dry_run: true`, before the soak.
+0. **Your real `config.yaml` + `strategy.yaml`.** Both are gitignored (not in the clone).
+   If you pushed them to SSM (step 1), `setup.sh` already materialized them on the box —
+   verify `/opt/quiver/config.yaml` + `/opt/quiver/strategy.yaml` are yours (still
+   `dry_run: true` for the soak). If you skipped SSM, `setup.sh` seeded the SAFE
+   `.example` templates (`dry_run:true`); SSH in and replace them before the soak. The
+   trading universe comes from `strategy.yaml`'s book, so a missing/empty book = nothing
+   to trade.
 1. Ensure `config.yaml: dry_run: true`. Let the timer run a **full market day** —
    the tick reviews-but-never-places. Confirm **zero `place_equity_order` calls**
    (tool-use logs + an empty Robinhood order history) and that the digests match a

@@ -114,14 +114,16 @@ stock a set number of times per day. That mode is **off** unless you turn it on.
 
 ### 1 · Turn it on
 
-First-time setup — make your private config + secrets from the committed templates
-(both are gitignored, so your real watchlist/mode/caps and keys never get shared):
+First-time setup — make your private config, strategy book, and secrets from the
+committed templates (all three are gitignored, so your live posture and macro book
+never get shared):
 
 ```bash
 cd ~/dev/quiver
-cp config.yaml.example config.yaml   # your settings — starts in dry_run (paper)
+cp config.yaml.example config.yaml       # your settings — starts in dry_run (paper)
+cp strategy.yaml.example strategy.yaml   # your portfolio book = what it trades
 cp .env.example .env && chmod 600 .env   # your keys + account number
-# then open config.yaml / .env and fill them in
+# then open config.yaml / strategy.yaml / .env and fill them in
 ```
 
 Quiver runs inside a Claude Code session that stays open. These commands start it and tell it
@@ -166,7 +168,6 @@ account. If you fund it with more, raise the dollar limits to match.
 | Setting | Example | What it means (in plain words) |
 |---|---|---|
 | `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
-| `watchlist` | `AAPL, MSFT, NVDA` | The stocks to look at each day. More stocks = a bit more cost. |
 | `max_dollars_per_trade` | `25` | The most it can spend on any single buy. |
 | `daily_capital_deploy_cap` | `75` | The most it can spend buying in one day, total. |
 | `max_open_position_per_ticker` | `50` | The most it will ever hold in one stock. |
@@ -181,6 +182,12 @@ account. If you fund it with more, raise the dollar limits to match.
 > The two "advanced" features — checking several times a day, and the fancy order types — are
 > **off by default**. With the defaults, Quiver does the simple, well-tested thing: one careful
 > buy or sell a day. Only turn the extras on after you've watched plenty of practice runs.
+
+> [!NOTE]
+> **Which stocks does it look at?** There's no separate "watchlist" to maintain. Quiver looks
+> at whatever is in your **portfolio plan** (`strategy.yaml` — the target weights it's trying to
+> hold). Cash (SGOV) and anything it can't get a live price for are skipped automatically. To
+> change what it trades, edit `strategy.yaml`, not `config.yaml`.
 
 ---
 
@@ -266,8 +273,9 @@ fails to send, trading carries on as normal.
 | `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
 | `lib/` | The building blocks: market hours, the logbook, the safety rules, email, memory. |
 | `TICK.md` | The exact step-by-step the helper follows on every run. |
-| `config.yaml` | All your settings (the table above). Private — gitignored, never shared. |
-| `config.yaml.example` | The committed template you copy to `config.yaml`. Safe defaults (paper mode). |
+| `config.yaml` | Your settings (the table above). Private — gitignored, never shared. |
+| `strategy.yaml` | Your portfolio book = the stocks it trades. Private — gitignored. |
+| `*.yaml.example` | The committed templates you copy to make the two files above. Safe defaults. |
 | `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
 | `tradingagents/` | The AI analyst team that powers the thinking. |
 | `.env` | Your private keys and account number. Never shared, never committed. |

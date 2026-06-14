@@ -40,6 +40,7 @@ from lib import notify  # noqa: E402
 from lib import signals  # noqa: E402
 from lib import storage  # noqa: E402
 from lib import memory  # noqa: E402
+from lib import universe  # noqa: E402
 
 LEDGER_DB = REPO / "state" / "ledger.db"
 ANALYZE_LOGS = REPO / "state" / "analyze_logs"
@@ -67,6 +68,33 @@ def _to_float(v):
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _analysis_universe(cfg, led) -> list:
+    """The day's universe of tickers to analyze = the active portfolio book's
+    engine names. Replaces the old hand-maintained `watchlist`: the universe is
+    now DERIVED from the defined portfolio so the two can never drift apart.
+
+    Source of truth, in order:
+      1. the ledger's active goal target book (runtime state — reflects any
+         continual-learning universe changes), when a goal has been seeded;
+      2. else strategy.yaml's default book (the committed source), so the bot is
+         live the moment a valid strategy.yaml exists, before `strategy-set` runs;
+      3. else empty — no portfolio defined, so the tick safely no-ops (fail-safe:
+         no universe, no trades).
+    The cash residual and non-quotable names are filtered out (lib.universe.
+    tradable_universe), matching how `construct` builds the executable book.
+    """
+    goal = led.get_active_goal()
+    if goal:
+        rows = led.active_target_portfolio(goal["id"], statuses=("active",))
+    elif cfg.strategy is not None:
+        book = cfg.strategy.book(cfg.strategy.default_book)
+        rows = [{"ticker": h.ticker, "sleeve": h.sleeve, "quotable": h.quotable,
+                 "status": "active"} for h in book.holdings]
+    else:
+        rows = []
+    return universe.tradable_universe(rows, cfg.risk.cash_sleeve_ticker)
 
 
 def cmd_preflight(_args) -> dict:
@@ -122,6 +150,13 @@ def cmd_preflight(_args) -> dict:
         out["reason"] = f"too_early (minutes_since_open={mso})"
         return out
 
+    # The universe is the active portfolio book (no hand-maintained watchlist). An
+    # empty universe means no portfolio is defined yet -> safe no-op, not an error.
+    book_universe = _analysis_universe(cfg, led)
+    if not book_universe:
+        out["reason"] = "no_portfolio_universe (set strategy.yaml / run strategy-set)"
+        return out
+
     if cfg.intraday_enabled:
         # Per-ticker eligibility: a ticker is due when its cadence timer has
         # elapsed AND it's under the daily analysis budget. Cheap-skip the rest
@@ -141,12 +176,12 @@ def cmd_preflight(_args) -> dict:
             except (TypeError, ValueError):
                 return True
 
-        pending = [t for t in cfg.watchlist if _due(t)]
+        pending = [t for t in book_universe if _due(t)]
         no_pending = "no_tickers_due_yet (cooldown/cadence/analysis-budget)"
     else:
         # Classic once-a-day path: at most one action per ticker per day.
-        pending = [t for t in cfg.watchlist if not led.already_acted(day, t)]
-        no_pending = "all_watchlist_tickers_already_acted_today"
+        pending = [t for t in book_universe if not led.already_acted(day, t)]
+        no_pending = "all_portfolio_tickers_already_acted_today"
 
     out["pending"] = pending
     if not pending:

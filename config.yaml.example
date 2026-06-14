@@ -1,9 +1,10 @@
 # Quiver config — EXAMPLE. Copy to config.yaml (which is gitignored) and tune:
 #   cp config.yaml.example config.yaml
-# config.yaml holds YOUR real watchlist / mode / caps and is NOT committed, so your
-# live posture stays private. This example ships SAFE defaults: dry_run: true and a
-# small generic watchlist — change them deliberately. No secrets live here either way
-# (account number + API keys + notify recipients are in .env / the MCP registration).
+# config.yaml holds YOUR real mode (dry_run) + risk caps and is NOT committed, so your
+# live posture stays private. This example ships a SAFE default: dry_run: true — change
+# it deliberately. The tickers the bot trades come from strategy.yaml's book, NOT here.
+# No secrets live here either way (account number + API keys + notify recipients are in
+# .env / the MCP registration).
 schema: 1
 
 # --- Account ---------------------------------------------------------------
@@ -21,8 +22,11 @@ dry_run: true
 kill_switch_file: "KILL"
 
 # --- Universe --------------------------------------------------------------
-# Keep small at first: LLM cost + runtime scale linearly with the watchlist.
-watchlist: ["AAPL", "MSFT"]
+# There is NO hand-maintained watchlist. The tickers analyzed each tick are DERIVED
+# from the active portfolio book — strategy.yaml's default book (or, once `tick.py
+# strategy-set` has run, the ledger's active goal). The cash residual (SGOV) and
+# non-quotable names (spot crypto) are excluded automatically. To change what the bot
+# trades, edit strategy.yaml's `books`, not this file.
 
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
 # Sized for the ~$100 Agentic account. Bump these proportionally if you fund more.

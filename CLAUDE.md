@@ -235,11 +235,18 @@ ledger rollups — all offline.
   deploy acceptance gate for the last-resort pager.
 - `lib/` — `config`, `market`, `ledger`, `signals`, `ds_config`, `notify`, `mailer`, `memory`,
   `storage` (see above).
-- `config.yaml` — `dry_run`, watchlist, dollar caps, order defaults (incl. `buy_type` +
+- `config.yaml` — `dry_run`, dollar caps, order defaults (incl. `buy_type` +
   `protective_stop`), model IDs, `loop` timing + `intraday_enabled`/cadence, `storage` retention,
-  `notify` (email digest + alerts — off unless `enabled: true`). **Per-user + gitignored** so a
-  public repo never exposes your live posture; copy `config.yaml.example` → `config.yaml` and tune.
-  Carries NO secrets (account number + keys + recipients are in `.env`).
+  `notify` (email digest + alerts — off unless `enabled: true`). **No watchlist** — the analysis
+  universe is derived from the active portfolio book (`strategy.yaml` / the ledger goal) via
+  `tick.py:_analysis_universe` + `lib/universe.tradable_universe` (cash + non-quotable excluded).
+  **Per-user + gitignored** (copy `config.yaml.example`) so a public repo never exposes your live
+  posture; carries NO secrets (those are in `.env`).
+- `strategy.yaml` — the macro book + goal as DATA; it IS the trading universe (the book's
+  holdings, minus cash/non-quotable). Also **per-user + gitignored** (copy `strategy.yaml.example`)
+  — it reveals your allocations. Fails SAFE: absent/empty book → nothing to analyze, no trades.
+- `config.yaml.example` / `strategy.yaml.example` — committed templates (SAFE: `dry_run: true`,
+  illustrative book). `cp *.example` to start; on the box both are pulled from SSM (see DEPLOY.md).
 - `TICK.md` — the per-tick runbook the orchestrator follows verbatim.
 - `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored from upstream;
   tracked, pruned; provenance in `tradingagents/UPSTREAM.md`, Apache-2.0 `tradingagents/LICENSE`).
@@ -249,8 +256,6 @@ ledger rollups — all offline.
 - `logs/` — `orchestrator.log` (one line per tick) + `reasoning/` (teed live thinking). Gitignored.
 - `.env` — per-user/secret values (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`,
   `RH_ACCOUNT_NUMBER` (the agentic_allowed account), and `NOTIFY_TO` (digest recipients,
-  comma-separated). `config.yaml` is gitignored (copy from `config.yaml.example`) and carries none
-  of these. MCP credentials (Robinhood, Resend) live in the operator's Claude config
-  (`claude mcp add`), NOT in this repo.
-- `config.yaml.example` — the committed template (SAFE defaults: `dry_run: true`, generic
-  watchlist). `cp config.yaml.example config.yaml` to start; your real `config.yaml` stays private.
+  comma-separated). `config.yaml` + `strategy.yaml` are gitignored (copy from the `*.example`
+  templates) and carry none of these. MCP credentials (Robinhood, Resend) live in the operator's
+  Claude config (`claude mcp add`), NOT in this repo.
