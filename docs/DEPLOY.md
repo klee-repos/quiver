@@ -23,7 +23,13 @@ order whose `ref_id` the Python `plan` did not reserve in the ledger (D5).
 - An EC2 key pair (for the one-time SSH MCP auth).
 - A **read-only deploy key** so the box can clone the private repo over SSH (created in
   step 1b). Set `repo_url` to the SSH form: `git@github.com:<you>/quiver.git`.
-- API keys: `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`, `RESEND_API_KEY`; `RH_ACCOUNT_NUMBER`, `NOTIFY_TO`.
+- **Claude Code auth for the headless orchestrator** — ONE of:
+  - **(recommended) your Claude Pro/Max subscription**: run `claude setup-token` locally, copy the
+    `sk-ant-oat...` token, and store it as SSM `CLAUDE_CODE_OAUTH_TOKEN`. No API billing — the box's
+    headless `claude` runs on your plan. (`setup.sh` writes it to `quiver.env`; it must NOT also set
+    `ANTHROPIC_API_KEY`, which would override the token and bill the API.)
+  - **or** an `ANTHROPIC_API_KEY` (API billing) stored as SSM `ANTHROPIC_API_KEY`.
+- API keys: `DEEPSEEK_API_KEY`, `RESEND_API_KEY`; `RH_ACCOUNT_NUMBER`, `NOTIFY_TO`.
 - A **Resend-verified sender domain** and `RESEND_FROM` (e.g. `quiver@yourdomain.com`). This powers
   the Python **last-resort pager** (`run_tick.py`): when the headless orchestrator crashes, times
   out, or preflight errors, it emails you directly over the Resend HTTP API — the failures you most
@@ -35,17 +41,23 @@ order whose `ref_id` the Python `plan` did not reserve in the ledger (D5).
 > **Shortcut — `./deploy/bootstrap-aws.sh`** does steps 1, 1b, and the EC2 key pair in
 > one idempotent run: it pushes every SSM secret from your local `.env` + the real
 > `config.yaml`/`strategy.yaml`, creates the read-only GitHub deploy key, and makes the
-> EC2 key pair. It leaves exactly the steps a human must do: `ANTHROPIC_API_KEY`,
+> EC2 key pair. It leaves exactly the steps a human must do: the Claude auth
+> (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY`),
 > `terraform apply`, the SNS email confirm, and the interactive `/mcp`. The manual
 > commands below are the same thing, spelled out.
 
 ## 1. Create the secrets in SSM (out-of-band — never in tfstate)
 ```bash
 P=/quiver
-for k in ANTHROPIC_API_KEY DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO RESEND_FROM; do
+for k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO RESEND_FROM; do
   read -rs -p "$k: " v; echo
   aws ssm put-parameter --name "$P/$k" --type SecureString --value "$v" --overwrite
 done
+# Claude Code auth for the headless orchestrator — pick ONE:
+#   subscription (recommended, no API billing):
+claude setup-token   # copy the sk-ant-oat... token it prints, then:
+aws ssm put-parameter --name "$P/CLAUDE_CODE_OAUTH_TOKEN" --type SecureString --value "<token>" --overwrite
+#   ...or API billing:  aws ssm put-parameter --name "$P/ANTHROPIC_API_KEY" --type SecureString --value "<key>" --overwrite
 # Optional: a separate pager list for critical alerts (falls back to NOTIFY_TO):
 # aws ssm put-parameter --name "$P/NOTIFY_ALERTS_TO" --type SecureString --value "pager@you.com" --overwrite
 # RH_OAUTH_TOKEN is set after the interactive auth in step 4; seed a placeholder for now:

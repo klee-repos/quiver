@@ -43,10 +43,15 @@ put_big STRATEGY_YAML "$(cat strategy.yaml)"
 echo "[3] RH_OAUTH_TOKEN placeholder (the real token comes from the interactive /mcp)"
 have RH_OAUTH_TOKEN || put RH_OAUTH_TOKEN "PENDING"
 
-echo "[4] ANTHROPIC_API_KEY"
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then put ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY";
-else echo "  >> NOT set — this is one of the few you must push yourself:";
-     echo "     aws ssm put-parameter --region $REGION --name $P/ANTHROPIC_API_KEY --type SecureString --value '<key>' --overwrite"; fi
+echo "[4] Claude Code auth for the headless orchestrator (subscription token OR API key)"
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then put CLAUDE_CODE_OAUTH_TOKEN "$CLAUDE_CODE_OAUTH_TOKEN";
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then put ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY";
+else
+  echo "  >> NOT set — push ONE of these yourself (subscription preferred, no API billing):";
+  echo "     claude setup-token   # uses your Pro/Max plan; copy the sk-ant-oat... token, then:";
+  echo "     aws ssm put-parameter --region $REGION --name $P/CLAUDE_CODE_OAUTH_TOKEN --type SecureString --value '<token>' --overwrite";
+  echo "     # ...or, for API billing instead:";
+  echo "     aws ssm put-parameter --region $REGION --name $P/ANTHROPIC_API_KEY --type SecureString --value '<key>' --overwrite"; fi
 
 echo "[5] GitHub read-only deploy key (the box clones over SSH)"
 if have GITHUB_DEPLOY_KEY; then echo "  SSM $P/GITHUB_DEPLOY_KEY: exists";
@@ -68,7 +73,8 @@ fi
 
 echo
 echo "DONE. Still human-only (cannot be automated):"
-echo "  1. ANTHROPIC_API_KEY -> SSM (above), if not done."
+echo "  1. Claude auth -> SSM (above): 'claude setup-token' -> CLAUDE_CODE_OAUTH_TOKEN (subscription),"
+echo "     or ANTHROPIC_API_KEY (API billing). Whichever, if not done above."
 echo "  2. cd deploy/terraform && terraform apply   (spins up the paid box)."
 echo "  3. Confirm the SNS subscription email AWS sends you."
 echo "  4. One-time Robinhood /mcp on the box, then push RH_OAUTH_TOKEN to SSM + re-run setup.sh."

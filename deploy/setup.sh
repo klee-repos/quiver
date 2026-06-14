@@ -53,13 +53,28 @@ fetch_opt() { aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_PREFIX/$
 # missing param. A failing `$(fetch K)` *inside* `echo "K=$(...)"` does NOT trip set -e
 # (echo exits 0), which would silently write an empty value — including a dead pager
 # RESEND_API_KEY. The assignment form `_v=$(...)` does propagate the failure.
-for _k in ANTHROPIC_API_KEY DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RH_OAUTH_TOKEN RESEND_API_KEY NOTIFY_TO; do
+for _k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RH_OAUTH_TOKEN RESEND_API_KEY NOTIFY_TO; do
   _v=$(fetch "$_k") || { echo "FATAL: required SSM param $SSM_PREFIX/$_k is missing" >&2; exit 1; }
   { [ -n "$_v" ] && [ "$_v" != "None" ]; } || { echo "FATAL: required SSM param $SSM_PREFIX/$_k is empty" >&2; exit 1; }
   printf -v "$_k" '%s' "$_v"
 done
+# Claude Code auth for the headless orchestrator: EITHER a subscription token
+# (CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token` — uses your Pro/Max plan, no API
+# billing) OR an ANTHROPIC_API_KEY. Prefer the subscription token, and write ONLY one —
+# an ANTHROPIC_API_KEY in the env would override the token and bill the API instead.
+_CCOT=$(fetch_opt CLAUDE_CODE_OAUTH_TOKEN)
+_AAK=$(fetch_opt ANTHROPIC_API_KEY)
+if [ -n "$_CCOT" ] && [ "$_CCOT" != "None" ]; then
+  CLAUDE_AUTH_LINE="CLAUDE_CODE_OAUTH_TOKEN=$_CCOT"
+elif [ -n "$_AAK" ] && [ "$_AAK" != "None" ]; then
+  CLAUDE_AUTH_LINE="ANTHROPIC_API_KEY=$_AAK"
+else
+  echo "FATAL: no Claude auth — set SSM $SSM_PREFIX/CLAUDE_CODE_OAUTH_TOKEN (run 'claude" >&2
+  echo "       setup-token' on your subscription) OR $SSM_PREFIX/ANTHROPIC_API_KEY" >&2
+  exit 1
+fi
 {
-  echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY"
+  echo "$CLAUDE_AUTH_LINE"
   echo "DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY"
   echo "RH_ACCOUNT_NUMBER=$RH_ACCOUNT_NUMBER"
   echo "RH_OAUTH_TOKEN=$RH_OAUTH_TOKEN"
