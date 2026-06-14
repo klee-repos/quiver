@@ -607,6 +607,7 @@ def _run_learn_review(cfg, led, data) -> dict:
     day = market.trading_day_et()
     ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress)
     recorded = []
+    new_proposals = []
     for p in ps["all"]:
         rid = led.record_universe_proposal(
             goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker,
@@ -615,6 +616,17 @@ def _run_learn_review(cfg, led, data) -> dict:
             reason=p.reason, goal_gap_pct=p.goal_gap_pct)
         if rid:
             recorded.append(rid)
+            new_proposals.append(p)
+    # The agent maintains STRATEGY.md: append each NEW proposal as a dated learning.
+    # Best-effort — a doc-write hiccup must never stop the tick. Risky changes still
+    # require approval; this only records what was learned, it never mutates weights.
+    try:
+        import lib.strategy_doc as strategy_doc
+        for p in new_proposals:
+            strategy_doc.append_learning(
+                f"[{p.kind}] {p.ticker or 'BOOK'} ({p.tier}) — {p.reason}", date=day)
+    except Exception:  # noqa: BLE001
+        pass
     regime_word = {"STAND_DOWN": "standdown", "DEPLOY": "deploy"}.get(macro_regime, "neutral")
     led.upsert_thesis_state(goal_id=goal["id"], as_of=day, regime=regime_word,
                             active_book=goal["active_book"], last_trigger=macro_regime,

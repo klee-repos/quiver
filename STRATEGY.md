@@ -1,0 +1,79 @@
+# Quiver — Primary Strategy
+
+**This is the human-readable strategy that drives portfolio allocation.** Edit it to
+steer the book; the agent appends what it learns (§7). It is the *intent* and the
+*why*.
+
+> ## How this relates to the deterministic layer (read this first)
+> The exact executable numbers — target weights, bands, dollar caps, sizing — live
+> in **`strategy.yaml`** (machine-readable) and are enforced by **Python**, never by
+> prose. That split is the safety guarantee: an LLM can't move money by reasoning.
+>
+> So the flow is: **you edit this doc → the numbers in `strategy.yaml` are updated to
+> match** (you, or the agent with your approval for risky changes) → Python executes
+> exactly those numbers. This doc decides *what the strategy is*; `strategy.yaml`
+> encodes it; Python runs it. Changing prose here never bypasses a cap, the
+> daily-loss halt, or the order guard.
+
+---
+
+## 1. The goal
+Beat **+15% total return over 12 months**, or hold cash (SGOV ~3.6%) instead — a
+return below the cash floor isn't worth the risk. Tracked against a straight-line
+glidepath; "ahead / on-track / behind" is the signal the per-ticker analysis sees.
+
+## 2. Philosophy — how allocation is decided
+A **convexity barbell**: concentrate in the cheap-with-momentum and high-torque
+sleeves that can clear the bar, hold a large cash anchor as both yield and dry
+powder, and size everything so a bad year is survivable, not terminal.
+
+- **Win small / lose less.** At a CAPE ~40 valuation the base case is modest; the
+  edge is selection + a fat cash buffer, not leverage.
+- **De-concentrate.** Spread the engine across semis, AI-power/uranium, value/
+  defensive, emerging markets, and a capped crypto kicker — but know they're *one*
+  AI/rate/liquidity bet that moves together on a Fed hike.
+- **Cash is the only ballast** (no bonds/TIPS/gold). It funds the dips the macro is
+  likely to hand us.
+
+## 3. Macro thesis (current regime view — edit as the world changes)
+- **As of 2026-06-13.** CAPE ~40 (2nd-highest in 140 years); hawkish Fed under Warsh
+  (0 cuts priced, ~45–57% odds of a 2026 hike); 10-yr ~4.5%; crypto mid-bear.
+- **Base case across all sleeves is only ~+6%.** +15% is reached *only* in a
+  bull-tilted, Fed-pivot year — the pivot is THE catalyst that lights semis +
+  uranium + EM + crypto at once.
+- **Triggers (operator-supplied data; the bot can't fetch macro):**
+  - **DEPLOY** when core PCE rolls toward **≤2.5%** → recommend the dial-up book.
+  - **STAND DOWN** when core PCE breaks **≥3.5%**, or the Fed hikes → de-risk to the
+    core book / cash.
+- **Watch:** the FOMC dot plot, core PCE, CPI prints.
+
+## 4. The books (exact weights in `strategy.yaml`)
+- **`core_55_45` (default, ~55% engine / 45% cash):** SMH, SOXX (semis); URA, GRID
+  (uranium/power); XLV, RSP (value/defensive); EEM (EM); IBIT, ETHA (crypto via spot
+  ETFs); SOL (held in cash — not MCP-tradable yet); SGOV (cash).
+- **`dial_up_63_37` (OFF by default):** the same engine dialed up, for a confirmed
+  dovish-pivot regime. Activating it requires an explicit flag — fail-safe.
+- **Crypto rule:** exposure is the asset or a spot-ETF wrapper (IBIT/ETHA), **never**
+  a crypto-treasury or miner stock.
+
+## 5. Allocation rules
+- Rebalance only when a holding drifts outside its band (no churn inside it).
+- A target weight can only *reduce* a buy or trigger a clamped trim — it never
+  overrides a per-trade / daily / buying-power cap or the daily-loss halt.
+- The cash sleeve (SGOV) is the residual — never churned like an engine name.
+
+## 6. Operator directives — INJECT YOUR LOGIC HERE
+*(Free-form. Anything you write here is your steering intent. To make a directive
+take effect in trading, mirror it as a number/flag in `strategy.yaml` — or ask the
+agent to, which it will do for non-risky changes and propose for risky ones.)*
+
+- _(none yet — e.g. "trim semis under any hike", "cap total crypto at 8%", "never
+  hold a single name above 12%")_
+
+## 7. Agent learnings (append-only — the agent maintains this)
+*(The continual-learning engine appends dated, proof-bearing notes here — which
+holdings are pulling their weight vs. the thesis, and any add/remove/de-risk it is
+proposing. Risky universe changes still require your approval before they touch
+`strategy.yaml`.)*
+
+- _(none yet)_

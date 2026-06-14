@@ -27,6 +27,7 @@ if str(_REPO) not in sys.path:
 
 from lib import market, runlock  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
+from lib.prompts import load_prompt  # noqa: E402
 
 VENV_PY = os.environ.get("QUIVER_PYTHON", str(_REPO / ".venv" / "bin" / "python"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -37,14 +38,8 @@ MODEL = os.environ.get("QUIVER_MODEL", "claude-haiku-4-5-20251001")
 EFFORT = os.environ.get("QUIVER_EFFORT", "low")  # ultracode OFF; Python does the thinking
 TICK_TIMEOUT_SEC = int(os.environ.get("QUIVER_TICK_TIMEOUT_SEC", "2400"))  # ~40 min ceiling
 
-SYSTEM_PROMPT = (
-    "You are Quiver's execution orchestrator running headless. ALL trading, sizing, "
-    "risk and portfolio decisions come from the deterministic Python in this repo — you "
-    "ONLY execute the MCP calls the runbook specifies and NEVER invent, resize, cancel, "
-    "or place an order the Python plan/protect output did not authorize. Follow ./TICK.md "
-    "EXACTLY, step by step. On ANY auth error from the Robinhood MCP, STOP immediately and "
-    "place nothing (never trade on stale auth). Be terse."
-)
+# The execution-orchestrator rules live in prompts/orchestrator.md (edit there).
+SYSTEM_PROMPT = load_prompt("orchestrator").strip()
 
 
 def _tick_json(args):

@@ -1395,5 +1395,31 @@ check("guard: cancel with an unreserved ref_id -> DENY",
 check("healthcheck: offline self-test green", _hc.run_healthcheck()["ok"], True)
 
 
+# ============================================================================
+# Prompts-as-markdown loader + the human/agent-editable strategy doc.
+# ============================================================================
+import lib.prompts as _prompts  # noqa: E402
+import lib.strategy_doc as _sdoc  # noqa: E402
+
+check_true("prompts: orchestrator prompt loads from md", "execution orchestrator" in _prompts.load_prompt("orchestrator"))
+check_true("prompts: framework agent prompt loads from md", "close_50_sma" in _prompts.load_prompt("agents/market_analyst"))
+check_true("prompts: raw load preserves a langchain placeholder", "{asset_label}" in _prompts.load_prompt("agents/news_analyst"))
+check_true("prompts: kwargs fill the placeholder", "ZZZ-specific" in _prompts.load_prompt("agents/news_analyst", asset_label="ZZZ"))
+check_raises("prompts: missing prompt raises", lambda: _prompts.load_prompt("nonexistent_xyz"), FileNotFoundError)
+
+# strategy doc append (the agent maintains STRATEGY.md as it learns)
+_tmp_strat = Path(tempfile.mktemp(suffix=".md"))
+_tmp_strat.write_text("# x\n## 7. Agent learnings\nintro\n\n- _(none yet)_\n", encoding="utf-8")
+check("sdoc: append replaces the placeholder", _sdoc.append_learning("first note", date="2026-06-14", doc_path=_tmp_strat), True)
+_t1 = _tmp_strat.read_text(encoding="utf-8")
+check_true("sdoc: dated bullet written + placeholder gone",
+           "- **2026-06-14** — first note" in _t1 and "_(none yet)_" not in _t1)
+_sdoc.append_learning("second note", date="2026-06-14", doc_path=_tmp_strat)
+check_true("sdoc: second append adds another bullet",
+           _tmp_strat.read_text(encoding="utf-8").count("- **2026-06-14**") == 2)
+check("sdoc: missing doc -> no-op (False, never crashes a tick)",
+      _sdoc.append_learning("x", date="d", doc_path=Path("/no/such/STRATEGY.md")), False)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
