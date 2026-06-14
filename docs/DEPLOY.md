@@ -32,6 +32,13 @@ order whose `ref_id` the Python `plan` did not reserve in the ledger (D5).
   a blank/unverified `RESEND_FROM` is a silent no-send. Optional: `NOTIFY_ALERTS_TO` to route critical
   alerts to a separate pager list.
 
+> **Shortcut — `./deploy/bootstrap-aws.sh`** does steps 1, 1b, and the EC2 key pair in
+> one idempotent run: it pushes every SSM secret from your local `.env` + the real
+> `config.yaml`/`strategy.yaml`, creates the read-only GitHub deploy key, and makes the
+> EC2 key pair. It leaves exactly the steps a human must do: `ANTHROPIC_API_KEY`,
+> `terraform apply`, the SNS email confirm, and the interactive `/mcp`. The manual
+> commands below are the same thing, spelled out.
+
 ## 1. Create the secrets in SSM (out-of-band — never in tfstate)
 ```bash
 P=/quiver
