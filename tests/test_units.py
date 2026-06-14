@@ -1089,7 +1089,7 @@ _s2gid = _s2.set_strategy_goal(created_at="t", target_return_pct=15, horizon_mon
     benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
     macro_thesis_json="{}", active_book="core_55_45", as_of="2026-06-13",
     start_date="2026-01-01", start_equity=100.0)
-for _tk, _w in [("URA", 7), ("ETHA", 2)]:
+for _tk, _w in [("URA", 7), ("ETH", 2)]:
     _s2.upsert_target_holding(goal_id=_s2gid, sleeve=("Uranium/Power" if _tk == "URA" else "Crypto ETH"),
         ticker=_tk, target_weight=_w, band=2, status="active", book="core_55_45",
         quotable=True, proxy_ticker=None, updated_at="t")
@@ -1102,8 +1102,8 @@ _tc_ura = _sctx.build_target_context(_s2, "URA", _sc)
 check("sctx: URA sleeve", _tc_ura["sleeve"], "Uranium/Power")
 check("sctx: URA tier CORE (weight 7)", _tc_ura["tier"], "CORE")
 check("sctx: URA goal regime AHEAD", _tc_ura["goal_regime"], "AHEAD")
-check("sctx: ETHA tier SATELLITE (weight 2)",
-      _sctx.build_target_context(_s2, "ETHA", _sc)["tier"], "SATELLITE")
+check("sctx: ETH tier SATELLITE (weight 2)",
+      _sctx.build_target_context(_s2, "ETH", _sc)["tier"], "SATELLITE")
 
 
 # render: disclaimer present, and the D2 WALL — no digit, no '$'
