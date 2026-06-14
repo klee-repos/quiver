@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -830,14 +831,30 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
         "halted": halted,
         "halt_reason": halt_reason,
         "event_detail": data.get("event_detail"),
+        "stage": data.get("stage"),
+        "severity": data.get("severity"),
+        "warnings": data.get("warnings") or [],
+        "host": data.get("host"),
+        # Digest footer hint: is the Python last-resort sender actually armed on this
+        # box? (RESEND_API_KEY + a resolvable from). So every healthy digest passively
+        # confirms the backup pager — a NOT-configured footer is itself a signal.
+        "mailer_armed": bool(os.environ.get("RESEND_API_KEY")
+                             and (os.environ.get("RESEND_FROM") or cfg.notify.from_addr))
+        if kind == "digest" else None,
         "account_risk": _account_risk(led),
         "tickers": [rows[t] for t in sorted(rows)],
     }
 
 
-def cmd_report(args) -> dict:
-    cfg, led = _cfg_and_ledger()
-    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+def _run_report(cfg, led, data: dict) -> dict:
+    """Core report logic: build the model, decide should_send + recipients.
+
+    Pure of I/O beyond the ledger (no network). Gates by the per-event toggle
+    (on_complete for the digest; on_error/on_warning for the alert family), routes
+    alert recipients to ``alerts_to`` (falling back to ``to``), and dedups on
+    (date, kind, stage) so distinct alert stages page independently. Mirrors the
+    ``_run_*`` cores so the e2e harness can drive it directly.
+    """
     date = data.get("date") or market.trading_day_et()
     now_iso = data.get("now_iso") or market.now_et().isoformat()
     kind = data.get("kind", "digest")
@@ -846,16 +863,38 @@ def cmd_report(args) -> dict:
         return {"should_send": False, "reason": "notify_disabled", "kind": kind}
 
     model = _build_report_model(cfg, led, data, date, now_iso, kind)
+    stage = notify.stage_of(model)
+    severity = notify.severity_of(model)
+
+    if kind == "digest":
+        if not cfg.notify.on_complete:
+            return {"should_send": False, "reason": "complete_disabled", "kind": kind}
+        # Belt-and-suspenders: never email a trivial wake with nothing to report.
+        if not model.get("tickers") and not model.get("halted"):
+            return {"should_send": False, "reason": "nothing_to_report", "kind": kind}
+        recipients = cfg.notify.to
+    else:
+        if severity == "warning":
+            if not cfg.notify.on_warning:
+                return {"should_send": False, "reason": "warning_disabled",
+                        "kind": kind, "stage": stage}
+        elif not cfg.notify.on_error:
+            return {"should_send": False, "reason": "error_disabled",
+                    "kind": kind, "stage": stage}
+        recipients = cfg.notify.alerts_to or cfg.notify.to
+
     digest = notify.build_digest(model)
-    already = led.last_notified_hash(date, kind)
+    already = led.last_notified_hash(date, kind, stage)
     should_send = digest["content_hash"] != already
     return {
         "should_send": should_send,
         "reason": "new" if should_send else "already_sent",
         "kind": kind,
+        "stage": stage,
+        "severity": severity,
         "date": date,
         "from": cfg.notify.from_addr,
-        "recipients": cfg.notify.to,
+        "recipients": recipients,
         "subject": digest["subject"],
         "html": digest["html"],
         "text": digest["text"],
@@ -863,13 +902,52 @@ def cmd_report(args) -> dict:
     }
 
 
+def cmd_report(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    return _run_report(cfg, led, data)
+
+
 def cmd_report_commit(args) -> dict:
-    """Record a digest as sent — AFTER the orchestrator confirms delivery."""
+    """Record a digest/alert as sent — AFTER the orchestrator confirms delivery."""
     led = Ledger(LEDGER_DB)
     now_iso = market.now_et().isoformat()
     led.mark_notified(args.date, args.kind, args.content_hash,
-                      args.recipients or "", now_iso)
-    return {"ok": True, "date": args.date, "kind": args.kind, "hash": args.content_hash}
+                      args.recipients or "", now_iso, stage=args.stage or "")
+    return {"ok": True, "date": args.date, "kind": args.kind,
+            "stage": args.stage or "", "hash": args.content_hash}
+
+
+def cmd_send_test(args) -> dict:
+    """Send a REAL alert through lib.mailer using the production env resolution.
+
+    The deploy acceptance gate: it exercises the exact RESEND_API_KEY / RESEND_FROM
+    path the last-resort sender uses, so an unverified from-domain or a stale key is
+    caught now, not during a real 2am incident. (QUIVER_MAILER_DISABLE=1 builds the
+    payload without sending — used by the offline tests.)
+    """
+    from lib import mailer  # local: ops-layer network egress, not the trading brain
+    cfg, led = _cfg_and_ledger()
+    date = market.trading_day_et()
+    now_iso = market.now_et().isoformat()
+    kind = args.kind or "auth_error"
+    data = {
+        "date": date, "now_iso": now_iso, "kind": kind,
+        "stage": args.stage or None, "severity": args.severity or "critical",
+        "event_detail": "send-test: Quiver alerting self-test (no real failure).",
+        "equity": 100.0, "host": os.environ.get("QUIVER_HOST_HINT") or None,
+    }
+    model = _build_report_model(cfg, led, data, date, now_iso, kind)
+    built = notify.build_digest(model)
+    to = [a.strip() for a in (args.to or "").split(",") if a.strip()] \
+        or cfg.notify.alerts_to or cfg.notify.to
+    from_addr = os.environ.get("RESEND_FROM", "").strip() or cfg.notify.from_addr
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    res = mailer.send_email(api_key=api_key, from_addr=from_addr, to=to,
+                            subject="[SELF-TEST] " + built["subject"],
+                            html=built["html"], text=built["text"])
+    return {"sent": bool(res.get("ok")), "result": res, "to": to,
+            "from": from_addr, "kind": kind, "stage": notify.stage_of(model)}
 
 
 # --- protective stop (Phase 5) -----------------------------------------------
@@ -1057,8 +1135,14 @@ def main(argv) -> int:
     p_rc = sub.add_parser("report-commit")
     p_rc.add_argument("--date", required=True)
     p_rc.add_argument("--kind", default="digest")
+    p_rc.add_argument("--stage", default="")
     p_rc.add_argument("--hash", required=True, dest="content_hash")
     p_rc.add_argument("--recipients", default="")
+    p_st = sub.add_parser("send-test")
+    p_st.add_argument("--kind", default="auth_error")
+    p_st.add_argument("--stage", default="")
+    p_st.add_argument("--severity", default="critical")
+    p_st.add_argument("--to", default="")
     p_reflect = sub.add_parser("reflect")
     p_reflect.add_argument("--input", required=True)
     p_protect = sub.add_parser("protect")
@@ -1090,6 +1174,8 @@ def main(argv) -> int:
             out = cmd_report(args)
         elif args.cmd == "report-commit":
             out = cmd_report_commit(args)
+        elif args.cmd == "send-test":
+            out = cmd_send_test(args)
         elif args.cmd == "reflect":
             out = cmd_reflect(args)
         elif args.cmd == "protect":

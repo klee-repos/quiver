@@ -129,6 +129,9 @@ def _write_config(d: dict) -> str:
 
 
 def make_config(notify_block=None):
+    import os as _os  # env-isolate: ambient NOTIFY_TO/NOTIFY_ALERTS_TO take precedence
+    for _k in ("NOTIFY_TO", "NOTIFY_ALERTS_TO"):
+        _os.environ.pop(_k, None)
     d = {
         "account_number": "12345678",
         "dry_run": True,
@@ -244,6 +247,110 @@ check("notify hash recorded", _led.last_notified_hash(DAY, "digest"), "abc123")
 check("notify hash isolated by kind", _led.last_notified_hash(DAY, "halt"), None)
 _led.mark_notified(DAY, "digest", "def456", "a@b.com", "t2")
 check("notify hash replaced when content changes", _led.last_notified_hash(DAY, "digest"), "def456")
+# stage-keyed dedup: same (date, kind) different stage -> independent rows (no clobber)
+_led.mark_notified(DAY, "error", "errplan", "a@b.com", "t", stage="plan")
+_led.mark_notified(DAY, "error", "errprune", "a@b.com", "t", stage="prune")
+check("notify rows isolated by stage (plan)", _led.last_notified_hash(DAY, "error", "plan"), "errplan")
+check("notify rows isolated by stage (prune)", _led.last_notified_hash(DAY, "error", "prune"), "errprune")
+check("notify stage default '' isolated", _led.last_notified_hash(DAY, "error"), None)
+
+# ============================ ALERT EMAIL KINDS ============================
+# The new `error` kind + the canonical stages + the cross-sender-stable alert hash.
+_m_err = {"date": "2026-05-30", "now_iso": "t", "kind": "error", "severity": "critical",
+          "stage": "plan", "dry_run": False, "event_detail": "daily cap math blew up",
+          "subject_prefix": "[Quiver]", "tickers": []}
+_de = notify.build_digest(_m_err)
+check_true("error subject names the stage", "TICK FAILED" in _de["subject"] and "plan" in _de["subject"])
+check_true("error body has a 'what to do' block", "What to do" in _de["html"] and "What to do" in _de["text"])
+check_true("error html escapes + shows detail", "daily cap math" in _de["text"])
+# auth_error carries actionable recovery in BOTH html and text (parity — locked-screen text fallback)
+_m_a2 = {"date": "2026-05-30", "now_iso": "t", "kind": "auth_error", "dry_run": False,
+         "event_detail": "401", "subject_prefix": "[Quiver]", "tickers": []}
+_da2 = notify.build_digest(_m_a2)
+check_true("auth_error text has /mcp + SSH", "/mcp" in _da2["text"] and "SSH" in _da2["text"])
+check_true("auth_error html has /mcp + SSH", "/mcp" in _da2["html"] and "SSH" in _da2["html"])
+check("auth_error stage derived", notify.stage_of(_m_a2), "broker_auth")
+check("halt stage derived", notify.stage_of({"kind": "halt"}), "daily_loss_halt")
+# warning severity: no alarmist CTA, self-heal copy
+_m_warn = {"date": "2026-05-30", "now_iso": "t", "kind": "error", "severity": "warning",
+           "stage": "prune", "dry_run": True, "event_detail": "blip", "subject_prefix": "[Quiver]",
+           "tickers": []}
+check("warning -> no action steps", notify.action_steps(_m_warn), [])
+check_true("warning subject says hiccup", "hiccup" in notify.build_digest(_m_warn)["subject"])
+# halt alert PRODUCTION shape (kind set; halted/halt_reason UNSET, as run_tick.py builds it):
+# the rm-KILL recovery must appear in BOTH html AND text (the text is the lock-screen
+# fallback for the single most critical alert) — regression guard for the parity bug.
+_m_halt_alert = {"date": "d", "now_iso": "t", "kind": "halt", "dry_run": False,
+                 "subject_prefix": "[Quiver]", "event_detail": "KILL written", "tickers": []}
+_dha = notify.build_digest(_m_halt_alert)
+check_true("halt alert text carries rm KILL recovery", "rm /opt/quiver/KILL" in _dha["text"])
+check_true("halt alert html carries rm KILL recovery", "rm /opt/quiver/KILL" in _dha["html"])
+check_true("halt alert text is not the misleading 'Halt: none'", "Halt: none" not in _dha["text"])
+# non-finite equity/pct must fall back to em-dash (corrupt broker read shouldn't print +nan%)
+check("nan money -> em-dash", notify._fmt_money(float("nan")), "—")
+check("inf pct -> em-dash", notify._fmt_pct(float("inf")), "—")
+check_true("nan pnl pill -> em-dash", "—" in notify._pnl_pill(float("nan")))
+# alert hash: cross-sender stable (ignores event_detail/equity/time), keyed on (kind, stage, severity, dry_run)
+_he = notify.digest_hash(_m_err)
+check("alert hash ignores event_detail (cross-sender stable)",
+      notify.digest_hash({**_m_err, "event_detail": "totally different text", "equity": 9}), _he)
+check_true("alert hash changes with stage", notify.digest_hash({**_m_err, "stage": "commit"}) != _he)
+check_true("alert hash changes with kind", notify.digest_hash({**_m_err, "kind": "auth_error"}) != _he)
+check_true("alert hash changes with dry_run", notify.digest_hash({**_m_err, "dry_run": True}) != _he)
+# digest hash is unchanged by the refactor (the 169-test skeleton invariant holds — re-pin)
+check("digest hash still skeleton-keyed (ignores stage field)",
+      notify.digest_hash({**MODEL, "stage": "whatever"}), notify.digest_hash(MODEL))
+
+# --- notify config: per-event toggles + alerts_to ---
+_cfg_def = make_config({"enabled": True, "to": ["a@b.com"], "from": "x@y.com"})
+check("on_complete defaults ON", _cfg_def.notify.on_complete, True)
+check("on_error defaults ON", _cfg_def.notify.on_error, True)
+check("on_warning defaults OFF", _cfg_def.notify.on_warning, False)
+check("alerts_to falls back to `to`", _cfg_def.notify.alerts_to, ["a@b.com"])
+check("on_warning explicit true parsed",
+      make_config({"enabled": True, "to": ["a@b.com"], "on_warning": True}).notify.on_warning, True)
+check("on_complete fail-safe (only explicit false disables)",
+      make_config({"enabled": True, "to": ["a@b.com"], "on_complete": "nope"}).notify.on_complete, True)
+check("alerts_to override parsed",
+      make_config({"enabled": True, "to": ["a@b.com"], "alerts_to": ["p@b.com"]}).notify.alerts_to, ["p@b.com"])
+check_raises("on_error with explicit-empty alerts_to raises",
+             lambda: make_config({"enabled": True, "to": ["a@b.com"], "alerts_to": []}), ConfigError)
+
+# --- design system: email-client-safety invariants (shared across all kinds) ---
+for _k, _extra in (("digest", {"tickers": MODEL["tickers"]}),
+                   ("auth_error", {"event_detail": "401", "tickers": []}),
+                   ("halt", {"halted": True, "halt_reason": "-6%", "tickers": []}),
+                   ("error", {"severity": "critical", "stage": "plan", "tickers": []})):
+    _mk = {"date": "2026-05-30", "now_iso": "t", "kind": _k, "dry_run": True,
+           "subject_prefix": "[Quiver]", "equity": 100.0, "baseline_equity": 100.0,
+           "drop_pct": 0.0, **_extra}
+    _hk = notify.build_digest(_mk)["html"]
+    check_true(f"{_k}: full email document (doctype+html+head)",
+               _hk.startswith("<!DOCTYPE html>") and "<html lang=\"en\"" in _hk and "<head>" in _hk)
+    check_true(f"{_k}: head carries charset+viewport+color-scheme",
+               "charset=\"utf-8\"" in _hk and "width=device-width" in _hk and "color-scheme" in _hk)
+    check_true(f"{_k}: Outlook-safe table layout (role=presentation, 640 cap, MSO ghost)",
+               "role=\"presentation\"" in _hk and "max-width:640px" in _hk and "PixelsPerInch" in _hk)
+    check_true(f"{_k}: hidden preheader present", "display:none" in _hk and "mso-hide:all" in _hk)
+    check_true(f"{_k}: shared brand chrome (Quiver header + footer)",
+               ">Quiver<" in _hk and "autonomous trading" in _hk)
+# alerts draw a colored status circle (not an emoji we depend on) + a severity word
+_ha = notify.build_digest({"date": "d", "now_iso": "t", "kind": "auth_error",
+                           "event_detail": "401", "subject_prefix": "[Quiver]", "tickers": []})["html"]
+check_true("alert draws a status circle (border-radius cell)", "border-radius:20px" in _ha)
+check_true("alert carries a non-color severity word", "CRITICAL" in _ha)
+# P&L pill is never color-only: it carries an explicit sign + arrow
+_hp = notify.build_digest({"date": "d", "now_iso": "t", "kind": "digest", "dry_run": False,
+                           "subject_prefix": "[Quiver]", "equity": 110.0, "baseline_equity": 100.0,
+                           "drop_pct": 10.0, "tickers": []})["html"]
+check_true("gain pill carries ▲ + sign (colorblind-safe)", "▲ +10.00%" in _hp)
+_hn = notify.build_digest({"date": "d", "now_iso": "t", "kind": "digest", "dry_run": False,
+                           "subject_prefix": "[Quiver]", "equity": 90.0, "baseline_equity": 100.0,
+                           "drop_pct": -10.0, "tickers": []})["html"]
+check_true("loss pill carries ▼ + sign (colorblind-safe)", "▼ -10.00%" in _hn)
+# digest subject front-loads the money (P&L before the buy/sell counts)
+check_true("digest subject leads with P&L",
+           notify.build_digest(MODEL)["subject"].index("%") < notify.build_digest(MODEL)["subject"].index("buy"))
 
 # ============================ STORAGE RETENTION =============================
 import os  # noqa: E402

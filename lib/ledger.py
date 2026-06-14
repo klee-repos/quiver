@@ -61,11 +61,12 @@ CREATE TABLE IF NOT EXISTS orders (
 );
 CREATE TABLE IF NOT EXISTS notifications (
     trade_date   TEXT NOT NULL,
-    kind         TEXT NOT NULL,          -- digest|halt|auth_error
+    kind         TEXT NOT NULL,          -- digest|halt|auth_error|error
+    stage        TEXT NOT NULL DEFAULT '',  -- alert sub-type (broker_auth|plan|commit|...); '' for digest
     content_hash TEXT NOT NULL,
     recipients   TEXT,
     sent_at      TEXT NOT NULL,
-    PRIMARY KEY (trade_date, kind)
+    PRIMARY KEY (trade_date, kind, stage)
 );
 -- Decision memory (ground of record for the scorecard). One row per analysis
 -- decision; `outcomes` links 1:1 once the call is old enough to score. Columns
@@ -243,6 +244,7 @@ class Ledger:
         with self._conn() as c:
             c.executescript(_SCHEMA)
             self._migrate_orders(c)
+            self._migrate_notifications(c)
 
     @staticmethod
     def _migrate_orders(c) -> None:
@@ -262,6 +264,40 @@ class Ledger:
         for col, decl in additions.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_notifications(c) -> None:
+        """Widen the notifications PK from (trade_date, kind) to
+        (trade_date, kind, stage) so distinct alert stages (e.g. a plan-error and a
+        prune-hiccup, both kind='error') get independent dedup rows instead of
+        clobbering one shared row.
+
+        SQLite can't ALTER a primary key in place, so an old (stage-less) table is
+        rebuilt: copy every existing row with stage='' (which is exactly the digest
+        grain). Idempotent — a no-op once the `stage` column exists (fresh dbs get the
+        new schema straight from _SCHEMA)."""
+        cols = {row[1] for row in c.execute("PRAGMA table_info(notifications)").fetchall()}
+        if not cols or "stage" in cols:
+            return
+        c.executescript(
+            """
+            ALTER TABLE notifications RENAME TO notifications_old;
+            CREATE TABLE notifications (
+                trade_date   TEXT NOT NULL,
+                kind         TEXT NOT NULL,
+                stage        TEXT NOT NULL DEFAULT '',
+                content_hash TEXT NOT NULL,
+                recipients   TEXT,
+                sent_at      TEXT NOT NULL,
+                PRIMARY KEY (trade_date, kind, stage)
+            );
+            INSERT INTO notifications
+                (trade_date, kind, stage, content_hash, recipients, sent_at)
+                SELECT trade_date, kind, '', content_hash, recipients, sent_at
+                FROM notifications_old;
+            DROP TABLE notifications_old;
+            """
+        )
 
     # --- daily baseline / halt ------------------------------------------------
 
@@ -613,22 +649,24 @@ class Ledger:
     # never re-send; a genuine change (e.g. a halt fires) produces a new hash,
     # which REPLACEs the stored one so it sends exactly once more.
 
-    def last_notified_hash(self, trade_date: str, kind: str) -> Optional[str]:
+    def last_notified_hash(self, trade_date: str, kind: str,
+                           stage: str = "") -> Optional[str]:
         with self._conn() as c:
             row = c.execute(
-                "SELECT content_hash FROM notifications WHERE trade_date=? AND kind=?",
-                (trade_date, kind),
+                "SELECT content_hash FROM notifications "
+                "WHERE trade_date=? AND kind=? AND stage=?",
+                (trade_date, kind, stage),
             ).fetchone()
             return row["content_hash"] if row else None
 
     def mark_notified(self, trade_date: str, kind: str, content_hash: str,
-                      recipients: str, now_iso: str) -> None:
+                      recipients: str, now_iso: str, stage: str = "") -> None:
         with self._conn() as c:
             c.execute(
                 "INSERT OR REPLACE INTO notifications "
-                "(trade_date, kind, content_hash, recipients, sent_at) "
-                "VALUES (?,?,?,?,?)",
-                (trade_date, kind, content_hash, recipients, now_iso),
+                "(trade_date, kind, stage, content_hash, recipients, sent_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (trade_date, kind, stage, content_hash, recipients, now_iso),
             )
 
     # --- strategy layer: goal, target book, goal tracking, thesis state -------

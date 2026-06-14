@@ -176,13 +176,28 @@ describes the exact JSON shapes `plan`/`commit`/`reflect`/`protect` consume.
   `deep_think_llm` does debates/judgment (reasoner model). Keeps `backend_url` as `None` on purpose
   so the provider default applies (forcing `/v1` risks a doubled path). Redirects framework state
   into `state/` rather than `~/.tradingagents`.
-- **`lib/notify.py`** — pure email-digest **renderer** (observability, NOT a decider). It takes an
-  already-assembled model dict and returns `{subject, html, text, content_hash}`; it never reads
-  config/ledger/trading limits and never hits the network. The orchestrator sends via the Resend
-  MCP. Email is **best-effort, at-least-once** — the inverse of the orders rule: a digest is marked
-  sent *after* delivery is confirmed, so the rare send/commit-gap crash re-sends a duplicate rather
-  than silently losing it. `content_hash` dedups on the decision skeleton (excludes timestamps), so
-  repeat hourly wakes don't re-send. A `report` error must never stop a tick.
+- **`lib/notify.py`** — pure email-**renderer** for ALL email kinds (observability, NOT a decider).
+  It takes an already-assembled model dict and returns `{subject, html, text, content_hash, kind}`;
+  it never reads config/ledger/trading limits and never hits the network. Kinds: `digest`
+  (run-complete), `halt`, `auth_error`, and `error` (`severity: critical|warning`, with a canonical
+  `stage` — `STAGES`/`AUTH_STAGE`/`HALT_STAGE` are the single source of truth shared by `tick.py`,
+  `run_tick.py`, and `TICK.md` so the two senders never disagree on a stage string). The orchestrator
+  sends via the Resend MCP. Email is **best-effort, at-least-once**: a send is marked sent *after*
+  delivery is confirmed, so the rare send/commit-gap crash re-sends a duplicate rather than silently
+  losing it. `content_hash` dedups: the digest on the decision skeleton (excludes timestamps); alert
+  kinds on `(kind, stage, severity, dry_run)` (excludes the variable error text) so the two senders
+  produce the SAME hash for one event and dedup against each other, and a recurring same-stage failure
+  pages once per day per stage, not every wake. A `report` error must never stop a tick.
+- **`lib/mailer.py`** — the **last-resort** Resend HTTP sender (stdlib `urllib`), the ONE network
+  egress, and a **deliberate, narrow carve-out** of the "the trading path never sends; the
+  orchestrator sends via the Resend MCP" rule. Scoped to the **ops supervisor** (`run_tick.py`):
+  it pages the operator for failures the in-tick MCP path can't cover — a `claude` subprocess
+  crash/timeout, a preflight error — because the process that would send the MCP email is the dead
+  one. It is best-effort (`send_email` NEVER raises → a send failure can't change a tick's exit code)
+  and MUST NEVER be imported by the trading brain (`analyze.py`/`lib.signals`/`lib.memory`/the plan
+  path); a unit test enforces that import graph. It needs `RESEND_API_KEY` + a verified `RESEND_FROM`
+  in the box env (the HTTP API has no implicit sender — a blank `from` is a no-send). Validate it
+  end-to-end with `tick.py send-test` before relying on it.
 
 When you change a guardrail, mirror it with a case in `tests/test_units.py` — that file is the
 spec for the sizing/mapping logic and runs without any network or broker. The same file also
@@ -213,11 +228,13 @@ ledger rollups — all offline.
   stderr so stdout stays JSON-only; tees that live chatter to `logs/reasoning/<date>_<TICKER>.log`
   (best-effort, never touches stdout); dumps a full audit report set to `state/analyze_logs/`.
 - `tick.py` — `preflight` / `plan` / `commit` / `reflect` / `protect` / `report` / `report-commit`
-  / `prune` subcommands. Every subcommand prints one JSON line and catches all exceptions into
-  `{"error": ...}` with exit code 1 (the orchestrator stops on a plan/commit error — but `report`,
-  `reflect`, and `prune` are observability/housekeeping and must NOT stop the tick).
-- `lib/` — `config`, `market`, `ledger`, `signals`, `ds_config`, `notify`, `memory`, `storage`
-  (see above).
+  / `send-test` / `prune` subcommands. Every subcommand prints one JSON line and catches all
+  exceptions into `{"error": ...}` with exit code 1 (the orchestrator stops on a plan/commit error
+  — but `report`, `reflect`, and `prune` are observability/housekeeping and must NOT stop the tick).
+  `send-test` actually sends one alert through `lib/mailer` via the production env resolution — the
+  deploy acceptance gate for the last-resort pager.
+- `lib/` — `config`, `market`, `ledger`, `signals`, `ds_config`, `notify`, `mailer`, `memory`,
+  `storage` (see above).
 - `config.yaml` — account, `dry_run`, watchlist, dollar caps, order defaults (incl. `buy_type` +
   `protective_stop`), model IDs, `loop` timing + `intraday_enabled`/cadence, `storage` retention,
   `notify` (email digest — off unless `enabled: true`).

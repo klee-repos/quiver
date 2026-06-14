@@ -8,7 +8,7 @@ orchestrator stops instead of trading on a bad config.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
@@ -53,6 +53,14 @@ class NotifyConfig:
     to: List[str]
     from_addr: str
     subject_prefix: str
+    # Per-event toggles (default ON for run-complete + critical alerts; warning
+    # hiccups OFF by default — they self-heal and would otherwise train the operator
+    # to ignore the channel). ``alerts_to`` lets critical alerts route to a separate
+    # pager list; it falls back to ``to`` when unset.
+    on_complete: bool = True
+    on_error: bool = True
+    on_warning: bool = False
+    alerts_to: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -299,22 +307,57 @@ def load_config(path) -> Config:
     to = [str(x).strip() for x in to_raw if str(x).strip()]
     from_addr = str(notify_d.get("from", "") or "").strip()
     subject_prefix = str(notify_d.get("subject_prefix", "[Quiver]") or "[Quiver]").strip()
+    # Per-event toggles. on_complete/on_error default ON (preserve today's always-send
+    # behavior for the digest + critical alerts); on_warning defaults OFF (best-effort
+    # hiccups self-heal — fold them into the digest, don't page). `... is not False`
+    # so only an explicit false disables; anything else stays on.
+    on_complete = notify_d.get("on_complete", True) is not False
+    on_error = notify_d.get("on_error", True) is not False
+    on_warning = notify_d.get("on_warning", False) is True
+    # Critical alerts can route to a separate pager list. Env NOTIFY_ALERTS_TO wins,
+    # then config notify.alerts_to, else fall back to the digest recipients (`to`).
+    alerts_env = os.environ.get("NOTIFY_ALERTS_TO", "").strip()
+    if alerts_env:
+        alerts_raw = alerts_env.split(",")
+    else:
+        alerts_raw = notify_d.get("alerts_to", None)
+        if alerts_raw is None:
+            alerts_raw = to_raw  # inherit the digest recipients
+        elif isinstance(alerts_raw, str):
+            alerts_raw = [alerts_raw]
+    alerts_to = [str(x).strip() for x in (alerts_raw or []) if str(x).strip()]
     if notify_enabled:
         if not to or any("@" not in addr for addr in to):
             raise ConfigError(
                 "config.yaml: notify.to must be a non-empty list of email "
                 "addresses when notify.enabled is true"
             )
-        # `from` is optional: blank means the Resend MCP's own SENDER_EMAIL_ADDRESS
-        # is used (the sender lives in the MCP registration, not this repo). Only
-        # validate it when the user explicitly overrides it here.
+        # `from` is optional for the in-tick MCP path (blank means the Resend MCP's own
+        # SENDER_EMAIL_ADDRESS is used). The Python last-resort HTTP sender, however,
+        # has no implicit sender — it resolves RESEND_FROM/notify.from at send time and
+        # skips loudly if both are blank (see lib/mailer). Only validate the override.
         if from_addr and "@" not in from_addr:
             raise ConfigError(
                 "config.yaml: notify.from, if set, must be a sender email address "
                 "(or leave it blank to use the Resend MCP's configured sender)"
             )
+        # When critical alerts are enabled, the resolved alert recipients (post-fallback)
+        # must be valid — else a real incident would page no one.
+        if on_error and (not alerts_to or any("@" not in addr for addr in alerts_to)):
+            raise ConfigError(
+                "config.yaml: notify.alerts_to (or its fallback notify.to / NOTIFY_TO) "
+                "must be a non-empty list of email addresses when notify.on_error is true"
+            )
+        # NOTE: a blank `from` is deliberately allowed even with on_error — the in-tick
+        # MCP path has an implicit sender. The Python last-resort pager (run_tick.py)
+        # has none, so a blank from + no RESEND_FROM leaves THAT path unconfigured; that
+        # is surfaced at runtime (run_tick emits `alert_unconfigured`, the digest footer
+        # shows "last-resort alerting: NOT configured") and is gated by `tick.py
+        # send-test` at deploy — not hard-failed here, so the MCP-only config stays valid.
     notify = NotifyConfig(
         enabled=notify_enabled, to=to, from_addr=from_addr, subject_prefix=subject_prefix,
+        on_complete=on_complete, on_error=on_error, on_warning=on_warning,
+        alerts_to=alerts_to,
     )
 
     # Storage retention + optional archival. Observability housekeeping only;

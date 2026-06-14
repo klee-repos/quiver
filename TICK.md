@@ -14,6 +14,38 @@ Run everything from the repo dir.
 
 ---
 
+## ALERT PROCEDURE (best-effort; referenced from every STOP point)
+
+When a step below says "**fire the alert**", email the operator using the SAME
+machinery as the digest (STEP 7b), but with an alert `kind`/`stage`. This is
+**best-effort**: if any part errors, log it and continue the STOP — an alert must
+NEVER change what the tick does. Steps:
+
+1. Write `state/tmp/report_input.json`:
+   ```json
+   {"date":"<trading_day>","now_iso":"<now_iso>","kind":"<error|auth_error|halt>",
+    "severity":"<critical|warning>","stage":"<the literal stage given at the STOP point>",
+    "event_detail":"<the error text / {\"error\":...} message>"}
+   ```
+   (Use EXACTLY the `stage` string the STOP point names — never invent one; the
+   dedup is keyed on it. `auth_error`/`halt` may omit `severity`/`stage`; Python
+   fills `broker_auth`/`daily_loss_halt` + `critical`.)
+2. `~/dev/quiver/.venv/bin/python tick.py report --input state/tmp/report_input.json`
+   — if it errors, log `ALERT_SKIPPED <error>` and continue. If `should_send` is
+   `false` (`error_disabled` / `warning_disabled` / `already_sent`) → done.
+3. If `should_send` is `true` → send via the Resend MCP
+   `send-email(to=<recipients>, subject=<subject>, html=<html>, text=<text>)`
+   (`from=<from>` only if non-empty), then record it:
+   `tick.py report-commit --date <date> --kind <kind> --stage <stage> --hash <content_hash> --recipients "<recipients>"`.
+   On send failure → log `ALERT_FAILED <error>` and continue (do NOT report-commit).
+
+The headless supervisor (`run_tick.py`) is the SAFETY NET for failures that prevent
+you from reaching this procedure (a crash/timeout, a preflight error) — it pages the
+same `(date, kind, stage)` row via the Python last-resort sender, so it dedups
+against whatever you already sent. You still fire the alert here whenever you can.
+
+---
+
 ## STEP 1 — Preflight (deterministic gate)
 
 Run:
@@ -21,7 +53,11 @@ Run:
 ~/dev/quiver/.venv/bin/python tick.py preflight
 ```
 Parse the JSON.
+- If the command **errors** (a non-JSON / `{"error":...}` result) → **fire the alert**
+  with `kind:"error"`, `severity:"critical"`, `stage:"preflight"`, `event_detail`=the
+  error text, then **STOP**.
 - If `proceed` is `false` → log the `reason` to `logs/orchestrator.log` and **STOP**.
+  This is a normal no-op wake, NOT a failure — do NOT fire an alert.
   (Common no-op reasons: `market_closed`, `too_early`, `kill_switch_present`,
   `daily_halt_flag_set`, `all_watchlist_tickers_already_acted_today`.)
 - If `unfinalized` is non-empty → see STEP 6 (reconcile) BEFORE anything else.
@@ -37,10 +73,12 @@ Parse the JSON.
 
 Call the Robinhood MCP with the `account_number` from preflight:
 1. `get_portfolio(account_number)` → read total **equity** and cash **buying_power**.
-   - If this returns an auth / 401 / expired-token error → log `AUTH_ERROR`, then run
-     the **digest procedure** (STEP 7b) with `kind:"auth_error"` and `event_detail` set
-     to the error text (best-effort — skip silently if it fails), and **STOP** (never
-     trade on stale auth). Recovery: a human re-runs `/mcp` to re-authenticate.
+   - If this returns an auth / 401 / expired-token error → log `AUTH_ERROR`, then
+     **fire the alert** with `kind:"auth_error"`, `stage:"broker_auth"` (severity is
+     critical; the email's "what to do" block carries the full re-auth + SSM + setup.sh
+     recovery), `event_detail`=the error text, and **STOP** (never trade on stale auth).
+     Recovery: a human re-runs `/mcp` on the box, pushes the token to SSM, and re-runs
+     `deploy/setup.sh` (see docs/DEPLOY.md).
 2. `get_equity_positions(account_number)` → for each held ticker record
    `{quantity, market_value}`.
 3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>])`
@@ -117,10 +155,12 @@ Run:
 ~/dev/quiver/.venv/bin/python tick.py plan --input state/tmp/plan_input.json
 ```
 Parse the JSON:
+- If the `plan` command **errors** → **fire the alert** with `kind:"error"`,
+  `severity:"critical"`, `stage:"plan"`, `event_detail`=the error text, then **STOP**.
 - If `halt` is `true` → the daily-loss kill-switch fired. If `write_kill` is true,
-  create the kill file: `touch ~/dev/quiver/KILL`. Log loudly, then run
-  the **digest procedure** (STEP 7b) with `kind:"halt"` (include the plan JSON as `plan`),
-  and **STOP**.
+  create the kill file: `touch ~/dev/quiver/KILL`. Log loudly, then **fire the alert**
+  with `kind:"halt"`, `stage:"daily_loss_halt"` (include the plan JSON as `plan` so the
+  email shows equity + the trip), and **STOP**.
 - `orders` is the explicit list to execute. `decisions` are the holds/skips/errors
   already recorded — just log them. If `orders` is empty → no trades to place, but
   STILL run STEP 6b (reflect) and STEP 7 (close-out, incl. cadence) before ending.
@@ -167,6 +207,9 @@ For EACH order object (do them one at a time):
     ```
     ~/dev/quiver/.venv/bin/python tick.py commit --input state/tmp/commit.json
     ```
+    If the `commit` command itself **errors** (the ledger write failed) → **fire the
+    alert** with `kind:"error"`, `severity:"critical"`, `stage:"commit"`,
+    `event_detail`=the error text, then **STOP** (a half-recorded order needs a human).
 
 5e. **Protective stop — only after a BUY actually fills** (`status:"placed"`, and only
     if `order.protective_stop.enabled`). With the fill price + filled quantity from the
@@ -232,11 +275,15 @@ Write `state/tmp/report_input.json`:
   "kind": "digest",
   "equity": <get_portfolio equity>,
   "event_detail": null,
+  "warnings": [ {"stage": "reflect", "detail": "<REFLECT_SKIPPED text>"}, ... ],
   "plan": <the FULL JSON object STEP 4 plan returned>
 }
 ```
-(For the auth-error/halt alerts that reference this procedure: set `kind` accordingly;
-auth_error has no `plan` — pass `event_detail` instead.)
+`warnings` is the list of any best-effort hiccups you logged THIS tick (a
+`REFLECT_SKIPPED` / `PRUNE_SKIPPED` / `ALERT_SKIPPED` etc.) — they ride along in the
+digest's "FYI" section so nothing is lost without paging you separately (omit / `[]`
+if none). The auth_error/halt/error ALERTS use the separate **ALERT PROCEDURE** above,
+not this digest input.
 
 Run:
 ```
@@ -244,17 +291,20 @@ Run:
 ```
 - If the command **errors** → log `EMAIL_SKIPPED <error>` and end the tick normally.
   A report error is NOT a tick error; never STOP for it.
-- Parse the JSON. If `should_send` is `false` (e.g. `notify_disabled`, or
-  `already_sent` — the daily digest already went out on an earlier tick) → done.
+- Parse the JSON. If `should_send` is `false` (e.g. `notify_disabled`,
+  `complete_disabled`, `nothing_to_report`, or `already_sent` — the daily digest
+  already went out on an earlier tick) → done.
 - If `should_send` is `true` → send via the **Resend MCP** (registered in your Claude
   config via `claude mcp add`, like the Robinhood MCP — not shipped in this repo):
   `send-email(to=<recipients>, subject=<subject>, html=<html>, text=<text>)`. Include
   `from=<from>` ONLY if the report's `from` field is non-empty; blank means the Resend
   MCP uses its own configured sender.
-  - On send **success** → record it so the next wake won't resend:
+  - On send **success** → record it so the next wake won't resend (pass the report's
+    `stage` too — `""` for the digest, the alert stage for an alert):
     ```
     ~/dev/quiver/.venv/bin/python tick.py report-commit \
-      --date <date> --kind <kind> --hash <content_hash> --recipients "<recipients joined by commas>"
+      --date <date> --kind <kind> --stage "<stage>" --hash <content_hash> \
+      --recipients "<recipients joined by commas>"
     ```
   - On send **failure** (incl. Resend MCP missing/unauthorized, or unverified `from`
     domain) → log `EMAIL_FAILED <error>` and continue. Do NOT `report-commit` — it will
@@ -294,4 +344,8 @@ End the tick.
 - Never place if `review_equity_order` returned a blocking alert.
 - Never invent a new `ref_id` for an order that might already be sent — reconcile via
   `get_equity_orders` first (STEP 6).
-- On any error in STEP 1 or STEP 2 → STOP the whole tick. Never trade blind.
+- On any error in STEP 1 or STEP 2 → **fire the alert** (best-effort, with the literal
+  `stage` the step names), then STOP the whole tick. Never trade blind.
+- Alerts are best-effort: NEVER let firing (or failing to fire) an alert change what
+  the tick does. Always use the exact `stage` string the STOP point names — never
+  invent one (the dedup is keyed on it).
