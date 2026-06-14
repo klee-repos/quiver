@@ -114,6 +114,16 @@ stock a set number of times per day. That mode is **off** unless you turn it on.
 
 ### 1 · Turn it on
 
+First-time setup — make your private config + secrets from the committed templates
+(both are gitignored, so your real watchlist/mode/caps and keys never get shared):
+
+```bash
+cd ~/dev/quiver
+cp config.yaml.example config.yaml   # your settings — starts in dry_run (paper)
+cp .env.example .env && chmod 600 .env   # your keys + account number
+# then open config.yaml / .env and fill them in
+```
+
 Quiver runs inside a Claude Code session that stays open. These commands start it and tell it
 to do one trading run at a time:
 
@@ -256,7 +266,8 @@ fails to send, trading carries on as normal.
 | `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
 | `lib/` | The building blocks: market hours, the logbook, the safety rules, email, memory. |
 | `TICK.md` | The exact step-by-step the helper follows on every run. |
-| `config.yaml` | All your settings (the table above). |
+| `config.yaml` | All your settings (the table above). Private — gitignored, never shared. |
+| `config.yaml.example` | The committed template you copy to `config.yaml`. Safe defaults (paper mode). |
 | `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
 | `tradingagents/` | The AI analyst team that powers the thinking. |
 | `.env` | Your private keys and account number. Never shared, never committed. |

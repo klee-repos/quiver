@@ -235,9 +235,11 @@ ledger rollups — all offline.
   deploy acceptance gate for the last-resort pager.
 - `lib/` — `config`, `market`, `ledger`, `signals`, `ds_config`, `notify`, `mailer`, `memory`,
   `storage` (see above).
-- `config.yaml` — account, `dry_run`, watchlist, dollar caps, order defaults (incl. `buy_type` +
+- `config.yaml` — `dry_run`, watchlist, dollar caps, order defaults (incl. `buy_type` +
   `protective_stop`), model IDs, `loop` timing + `intraday_enabled`/cadence, `storage` retention,
-  `notify` (email digest — off unless `enabled: true`).
+  `notify` (email digest + alerts — off unless `enabled: true`). **Per-user + gitignored** so a
+  public repo never exposes your live posture; copy `config.yaml.example` → `config.yaml` and tune.
+  Carries NO secrets (account number + keys + recipients are in `.env`).
 - `TICK.md` — the per-tick runbook the orchestrator follows verbatim.
 - `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored from upstream;
   tracked, pruned; provenance in `tradingagents/UPSTREAM.md`, Apache-2.0 `tradingagents/LICENSE`).
@@ -247,5 +249,8 @@ ledger rollups — all offline.
 - `logs/` — `orchestrator.log` (one line per tick) + `reasoning/` (teed live thinking). Gitignored.
 - `.env` — per-user/secret values (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`,
   `RH_ACCOUNT_NUMBER` (the agentic_allowed account), and `NOTIFY_TO` (digest recipients,
-  comma-separated). `config.yaml` is committed and carries none of these. MCP credentials
-  (Robinhood, Resend) live in the operator's Claude config (`claude mcp add`), NOT in this repo.
+  comma-separated). `config.yaml` is gitignored (copy from `config.yaml.example`) and carries none
+  of these. MCP credentials (Robinhood, Resend) live in the operator's Claude config
+  (`claude mcp add`), NOT in this repo.
+- `config.yaml.example` — the committed template (SAFE defaults: `dry_run: true`, generic
+  watchlist). `cp config.yaml.example config.yaml` to start; your real `config.yaml` stays private.

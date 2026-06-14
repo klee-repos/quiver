@@ -1,10 +1,17 @@
 # Secrets
 .env
 
+# Per-user config — your real watchlist / mode (dry_run) / risk caps. Kept private so
+# a public repo never exposes your live posture. Copy config.yaml.example -> config.yaml.
+config.yaml
+
 # Runtime state & logs
 state/
 logs/
 KILL
+
+# Editor / local
+.vscode/
 
 # Python
 .venv/

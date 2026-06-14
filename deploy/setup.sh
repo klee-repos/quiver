@@ -73,6 +73,15 @@ done
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
 [ -f "$QUIVER_HOME/deploy/runner/mcp.json" ] || cp "$QUIVER_HOME/deploy/runner/mcp.json.example" "$QUIVER_HOME/deploy/runner/mcp.json"
+# config.yaml is per-user + gitignored, so it is NOT in the clone. Seed it from the
+# example (SAFE: dry_run:true, generic watchlist) so the box boots; then SSH in and
+# replace it with your real watchlist/caps before flipping dry_run to false. (For a
+# fully-automated box, push your config.yaml to the host out-of-band instead.)
+if [ ! -f "$QUIVER_HOME/config.yaml" ]; then
+  cp "$QUIVER_HOME/config.yaml.example" "$QUIVER_HOME/config.yaml"
+  chown "$QUIVER_USER:$QUIVER_USER" "$QUIVER_HOME/config.yaml"
+  echo "  NOTE: seeded config.yaml from config.yaml.example (dry_run:true). Replace it with your real config before going live."
+fi
 
 echo "[7/9] systemd units + timer"
 cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service

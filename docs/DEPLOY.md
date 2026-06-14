@@ -95,6 +95,10 @@ sudo bash /opt/quiver/deploy/setup.sh                    # re-materializes /etc/
 On expiry you'll be paged via SNS; repeat this step.
 
 ## 5. Dry-run soak, then go live (decision D2)
+0. **Put your real `config.yaml` on the box.** `config.yaml` is gitignored, so the clone
+   doesn't include it — `setup.sh` seeds it from `config.yaml.example` (SAFE: `dry_run:
+   true`, generic watchlist). SSH in and replace `/opt/quiver/config.yaml` with your real
+   watchlist + caps (`scp` it up, or paste it), still `dry_run: true`, before the soak.
 1. Ensure `config.yaml: dry_run: true`. Let the timer run a **full market day** —
    the tick reviews-but-never-places. Confirm **zero `place_equity_order` calls**
    (tool-use logs + an empty Robinhood order history) and that the digests match a

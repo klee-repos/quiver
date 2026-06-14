@@ -1,3 +1,9 @@
+# Quiver config — EXAMPLE. Copy to config.yaml (which is gitignored) and tune:
+#   cp config.yaml.example config.yaml
+# config.yaml holds YOUR real watchlist / mode / caps and is NOT committed, so your
+# live posture stays private. This example ships SAFE defaults: dry_run: true and a
+# small generic watchlist — change them deliberately. No secrets live here either way
+# (account number + API keys + notify recipients are in .env / the MCP registration).
 schema: 1
 
 # --- Account ---------------------------------------------------------------
@@ -9,21 +15,21 @@ schema: 1
 # --- Mode ------------------------------------------------------------------
 # START in dry_run. The orchestrator will call review_equity_order but NEVER
 # place_equity_order. Flip to false only after a clean dry-run validation.
-dry_run: false
+dry_run: true
 # Relative to the repo root (where tick.py runs). `touch KILL` halts the next
 # tick; `rm KILL` resumes. Use an absolute path if you run from elsewhere.
 kill_switch_file: "KILL"
 
 # --- Universe --------------------------------------------------------------
 # Keep small at first: LLM cost + runtime scale linearly with the watchlist.
-watchlist: ["CBRS", "PLTR", "AMZN", "REMX", "HOOD", "TSLA", "GOOGL"]
+watchlist: ["AAPL", "MSFT"]
 
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
-# Sized for the ~$100 Agentic account. Bump these if you fund it with more.
+# Sized for the ~$100 Agentic account. Bump these proportionally if you fund more.
 risk:
-  max_dollars_per_trade: 100           # hard per-trade ceiling
-  daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
-  daily_capital_deploy_cap: 1000        # max total $ of BUYS across all tickers per day
+  max_dollars_per_trade: 25            # hard per-trade ceiling
+  daily_loss_halt_pct: 5.0             # equity drop >= this vs today's baseline -> halt + KILL
+  daily_capital_deploy_cap: 75         # max total $ of BUYS across all tickers per day
   max_open_position_per_ticker: 50    # max $ market value held in any one ticker
   min_buying_power_buffer: 5          # never spend below this much remaining buying power
   # Intraday-only caps (ignored when loop.intraday_enabled is false). max_actions
@@ -68,19 +74,27 @@ loop:
   review_ceiling_open_min: 120        # while market OPEN, never wait longer than this
   review_ceiling_min: 1440            # after close, may wait up to this (next session)
 
-# --- Notifications (email digest of each run) ------------------------------
-# Python (tick.py report) BUILDS the email + decides if it's new; the
-# orchestrator SENDS it via the Resend MCP. The MCP is registered in YOUR
-# Claude config (`claude mcp add resend ...`), exactly like the Robinhood MCP —
-# it is NOT shipped in this repo, and the RESEND_API_KEY + sender live in that
-# MCP registration, not here. See README "Email digest" to enable.
+# --- Notifications (email digest + alerts) ---------------------------------
+# Python (tick.py report) BUILDS the email + decides if it's new; the orchestrator
+# SENDS the in-tick mail via the Resend MCP. A separate Python last-resort sender
+# (run_tick.py -> lib/mailer, Resend HTTP API) pages you when the orchestrator
+# itself crashes/times out — it needs RESEND_API_KEY + a verified RESEND_FROM in the
+# env (see .env.example). Recipients live in .env (NOTIFY_TO), not here.
 # Fails SAFE: stays OFF unless enabled is exactly `true`.
 notify:
   enabled: true
-  # Recipients are per-user and NOT committed: set NOTIFY_TO in .env
-  # (comma-separated for multiple). Required when enabled is true.
-  from: ""                              # blank -> the Resend MCP's own SENDER_EMAIL_ADDRESS is used
+  from: ""                              # blank -> the Resend MCP's own SENDER_EMAIL_ADDRESS
+                                        # (the Python last-resort sender needs a real
+                                        #  verified from: set RESEND_FROM in the env)
   subject_prefix: "[Quiver]"
+  # Per-event delivery toggles (defaults shown; omit to accept them):
+  on_complete: true                     # email the run-complete digest (~once/trading day)
+  on_error: true                        # email critical alerts (auth expired / halt / hard tick failure)
+  on_warning: false                     # best-effort hiccups ride in the digest's FYI section by
+                                        #  default; flip true to also email them separately
+  # Critical alerts route here; falls back to NOTIFY_TO when unset. Env
+  # NOTIFY_ALERTS_TO overrides. Validated only when on_error is true.
+  # alerts_to: ["pager@example.com"]
 
 # --- Storage retention (observability housekeeping; never blocks a tick) ---
 # Bulky run artifacts (logs/reasoning, state/analyze_logs, framework results/cache)
