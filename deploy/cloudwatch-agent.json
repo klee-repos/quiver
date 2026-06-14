@@ -1,0 +1,21 @@
+{
+  "_comment": "amazon-cloudwatch-agent config (logs-only). Tails the clean per-tick status file that run_tick.py writes (deploy/quiver.service sets QUIVER_TICK_LOG=/var/log/quiver/tick.log) and ships each line to the /quiver/tick log group, where the Terraform metric-filter alarms (AUTH_ERROR / write_kill / plan error) fire to SNS. Installed + started by deploy/setup.sh. No metrics section on purpose: logs-only keeps the instance-role IAM minimal (the role already grants logs:Create*/PutLogEvents/DescribeLogStreams). The /quiver/tick group + its 30-day retention are owned by Terraform; this config only writes into it.",
+  "agent": {
+    "run_as_user": "root"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/quiver/tick.log",
+            "log_group_name": "/quiver/tick",
+            "log_stream_name": "{instance_id}/tick",
+            "timezone": "UTC",
+            "retention_in_days": -1
+          }
+        ]
+      }
+    }
+  }
+}

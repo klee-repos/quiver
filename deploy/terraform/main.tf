@@ -137,7 +137,17 @@ resource "aws_instance" "quiver" {
     #!/usr/bin/env bash
     set -euo pipefail
     export AWS_REGION=${var.aws_region} SSM_PREFIX=${var.ssm_prefix} QUIVER_REPO_URL=${var.repo_url}
-    git clone "${var.repo_url}" /opt/quiver 2>/dev/null || true
+    # Bootstrap just enough to read the read-only deploy key from SSM and clone the
+    # PRIVATE repo over SSH (GitHub host key pinned, not trust-on-first-use); the
+    # idempotent setup.sh installs everything else. Fails closed: a missing key or a
+    # failed clone aborts provisioning rather than leaving a half-built box.
+    apt-get update -y && apt-get install -y git curl unzip
+    command -v aws >/dev/null || { curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip ; unzip -q -o /tmp/awscliv2.zip -d /tmp ; /tmp/aws/install --update ; }
+    install -d -m 700 /root/.ssh
+    aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_PREFIX/GITHUB_DEPLOY_KEY" --with-decryption --query Parameter.Value --output text > /root/.ssh/id_ed25519
+    chmod 600 /root/.ssh/id_ed25519
+    echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /root/.ssh/known_hosts
+    git clone "$QUIVER_REPO_URL" /opt/quiver
     bash /opt/quiver/deploy/setup.sh
   EOF
   tags      = { Name = var.name }

@@ -4,4 +4,4 @@ instance_type = "t4g.small"
 ssm_prefix    = "/quiver"
 alert_email   = "you@example.com"
 key_name      = "your-ec2-keypair"
-repo_url      = "https://github.com/youruser/quiver.git"
+repo_url      = "git@github.com:youruser/quiver.git"   # SSH form — the box clones with the read-only deploy key in SSM (see DEPLOY.md §1b)

@@ -9,6 +9,10 @@ User=quiver
 Group=quiver
 WorkingDirectory=/opt/quiver
 EnvironmentFile=/etc/quiver/quiver.env
+# Clean per-tick status lines also go to this file (stdout still goes to journald),
+# so the CloudWatch agent can tail it and the metric-filter alarms have data. It sits
+# under ReadWritePaths below; locally run_tick.py defaults to logs/tick.log instead.
+Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
 ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_tick.py
 TimeoutStartSec=3000
 StandardOutput=journal
