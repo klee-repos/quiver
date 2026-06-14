@@ -120,10 +120,9 @@ never get shared):
 
 ```bash
 cd ~/dev/quiver
-cp config.yaml.example config.yaml       # your settings — starts in dry_run (paper)
-cp strategy.yaml.example strategy.yaml   # your portfolio book = what it trades
+cp strategy.yaml.example strategy.yaml   # your portfolio book = what it trades (private)
 cp .env.example .env && chmod 600 .env   # your keys + account number
-# then open config.yaml / strategy.yaml / .env and fill them in
+# then open config.yaml (already in the repo), strategy.yaml, and .env and fill them in
 ```
 
 Quiver runs inside a Claude Code session that stays open. These commands start it and tell it
@@ -273,9 +272,9 @@ fails to send, trading carries on as normal.
 | `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
 | `lib/` | The building blocks: market hours, the logbook, the safety rules, email, memory. |
 | `TICK.md` | The exact step-by-step the helper follows on every run. |
-| `config.yaml` | Your settings (the table above). Private — gitignored, never shared. |
+| `config.yaml` | Your settings (the table above). Committed — carries no secrets (those live in `.env`). |
 | `strategy.yaml` | Your portfolio book = the stocks it trades. Private — gitignored. |
-| `*.yaml.example` | The committed templates you copy to make the two files above. Safe defaults. |
+| `strategy.yaml.example` | The committed template you copy to make `strategy.yaml`. Safe defaults. |
 | `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
 | `tradingagents/` | The AI analyst team that powers the thinking. |
 | `.env` | Your private keys and account number. Never shared, never committed. |

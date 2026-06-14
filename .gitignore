@@ -1,11 +1,10 @@
 # Secrets
 .env
 
-# Per-user config + strategy book — your real mode (dry_run) / risk caps and your macro
-# allocations + the derived trading universe. Kept private so a public repo never exposes
-# your live posture. Copy the *.example templates to start; on the box they're pulled from
-# SSM (see DEPLOY.md).
-config.yaml
+# Per-user strategy book — your macro allocations + the derived trading universe. Kept
+# private so a public repo never exposes your holdings. Copy strategy.yaml.example to
+# start; on the box it's pulled from SSM (see DEPLOY.md). config.yaml carries NO secrets
+# (those are in .env) and IS committed.
 strategy.yaml
 
 # Runtime state & logs

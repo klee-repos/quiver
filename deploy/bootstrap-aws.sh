@@ -5,8 +5,8 @@
 #
 # It is IDEMPOTENT (re-runnable): SSM puts use --overwrite; the EC2 key pair + GitHub
 # deploy key are created only if absent. Run from the repo root with AWS creds + `gh`
-# authed. Reads secrets from ./.env and the real config.yaml / strategy.yaml; pushes
-# them to SSM SecureString so they never touch the repo or tfstate.
+# authed. Reads secrets from ./.env and the private strategy.yaml; pushes them to SSM
+# SecureString so they never touch the repo or tfstate. (config.yaml is committed.)
 #
 #   ./deploy/bootstrap-aws.sh
 #
@@ -21,7 +21,6 @@ KEYNAME="${QUIVER_KEY_NAME:-quiver-box}"
 
 cd "$(dirname "$0")/.."
 [ -f .env ] || { echo "FATAL: no .env (cp .env.example .env first)"; exit 1; }
-[ -f config.yaml ] || { echo "FATAL: no config.yaml (cp config.yaml.example config.yaml)"; exit 1; }
 [ -f strategy.yaml ] || { echo "FATAL: no strategy.yaml (cp strategy.yaml.example strategy.yaml)"; exit 1; }
 
 echo "AWS account: $(aws sts get-caller-identity --query Account --output text)  region: $REGION  prefix: $P"
@@ -36,8 +35,9 @@ for k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER NOTIFY_TO RESEND_API_KEY RESEND_FROM
   v="${!k:-}"; [ -n "$v" ] && put "$k" "$v" || echo "  $k: (empty in .env, skipped)"
 done
 
-echo "[2] your private config + strategy -> SSM (Intelligent-Tiering)"
-put_big CONFIG_YAML   "$(cat config.yaml)"
+# config.yaml is committed (no secrets), so it ships in the clone — only the private
+# strategy book needs pushing to SSM.
+echo "[2] your private strategy book -> SSM (Intelligent-Tiering)"
 put_big STRATEGY_YAML "$(cat strategy.yaml)"
 
 echo "[3] RH_OAUTH_TOKEN placeholder (the real token comes from the interactive /mcp)"

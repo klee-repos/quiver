@@ -1,0 +1,98 @@
+schema: 1
+
+# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, DEEPSEEK_API_KEY,
+# NOTIFY_TO and the Resend key all live in .env / the MCP registration, never here.
+# What the bot TRADES is derived from strategy.yaml's book, not this file.
+
+# --- Mode ------------------------------------------------------------------
+dry_run: false                         # false = LIVE (places orders); true = paper (review only)
+kill_switch_file: "KILL"               # `touch KILL` halts the next tick; `rm KILL` resumes
+
+# --- Risk guardrails (coded backstops around the model's own sizing) -------
+# Sized for the ~$100 Agentic account; bump proportionally if funded with more.
+risk:
+  max_dollars_per_trade: 100           # hard per-trade ceiling
+  daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
+  daily_capital_deploy_cap: 1000       # max total $ of BUYS across all tickers per day
+  max_open_position_per_ticker: 50     # max $ market value held in any one ticker
+  min_buying_power_buffer: 5           # never spend below this much remaining buying power
+  max_actions_per_ticker_per_day: 10   # intraday-only: repeat TRADES/ticker/day
+  max_analyses_per_ticker_per_day: 10  # intraday-only: LLM-cost circuit breaker
+
+  # Strategy/portfolio layer (active only once `tick.py strategy-set` seeds a goal):
+  rebalance_enabled: true              # target weights drive buys + trim/exit (only ever REDUCES a buy)
+  reconcile_unmanaged: true            # sell any HELD position not in the book down to cash
+  rebalance_drift_band_pct: 5.0        # default no-trade dead-band (per-holding `band` overrides)
+  cash_sleeve_ticker: "SGOV"           # the residual ballast; never churned like an engine name
+
+  # Memory-grounded strategy-consistency gate: suppress RANDOM cross-day buy/sell flips;
+  # allow reversals grounded in the recorded plan (stop/target/loss) or a named new
+  # catalyst (within budget). NOT a calendar dwell. enabled:false = byte-identical classic.
+  consistency:
+    enabled: true
+    max_discretionary_reversals: 1     # ungrounded "changed my mind" flips per window (0 = stop/target exits only)
+    flip_window: 6                     # recent COMPLETED trades the budget looks back over
+    loss_catalyst_pct: 8.0             # a sell within the window is grounded if the position is down >= this %
+
+# --- Order defaults --------------------------------------------------------
+order:
+  buy_type: "market"                   # "market" (fractional $) | "limit" (whole shares)
+  limit_slippage_pct: 0.3              # marketable-limit buffer over the live quote (buys)
+  sell_mode: "close_position"
+  time_in_force: "gfd"
+  market_hours: "regular_hours"        # fractional/dollar orders only fill in RTH
+  protective_stop:                     # GTC stop placed AFTER an entry fills; price Python-clamped. OFF by default.
+    enabled: false
+    stop_pct: 8.0                      # target distance below fill; clamped to a safe band
+    time_in_force: "gtc"
+
+# --- Models (DeepSeek) -----------------------------------------------------
+# chat (flash) does the analysts' tool-calling (must support function calling);
+# reasoner (pro) does the debates. Verify IDs at /v1/models if a call rejects them.
+deepseek:
+  chat_model: "deepseek-v4-flash"
+  reasoner_model: "deepseek-v4-pro"
+
+# --- Loop timing -----------------------------------------------------------
+loop:
+  act_after_open_minutes: 5            # wait N min after the open before acting
+  analyze_timeout_sec: 900             # per-ticker analyze.py subprocess timeout
+  # intraday_enabled OFF = the validated once-a-day path (the cadence code stays dormant).
+  intraday_enabled: false
+  per_ticker_cooldown_min: 60          # min minutes between repeat trades on a ticker
+  review_floor_min: 30                 # never re-analyze a ticker sooner than this
+  review_ceiling_open_min: 120         # while market OPEN, never wait longer than this
+  review_ceiling_min: 1440             # after close, may wait up to this (next session)
+
+# --- Notifications (email digest + alerts) ---------------------------------
+# Python builds the email; the orchestrator sends it via the Resend MCP. Recipients
+# come from NOTIFY_TO in .env. Fails SAFE: OFF unless enabled is exactly `true`.
+notify:
+  enabled: true
+  from: ""                             # blank -> the Resend MCP's own sender is used
+  subject_prefix: "[Quiver]"
+
+# --- Storage retention (observability housekeeping; never blocks a tick) ---
+storage:
+  retention_days: 30                   # 0 disables pruning (decision state lives in the ledger)
+  archive:
+    enabled: false                     # S3 backend deferred — keep false
+    backend: "s3"
+    bucket: ""
+    prefix: "quiver/"
+
+# --- Reflective memory + deterministic risk metrics (analysis CONTEXT only) -
+# Python computes Sharpe/Sortino/vol/drawdown/hit-rate (with proof) and injects them
+# into the agents' reasoning; it NEVER feeds sizing. Read-only, defaults ON.
+memory:
+  enabled: true
+  dir: "state/memory/reflect"          # gitignored (under state/), prune-exempt
+  risk_free_rate: 0.0
+  low_confidence_min_n: 5              # N below this -> metrics flagged LOW-CONFIDENCE
+  rolling_window: 10                   # improvement trend: last N vs prior N
+  periods_per_year: 50.0               # annualized-Sharpe ESTIMATE only
+  conviction:                          # deterministic guidance bands (reduced must be <= elevated)
+    hit_rate_elevated: 0.60
+    hit_rate_reduced: 0.40
+    sharpe_elevated: 0.50
+    sharpe_reduced: 0.0

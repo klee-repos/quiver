@@ -88,11 +88,11 @@ fi
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
 [ -f "$QUIVER_HOME/deploy/runner/mcp.json" ] || cp "$QUIVER_HOME/deploy/runner/mcp.json.example" "$QUIVER_HOME/deploy/runner/mcp.json"
-# config.yaml + strategy.yaml are per-user + gitignored, so they are NOT in the clone.
-# Pull the REAL files from SSM if present (keeps the box reproducible from `terraform
-# apply` AND keeps your live posture / macro book private); else seed the SAFE example
-# (dry_run:true; the example book's holdings become the universe). Re-runs NEVER clobber
-# an existing file, so a manual edit on the box survives the next setup.sh.
+# config.yaml carries no secrets and IS committed, so it ships in the clone — nothing to
+# seed. strategy.yaml is per-user + gitignored (it reveals your macro book), so it is NOT
+# in the clone: pull the REAL file from SSM if present (keeps the box reproducible from
+# `terraform apply` AND keeps the book private); else seed the SAFE example. Re-runs NEVER
+# clobber an existing file, so a manual edit on the box survives the next setup.sh.
 seed_yaml() {  # $1=SSM param name  $2=dest path  $3=example path
   [ -f "$2" ] && return 0
   local v
@@ -107,7 +107,6 @@ seed_yaml() {  # $1=SSM param name  $2=dest path  $3=example path
   fi
   chown "$QUIVER_USER:$QUIVER_USER" "$2"
 }
-seed_yaml CONFIG_YAML   "$QUIVER_HOME/config.yaml"   "$QUIVER_HOME/config.yaml.example"
 seed_yaml STRATEGY_YAML "$QUIVER_HOME/strategy.yaml" "$QUIVER_HOME/strategy.yaml.example"
 
 echo "[7/9] systemd units + timer"
@@ -138,6 +137,6 @@ DONE. Two steps that CANNOT be automated:
   1) Robinhood MCP auth (the token has NO refresh — re-auth is interactive): as the
      quiver user run `claude` then `/mcp` to authenticate, and push the resulting
      token to SSM ($SSM_PREFIX/RH_OAUTH_TOKEN). On expiry, repeat and re-run setup.
-  2) Keep config.yaml dry_run=true for the soak; flip to false on a FRESH trading
-     day only after a clean dry-run validation (clear that day's ledger rows first).
+  2) Soak in dry_run first: set config.yaml dry_run=true, then flip to false on a FRESH
+     trading day only after a clean dry-run validation (clear that day's ledger rows first).
 NOTE
