@@ -6,7 +6,8 @@ Ubuntu** box runs a **systemd timer** that, on each weekday market-hours wake, d
 **SSM Parameter Store** (free); the box runs the **CloudWatch agent** to ship the
 per-tick log, and CloudWatch metric-filter alarms page via **SNS**; **EC2
 auto-recovery** reboots-in-place on host failure (D4). ~**$12–15/mo** on-demand
-(excluding Anthropic/DeepSeek token usage).
+(plus your Claude Pro/Max subscription — the headless orchestrator runs on it, see §0 —
+and DeepSeek analysis usage).
 
 Execution-only by construction: the Python brain owns every decision, and the
 **PreToolUse order guard** (`deploy/runner/order_guard.py`) mechanically denies any
@@ -20,9 +21,11 @@ order whose `ref_id` the Python `plan` did not reserve in the ledger (D5).
 
 ## 0. Prerequisites (you provide)
 - An AWS account + region (default `us-east-1`), AWS CLI configured locally, Terraform ≥ 1.5.
-- An EC2 key pair (for the one-time SSH MCP auth).
-- A **read-only deploy key** so the box can clone the private repo over SSH (created in
-  step 1b). Set `repo_url` to the SSH form: `git@github.com:<you>/quiver.git`.
+- An EC2 key pair for the one-time SSH `/mcp` auth (`bootstrap-aws.sh` creates `quiver-box`).
+- The box clones over SSH with a **read-only deploy key** (created in step 1b /
+  `bootstrap-aws.sh`); set `repo_url` to the SSH form `git@github.com:<you>/quiver.git`.
+  (The repo can be public — the deploy key is still how the current IaC clones; you could
+  instead set `repo_url` to the `https://…` URL and skip the key.)
 - **Claude Code auth for the headless orchestrator** — ONE of:
   - **(recommended) your Claude Pro/Max subscription**: run `claude setup-token` locally, copy the
     `sk-ant-oat...` token, and store it as SSM `CLAUDE_CODE_OAUTH_TOKEN`. No API billing — the box's
@@ -74,8 +77,9 @@ aws ssm put-parameter --name "$P/STRATEGY_YAML" --type SecureString --tier Intel
 ```
 
 ## 1b. GitHub deploy key (read-only, repo-scoped — the box clones over SSH)
-Modern best practice for one host needing read-only access to one private repo. The
-key is scoped to this repo, can't push, and isn't tied to your account's other access.
+`bootstrap-aws.sh` does this for you. Manual equivalent below. The key is scoped to this
+one repo, can't push, and isn't tied to your account's other access (harmless on a public
+repo; required only because the IaC clones over SSH).
 ```bash
 ssh-keygen -t ed25519 -C "quiver-deploy-key" -f ~/.ssh/quiver_deploy -N ""    # no passphrase (unattended boot)
 # Add the PUBLIC key as a read-only deploy key (leave write access OFF):
@@ -123,26 +127,31 @@ sudo bash /opt/quiver/deploy/setup.sh                    # re-materializes /etc/
 On expiry you'll be paged via SNS; repeat this step.
 
 ## 5. Dry-run soak, then go live (decision D2)
-0. **Your real `config.yaml` + `strategy.yaml`.** Both are gitignored (not in the clone).
-   If you pushed them to SSM (step 1), `setup.sh` already materialized them on the box —
-   verify `/opt/quiver/config.yaml` + `/opt/quiver/strategy.yaml` are yours (still
-   `dry_run: true` for the soak). If you skipped SSM, `setup.sh` seeded the SAFE
-   `.example` templates (`dry_run:true`); SSH in and replace them before the soak. The
-   trading universe comes from `strategy.yaml`'s book, so a missing/empty book = nothing
-   to trade.
-1. Ensure `config.yaml: dry_run: true`. Let the timer run a **full market day** —
-   the tick reviews-but-never-places. Confirm **zero `place_equity_order` calls**
-   (tool-use logs + an empty Robinhood order history) and that the digests match a
-   local `/loop` dry-run. **Measure how long the OAuth token survives.**
-2. Activate the strategy book (off-tick):
+0. **How config reaches the box.** At first setup, `setup.sh` materializes
+   `/opt/quiver/config.yaml` + `/opt/quiver/strategy.yaml` from SSM
+   `CONFIG_YAML`/`STRATEGY_YAML` (or the SAFE `*.example` templates if those SSM params
+   are absent). It does **NOT overwrite them on re-run** — so to CHANGE config on a
+   running box, **edit the on-box file directly** (`sudo -u quiver vi
+   /opt/quiver/config.yaml`). Re-pushing SSM only affects a fresh/re-provisioned box, or
+   after you `rm` the on-box file and re-run `setup.sh`. The trading universe is derived
+   from `strategy.yaml`'s book (cash + non-quotable excluded), so the bot trades that book
+   the moment a valid `strategy.yaml` is present — no `strategy-set` needed for the universe.
+1. **Soak in paper.** Make sure `/opt/quiver/config.yaml` has `dry_run: true` (push a
+   `dry_run: true` `CONFIG_YAML` to SSM BEFORE first boot, or edit it on the box). Let the
+   timer run a **full market day** — reviews but never places. Confirm **zero
+   `place_equity_order` calls** (tool-use logs + empty Robinhood order history) and that
+   digests match a local `/loop` dry-run. **Measure how long the OAuth token survives.**
+2. **(optional) Target-aware sizing.** The book is already the universe; to add glidepath
+   rebalancing on top, run off-tick:
    `sudo -u quiver /opt/quiver/.venv/bin/python /opt/quiver/tick.py strategy-set --input '{"equity": <equity>}'`
-   then flip `config.yaml: risk.rebalance_enabled: true` once you want target-aware sizing.
-3. **Go live** on a fresh trading day only: flip `config.yaml: dry_run: false`
-   (clear that day's ledger rows first if it already has any — see CLAUDE.md), with
-   the caps in `config.yaml` sized for the account.
+   then set `risk.rebalance_enabled: true` in `/opt/quiver/config.yaml`. Until then, sizing
+   is the validated per-ticker path.
+3. **Go live** on a fresh trading day only: set `dry_run: false` in
+   `/opt/quiver/config.yaml` (clear that day's ledger rows first if it already has any —
+   see CLAUDE.md). Caps in `config.yaml` are sized for the account.
 
-`dial_up_63_37.enabled` and the `learning.auto_apply_*` flags stay **OFF** until you
-explicitly enable them.
+The dial-up book's `enabled` flag and the `learning.auto_apply_*` flags stay **OFF**
+until you explicitly enable them.
 
 ---
 
