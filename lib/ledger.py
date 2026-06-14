@@ -85,7 +85,17 @@ CREATE TABLE IF NOT EXISTS decisions (
     stop_loss         REAL,
     next_review_hours REAL,
     decision_price    REAL,
-    rationale         TEXT
+    rationale         TEXT,
+    -- Consistency layer (back-filled on old dbs via _migrate_decisions):
+    --   basis        = the declared strategy/thesis tag the call rests on
+    --   plan_trigger = a Python-verified reason a reversal executes the recorded
+    --                  plan (stop_hit|loss_catalyst|target_hit|review_due); NULL otherwise
+    --   target_price = the model-seeded take-profit target (for plan-trigger checks)
+    --   proof_json   = the auditable proof bundle assembled at plan time
+    basis             TEXT,
+    plan_trigger      TEXT,
+    target_price      REAL,
+    proof_json        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ticker ON decisions(ticker, decided_at);
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -180,11 +190,20 @@ CREATE INDEX IF NOT EXISTS idx_goal_tracking_goal ON goal_tracking(goal_id, trad
 CREATE TABLE IF NOT EXISTS thesis_state (
     goal_id         INTEGER PRIMARY KEY,
     as_of           TEXT,
-    regime          TEXT NOT NULL DEFAULT 'neutral',     -- neutral|deploy|standdown
+    regime          TEXT NOT NULL DEFAULT 'neutral',     -- neutral|deploy|standdown (the EFFECTIVE, confirmed regime)
     active_book     TEXT DEFAULT 'core_55_45',           -- core_55_45|dial_up_63_37|derisked_cash
     last_trigger    TEXT,
     last_macro_json TEXT,
-    updated_at      TEXT
+    updated_at      TEXT,
+    -- Regime confirmation/hysteresis state (back-filled via _migrate_thesis_state):
+    --   pending_regime = a different regime currently accumulating confirmations
+    --   confirm_count  = consecutive readings seen for pending_regime
+    --   pending_since  = when pending_regime first appeared
+    --   regime_since   = when the EFFECTIVE regime last changed (for min-dwell)
+    pending_regime  TEXT,
+    pending_since   TEXT,
+    confirm_count   INTEGER NOT NULL DEFAULT 0,
+    regime_since    TEXT
 );
 CREATE TABLE IF NOT EXISTS universe_change_log (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -208,6 +227,24 @@ CREATE INDEX IF NOT EXISTS idx_universe_change_status ON universe_change_log(goa
 -- Dedup OPEN proposals: at most one 'proposed' row per (goal_id, content_hash),
 -- so re-proposing the same change every tick is an INSERT OR IGNORE no-op.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_universe_open ON universe_change_log(goal_id, content_hash) WHERE status='proposed';
+-- Append-only audit trail for EVERY strategic change (regime, book, weight, status,
+-- basis). The thesis_state/target_portfolio tables are latest-snapshot UPSERTs; this
+-- is the history that makes a flip-flop detectable after the fact and gives each
+-- strategic change a proof. Written ONLY on a real diff (the tick.py glue compares
+-- prior vs new). Observability — never gates a tick.
+CREATE TABLE IF NOT EXISTS strategy_change_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    goal_id     INTEGER,
+    changed_at  TEXT NOT NULL,
+    change_type TEXT NOT NULL,                            -- regime|book|weight|status|basis
+    ticker      TEXT,                                     -- NULL for goal-level (regime|book)
+    from_value  TEXT,
+    to_value    TEXT,
+    trigger     TEXT,                                     -- what caused it (macro_reading, strategy-set, ...)
+    reason      TEXT,
+    proof_json  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_change_goal ON strategy_change_log(goal_id, changed_at);
 CREATE TABLE IF NOT EXISTS run_lock (
     id          INTEGER PRIMARY KEY CHECK (id = 1),      -- single-row mutex
     holder      TEXT NOT NULL,
@@ -245,6 +282,43 @@ class Ledger:
             c.executescript(_SCHEMA)
             self._migrate_orders(c)
             self._migrate_notifications(c)
+            self._migrate_decisions(c)
+            self._migrate_thesis_state(c)
+
+    @staticmethod
+    def _migrate_decisions(c) -> None:
+        """Back-fill the consistency-layer columns on a decisions table created
+        earlier. PRAGMA-diff + ADD COLUMN, same idempotent pattern as
+        _migrate_orders (fresh dbs get them from _SCHEMA)."""
+        existing = {row[1] for row in c.execute("PRAGMA table_info(decisions)").fetchall()}
+        additions = {
+            "basis": "TEXT",
+            "plan_trigger": "TEXT",
+            "target_price": "REAL",
+            "proof_json": "TEXT",
+        }
+        for col, decl in additions.items():
+            if col not in existing:
+                c.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_thesis_state(c) -> None:
+        """Back-fill the regime-confirmation columns on a thesis_state table created
+        earlier. PRAGMA-diff + ADD COLUMN (fresh dbs get them from _SCHEMA)."""
+        # An empty result means the table doesn't exist yet on this db — _SCHEMA's
+        # CREATE IF NOT EXISTS already made it with the columns, so nothing to add.
+        existing = {row[1] for row in c.execute("PRAGMA table_info(thesis_state)").fetchall()}
+        if not existing:
+            return
+        additions = {
+            "pending_regime": "TEXT",
+            "pending_since": "TEXT",
+            "confirm_count": "INTEGER NOT NULL DEFAULT 0",
+            "regime_since": "TEXT",
+        }
+        for col, decl in additions.items():
+            if col not in existing:
+                c.execute(f"ALTER TABLE thesis_state ADD COLUMN {col} {decl}")
 
     @staticmethod
     def _migrate_orders(c) -> None:
@@ -413,16 +487,26 @@ class Ledger:
         position_pct: Optional[float] = None, entry_price: Optional[float] = None,
         stop_loss: Optional[float] = None, next_review_hours: Optional[float] = None,
         decision_price: Optional[float] = None, rationale: Optional[str] = None,
-        run_id: Optional[str] = None,
+        run_id: Optional[str] = None, basis: Optional[str] = None,
+        plan_trigger: Optional[str] = None, target_price: Optional[float] = None,
+        proof_json: Optional[str] = None,
     ) -> int:
-        """Persist one analysis decision; returns its id (the outcome FK)."""
+        """Persist one analysis decision; returns its id (the outcome FK).
+
+        ``basis``/``plan_trigger``/``target_price``/``proof_json`` are the
+        consistency-layer fields (the declared strategy tag, the Python-verified
+        plan-execution trigger, the take-profit seed, and the auditable proof bundle).
+        All optional — older callers and back-filled rows leave them NULL.
+        """
         with self._conn() as c:
             cur = c.execute(
                 "INSERT INTO decisions (trade_date, ticker, run_id, decided_at, signal, "
                 "intent, position_pct, entry_price, stop_loss, next_review_hours, "
-                "decision_price, rationale) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "decision_price, rationale, basis, plan_trigger, target_price, proof_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (trade_date, ticker, run_id, decided_at, signal, intent, position_pct,
-                 entry_price, stop_loss, next_review_hours, decision_price, rationale),
+                 entry_price, stop_loss, next_review_hours, decision_price, rationale,
+                 basis, plan_trigger, target_price, proof_json),
             )
             rid = cur.lastrowid
             if rid is None:  # never happens after a successful INSERT, but be explicit
@@ -470,6 +554,85 @@ class Ledger:
                 "o.unrealized_pnl, o.scored_against FROM decisions d "
                 "LEFT JOIN outcomes o ON o.decision_id = d.id "
                 "WHERE d.ticker = ? ORDER BY d.decided_at DESC, d.id DESC LIMIT ?",
+                (ticker, limit),
+            ).fetchall()]
+
+    # --- cross-day consistency reads (the strategy-consistency gate, Component A) --
+    # These span DAYS (unlike the trade_date-scoped intraday gates) so the plan can
+    # ask "what stance did we last actually take on this name, and what plan did it
+    # declare?" — the ground for deciding whether today's reversal is a consistent
+    # strategy executing or a random flip. Read-only over decisions/actions.
+
+    def last_completed_trade(self, ticker: str) -> Optional[dict]:
+        """The most recent COMPLETED trade for a ticker across ALL days, joined to the
+        decision that drove it (for its recorded plan: stop/target/price/basis).
+
+        A 'completed trade' is an ``actions`` event with intent buy|sell and status
+        placed|dry_run (the same definition the intraday gates use), NOT date-scoped.
+        Joined to the ``decisions`` row sharing (ticker, trade_date, intent) — unique
+        per day in classic mode; the newest decision wins on an intraday tie. Returns
+        the prior stance + its declared plan, or None when the name was never traded.
+        """
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT a.ticker, a.intent, a.trade_date, a.ts, a.signal, "
+                "d.decision_price, d.stop_loss, d.target_price, d.next_review_hours, "
+                "d.decided_at, d.basis "
+                "FROM actions a LEFT JOIN decisions d "
+                # Pick the SINGLE newest matching decision (not a fan-out): a (day,ticker,
+                # intent) can have many decision rows (intraday re-analysis / plan retries).
+                "  ON d.id = (SELECT d2.id FROM decisions d2 WHERE d2.ticker = a.ticker "
+                "             AND d2.trade_date = a.trade_date AND d2.intent = a.intent "
+                "             ORDER BY d2.id DESC LIMIT 1) "
+                # Only a DISCRETIONARY stance counts — exclude system de-risking exits
+                # (reconcile/rebalance), which are not a committed buy/sell view.
+                "WHERE a.ticker = ? AND a.intent IN ('buy','sell') "
+                "  AND a.status IN ('placed','dry_run') "
+                "  AND COALESCE(a.signal,'') NOT IN ('REBALANCE','RECONCILE') "
+                "ORDER BY a.ts DESC, a.id DESC LIMIT 1",
+                (ticker,),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def recent_decisions(self, ticker: str, limit: int = 8) -> list:
+        """Recent decisions for a ticker (newest first) with the consistency fields.
+
+        The ADVISORY read (analysis side, Component F): includes hold/skip rows so the
+        stance-history block can show the full sequence. Reads decisions only, so it
+        stays inside the memory carve-out.
+        """
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT trade_date, decided_at, signal, intent, basis, plan_trigger "
+                "FROM decisions WHERE ticker = ? ORDER BY decided_at DESC, id DESC LIMIT ?",
+                (ticker, limit),
+            ).fetchall()]
+
+    def recent_completed_trades(self, ticker: str, limit: int = 8) -> list:
+        """Recent COMPLETED trades (newest first), joined to each driving decision's
+        plan_trigger/basis — the binding flip-budget read (Component A).
+
+        Counts only trades that ACTUALLY moved the stance (intent buy|sell, status
+        placed|dry_run), so a suppressed/blocked reversal ATTEMPT never inflates the
+        churn budget — only real direction changes do. Same join key as
+        last_completed_trade ((ticker, trade_date, intent)).
+        """
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT a.intent, a.trade_date, a.ts, a.signal, d.plan_trigger, d.basis "
+                "FROM actions a LEFT JOIN decisions d "
+                # Single newest matching decision per event — NOT a fan-out (a (day,ticker,
+                # intent) may have many decision rows; a naive join would fill the LIMIT
+                # window with duplicates and UNDER-count reversals -> fail permissive).
+                "  ON d.id = (SELECT d2.id FROM decisions d2 WHERE d2.ticker = a.ticker "
+                "             AND d2.trade_date = a.trade_date AND d2.intent = a.intent "
+                "             ORDER BY d2.id DESC LIMIT 1) "
+                # Exclude system de-risking exits (reconcile/rebalance) — not a discretionary
+                # stance, so they must not seed the reversal check or the churn budget.
+                "WHERE a.ticker = ? AND a.intent IN ('buy','sell') "
+                "  AND a.status IN ('placed','dry_run') "
+                "  AND COALESCE(a.signal,'') NOT IN ('REBALANCE','RECONCILE') "
+                "ORDER BY a.ts DESC, a.id DESC LIMIT ?",
                 (ticker, limit),
             ).fetchall()]
 
@@ -698,6 +861,52 @@ class Ledger:
                 raise RuntimeError("strategy_goal INSERT did not return a row id")
             return int(rid)
 
+    def set_strategy_goal_with_holdings(self, *, goal: dict, holdings: list) -> int:
+        """ATOMIC strategy-set: supersede prior goals, insert the new active goal,
+        AND upsert all its target holdings in ONE transaction (a single commit).
+
+        This is the SAFE production path. The piecewise set_strategy_goal +
+        upsert_target_holding each commit separately, so a crash/kill between them
+        leaves an active goal with a PARTIAL or empty target book — and with
+        reconciliation on, `construct` would then flag every held name not in that
+        truncated book as an orphan and SELL the whole portfolio. Doing it in one
+        transaction means a partial write commits nothing and is never observable.
+
+        `goal` carries the set_strategy_goal kwargs; `holdings` is a list of dicts
+        with keys sleeve/ticker/target_weight/band/status/book/quotable/proxy_ticker.
+        Returns the new goal id.
+        """
+        with self._conn() as c:
+            c.execute("UPDATE strategy_goal SET status='superseded' WHERE status='active'")
+            cur = c.execute(
+                "INSERT INTO strategy_goal (created_at, status, target_return_pct, "
+                "horizon_months, benchmark, benchmark_annual_pct, constraint_note, "
+                "macro_thesis_version, macro_thesis_json, active_book, as_of, "
+                "start_date, start_equity) VALUES (?, 'active', ?,?,?,?,?,?,?,?,?,?,?)",
+                (goal["created_at"], goal["target_return_pct"], goal["horizon_months"],
+                 goal["benchmark"], goal["benchmark_annual_pct"], goal["constraint_note"],
+                 goal["macro_thesis_version"], goal["macro_thesis_json"], goal["active_book"],
+                 goal["as_of"], goal["start_date"], goal["start_equity"]),
+            )
+            rid = cur.lastrowid
+            if rid is None:
+                raise RuntimeError("strategy_goal INSERT did not return a row id")
+            gid = int(rid)
+            for h in holdings:
+                c.execute(
+                    "INSERT INTO target_portfolio (goal_id, sleeve, ticker, target_weight, "
+                    "band, status, book, quotable, proxy_ticker, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(goal_id, ticker) DO UPDATE SET sleeve=excluded.sleeve, "
+                    "target_weight=excluded.target_weight, band=excluded.band, "
+                    "status=excluded.status, book=excluded.book, quotable=excluded.quotable, "
+                    "proxy_ticker=excluded.proxy_ticker, updated_at=excluded.updated_at",
+                    (gid, h["sleeve"], h["ticker"], h["target_weight"], h["band"],
+                     h["status"], h["book"], 1 if h["quotable"] else 0,
+                     h.get("proxy_ticker"), h["updated_at"]),
+                )
+            return gid
+
     def get_active_goal(self) -> Optional[dict]:
         with self._conn() as c:
             row = c.execute(
@@ -775,16 +984,61 @@ class Ledger:
             return dict(row) if row else None
 
     def upsert_thesis_state(self, *, goal_id: int, as_of, regime, active_book, last_trigger,
-                            last_macro_json, updated_at) -> None:
+                            last_macro_json, updated_at, pending_regime=None,
+                            pending_since=None, confirm_count=0, regime_since=None) -> None:
+        """Upsert the thesis/regime state. ``regime`` is the EFFECTIVE (confirmed)
+        regime; ``pending_regime``/``confirm_count``/``pending_since`` carry the
+        in-flight confirmation; ``regime_since`` stamps when the effective regime last
+        changed (min-dwell). The confirmation fields default to "no pending change"."""
         with self._conn() as c:
             c.execute(
                 "INSERT INTO thesis_state (goal_id, as_of, regime, active_book, last_trigger, "
-                "last_macro_json, updated_at) VALUES (?,?,?,?,?,?,?) "
+                "last_macro_json, updated_at, pending_regime, pending_since, confirm_count, "
+                "regime_since) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(goal_id) DO UPDATE SET as_of=excluded.as_of, regime=excluded.regime, "
                 "active_book=excluded.active_book, last_trigger=excluded.last_trigger, "
-                "last_macro_json=excluded.last_macro_json, updated_at=excluded.updated_at",
-                (goal_id, as_of, regime, active_book, last_trigger, last_macro_json, updated_at),
+                "last_macro_json=excluded.last_macro_json, updated_at=excluded.updated_at, "
+                "pending_regime=excluded.pending_regime, pending_since=excluded.pending_since, "
+                "confirm_count=excluded.confirm_count, regime_since=excluded.regime_since",
+                (goal_id, as_of, regime, active_book, last_trigger, last_macro_json, updated_at,
+                 pending_regime, pending_since, confirm_count, regime_since),
             )
+
+    # --- strategy change log (append-only audit trail for strategic changes) ------
+    # Written ONLY on a real diff by the tick.py glue that knows the trigger/reason/
+    # proof (regime/book in construct+learn-review, weight/status in strategy-set +
+    # universe-apply). Observability — a change-log error never blocks a tick.
+
+    def record_strategy_change(self, *, goal_id, changed_at, change_type, ticker=None,
+                               from_value=None, to_value=None, trigger=None, reason=None,
+                               proof_json=None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO strategy_change_log (goal_id, changed_at, change_type, ticker, "
+                "from_value, to_value, trigger, reason, proof_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                (goal_id, changed_at, change_type,
+                 None if ticker is None else str(ticker).upper(),
+                 None if from_value is None else str(from_value),
+                 None if to_value is None else str(to_value),
+                 trigger, reason, proof_json),
+            )
+            return int(cur.lastrowid or 0)
+
+    def strategy_change_history(self, goal_id: int, *, limit: int = 50,
+                                change_type: Optional[str] = None) -> list:
+        """Strategic changes for a goal, NEWEST first (optionally one change_type)."""
+        with self._conn() as c:
+            if change_type:
+                rows = c.execute(
+                    "SELECT * FROM strategy_change_log WHERE goal_id=? AND change_type=? "
+                    "ORDER BY changed_at DESC, id DESC LIMIT ?",
+                    (goal_id, change_type, limit)).fetchall()
+            else:
+                rows = c.execute(
+                    "SELECT * FROM strategy_change_log WHERE goal_id=? "
+                    "ORDER BY changed_at DESC, id DESC LIMIT ?",
+                    (goal_id, limit)).fetchall()
+            return [dict(r) for r in rows]
 
     # --- universe change log (continual learning proposals; Stage 4) ----------
 
@@ -828,6 +1082,29 @@ class Ledger:
                             "WHERE goal_id=? AND status='proposed' AND proposed_at < ?",
                             (goal_id, before_date))
             return cur.rowcount
+
+    def last_decided_universe_change(self, goal_id: int, content_hash: str) -> Optional[dict]:
+        """Most recent DECIDED (applied|rejected) row for a content_hash — the
+        anti-oscillation read (Component E1). A change rejected/applied recently is in
+        cooldown; re-proposing it before the window is suppressed. None if never decided."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM universe_change_log WHERE goal_id=? AND content_hash=? "
+                "AND status IN ('applied','rejected') ORDER BY decided_at DESC, id DESC LIMIT 1",
+                (goal_id, content_hash)).fetchone()
+            return dict(row) if row else None
+
+    def count_proposal_recurrence(self, goal_id: int, content_hash: str) -> int:
+        """Distinct DAYS a content_hash has been proposed (across all statuses) — the
+        confirm-over-N read (Component E2). A REMOVE/DERISK is actionable only once it
+        has recurred on >= universe_confirm_days distinct days, so one crossing can't
+        evict a sleeve."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(DISTINCT substr(proposed_at,1,10)) AS d "
+                "FROM universe_change_log WHERE goal_id=? AND content_hash=?",
+                (goal_id, content_hash)).fetchone()
+            return int(row["d"] or 0)
 
     # --- run_lock: single-writer mutex (belt-and-suspenders; Stage 5) ---------
 

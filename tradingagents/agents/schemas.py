@@ -145,6 +145,37 @@ class TraderProposal(BaseModel):
             "execution layer reads this number directly and still clamps it to its caps."
         ),
     )
+    strategy_basis: Optional[str] = Field(
+        default=None,
+        description=(
+            "The named strategy/thesis this call rests on, as a short stable tag (e.g. "
+            "'momentum_breakout', 'mean_reversion_band', 'long_term_secular', "
+            "'thesis_intact_hold', 'rate_cut_beneficiary'). Keep it the SAME across runs "
+            "for the same ticker as long as the thesis holds — it is how the system keeps "
+            "your day-to-day decisions self-consistent. Only change it when a real new "
+            "catalyst changes the thesis (and then name that catalyst below)."
+        ),
+    )
+    catalyst: Optional[str] = Field(
+        default=None,
+        description=(
+            "REQUIRED ONLY WHEN YOU REVERSE your prior stance on this ticker (you were "
+            "accumulating and now want to sell, or you exited and now want to buy back): "
+            "name the SPECIFIC, data-backed NEW catalyst that justifies the reversal — an "
+            "earnings miss, a broken support level, a macro-regime shift, a stop breached. "
+            "Absent a genuine named catalyst, DO NOT reverse: hold your prior stance. A "
+            "reversal with no catalyst and no triggered stop/target is treated as "
+            "inconsistent and suppressed by the execution layer."
+        ),
+    )
+    target_price: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional take-profit target price (quote currency). If the live price reaches "
+            "it, a later sell is treated as the recorded plan executing — a consistent "
+            "exit, not a flip — so set it when your thesis has a clear profit objective."
+        ),
+    )
 
 
 def render_trader_proposal(proposal: TraderProposal) -> str:
@@ -167,6 +198,12 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
         parts.extend(["", f"**Position Sizing**: {proposal.position_sizing}"])
     if proposal.position_pct is not None:
         parts.extend(["", f"**Position Pct**: {proposal.position_pct}"])
+    if proposal.strategy_basis:
+        parts.extend(["", f"**Strategy Basis**: {proposal.strategy_basis}"])
+    if proposal.target_price is not None:
+        parts.extend(["", f"**Target Price**: {proposal.target_price}"])
+    if proposal.catalyst:
+        parts.extend(["", f"**Catalyst**: {proposal.catalyst}"])
     parts.extend([
         "",
         f"FINAL TRANSACTION PROPOSAL: **{proposal.action.value.upper()}**",

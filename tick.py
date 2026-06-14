@@ -42,7 +42,11 @@ from lib import storage  # noqa: E402
 from lib import memory  # noqa: E402
 from lib import universe  # noqa: E402
 
-LEDGER_DB = REPO / "state" / "ledger.db"
+# Paths default to the repo's state/config but accept env overrides so an isolated
+# end-to-end test (or an alternate deployment) can point the SAME CLI at a temp DB +
+# temp config WITHOUT touching live trading state. Production sets neither var.
+LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (REPO / "state" / "ledger.db"))
+CONFIG_PATH = Path(os.environ.get("QUIVER_CONFIG") or (REPO / "config.yaml"))
 ANALYZE_LOGS = REPO / "state" / "analyze_logs"
 # Bulky, reconstructable artifacts the retention sweep ages out (state of record
 # is the ledger, never these). Kept here so `prune` and any future caller agree.
@@ -55,7 +59,7 @@ PRUNE_TARGETS = [
 
 
 def _cfg_and_ledger():
-    cfg = load_config(REPO / "config.yaml")
+    cfg = load_config(CONFIG_PATH)
     led = Ledger(LEDGER_DB)
     return cfg, led
 
@@ -97,8 +101,41 @@ def _analysis_universe(cfg, led) -> list:
     return universe.tradable_universe(rows, cfg.risk.cash_sleeve_ticker)
 
 
+def _has_winddown_work(cfg, led, *, include_reconcile: bool) -> bool:
+    """Pending SELL work that needs a tick even when there's nothing to analyze, so
+    preflight keeps the tick alive. The exits live in `cmd_plan`'s sell pass, which
+    only runs AFTER preflight proceeds. Dormant with no active goal (classic path
+    unchanged). Two sources:
+
+      * rebalance_enabled + an `exiting` in-book holding -> Stage 3 wind-down. A
+        cheap LEDGER fact, so it gates BOTH preflight no-op checks.
+      * reconcile_unmanaged + an active goal -> a held off-book position may need a
+        reconcile-exit. Positions aren't known at preflight (no snapshot yet), so
+        this can't be conditioned on an actual orphan; it is honored only at the
+        EMPTY-universe gate (``include_reconcile=True``) — an all-cash / fully
+        wound-down book has no analysis tick to carry the sell, so reconcile must
+        keep it alive. It is NOT honored at the all-acted gate: a normal book
+        already did its sell work on the day's first (pending) tick, and keeping
+        every later wake alive just to re-check would defeat the cheap hourly no-op.
+        (An orphan introduced AFTER all in-book names acted that day self-heals on
+        the next session — the conservative, fails-to-sell direction.)
+    """
+    goal = led.get_active_goal()
+    if not goal:
+        return False
+    if include_reconcile and cfg.risk.reconcile_unmanaged:
+        return True
+    if cfg.risk.rebalance_enabled:
+        return bool(led.active_target_portfolio(goal["id"], statuses=("exiting",)))
+    return False
+
+
 def cmd_preflight(_args) -> dict:
     cfg, led = _cfg_and_ledger()
+    return _run_preflight(cfg, led)
+
+
+def _run_preflight(cfg, led) -> dict:
     day = market.trading_day_et()
     now = market.now_et().isoformat()
 
@@ -151,9 +188,22 @@ def cmd_preflight(_args) -> dict:
         return out
 
     # The universe is the active portfolio book (no hand-maintained watchlist). An
-    # empty universe means no portfolio is defined yet -> safe no-op, not an error.
+    # empty universe means no portfolio is defined yet -> safe no-op, not an error
+    # UNLESS plan still has SELL wind-down work (rebalance `exiting` holdings, or a
+    # reconcile-exit of an off-book holding) — those aren't in the analysis universe
+    # but must still be sold; keep the tick alive so construct -> plan can place them.
     book_universe = _analysis_universe(cfg, led)
     if not book_universe:
+        # No analyzable engine names (no goal/strategy, or an all-cash / fully
+        # wound-down book). There is no analysis tick to carry a sell, so keep the
+        # tick alive ONLY if there is wind-down SELL work — a reconcile-exit of an
+        # off-book holding or a rebalance `exiting` holding (include_reconcile=True);
+        # otherwise it's a safe no-op, not an error.
+        if _has_winddown_work(cfg, led, include_reconcile=True):
+            out["proceed"] = True
+            out["pending"] = []
+            out["reason"] = "winddown_only (rebalance/reconcile sells; no analysis universe)"
+            return out
         out["reason"] = "no_portfolio_universe (set strategy.yaml / run strategy-set)"
         return out
 
@@ -184,12 +234,19 @@ def cmd_preflight(_args) -> dict:
         no_pending = "all_portfolio_tickers_already_acted_today"
 
     out["pending"] = pending
-    if not pending:
+    # All-acted gate (book HAS engines, but all acted today): a normal book already
+    # did its sell work on the day's first (pending) tick, so reconcile does NOT keep
+    # every later wake alive here (include_reconcile=False) — only a cheap-to-detect
+    # rebalance `exiting` holding does. (An orphan introduced after all names acted
+    # self-heals on the next session — the conservative, fails-to-sell direction.)
+    if not pending and not _has_winddown_work(cfg, led, include_reconcile=False):
         out["reason"] = no_pending
         return out
 
     out["proceed"] = True
-    out["reason"] = "ok"
+    # An empty `pending` here means a rebalance `exiting` wind-down tick: nothing to
+    # analyze, but construct -> plan's sell pass still has exits to place.
+    out["reason"] = "ok" if pending else "winddown_only (rebalance exiting sells; no new analysis)"
     return out
 
 
@@ -216,6 +273,72 @@ def _target_room(target_weights, ticker: str, held_mv: float):
     if td is None:
         return None
     return signals.room_under_target(td, held_mv)
+
+
+def _plan_trigger(prior, new_intent, quote, loss_catalyst_pct):
+    """Python-VERIFIED reason a buy<->sell REVERSAL executes the recorded plan, or None.
+
+    Only the substantive, price-event exits ground a reversal (Component A G1): a SELL
+    after a recorded BUY that breaches the recorded stop, takes a real loss, or hits the
+    recorded target. The model's word is never trusted here — every trigger is checked
+    against the live quote + the prior decision's recorded numbers. Re-entries (buy after
+    sell) and target-less profit-taking carry NO auto-trigger; they must be grounded by a
+    declared basis change instead (so a short review horizon can't make the gate toothless).
+    """
+    if not prior:
+        return None
+    prior_intent = prior.get("intent")
+    if not signals.is_reversal(prior_intent, new_intent):
+        return None
+    q = _to_float(quote)
+    if new_intent == "sell" and signals.direction_of(prior_intent) == "open":
+        stop = _to_float(prior.get("stop_loss"))
+        if q is not None and stop and q <= stop:
+            return "stop_hit"
+        dp = _to_float(prior.get("decision_price"))
+        if q is not None and dp and dp > 0 and (q - dp) / dp <= -(loss_catalyst_pct / 100.0):
+            return "loss_catalyst"
+        tgt = _to_float(prior.get("target_price"))
+        if q is not None and tgt and q >= tgt:
+            return "target_hit"
+    return None
+
+
+def _consistency_context(cfg, led, ticker, new_intent, quote, new_basis,
+                         decision_price, position_pct):
+    """Assemble the cross-day consistency verdict + its proof for one ticker.
+
+    Reads the prior completed-trade stance + the recent completed-trade flip history,
+    computes the Python-verified plan_trigger, and returns
+    (allowed, reason, plan_trigger, proof_dict). Degrades to ALLOW on any read error
+    (the gate goes off for this ticker this tick rather than blocking a legit trade —
+    the daily $ caps + dedup still bound exposure); never raises into the tick.
+    """
+    proof: dict = {"decision_price": decision_price, "position_pct": position_pct}
+    try:
+        prior = led.last_completed_trade(ticker)
+        prior_intent = (prior or {}).get("intent")
+        prior_basis = (prior or {}).get("basis")
+        reversal = signals.is_reversal(prior_intent, new_intent)
+        plan_trigger = _plan_trigger(prior, new_intent, quote, cfg.risk.loss_catalyst_pct)
+        basis_changed = bool(new_basis) and (new_basis != prior_basis)
+        recent = led.recent_completed_trades(ticker, cfg.risk.consistency_flip_window)
+        recent_flips = signals.count_discretionary_reversals(list(reversed(recent)))
+        allowed, reason = signals.strategy_consistency_verdict(
+            prior_intent=prior_intent, new_intent=new_intent, plan_trigger=plan_trigger,
+            basis_changed=basis_changed, recent_discretionary_reversals=recent_flips,
+            max_discretionary_reversals=cfg.risk.max_discretionary_reversals,
+            enabled=cfg.risk.consistency_enabled)
+        proof.update(
+            prior_intent=prior_intent, prior_basis=prior_basis, new_basis=new_basis,
+            basis_changed=basis_changed, reversal=reversal, plan_trigger=plan_trigger,
+            recent_discretionary_reversals=recent_flips,
+            max_discretionary_reversals=cfg.risk.max_discretionary_reversals,
+            verdict={"allowed": allowed, "reason": reason})
+        return allowed, reason, plan_trigger, proof
+    except Exception as e:  # noqa: BLE001 — a gate read error must never crash the tick
+        proof["gate_error"] = str(e)
+        return True, "gate_error_degraded", None, proof
 
 
 def cmd_plan(args) -> dict:
@@ -306,10 +429,22 @@ def _run_plan(cfg, led, data) -> dict:
 
         intent, frac = signals.plan_action(signal, has_position)
 
+        # Cross-day strategy-consistency gate (Component A): is today's buy<->sell a
+        # consistent recorded strategy executing, or a RANDOM reversal? Computed BEFORE
+        # the decision is recorded so the verdict + its proof are persisted with it.
+        # The declared strategy basis the call rests on (model-emitted; None pre-Phase-4).
+        new_basis = (str(a.get("basis") or "").strip() or None)
+        _decision_price = (quote or _to_float(a.get("decision_price"))
+                           or _to_float(a.get("entry_price")))
+        c_allowed, c_reason, c_plan_trigger, c_proof = _consistency_context(
+            cfg, led, ticker, intent, quote, new_basis,
+            _decision_price, _to_float(a.get("position_pct")))
+
         # Persist the analysis decision to the ledger — the ground of record for
         # the memory scorecard. Recorded for EVERY valid signal (incl. hold/skip),
         # since directional grading applies to those too. decision_price comes
         # from a live RH quote when present (Phase 4), else the model's entry_price.
+        # basis/plan_trigger/proof_json are the consistency-layer fields (Component A/B).
         led.record_decision(
             trade_date=day, ticker=ticker, decided_at=now_iso,
             signal=signal, intent=intent,
@@ -319,7 +454,9 @@ def _run_plan(cfg, led, data) -> dict:
             next_review_hours=_to_float(a.get("next_review_hours")),
             decision_price=quote or _to_float(a.get("decision_price")) or _to_float(a.get("entry_price")),
             rationale=a.get("rationale_summary"),
-            run_id=run_id,
+            run_id=run_id, basis=new_basis, plan_trigger=c_plan_trigger,
+            target_price=_to_float(a.get("target_price")),
+            proof_json=json.dumps(c_proof),
         )
 
         # Cadence (intraday only): schedule this ticker's next look and count the
@@ -366,6 +503,17 @@ def _run_plan(cfg, led, data) -> dict:
                 decision.update(status="skipped", intent=intent, detail=gate)
                 result["decisions"].append(decision)
                 continue
+
+        # Cross-day strategy-consistency gate (Component A): suppress a RANDOM reversal
+        # (an ungrounded buy<->sell flip, or serial basis churn). A reversal grounded in
+        # the recorded plan (stop/loss/target firing) or a budget-respecting basis change
+        # passes. Only ever fires on a reversal — a continuation/buy is never blocked.
+        if not c_allowed:
+            led.record_action(day, ticker, signal=signal, intent=intent,
+                              status="skipped", detail=f"consistency:{c_reason}", now_iso=now_iso)
+            decision.update(status="skipped", intent=intent, detail=f"consistency:{c_reason}")
+            result["decisions"].append(decision)
+            continue
 
         if intent == "buy":
             room = max(0.0, cfg.risk.max_open_position_per_ticker - held_mv)
@@ -462,20 +610,32 @@ def _run_plan(cfg, led, data) -> dict:
             decision.update(status="order", intent="sell", quantity=qty)
             result["decisions"].append(decision)
 
-    # Rebalance trim/exit pass (Stage 3): wind overweight/removed holdings toward
-    # their target weight. Gated behind rebalance_enabled + a target_weights map
-    # (so it never runs on the classic path). Respects the daily (date,ticker)
-    # dedup and the halt, reserves a ref_id before the broker call like every
-    # other order, and cancels any resting protective stop first. Sizing is
+    # Reconcile + rebalance SELL pass (Stage 3). Two independently-gated jobs over
+    # construct's target_weights map:
+    #   * orphan full-exit (`orphan: True`) -> a HELD name NOT in the book; gated on
+    #     reconcile_unmanaged. This is the bot self-healing: anything outside the plan
+    #     (a prior watchlist, a removed engine) is wound to zero. Long-only -> sell.
+    #   * in-book trim/exit -> wind an overweight/removed book holding toward its
+    #     target weight; gated on rebalance_enabled (Stage 3, byte-identical when off).
+    # Both respect the daily (date,ticker) dedup + the halt, reserve a ref_id before
+    # the broker call, and cancel any resting protective stop first. Sizing is
     # Python-clamped; the orchestrator only executes what lands in result["orders"].
-    if target_weights and not result["halt"]:
+    sell_map = data.get("target_weights") or {}
+    if (sell_map and not result["halt"]
+            and (cfg.risk.rebalance_enabled or cfg.risk.reconcile_unmanaged)):
         handled = {d.get("ticker") for d in result["decisions"]}
-        for raw_ticker, tw in target_weights.items():
+        for raw_ticker, tw in sell_map.items():
             ticker = str(raw_ticker).upper()
             if ticker in handled or led.already_acted(day, ticker):
                 continue
-            if tw.get("intent") not in ("trim", "exit"):
-                continue
+            is_orphan = bool(tw.get("orphan"))
+            intent = tw.get("intent")
+            if is_orphan:
+                if not cfg.risk.reconcile_unmanaged or intent != "exit":
+                    continue
+            else:
+                if not cfg.risk.rebalance_enabled or intent not in ("trim", "exit"):
+                    continue
             pos = positions.get(ticker) or {}
             held_qty = float(pos.get("quantity", 0) or 0)
             if held_qty <= 0:
@@ -484,14 +644,18 @@ def _run_plan(cfg, led, data) -> dict:
             held_mv = float(pos.get("market_value", 0) or 0)
             if held_mv == 0 and quote and held_qty:
                 held_mv = quote * held_qty
-            full_exit = tw.get("intent") == "exit"
+            full_exit = is_orphan or intent == "exit"
             qty = signals.resolve_target_sell_quantity(
                 held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
                 full_exit=full_exit)
             if qty <= 0:
                 continue
             cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
-            order_kind = "rebalance_exit" if full_exit else "rebalance_trim"
+            if is_orphan:
+                order_kind, signal = "reconcile_exit", "RECONCILE"
+            else:
+                order_kind = "rebalance_exit" if full_exit else "rebalance_trim"
+                signal = "REBALANCE"
             ref_id = None
             if not cfg.dry_run:
                 ref_id = led.new_ref_id()
@@ -499,14 +663,14 @@ def _run_plan(cfg, led, data) -> dict:
                                   dollar_amount=None, quantity=qty, now_iso=now_iso,
                                   order_kind=order_kind)
             result["orders"].append({
-                "ticker": ticker, "signal": "REBALANCE", "intent": "sell",
+                "ticker": ticker, "signal": signal, "intent": "sell",
                 "ref_id": ref_id, "side": "sell", "type": "market",
                 "dollar_amount": None, "quantity": qty,
                 "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
                 "order_kind": order_kind, "cancel_ref_ids": cancel_ref_ids,
             })
             result["decisions"].append({
-                "ticker": ticker, "signal": "REBALANCE", "status": "order",
+                "ticker": ticker, "signal": signal, "status": "order",
                 "intent": "sell", "quantity": qty, "detail": order_kind})
 
     # Loop cadence: wake at the soonest re-look the model asked for (clamped),
@@ -539,22 +703,110 @@ def _run_strategy_set(cfg, led, data) -> dict:
     now_iso = data.get("now_iso") or market.now_et().isoformat()
     equity = _to_float(data.get("equity"))
     book = sc.book(sc.default_book)
-    gid = led.set_strategy_goal(
-        created_at=now_iso, target_return_pct=sc.goal.target_return_pct,
-        horizon_months=sc.goal.horizon_months, benchmark=sc.goal.benchmark,
-        benchmark_annual_pct=sc.goal.benchmark_annual_pct,
-        constraint_note=sc.goal.constraint, macro_thesis_version=sc.macro_thesis.version,
-        macro_thesis_json=json.dumps({"summary": sc.macro_thesis.summary,
-                                      "correlation_note": sc.macro_thesis.correlation_note}),
-        active_book=sc.default_book, as_of=sc.macro_thesis.version,
-        start_date=day, start_equity=equity)
-    for h in book.holdings:
-        led.upsert_target_holding(
-            goal_id=gid, sleeve=h.sleeve, ticker=h.ticker, target_weight=h.weight,
-            band=h.band, status="active", book=sc.default_book, quotable=h.quotable,
-            proxy_ticker=h.proxy_ticker, updated_at=now_iso)
+    # Component D3: capture the PRIOR active book before we supersede it, so we can diff
+    # and log each changed weight / added / removed holding to the strategy_change_log.
+    prior_goal = led.get_active_goal()
+    prior_targets = (led.active_target_portfolio(
+        prior_goal["id"], statuses=("active", "exiting", "removed")) if prior_goal else [])
+    # ATOMIC: the goal + ALL its holdings commit together (one transaction) or not
+    # at all. A partial write (crash mid-setup) would leave a truncated book that
+    # reconciliation reads as "everything else is unmanaged" -> mass liquidation.
+    goal_fields = {
+        "created_at": now_iso, "target_return_pct": sc.goal.target_return_pct,
+        "horizon_months": sc.goal.horizon_months, "benchmark": sc.goal.benchmark,
+        "benchmark_annual_pct": sc.goal.benchmark_annual_pct,
+        "constraint_note": sc.goal.constraint, "macro_thesis_version": sc.macro_thesis.version,
+        "macro_thesis_json": json.dumps({"summary": sc.macro_thesis.summary,
+                                         "correlation_note": sc.macro_thesis.correlation_note}),
+        "active_book": sc.default_book, "as_of": sc.macro_thesis.version,
+        "start_date": day, "start_equity": equity,
+    }
+    holdings = [{"sleeve": h.sleeve, "ticker": h.ticker, "target_weight": h.weight,
+                 "band": h.band, "status": "active", "book": sc.default_book,
+                 "quotable": h.quotable, "proxy_ticker": h.proxy_ticker,
+                 "updated_at": now_iso} for h in book.holdings]
+    gid = led.set_strategy_goal_with_holdings(goal=goal_fields, holdings=holdings)
+    # D3: diff the new book against the prior one + log the strategic changes (best-effort
+    # — a change-log hiccup must never block setup). Also a min-interval note (D3) when the
+    # book is re-set sooner than advised, surfacing churn without blocking it.
+    changes = []
+    interval_note = None
+    try:
+        cons = sc.consistency or strategy.ConsistencyConfig()
+        prior_by_tk = {str(t["ticker"]).upper(): t for t in prior_targets}
+        new_by_tk = {h["ticker"].upper(): h for h in holdings}
+        if prior_goal and cons.min_strategy_set_interval_days > 0 and prior_goal.get("created_at"):
+            try:
+                _days = (datetime.fromisoformat(now_iso)
+                         - datetime.fromisoformat(prior_goal["created_at"])).days
+                if _days < cons.min_strategy_set_interval_days:
+                    interval_note = (f"strategy-set re-run after {_days}d "
+                                     f"(< {cons.min_strategy_set_interval_days}d advised)")
+            except (TypeError, ValueError):
+                pass
+        for tk, h in new_by_tk.items():
+            prior = prior_by_tk.get(tk)
+            if prior is None:
+                if prior_goal:  # only an audit-worthy ADD when there WAS a prior book
+                    led.record_strategy_change(goal_id=gid, changed_at=now_iso, change_type="status",
+                                               ticker=tk, from_value=None, to_value="added",
+                                               trigger="strategy-set", reason="holding added to the book")
+                    changes.append({"ticker": tk, "change": "added"})
+            elif float(prior.get("target_weight", 0) or 0) != float(h["target_weight"]):
+                led.record_strategy_change(goal_id=gid, changed_at=now_iso, change_type="weight",
+                                           ticker=tk, from_value=prior.get("target_weight"),
+                                           to_value=h["target_weight"], trigger="strategy-set",
+                                           reason="target weight changed")
+                changes.append({"ticker": tk, "change": "weight",
+                                "from": prior.get("target_weight"), "to": h["target_weight"]})
+        for tk in prior_by_tk:
+            if tk not in new_by_tk:
+                led.record_strategy_change(goal_id=gid, changed_at=now_iso, change_type="status",
+                                           ticker=tk, from_value="active", to_value="removed",
+                                           trigger="strategy-set", reason="holding removed from the book")
+                changes.append({"ticker": tk, "change": "removed"})
+    except Exception:  # noqa: BLE001 — change-logging is observability; never blocks setup
+        pass
     return {"goal_id": gid, "active_book": sc.default_book, "holdings": len(book.holdings),
-            "start_equity": equity, "start_date": day}
+            "start_equity": equity, "start_date": day, "changes": changes,
+            "interval_note": interval_note}
+
+
+def _confirm_and_persist_regime(cfg, led, goal, macro_reading, now_iso, day):
+    """Advance + persist the CONFIRMED macro regime (Component C) and return the effective
+    regime (a REGIME_* constant). Run from CONSTRUCT — the in-runbook step that carries
+    macro_reading — so the hysteresis is actually LIVE (learn-review, which only READS the
+    result, is not in the runbook). Best-effort; the SOLE confirmer so the counter advances
+    exactly once per tick. A missing/None macro_reading is NO new evidence -> hold the
+    current effective regime (an operator omission never accumulates a flip toward HOLD)."""
+    import lib.strategy as strategy
+    prior_ts = led.get_thesis_state(goal["id"])
+    effective_now = strategy.normalize_regime((prior_ts or {}).get("regime"))
+    if not macro_reading:
+        return effective_now  # no reading == no new evidence; hold current, accumulate nothing
+    cons = (cfg.strategy.consistency if cfg.strategy is not None else None) or strategy.ConsistencyConfig()
+    raw_regime = strategy.regime_label_banded(cfg.strategy, macro_reading, cons.regime_deadband_pce)
+    conf = strategy.regime_with_confirmation(
+        prior_ts, raw_regime, confirm_n=cons.regime_confirm_n,
+        min_dwell_days=cons.regime_min_dwell_days, today=day)
+    effective = conf["effective_regime"]
+    _word = {strategy.REGIME_STAND_DOWN: "standdown", strategy.REGIME_DEPLOY: "deploy"}
+    pending_word = _word.get(conf["pending_regime"], "neutral") if conf["pending_regime"] else None
+    led.upsert_thesis_state(
+        goal_id=goal["id"], as_of=day, regime=_word.get(effective, "neutral"),
+        active_book=goal["active_book"], last_trigger=raw_regime,
+        last_macro_json=json.dumps(macro_reading or {}), updated_at=now_iso,
+        pending_regime=pending_word, pending_since=conf["pending_since"],
+        confirm_count=conf["confirm_count"], regime_since=conf["regime_since"])
+    if conf["changed"]:
+        try:
+            led.record_strategy_change(
+                goal_id=goal["id"], changed_at=now_iso, change_type="regime",
+                from_value=effective_now, to_value=effective, trigger="macro_reading",
+                reason=conf["reason"], proof_json=json.dumps(macro_reading or {}))
+        except Exception:  # noqa: BLE001 — the change-log is observability; never blocks
+            pass
+    return effective
 
 
 def cmd_construct(args) -> dict:
@@ -576,12 +828,30 @@ def _run_construct(cfg, led, data) -> dict:
     positions_in = data.get("positions", {}) or {}
     positions_mv = {str(tk).upper(): (_to_float((pos or {}).get("market_value")) or 0.0)
                     for tk, pos in positions_in.items()}
-    # The recommended book from the operator macro reading (advisory: the executable
-    # targets still come from the ledger's current book; switching to dial-up is a
-    # gated universe change, not an automatic construct-time swap).
+    now_iso = data.get("now_iso") or market.now_et().isoformat()
+    day = market.trading_day_et()
+    # Component C: advance + persist the CONFIRMED regime HERE (the in-runbook step) so the
+    # hysteresis is live. Best-effort — a hiccup falls back to the prior/raw regime; it never
+    # blocks construct. The recommended book then follows the CONFIRMED effective regime, NOT
+    # the raw per-tick macro_reading, so a single noisy PCE print can't swing the recommendation.
+    effective_regime = None
+    if cfg.strategy is not None:
+        try:
+            effective_regime = _confirm_and_persist_regime(
+                cfg, led, goal, data.get("macro_reading"), now_iso, day)
+        except Exception:  # noqa: BLE001 — regime bookkeeping is best-effort
+            effective_regime = None
     book_name, book_reason = goal["active_book"], "active goal book"
     if cfg.strategy is not None:
-        book_name, book_reason = strategy.select_active_book(cfg.strategy, data.get("macro_reading"))
+        if effective_regime is None:
+            _ts = led.get_thesis_state(goal["id"])
+            effective_regime = (strategy.normalize_regime(_ts["regime"])
+                                if (_ts and _ts.get("regime")) else None)
+        if effective_regime is not None:
+            book_name, book_reason = strategy.book_for_regime(cfg.strategy, effective_regime)
+            book_reason = f"confirmed regime {effective_regime}: {book_reason}"
+        else:
+            book_name, book_reason = strategy.select_active_book(cfg.strategy, data.get("macro_reading"))
     targets = led.active_target_portfolio(goal["id"], statuses=("active", "exiting"))
     rows = portfolio.construct_target_book(
         targets, positions_mv, equity, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
@@ -589,8 +859,31 @@ def _run_construct(cfg, led, data) -> dict:
                                     "target_weight": r["target_weight"],
                                     "delta_dollars": r.get("delta_dollars"),
                                     "quotable": r["quotable"]} for r in rows}
+    # Self-reconciliation: any HELD position NOT in the book (and not the cash sleeve)
+    # is UNMANAGED -> emit a full-exit so plan winds it to zero. This is how the bot
+    # heals its own drift after a book edit or a prior hand-maintained watchlist:
+    # whatever is no longer in the plan gets sold. Long-only (only ever SELLS, to cash).
+    # Plan executes these only when cfg.risk.reconcile_unmanaged is on; we surface
+    # them in `decisions`/`orders` (RECONCILE) so the run is fully auditable.
+    # FAIL-SAFE FLOOR: only reconcile against a NON-EMPTY book. An active goal with
+    # zero target rows can only arise from corruption (a valid strategy.yaml always
+    # sums to ~100, and strategy-set is atomic) — and "sell everything" is never a
+    # safe deterministic default. With no targets we emit NO orphans. (A deliberate
+    # all-cash book still HAS the SGOV row, so a real go-to-cash instruction is
+    # unaffected; this only blocks the degenerate empty-book case.)
+    book_tickers = {str(t["ticker"]).upper() for t in targets}
+    cash = (cfg.risk.cash_sleeve_ticker or "SGOV").upper()
+    unmanaged = []
+    if book_tickers:
+        for tk, mv in positions_mv.items():
+            if mv <= 0 or tk in book_tickers or tk == cash:
+                continue
+            target_weights[tk] = {"intent": "exit", "target_dollars": 0.0, "target_weight": 0.0,
+                                  "delta_dollars": -round(mv, 2), "quotable": True, "orphan": True}
+            unmanaged.append(tk)
     return {"proceed": True, "goal_id": goal["id"], "active_book": goal["active_book"],
             "recommended_book": book_name, "book_reason": book_reason,
+            "reconcile_unmanaged": cfg.risk.reconcile_unmanaged, "unmanaged": unmanaged,
             "target_weights": target_weights}
 
 
@@ -637,18 +930,39 @@ def _run_learn_review(cfg, led, data) -> dict:
     if not goal or cfg.strategy is None:
         return {"reviewed": False, "reason": "no active goal / strategy layer inactive"}
     learning = cfg.strategy.learning
-    macro_regime = strategy.regime_label(cfg.strategy, data.get("macro_reading"))
-    progress = goal_mod.compute_from_ledger(led, goal)
+    cons = cfg.strategy.consistency or strategy.ConsistencyConfig()
     now_iso = market.now_et().isoformat()
     day = market.trading_day_et()
+    # Component C: the regime that drives the DERISK proposal is the CONFIRMED effective
+    # regime that CONSTRUCT advanced + persisted earlier this tick (construct is the SOLE
+    # confirmer, so the counter advances exactly once per tick). Here we only READ it. If
+    # construct didn't run (no thesis_state yet), fall back to a raw banded reading for the
+    # proposal only — best-effort, dormant when the strategy layer is otherwise inactive.
+    _ts = led.get_thesis_state(goal["id"])
+    if _ts and _ts.get("regime"):
+        macro_regime = strategy.normalize_regime(_ts["regime"])
+    else:
+        macro_regime = strategy.regime_label_banded(
+            cfg.strategy, data.get("macro_reading"), cons.regime_deadband_pce)
+    progress = goal_mod.compute_from_ledger(led, goal)
     ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress)
     recorded = []
     new_proposals = []
+    cooled = []  # E1: hashes suppressed because they were recently decided
+    cooldown_cut = (datetime.fromisoformat(now_iso)
+                    - timedelta(days=cons.proposal_cooldown_days)).isoformat()
     for p in ps["all"]:
+        chash = p.content_hash()
+        # E1 — anti-oscillation: if this exact change was applied/rejected within the
+        # cooldown window, do NOT re-propose it (stops propose->reject->propose churn).
+        last = led.last_decided_universe_change(goal["id"], chash)
+        if last and (last.get("decided_at") or "") >= cooldown_cut:
+            cooled.append(chash)
+            continue
         rid = led.record_universe_proposal(
             goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker,
             sleeve=p.sleeve, from_book=p.from_book, to_book=p.to_book,
-            target_weight=p.target_weight, tier=p.tier, content_hash=p.content_hash(),
+            target_weight=p.target_weight, tier=p.tier, content_hash=chash,
             reason=p.reason, goal_gap_pct=p.goal_gap_pct)
         if rid:
             recorded.append(rid)
@@ -663,16 +977,14 @@ def _run_learn_review(cfg, led, data) -> dict:
                 f"[{p.kind}] {p.ticker or 'BOOK'} ({p.tier}) — {p.reason}", date=day)
     except Exception:  # noqa: BLE001
         pass
-    regime_word = {"STAND_DOWN": "standdown", "DEPLOY": "deploy"}.get(macro_regime, "neutral")
-    led.upsert_thesis_state(goal_id=goal["id"], as_of=day, regime=regime_word,
-                            active_book=goal["active_book"], last_trigger=macro_regime,
-                            last_macro_json=json.dumps(data.get("macro_reading") or {}),
-                            updated_at=now_iso)
+    # (Regime confirmation + thesis_state persistence + the regime change-log live in
+    # construct now — the in-runbook step + the SOLE confirmer. Learn-review only READS
+    # the effective regime above, so the counter never double-advances.)
     cutoff = (datetime.fromisoformat(now_iso) - timedelta(days=learning.proposal_expiry_days)).isoformat()
     expired = led.expire_old_proposals(goal["id"], cutoff)
     return {"reviewed": True, "macro_regime": macro_regime, "proposals": len(ps["all"]),
             "needs_approval": len(ps["needs_approval"]), "auto_apply_eligible": len(ps["auto_apply"]),
-            "recorded_ids": recorded, "expired": expired}
+            "recorded_ids": recorded, "expired": expired, "suppressed_cooldown": len(cooled)}
 
 
 def cmd_universe_apply(args) -> dict:
@@ -698,16 +1010,111 @@ def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
         flag = "auto_apply_derisk" if tier == "derisk" else "auto_apply_universe_changes"
         return {"applied": False, "reason": f"tier '{tier}' requires --approve ({flag} is off)",
                 "change": change}
+    import lib.strategy as strategy
+    cons = (cfg.strategy.consistency if cfg.strategy is not None else None) or strategy.ConsistencyConfig()
     now_iso = market.now_et().isoformat()
     goal = led.get_active_goal()
+
+    # E2/E3 guards apply to the AUTOMATIC path (learning auto-apply flags). A human
+    # `--approve` is itself a deliberate, out-of-band confirmation, so it does the
+    # book-conserving transform but is not re-gated by the recurrence/freshness checks.
+    auto = not approve
+    revalidation_note = None
+
+    # E2 — confirm-over-N: an AUTO REMOVE/DERISK is actionable only after it has recurred
+    # on >= universe_confirm_days distinct days, so one bad crossing can't evict a sleeve.
+    recurrence = led.count_proposal_recurrence(goal["id"], change["content_hash"]) if goal else 0
+    if auto and change["kind"] in ("PROPOSE_REMOVE", "PROPOSE_DERISK"):
+        if recurrence < cons.universe_confirm_days:
+            return {"applied": False, "change": change,
+                    "reason": f"not yet confirmed: seen on {recurrence}/{cons.universe_confirm_days} "
+                              "distinct days (re-proposed until it persists)"}
+
     effect = "recorded"
     if change["kind"] == "PROPOSE_REMOVE" and change.get("ticker") and goal:
-        led.set_holding_status(goal["id"], change["ticker"], "exiting", now_iso)
-        effect = "holding set to exiting (rebalancer winds to zero; freed dollars -> cash)"
+        import lib.risk as risk
+        import lib.universe as universe
+        learning = cfg.strategy.learning
+        # E3a — re-validate the underperformance NOW for the AUTO path (the propose-time
+        # proof may be stale; the name may have recovered). A human --approve trusts the
+        # operator's judgment and skips the re-litigation.
+        rows = led.ticker_return_series(change["ticker"])
+        returns = [r["directional_return"] for r in rows if r.get("directional_return") is not None]
+        m = risk.sustained_underperformance(
+            returns, window=learning.underperf_window, min_n=learning.min_resolved_n,
+            hit_floor=learning.underperf_hit_floor, mean_floor=learning.underperf_mean_floor)
+        if auto and (m.value is None or m.value < 1.0):
+            return {"applied": False, "change": change,
+                    "reason": f"underperformance no longer holds at apply time [{m.proof()}]"}
+        revalidation_note = m.proof()
+        # E3b — apply the pure remove + conserve freed weight into cash (keeps the book
+        # summed to ~100%). The AUTO path REFUSES a resulting malformed book; a human
+        # --approve proceeds with the conserved transform (logged) since they own the call.
+        current = led.active_target_portfolio(goal["id"], statuses=("active", "exiting", "removed"))
+        new_rows, freed = universe.apply_remove(current, change["ticker"])
+        new_rows = universe.redistribute_to_cash(new_rows, freed, cfg.risk.cash_sleeve_ticker)
+        ok, why = universe.validate_book(new_rows)
+        if not ok and auto:
+            return {"applied": False, "change": change,
+                    "reason": f"refusing remove: resulting book invalid ({why})"}
+        if not ok:
+            revalidation_note = f"{revalidation_note}; book-check WARN: {why}"
+        for r in new_rows:
+            led.upsert_target_holding(
+                goal_id=goal["id"], sleeve=r.get("sleeve"), ticker=r["ticker"],
+                target_weight=r.get("target_weight"), band=r.get("band", 0) or 0,
+                status=r.get("status", "active"), book=r.get("book"),
+                quotable=bool(r.get("quotable", 1)), proxy_ticker=r.get("proxy_ticker"),
+                updated_at=now_iso)
+        try:
+            led.record_strategy_change(
+                goal_id=goal["id"], changed_at=now_iso, change_type="status",
+                ticker=change["ticker"], from_value="active", to_value="exiting",
+                trigger="universe-apply", reason=change.get("reason"),
+                proof_json=json.dumps({"recurrence": recurrence, "revalidation": m.proof(),
+                                       "freed_weight": round(freed, 2)}))
+        except Exception:  # noqa: BLE001
+            pass
+        effect = (f"holding set to exiting; {round(freed, 2)}%% freed weight -> cash; "
+                  "book re-validated to ~100% (rebalancer winds the position to zero)")
     led.mark_universe_change(change_id, "applied", now_iso, "operator" if approve else "auto")
     return {"applied": True, "change_id": change_id, "kind": change["kind"],
             "ticker": change.get("ticker"), "effect": effect,
             "via": "operator" if approve else "auto"}
+
+
+def cmd_decision_proof(args) -> dict:
+    """Print the stored proof bundle for one decision id (Component B observability).
+
+    Shows the consistency verdict + its inputs (prior stance, plan_trigger, basis
+    change, flip count) so a human can audit WHY a decision was allowed or suppressed."""
+    led = Ledger(LEDGER_DB)
+    d = led.get_decision(int(args.id))
+    if not d:
+        return {"ok": False, "reason": "no such decision id", "id": int(args.id)}
+    proof = None
+    if d.get("proof_json"):
+        try:
+            proof = json.loads(d["proof_json"])
+        except Exception:  # noqa: BLE001
+            proof = {"raw": d["proof_json"]}
+    return {"ok": True, "id": d["id"], "ticker": d["ticker"], "trade_date": d["trade_date"],
+            "signal": d.get("signal"), "intent": d.get("intent"), "basis": d.get("basis"),
+            "plan_trigger": d.get("plan_trigger"), "proof": proof}
+
+
+def cmd_strategy_history(args) -> dict:
+    """Print the recent strategic-change audit trail (Component D observability).
+
+    The append-only record of every regime/book/weight/status change with from->to +
+    trigger + reason + proof — so a posture/weight flip-flop is detectable after the fact."""
+    led = Ledger(LEDGER_DB)
+    goal = led.get_active_goal()
+    if not goal:
+        return {"ok": True, "reason": "no active goal", "changes": []}
+    rows = led.strategy_change_history(goal["id"], limit=int(getattr(args, "limit", 50) or 50),
+                                       change_type=getattr(args, "type", None) or None)
+    return {"ok": True, "goal_id": goal["id"], "count": len(rows), "changes": rows}
 
 
 def cmd_commit(args) -> dict:
@@ -1094,7 +1501,7 @@ def cmd_reflect(args) -> dict:
     # fail the tick (reflect is best-effort) — surface it in the output instead.
     if affected:
         try:
-            cfg = load_config(REPO / "config.yaml")
+            cfg = load_config(CONFIG_PATH)
             from lib import reflect_memory
             out["memory_update"] = reflect_memory.update_after_outcome(
                 led, affected, cfg.memory, cfg.memory.dir, now_label=now_iso)
@@ -1110,7 +1517,7 @@ def cmd_reflect(args) -> dict:
 # tick — prune_dir/get_archiver never raise.
 
 def cmd_prune(_args) -> dict:
-    cfg = load_config(REPO / "config.yaml")
+    cfg = load_config(CONFIG_PATH)
     arch = storage.get_archiver(cfg.storage)
     summaries = [
         storage.prune_dir(t, cfg.storage.retention_days, archiver=arch)
@@ -1132,7 +1539,7 @@ def cmd_prune(_args) -> dict:
 # memory-rebuild regenerates every file from the ledger (also backfills history).
 
 def cmd_memory_show(args) -> dict:
-    cfg = load_config(REPO / "config.yaml")
+    cfg = load_config(CONFIG_PATH)
     led = Ledger(LEDGER_DB)
     from lib import reflect_memory
     ticker = (getattr(args, "ticker", "") or "").strip().upper()
@@ -1149,7 +1556,7 @@ def cmd_memory_show(args) -> dict:
 
 
 def cmd_memory_rebuild(_args) -> dict:
-    cfg = load_config(REPO / "config.yaml")
+    cfg = load_config(CONFIG_PATH)
     led = Ledger(LEDGER_DB)
     from lib import reflect_memory
     now_iso = market.now_et().isoformat()
@@ -1196,6 +1603,11 @@ def main(argv) -> int:
     p_ms = sub.add_parser("memory-show")
     p_ms.add_argument("--ticker", default="")
     sub.add_parser("memory-rebuild")
+    p_dp = sub.add_parser("decision-proof")
+    p_dp.add_argument("--id", required=True)
+    p_sh = sub.add_parser("strategy-history")
+    p_sh.add_argument("--limit", default="50")
+    p_sh.add_argument("--type", default="")
     args = ap.parse_args(argv)
 
     try:
@@ -1231,6 +1643,10 @@ def main(argv) -> int:
             out = cmd_memory_show(args)
         elif args.cmd == "memory-rebuild":
             out = cmd_memory_rebuild(args)
+        elif args.cmd == "decision-proof":
+            out = cmd_decision_proof(args)
+        elif args.cmd == "strategy-history":
+            out = cmd_strategy_history(args)
         else:  # unreachable
             raise SystemExit(2)
     except Exception as e:  # noqa: BLE001

@@ -193,6 +193,110 @@ def is_material_change(cur_signal, cur_intent, last_signal, last_intent) -> bool
     return (cur_signal, cur_intent) != (last_signal, last_intent)
 
 
+# --- memory-grounded strategy-consistency gate (Component A; cross-DAY) -------
+# Unlike the intraday gates above (cooldown/action-cap/on-change), these span days
+# and answer: "is today's buy<->sell REVERSAL part of a consistent recorded strategy,
+# or is it random?" Pure + total + unit-tested; tick.py feeds them ledger facts (the
+# prior completed-trade stance + its declared plan) and a Python-VERIFIED plan_trigger.
+# NOT a calendar dwell: a reversal is fine the very next day IF it executes the
+# recorded plan (a stop/target/review firing) or a genuine, budget-respecting basis
+# change; it is suppressed only when it is ungrounded (silently contradicts the
+# recorded stance) or serial churn. This module never imports lib.risk (the wall).
+
+_OPENING = {"buy"}
+_CLOSING = {"sell"}
+
+
+def direction_of(intent: Optional[str]) -> str:
+    """Map an order intent to a position DIRECTION: 'open' (buy/add), 'close'
+    (sell/trim), or 'neutral' (hold/skip/unknown). The unit the reversal check works in."""
+    i = (intent or "").strip().lower()
+    if i in _OPENING:
+        return "open"
+    if i in _CLOSING:
+        return "close"
+    return "neutral"
+
+
+def is_reversal(prior_intent: Optional[str], new_intent: Optional[str]) -> bool:
+    """True iff the new intent REVERSES the prior committed direction (open<->close).
+
+    A continuation (open->open / close->close) or anything touching 'neutral' (no
+    prior stance, or a hold) is NOT a reversal — only a real direction flip is gated.
+    """
+    a, b = direction_of(prior_intent), direction_of(new_intent)
+    if a == "neutral" or b == "neutral":
+        return False
+    return a != b
+
+
+def reversal_rate(intents) -> Tuple[int, int]:
+    """(reversals, transitions) over an ordered intent sequence (oldest->newest).
+
+    Pure churn counter for the ADVISORY signal_stability metric (lib.risk reuses it).
+    'neutral' intents (hold/skip) are dropped so only real stance changes count.
+    """
+    dirs = [d for d in (direction_of(i) for i in intents) if d in ("open", "close")]
+    transitions = max(0, len(dirs) - 1)
+    reversals = sum(1 for a, b in zip(dirs, dirs[1:]) if a != b)
+    return (reversals, transitions)
+
+
+def count_discretionary_reversals(records) -> int:
+    """Recent DISCRETIONARY reversals — the 'changed my mind' flips that count against
+    the consistency budget. ``records`` is oldest->newest dicts with 'intent' and an
+    optional 'plan_trigger'. A reversal driven by a plan_trigger (a recorded stop/
+    target/review firing) is the strategy EXECUTING, not churn, so it does NOT count;
+    only reversals with no plan_trigger do.
+    """
+    seq = []
+    for r in records:
+        d = direction_of((r or {}).get("intent"))
+        if d in ("open", "close"):
+            seq.append((d, (r or {}).get("plan_trigger")))
+    count = 0
+    for (a, _), (b, trig_b) in zip(seq, seq[1:]):
+        if a != b and not trig_b:
+            count += 1
+    return count
+
+
+def strategy_consistency_verdict(
+    *, prior_intent: Optional[str], new_intent: Optional[str],
+    plan_trigger: Optional[str], basis_changed: bool,
+    recent_discretionary_reversals: int, max_discretionary_reversals: int,
+    enabled: bool = True,
+) -> Tuple[bool, str]:
+    """Decide whether a discretionary buy/sell may proceed given the recorded stance.
+
+    Returns (allowed, reason). Pure + total. The order of grounding (see plan):
+      * gate disabled -> always allow (byte-identical to the classic path).
+      * not a reversal (continuation / neutral) -> allow.
+      * a Python-VERIFIED plan_trigger (stop/target/loss/review) -> allow: the recorded
+        strategy is executing (this is the "buy one day, sell the next, consistently"
+        case the user wants permitted).
+      * a genuine basis change, WITHIN the churn budget -> allow.
+      * a basis change OVER the budget -> suppress ('basis_churn'): serial unexplained
+        changes of mind are the operational definition of random.
+      * neither a trigger nor a declared basis change -> suppress ('ungrounded_reversal').
+
+    Fail-safe: the suppressing branches only ever fire on a REVERSAL, never on a
+    continuation/open — so a gate error (caller passes conservative defaults) can only
+    block a flip, never a normal buy/add.
+    """
+    if not enabled:
+        return (True, "gate_disabled")
+    if not is_reversal(prior_intent, new_intent):
+        return (True, "continuation_or_neutral")
+    if plan_trigger:
+        return (True, f"executing_recorded_plan:{plan_trigger}")
+    if basis_changed:
+        if recent_discretionary_reversals >= max_discretionary_reversals:
+            return (False, "basis_churn")
+        return (True, "recorded_basis_change")
+    return (False, "ungrounded_reversal")
+
+
 # Absolute upper bound on any re-check delay, enforced in code regardless of
 # config. The model may propose an absurd cadence (e.g. 168h = 7 days) and an
 # operator may mis-set review_ceiling_min in config.yaml — this backstop

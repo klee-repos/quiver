@@ -36,7 +36,7 @@ FAIL = 0
 def _cfg():
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/judge_kill",
-        "strategy_path": str(_REPO / "strategy.yaml"),
+        "strategy_path": str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml"),
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 20.0,
                  "daily_capital_deploy_cap": 1000, "max_open_position_per_ticker": 50,
                  "min_buying_power_buffer": 5, "rebalance_enabled": True},
@@ -119,6 +119,24 @@ def main() -> int:
         "CBRS, PLTR, AMZN, REMX, HOOD, TSLA, GOOGL."),
         {"derived_universe": derived_universe, "book": book})
 
+    # 1c) The LIVE strategy book — validate the actual strategy.yaml the bot trades:
+    #     a focused AI end-to-end supply chain, incl. SpaceX + a tradable Solana ETF.
+    import lib.strategy as _strat_mod
+    _live = _strat_mod.load_strategy(_REPO / "strategy.yaml")
+    ai_book = {h.ticker: {"sleeve": h.sleeve, "weight": h.weight, "quotable": bool(h.quotable)}
+               for h in _live.book(_live.default_book).holdings}
+    judge("ai-supply-chain-book", (
+        "This is the LIVE strategy book the bot actually trades. It must be a focused AI "
+        "END-TO-END supply-chain portfolio:\n"
+        "1. Weights sum to ~100 (within 1).\n"
+        "2. It spans the AI value chain — it must cover compute/semis AND power-or-grid AND "
+        "data-center-or-networking sleeves (not just one).\n"
+        "3. It includes SpaceX as ticker SPCX.\n"
+        "4. It includes Solana via a tradable ETF ticker BSOL with quotable == true (NOT a "
+        "non-tradable spot coin).\n"
+        "5. It keeps a cash ballast (SGOV present).\n"
+        "6. Every holding is quotable == true (no quotable:false spot-crypto entries)."), ai_book)
+
     # 2) Construct -------------------------------------------------------------
     con = T._run_construct(cfg, led, {"equity": 100.0, "positions": {"XLV": {"market_value": 20.0}},
                                       "macro_reading": None})
@@ -128,6 +146,18 @@ def main() -> int:
         "3. XLV is held at $20 vs a ~$9 target, so XLV intent must be 'trim'.\n"
         "4. SOL (spot crypto, unquotable) intent must be 'skip_unquotable'.\n"
         "5. SGOV intent must be 'cash_residual'."), con)
+
+    # 2b) Self-reconciliation — a HELD position not in the book is wound to zero.
+    con_rec = T._run_construct(cfg, led, {"equity": 100.0,
+        "positions": {"AAPL": {"market_value": 15.0}, "SMH": {"market_value": 5.0}},
+        "macro_reading": None})
+    judge("reconcile-unmanaged", (
+        "The bot SELF-RECONCILES: it sells any held position that is NOT in the strategy book "
+        "down to zero (long-only). Here AAPL is held but is NOT a book holding:\n"
+        "1. 'unmanaged' includes AAPL.\n"
+        "2. In target_weights, AAPL has intent 'exit' and orphan == true (it will be wound to zero).\n"
+        "3. SMH (a real book holding) is NOT in 'unmanaged'.\n"
+        "4. The cash sleeve SGOV is NEVER listed in 'unmanaged'."), con_rec)
 
     # 3) Plan dry-run safety ---------------------------------------------------
     plan = T._run_plan(cfg, led, {

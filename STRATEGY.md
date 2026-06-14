@@ -76,4 +76,8 @@ holdings are pulling their weight vs. the thesis, and any add/remove/de-risk it 
 proposing. Risky universe changes still require your approval before they touch
 `strategy.yaml`.)*
 
-- _(none yet)_
+- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
+- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
+- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
+- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
+- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash

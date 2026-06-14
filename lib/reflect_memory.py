@@ -291,10 +291,29 @@ def rebuild_all(led, cfg_memory, base_dir, *, now_label: str = "") -> dict:
 
 # --- read path: enriched context with ordered fallback (D3) ------------------
 
+def _stance_block(led, ticker: str, *, compact: bool = False) -> str:
+    """Advisory stance-history block (Component F): the recent decision SEQUENCE +
+    the deterministic reversal-rate (with proof) + the no-reverse-without-a-catalyst
+    contract. Lets the model SEE its own churn so it stays self-consistent. Reads
+    decisions only (the analysis carve-out); never gates — the binding gate is Python."""
+    rows = led.recent_decisions(ticker, 4 if compact else 8)  # newest first
+    directional = [r for r in rows if r.get("intent") in ("buy", "sell")]
+    if len(directional) < 2:
+        return ""  # nothing to be consistent WITH yet
+    intents_oldest_first = [r["intent"] for r in reversed(directional)]
+    metric = risk.signal_stability(intents_oldest_first)
+    seq = " <- ".join(f"{r.get('trade_date')}:{r.get('signal')}" for r in directional[:5])
+    contract = ("Consistency contract: a REVERSAL of your prior stance needs a NAMED new "
+                "catalyst (state it in Catalyst); absent one, hold your prior stance — the "
+                "execution layer suppresses ungrounded flips.")
+    return (f"Your recent stance on {ticker} (newest first): {seq}.\n"
+            f"{metric.render()}\n{contract}")
+
+
 def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False) -> str:
-    """Compose the injectable context: existing scorecard + per-ticker risk block +
-    portfolio risk block (each with proof). compact=True (upstream agents) trims the
-    scorecard's decision list. Each block is independently isolated."""
+    """Compose the injectable context: existing scorecard + stance-consistency block +
+    per-ticker risk block + portfolio risk block (each with proof). compact=True
+    (upstream agents) trims the lists. Each block is independently isolated."""
     recent = 3 if compact else 6
     limit = 3 if compact else 8
     parts: List[str] = []
@@ -303,6 +322,14 @@ def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False)
         sc = memory.build_scorecard(ticker, rows, recent=recent)
         if sc:
             parts.append(sc)
+    except Exception:  # noqa: BLE001
+        pass
+    # Stance-consistency block — its own try/except so a hiccup never shrinks the
+    # proven scorecard/risk context below.
+    try:
+        block = _stance_block(led, ticker, compact=compact)
+        if block:
+            parts.append(block)
     except Exception:  # noqa: BLE001
         pass
     for key in ("ticker", "portfolio"):

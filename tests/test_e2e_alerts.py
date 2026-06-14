@@ -210,10 +210,14 @@ def main() -> int:
     rt._maybe_alert(led_g, kind="error", stage="commit", day=DAY, now_iso=NOW,
                     event_detail="y", send=_boom)  # must not raise
     ok("a raising transport is swallowed (never crashes the supervisor)", len(sent) == before)
-    os.environ.pop("RESEND_API_KEY", None)
+    # Simulate an UNCONFIGURED box by blanking the key (not popping it): _maybe_alert
+    # calls load_config -> load_dotenv, which would re-inject RESEND_API_KEY from a real
+    # .env (dotenv only fills UNSET vars; override=False leaves a present-but-empty one).
+    os.environ["RESEND_API_KEY"] = ""
     rt._maybe_alert(led_g, kind="error", stage="reflect", day=DAY, now_iso=NOW,
                     event_detail="z", send=lambda **k: sent.append(k) or {"ok": True})
     ok("unconfigured (no key) -> no send, no raise", len(sent) == before)
+    os.environ.pop("RESEND_API_KEY", None)
     os.environ.pop("NOTIFY_ALERTS_TO", None)
     os.environ.pop("RESEND_FROM", None)
     # generic orchestrator-crash alert is suppressed when the in-tick path already paged

@@ -84,9 +84,13 @@ Call the Robinhood MCP with the `account_number` from preflight:
      `deploy/setup.sh` (see docs/DEPLOY.md).
 2. `get_equity_positions(account_number)` → for each held ticker record
    `{quantity, market_value}`.
-3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>])`
+3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>
+   + <every currently-held position ticker>])`
    → record each ticker's latest price as `{TICKER: last_price}`. This is the single
    price source Python uses for sizing, decision-price capture, and outcome scoring.
+   Include the held tickers so Python can price rebalance trims AND reconcile-exits
+   of positions that are no longer in the book (a full exit still sells without a
+   quote, but include them so a trim is priced correctly).
 
 ## STEP 3 — Analyze each pending ticker (DeepSeek, slow)
 
@@ -106,15 +110,19 @@ nothing for you to do. To inspect the math any time:
 
 ## STEP 3b — Construct the target book (deterministic; no-op on the classic path)
 
-Keeps the day's orders pointed at the 15%-goal book. A NO-OP unless the strategy
-layer is active (an active goal exists AND `config.yaml: risk.rebalance_enabled`
-is `true`). Python decides everything; you only copy JSON.
+Keeps the day's orders pointed at the 15%-goal book. A NO-OP only when there is no
+active strategy goal (`proceed:false`). With an active goal it returns the deterministic
+`target_weights` that drive (a) rebalance trims/buys toward the book when
+`config.yaml: risk.rebalance_enabled` is `true`, and (b) **reconciliation exits** of
+any HELD position that is no longer in the book when `risk.reconcile_unmanaged` is `true`.
+Python decides everything; you only copy JSON. **Pass EVERY currently-held position** so
+construct can flag off-book holdings for wind-down.
 
 Write `state/tmp/construct_input.json`:
 ```json
 {
   "equity": <from get_portfolio>,
-  "positions": { "AAPL": {"market_value": 600.0}, ... },
+  "positions": { "AAPL": {"market_value": 600.0}, ... },   // ALL held positions
   "macro_reading": { "core_pce_pct": <latest core-PCE % or null>, "fed_hike": <true|false> }
 }
 ```
@@ -126,6 +134,8 @@ the invariant); omit it / use null to hold the conservative default book. Run:
 - `proceed: false` → no active strategy goal → SKIP this step; STEP 4 runs classic.
 - Otherwise drop the returned `target_weights` object verbatim into the STEP 4
   `plan_input.json` under a `"target_weights"` key. Do not compute weights yourself.
+  (`unmanaged` lists held tickers not in the book — folded into `target_weights` as
+  exits; plan winds them to zero when `reconcile_unmanaged` is on. Long-only: sells only.)
 
 (One-time, off-tick: `tick.py strategy-set --input '{"equity": <equity>}'` writes the
 active goal + book from `strategy.yaml`. Best-effort `tick.py goal-track` in STEP 7
@@ -148,11 +158,12 @@ Write a file `state/tmp/plan_input.json` containing:
 ```
 (`quotes` is the STEP 2.3 map. Omit a ticker only if its quote was unavailable —
 Python falls back to the model's entry_price for that ticker's decision price.
-`target_weights` is consumed ONLY when `rebalance_enabled` is true; absent or with
-the flag off, `plan` is byte-identical to the validated once-a-day path. When it
-is active, a target can only REDUCE a buy or trigger a clamped `rebalance_trim`/
-`rebalance_exit` — it never bypasses the per-trade/daily/buying-power caps or the
-daily-loss halt.)
+`target_weights` is consumed when `rebalance_enabled` OR `reconcile_unmanaged` is
+true; with BOTH off (and no active goal) `plan` is byte-identical to the validated
+once-a-day path. When active, a target can only REDUCE a buy or trigger a clamped
+sell — `rebalance_trim`/`rebalance_exit` for in-book drift, or `reconcile_exit` to
+wind an off-book holding to zero — never bypassing the per-trade/daily/buying-power
+caps or the daily-loss halt. All such sells are long-only.)
 Run:
 ```
 ~/dev/quiver/.venv/bin/python tick.py plan --input state/tmp/plan_input.json
@@ -165,7 +176,11 @@ Parse the JSON:
   with `kind:"halt"`, `stage:"daily_loss_halt"` (include the plan JSON as `plan` so the
   email shows equity + the trip), and **STOP**.
 - `orders` is the explicit list to execute. `decisions` are the holds/skips/errors
-  already recorded — just log them. If `orders` is empty → no trades to place, but
+  already recorded — just log them. A decision with `detail` starting `consistency:`
+  (e.g. `consistency:ungrounded_reversal` / `consistency:basis_churn`) is the
+  strategy-consistency gate suppressing a RANDOM cross-day buy/sell flip — Python's
+  call, recorded with its proof; just log it like any other skip, never override it.
+  If `orders` is empty → no trades to place, but
   STILL run STEP 6b (reflect) and STEP 7 (close-out, incl. cadence) before ending.
 - `next_review_minutes` / `next_wake_iso` (intraday only): the Python-clamped,
   market-snapped delay until the next wake — used in STEP 7 to schedule the next tick.

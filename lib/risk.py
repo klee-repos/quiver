@@ -273,6 +273,28 @@ def win_loss_stats(returns: Sequence[float], *, low_n: int = 5) -> Dict[str, Met
     }
 
 
+def signal_stability(intents: Sequence[Optional[str]], *, low_n: int = 5) -> Metric:
+    """Stance churn over a decision history (the ADVISORY side of Component A).
+
+    ``intents`` is the ordered (oldest->newest) buy/sell/hold intents from the ledger
+    decisions. Reuses the PURE ``lib.signals.reversal_rate`` counter (single source of
+    truth — risk.py is allowed to import the pure signals mapping; the wall only forbids
+    the reverse). value = reversals / direction-transitions, a churn rate in [0,1] where
+    LOWER means a more self-consistent stance. None when there are <2 directional stances
+    to compare. Analysis CONTEXT only — it never feeds sizing (the binding gate lives in
+    tick.py + lib.signals)."""
+    from lib.signals import reversal_rate
+    reversals, transitions = reversal_rate(intents)
+    value = (reversals / transitions) if transitions > 0 else None
+    return Metric(
+        "stance_reversal_rate", value, transitions,
+        "reversals / direction-transitions (lower = more consistent)",
+        f"reversals={reversals}, transitions={transitions}", unit="pct",
+        note=("" if transitions > 0 else "n<2 directional stances: undefined"),
+        low_confidence=(transitions < low_n),
+    )
+
+
 def rolling_window_trend(
     returns: Sequence[float],
     graded: Sequence[Tuple[Optional[str], float]],

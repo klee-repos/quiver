@@ -94,3 +94,20 @@ learning:
   auto_apply_universe_changes: false    # risky direction; human-gated
   goal_gap_derisk_pct: -5.0
   proposal_expiry_days: 5
+
+# --- Strategic-change consistency (Component C/D/E) -------------------------
+# Makes PORTFOLIO-construction changes strategic, infrequent, and proof-backed:
+#   * the macro REGIME (which drives the book recommendation + the DERISK proposal)
+#     only flips after a dead-banded reading is CONFIRMED N times and a min-dwell has
+#     elapsed — so a single noisy PCE print can't swing the posture;
+#   * an AUTO universe REMOVE/DERISK must RECUR on N distinct days and re-validate its
+#     underperformance proof at apply time, and a rejected/applied change is suppressed
+#     for a cooldown window (no propose->reject->propose oscillation).
+# All defaults below match the code defaults; omit the block to use them.
+consistency:
+  regime_confirm_n: 2                   # consecutive confirming readings before the regime flips
+  regime_min_dwell_days: 5              # min days an effective regime holds before it can change
+  regime_deadband_pce: 0.1              # band (core-PCE %) around the deploy/standdown triggers
+  proposal_cooldown_days: 5             # suppress re-proposing a change decided within this window
+  universe_confirm_days: 2              # distinct days a REMOVE/DERISK must recur to auto-apply
+  min_strategy_set_interval_days: 0     # informational note when strategy-set re-runs sooner (0 = off)

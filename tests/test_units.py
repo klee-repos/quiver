@@ -995,8 +995,8 @@ import lib.strategy as _strat  # noqa: E402
 from lib.config import RiskConfig as _RiskConfig  # noqa: E402
 
 _REPO = Path(__file__).resolve().parent.parent
-_sc = _strat.load_strategy(_REPO / "strategy.yaml")
-_base_yaml = (_REPO / "strategy.yaml").read_text(encoding="utf-8")
+_sc = _strat.load_strategy(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml")
+_base_yaml = (_REPO / "tests" / "fixtures" / "strategy_fixture.yaml").read_text(encoding="utf-8")
 
 
 def _write_tmp(text):
@@ -1072,8 +1072,8 @@ _rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capit
                   max_open_position_per_ticker=50, min_buying_power_buffer=5,
                   max_actions_per_ticker_per_day=1, max_analyses_per_ticker_per_day=1)
 check("config: RiskConfig rebalance knobs default to today's behavior",
-      (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct),
-      (False, "SGOV", 5.0))
+      (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.reconcile_unmanaged),
+      (False, "SGOV", 5.0, True))
 
 # --- ledger: the 6 new tables round-trip (temp db; fresh + existing) ---
 _db = tempfile.mktemp(suffix=".db")
@@ -1333,7 +1333,7 @@ check("plan: NO trim/exit when rebalance OFF",
       _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_trim))["orders"], [])
 
 # strategy-set -> construct -> goal-track lifecycle (offline, real strategy.yaml)
-_cfg_s3 = _cfg_rebal(True, strategy_path=str(_REPO / "strategy.yaml"))
+_cfg_s3 = _cfg_rebal(True, strategy_path=str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml"))
 _led_s3 = _tmp_ledger()
 _ss = _tick._run_strategy_set(_cfg_s3, _led_s3, {"equity": 100.0, "now_iso": "2026-06-13T10:00:00-04:00"})
 check_true("strategy-set: writes the core book holdings", _ss["holdings"] >= 10)
@@ -1346,6 +1346,70 @@ check("construct: SOL flagged unquotable (skipped)", _con["target_weights"]["SOL
 check("construct: SGOV held as cash residual", _con["target_weights"]["SGOV"]["intent"], "cash_residual")
 check("construct: no active goal -> proceed False",
       _tick._run_construct(_cfg_s3, _tmp_ledger(), {"equity": 100.0})["proceed"], False)
+
+# --- self-reconciliation: a HELD position not in the book is wound to zero -------
+# construct flags off-book holdings; plan winds them down (gated reconcile_unmanaged).
+_con_rec = _tick._run_construct(_cfg_s3, _led_s3, {"equity": 100.0,
+    "positions": {"AAPL": {"market_value": 12.0}, "SMH": {"market_value": 2.0},
+                  "SGOV": {"market_value": 50.0}}, "macro_reading": None})
+check_true("construct: off-book holding (AAPL) flagged unmanaged", "AAPL" in _con_rec["unmanaged"])
+check("construct: orphan gets a full-exit intent", _con_rec["target_weights"]["AAPL"]["intent"], "exit")
+check_true("construct: orphan carries the orphan flag", _con_rec["target_weights"]["AAPL"].get("orphan") is True)
+check_true("construct: in-book SMH NOT flagged unmanaged", "SMH" not in _con_rec["unmanaged"])
+check_true("construct: cash SGOV NOT flagged unmanaged", "SGOV" not in _con_rec["unmanaged"])
+
+_p_rec = {"run_id": "REC", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+          "buying_power": 100.0, "positions": {"AAPL": {"quantity": 2.0, "market_value": 12.0}},
+          "quotes": {"AAPL": 6.0}, "analyses": [], "target_weights": _con_rec["target_weights"]}
+_out_rec = _tick._run_plan(_cfg_s3, _tmp_ledger(), _copy.deepcopy(_p_rec))
+_aapl = next((o for o in _out_rec["orders"] if o["ticker"] == "AAPL"), None)
+check_true("plan: reconcile sells the off-book holding (full exit)",
+           _aapl is not None and _aapl["order_kind"] == "reconcile_exit" and _aapl["quantity"] == 2.0)
+check("plan: reconcile sell is long-only (a SELL)", _aapl["side"], "sell")
+# reconcile OFF (and rebalance off) -> the off-book holding is left untouched
+_cfg_norec = load_config(_write_config({
+    "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_norec",
+    "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
+             "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5,
+             "rebalance_enabled": False, "reconcile_unmanaged": False},
+    "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+    "strategy_path": str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml")}))
+_out_norec = _tick._run_plan(_cfg_norec, _tmp_ledger(), _copy.deepcopy(_p_rec))
+check("plan: reconcile OFF leaves the off-book holding untouched",
+      [o for o in _out_norec["orders"] if o["ticker"] == "AAPL"], [])
+check("config: reconcile_unmanaged defaults ON", _cfg_s3.risk.reconcile_unmanaged, True)
+check("config: reconcile_unmanaged explicit false respected", _cfg_norec.risk.reconcile_unmanaged, False)
+
+# CRITICAL fail-safe: an active goal with an EMPTY target book (corruption / an
+# interrupted setup) must NOT make reconcile sell the whole held portfolio.
+_led_empty = _tmp_ledger()
+_led_empty.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_ai", as_of="d", start_date="d", start_equity=100.0)
+_con_empty = _tick._run_construct(_cfg_s3, _led_empty, {"equity": 100.0,
+    "positions": {"SMH": {"market_value": 30.0}, "CEG": {"market_value": 20.0}}, "macro_reading": None})
+check("construct: empty book emits NO orphans (no mass liquidation)", _con_empty["unmanaged"], [])
+check_true("construct: empty book target_weights has no orphan exits",
+           not any(v.get("orphan") for v in _con_empty["target_weights"].values()))
+
+# Atomic strategy-set: goal + ALL holdings land in one transaction (the piecewise
+# path could leave a partial book mid-crash -> the mass-liquidation above).
+_led_atom = _tmp_ledger()
+_gid_atom = _led_atom.set_strategy_goal_with_holdings(
+    goal={"created_at": "t", "target_return_pct": 15, "horizon_months": 12, "benchmark": "SGOV",
+          "benchmark_annual_pct": 3.6, "constraint_note": "", "macro_thesis_version": "v",
+          "macro_thesis_json": "{}", "active_book": "core_ai", "as_of": "d", "start_date": "d",
+          "start_equity": 100.0},
+    holdings=[{"sleeve": "Compute", "ticker": "SMH", "target_weight": 60, "band": 5,
+               "status": "active", "book": "core_ai", "quotable": True, "proxy_ticker": None,
+               "updated_at": "t"},
+              {"sleeve": "Cash", "ticker": "SGOV", "target_weight": 40, "band": 0,
+               "status": "active", "book": "core_ai", "quotable": True, "proxy_ticker": None,
+               "updated_at": "t"}])
+check("ledger: atomic strategy-set writes the goal", _led_atom.get_active_goal()["id"], _gid_atom)
+check("ledger: atomic strategy-set writes ALL holdings in one txn",
+      len(_led_atom.active_target_portfolio(_gid_atom)), 2)
+
 _led_s3.get_or_create_baseline("2026-09-01", 110.0, "2026-09-01T00:00:00-04:00")
 _gt = _tick._run_goal_track(_cfg_s3, _led_s3)
 check("goal-track: records a snapshot", _gt["recorded"], True)
@@ -1366,6 +1430,67 @@ check_true("universe: falls back to strategy.yaml book before strategy-set runs"
 _cfg_nostrat = _cfg_rebal(False, strategy_path="/nonexistent/strategy.yaml")
 check("universe: no strategy -> empty (fail-safe no-op)",
       _tick._analysis_universe(_cfg_nostrat, _tmp_ledger()), [])
+
+# Precedence (yaml=source, ledger=runtime): with a goal present the LEDGER book wins
+# over strategy.yaml. DIVERGENT data so a yaml-first regression is actually caught.
+_led_div = _tmp_ledger()
+_gdiv = _led_div.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d", start_date="d", start_equity=100.0)
+_led_div.upsert_target_holding(goal_id=_gdiv, sleeve="Semis", ticker="ZZZZ", target_weight=55, band=5,
+    status="active", book="core_55_45", quotable=True, proxy_ticker=None, updated_at="t")
+_led_div.upsert_target_holding(goal_id=_gdiv, sleeve="Cash", ticker="SGOV", target_weight=45, band=0,
+    status="active", book="core_55_45", quotable=True, proxy_ticker=None, updated_at="t")
+check("universe: active ledger goal WINS over strategy.yaml (no yaml fallback)",
+      _tick._analysis_universe(_cfg_s3, _led_div), ["ZZZZ"])
+
+# Active goal whose engines are ALL wound down (only cash active) -> empty universe,
+# and it must NOT revert to the stale strategy.yaml book (a de-risked book stays de-risked).
+_led_wound = _tmp_ledger()
+_tick._run_strategy_set(_cfg_s3, _led_wound, {"equity": 100.0, "now_iso": "2026-06-13T10:00:00-04:00"})
+_gw = _led_wound.get_active_goal()["id"]
+for _r in _led_wound.active_target_portfolio(_gw, statuses=("active",)):
+    if _r["sleeve"] != "Cash":
+        _led_wound.set_holding_status(_gw, _r["ticker"], "exiting", "t")
+check("universe: active goal all-exiting -> [] (no stale yaml fallback)",
+      _tick._analysis_universe(_cfg_s3, _led_wound), [])
+
+# --- cmd_preflight wiring (offline; market open/time gates monkeypatched) -------
+_pf_saved = (_market.is_regular_session_open, _market.minutes_since_open)
+_market.is_regular_session_open = lambda *a, **k: True
+_market.minutes_since_open = lambda *a, **k: 999
+try:
+    _pf_day = _market.trading_day_et()
+    # (a) active goal, nothing acted -> proceed; pending = engine names (no cash/non-quotable)
+    _led_pf = _tmp_ledger()
+    _tick._run_strategy_set(_cfg_s3, _led_pf, {"equity": 100.0, "now_iso": "2026-06-13T10:00:00-04:00"})
+    _pf_a = _tick._run_preflight(_cfg_s3, _led_pf)
+    check("preflight: proceeds on the portfolio universe", _pf_a["proceed"], True)
+    check_true("preflight: pending = engine names, cash/non-quotable excluded",
+               "SMH" in _pf_a["pending"] and "SGOV" not in _pf_a["pending"] and "SOL" not in _pf_a["pending"])
+    # (b) every engine already acted today -> no-op with the RENAMED reason (TICK.md-coupled)
+    for _t in _pf_a["pending"]:
+        _led_pf.record_action(_pf_day, _t, signal="Hold", intent="hold", status="skipped",
+                              detail="x", now_iso="t")
+    _pf_b = _tick._run_preflight(_cfg_s3, _led_pf)
+    check("preflight: all acted -> proceed False", _pf_b["proceed"], False)
+    check("preflight: renamed no-op reason string", _pf_b["reason"], "all_portfolio_tickers_already_acted_today")
+    # (c) no goal + no strategy -> no_portfolio_universe (fail-safe, not an error)
+    _pf_c = _tick._run_preflight(_cfg_nostrat, _tmp_ledger())
+    check("preflight: empty universe -> proceed False", _pf_c["proceed"], False)
+    check_true("preflight: no_portfolio_universe reason", _pf_c["reason"].startswith("no_portfolio_universe"))
+    # (d) wind-down work (rebalance exiting OR reconcile) keeps an empty-universe tick alive
+    check("preflight: rebalance+reconcile keep the tick alive to wind down",
+          _tick._run_preflight(_cfg_s3, _led_wound)["proceed"], True)
+    # (e) reconcile-only (rebalance OFF, reconcile ON) ALSO keeps it alive (independent of rebalance)
+    _cfg_reconly = _cfg_rebal(False, strategy_path=str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml"))
+    check("preflight: reconcile alone keeps the tick alive (winddown, no rebalance)",
+          _tick._run_preflight(_cfg_reconly, _led_wound)["proceed"], True)
+    # (f) BOTH rebalance and reconcile OFF -> the wound-down book correctly no-ops
+    check("preflight: rebalance+reconcile both OFF -> proceed False",
+          _tick._run_preflight(_cfg_norec, _led_wound)["proceed"], False)
+finally:
+    _market.is_regular_session_open, _market.minutes_since_open = _pf_saved
 
 
 # ============================================================================
@@ -1408,6 +1533,11 @@ check("uni: tradable_universe quotable + status default permissive",
       _uni.tradable_universe([{"ticker": "URA", "sleeve": "Uranium"}], "SGOV"), ["URA"])
 check("uni: tradable_universe empty rows -> []", _uni.tradable_universe([], "SGOV"), [])
 check("uni: tradable_universe skips blank tickers", _uni.tradable_universe([{"ticker": ""}], "SGOV"), [])
+# Order is load-bearing on the yaml-fallback path (declaration order -> analysis order);
+# multiple survivors in non-alphabetical input proves it is NOT sorted/reversed.
+check("uni: tradable_universe preserves declaration order (not sorted)",
+      _uni.tradable_universe([{"ticker": "URA"}, {"ticker": "SMH"}, {"ticker": "ETHA"}], "SGOV"),
+      ["URA", "SMH", "ETHA"])
 
 # --- risk learning helpers ---
 check("risk: sustained_underperf insufficient (N<min) -> None",
@@ -1553,6 +1683,249 @@ check_true("sdoc: second append adds another bullet",
            _tmp_strat.read_text(encoding="utf-8").count("- **2026-06-14**") == 2)
 check("sdoc: missing doc -> no-op (False, never crashes a tick)",
       _sdoc.append_learning("x", date="d", doc_path=Path("/no/such/STRATEGY.md")), False)
+
+
+# ============================================================================
+# CONSISTENCY LAYER (Component A-F): memory-grounded strategy-consistency gate,
+# regime hysteresis/confirmation, strategic change-log, decision proof.
+# ============================================================================
+import lib.risk as _crisk  # noqa: E402
+import json as _json_mod  # noqa: E402
+
+# --- A: pure direction / reversal helpers ---
+check("cons: direction_of buy=open", signals.direction_of("buy"), "open")
+check("cons: direction_of sell=close", signals.direction_of("sell"), "close")
+check("cons: direction_of hold=neutral", signals.direction_of("hold"), "neutral")
+check_true("cons: is_reversal buy->sell", signals.is_reversal("buy", "sell"))
+check_true("cons: is_reversal sell->buy", signals.is_reversal("sell", "buy"))
+check_true("cons: continuation buy->buy is NOT a reversal", not signals.is_reversal("buy", "buy"))
+check_true("cons: no prior stance is NOT a reversal", not signals.is_reversal(None, "sell"))
+check_true("cons: hold is neutral, not a reversal", not signals.is_reversal("hold", "sell"))
+check("cons: reversal_rate counts flips", signals.reversal_rate(["buy", "sell", "buy", "hold", "buy"]), (2, 3))
+check("cons: reversal_rate empty", signals.reversal_rate([]), (0, 0))
+check("cons: discretionary reversals (no triggers) = 2",
+      signals.count_discretionary_reversals([{"intent": "buy"}, {"intent": "sell"}, {"intent": "buy"}]), 2)
+check("cons: a plan-triggered reversal does NOT count toward churn",
+      signals.count_discretionary_reversals(
+          [{"intent": "buy"}, {"intent": "sell", "plan_trigger": "stop_hit"}, {"intent": "buy"}]), 1)
+
+# --- A: strategy_consistency_verdict — every branch ---
+_V = signals.strategy_consistency_verdict
+check("cons: continuation allowed", _V(prior_intent="buy", new_intent="buy", plan_trigger=None,
+      basis_changed=False, recent_discretionary_reversals=9, max_discretionary_reversals=1), (True, "continuation_or_neutral"))
+check_true("cons: plan-trigger reversal allowed (overrides churn)",
+           _V(prior_intent="buy", new_intent="sell", plan_trigger="stop_hit", basis_changed=False,
+              recent_discretionary_reversals=9, max_discretionary_reversals=1)[0])
+check("cons: ungrounded reversal suppressed", _V(prior_intent="buy", new_intent="sell", plan_trigger=None,
+      basis_changed=False, recent_discretionary_reversals=0, max_discretionary_reversals=1), (False, "ungrounded_reversal"))
+check("cons: basis-change reversal within budget allowed", _V(prior_intent="buy", new_intent="sell", plan_trigger=None,
+      basis_changed=True, recent_discretionary_reversals=0, max_discretionary_reversals=1), (True, "recorded_basis_change"))
+check("cons: basis-change OVER budget = churn suppressed", _V(prior_intent="buy", new_intent="sell", plan_trigger=None,
+      basis_changed=True, recent_discretionary_reversals=1, max_discretionary_reversals=1), (False, "basis_churn"))
+check("cons: max=0 blocks even a basis change (stop/target only)", _V(prior_intent="buy", new_intent="sell",
+      plan_trigger=None, basis_changed=True, recent_discretionary_reversals=0, max_discretionary_reversals=0), (False, "basis_churn"))
+check("cons: disabled gate always allows", _V(prior_intent="buy", new_intent="sell", plan_trigger=None,
+      basis_changed=False, recent_discretionary_reversals=0, max_discretionary_reversals=1, enabled=False), (True, "gate_disabled"))
+
+# --- F: signal_stability metric (reuses signals.reversal_rate) ---
+_sm = _crisk.signal_stability(["buy", "sell", "buy"])
+check("cons: signal_stability value = reversals/transitions", round(_sm.value, 3), 1.0)
+check("cons: signal_stability n = transitions", _sm.n, 2)
+check("cons: signal_stability None for <2 stances", _crisk.signal_stability(["buy"]).value, None)
+
+# --- C: regime hysteresis + confirmation ---
+import types as _types2  # noqa: E402
+_mcfg = _types2.SimpleNamespace(macro_thesis=_types2.SimpleNamespace(
+    deploy_trigger_pce_pct=2.5, standdown_trigger_pce_pct=3.5, standdown_on_hike=True))
+check("cons: banded regime clears standdown band", _strat.regime_label_banded(_mcfg, {"core_pce_pct": 3.65}, 0.1), _strat.REGIME_STAND_DOWN)
+check("cons: banded regime WITHIN band reads HOLD", _strat.regime_label_banded(_mcfg, {"core_pce_pct": 3.55}, 0.1), _strat.REGIME_HOLD)
+check("cons: banded regime clears deploy band", _strat.regime_label_banded(_mcfg, {"core_pce_pct": 2.35}, 0.1), _strat.REGIME_DEPLOY)
+check("cons: fed hike is categorical standdown", _strat.regime_label_banded(_mcfg, {"fed_hike": True}, 0.1), _strat.REGIME_STAND_DOWN)
+check("cons: normalize legacy lowercase", _strat.normalize_regime("standdown"), _strat.REGIME_STAND_DOWN)
+# confirmation state machine
+_r1 = _strat.regime_with_confirmation(None, _strat.REGIME_STAND_DOWN, confirm_n=2, min_dwell_days=5, today="2026-06-01")
+check_true("cons: 1st reading -> pending, no change", _r1["effective_regime"] == _strat.REGIME_HOLD and not _r1["changed"] and _r1["confirm_count"] == 1)
+_st1 = {"regime": "neutral", "pending_regime": "standdown", "confirm_count": 1, "regime_since": None}
+_r2 = _strat.regime_with_confirmation(_st1, _strat.REGIME_STAND_DOWN, confirm_n=2, min_dwell_days=5, today="2026-06-02")
+check_true("cons: 2nd consecutive -> confirmed flip", _r2["effective_regime"] == _strat.REGIME_STAND_DOWN and _r2["changed"] and _r2["regime_since"] == "2026-06-02")
+_st2 = {"regime": "standdown", "pending_regime": "deploy", "confirm_count": 2, "regime_since": "2026-06-02"}
+_r3 = _strat.regime_with_confirmation(_st2, _strat.REGIME_DEPLOY, confirm_n=2, min_dwell_days=5, today="2026-06-04")
+check_true("cons: confirmed but dwell-locked stays put", _r3["effective_regime"] == _strat.REGIME_STAND_DOWN and not _r3["changed"] and "dwell" in _r3["reason"])
+_r4 = _strat.regime_with_confirmation(_st2, _strat.REGIME_DEPLOY, confirm_n=2, min_dwell_days=5, today="2026-06-09")
+check_true("cons: flips once dwell elapses", _r4["effective_regime"] == _strat.REGIME_DEPLOY and _r4["changed"])
+_st3 = {"regime": "standdown", "pending_regime": "deploy", "confirm_count": 1, "regime_since": "2026-06-02"}
+_r5 = _strat.regime_with_confirmation(_st3, _strat.REGIME_STAND_DOWN, confirm_n=2, min_dwell_days=5, today="2026-06-05")
+check_true("cons: a stable reading clears the pending candidate", _r5["pending_regime"] is None and _r5["confirm_count"] == 0)
+
+# --- ledger: new consistency reads + migrations ---
+_lc2 = _tmp_ledger()
+_did = _lc2.record_decision(trade_date="2026-06-10", ticker="NVDA", decided_at="2026-06-10T10:00:00",
+                            signal="Buy", intent="buy", decision_price=100.0, stop_loss=90.0,
+                            basis="momentum", plan_trigger=None, target_price=130.0,
+                            proof_json='{"verdict":{"allowed":true,"reason":"continuation_or_neutral"}}')
+check_true("cons: record_decision returns an id", isinstance(_did, int) and _did > 0)
+_dec = _lc2.get_decision(_did)
+check("cons: decision persisted basis", _dec["basis"], "momentum")
+check("cons: decision persisted plan_trigger NULL", _dec["plan_trigger"], None)
+check("cons: decision persisted proof_json round-trips",
+      _json_mod.loads(_dec["proof_json"])["verdict"]["reason"], "continuation_or_neutral")
+# completed-trade reads need an actions event
+_lc2.record_event(trade_date="2026-06-10", ticker="NVDA", ts="2026-06-10T10:00:01", signal="Buy",
+                  intent="buy", status="dry_run")
+_lct = _lc2.last_completed_trade("NVDA")
+check("cons: last_completed_trade intent", _lct["intent"], "buy")
+check("cons: last_completed_trade joins the decision's stop", _lct["stop_loss"], 90.0)
+check("cons: last_completed_trade joins basis", _lct["basis"], "momentum")
+check("cons: last_completed_trade None for untraded name", _lc2.last_completed_trade("ZZZZ"), None)
+check("cons: recent_completed_trades returns the buy", len(_lc2.recent_completed_trades("NVDA", 6)), 1)
+# strategy change log
+_g5 = _lc2.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12, benchmark="SGOV",
+    benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v", macro_thesis_json="{}",
+    active_book="core_55_45", as_of="x", start_date="2026-01-01", start_equity=100.0)
+_lc2.record_strategy_change(goal_id=_g5, changed_at="2026-06-12T00:00:00", change_type="regime",
+                            from_value="HOLD", to_value="STAND_DOWN", trigger="macro_reading", reason="confirmed")
+_hist = _lc2.strategy_change_history(_g5)
+check("cons: strategy_change_history records the regime change", len(_hist), 1)
+check("cons: change row carries from->to", (_hist[0]["from_value"], _hist[0]["to_value"]), ("HOLD", "STAND_DOWN"))
+check("cons: strategy_change_history filters by type",
+      len(_lc2.strategy_change_history(_g5, change_type="weight")), 0)
+# universe-proposal history reads (E1/E2)
+_ch = "consid_hash"
+_lc2.record_universe_proposal(goal_id=_g5, proposed_at="2026-06-10T00:00:00Z", kind="PROPOSE_REMOVE",
+    ticker="XYZ", sleeve="s", from_book=None, to_book=None, target_weight=5.0, tier="universe",
+    content_hash=_ch, reason="r", goal_gap_pct=-5.0)
+check("cons: count_proposal_recurrence = 1 distinct day", _lc2.count_proposal_recurrence(_g5, _ch), 1)
+check("cons: last_decided_universe_change None while proposed", _lc2.last_decided_universe_change(_g5, _ch), None)
+# migrations idempotent on a fresh + re-opened db
+_dbp2 = tempfile.mktemp(suffix=".db")
+Ledger(_dbp2)
+_reopen = Ledger(_dbp2)  # re-running migrations must not raise
+check_true("cons: migrations idempotent on re-open", _reopen.get_active_goal() is None)
+
+# --- config: risk.consistency validation ---
+def _cfg_with_consistency(cons_block):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kcons",
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                  "min_buying_power_buffer": 5, "consistency": cons_block},
+         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+    return load_config(_write_config(d))
+
+_cc = _cfg_with_consistency({"enabled": False, "max_discretionary_reversals": 2, "flip_window": 4, "loss_catalyst_pct": 10.0})
+check("cons-cfg: parsed enabled false", _cc.risk.consistency_enabled, False)
+check("cons-cfg: parsed max_discretionary_reversals", _cc.risk.max_discretionary_reversals, 2)
+check("cons-cfg: parsed flip_window", _cc.risk.consistency_flip_window, 4)
+check("cons-cfg: default ON when block absent", _cfg_rebal(False).risk.consistency_enabled, True)
+check_raises("cons-cfg: negative max_discretionary_reversals raises",
+             lambda: _cfg_with_consistency({"max_discretionary_reversals": -1}), ConfigError)
+check_raises("cons-cfg: zero flip_window raises",
+             lambda: _cfg_with_consistency({"flip_window": 0}), ConfigError)
+
+# --- tick._run_plan integration: the gate suppresses random flips, allows grounded ones ---
+def _cfg_cons(**risk):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kc_int",
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 50.0, "daily_capital_deploy_cap": 1000,
+                  "max_open_position_per_ticker": 100, "min_buying_power_buffer": 5, **risk},
+         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+    return load_config(_write_config(d))
+
+def _seed_buy(led, ticker, day, *, stop=90.0, basis="momentum", price=100.0):
+    led.record_decision(trade_date=day, ticker=ticker, decided_at=f"{day}T10:00:00-04:00", signal="Buy",
+                        intent="buy", decision_price=price, stop_loss=stop, basis=basis)
+    led.record_event(trade_date=day, ticker=ticker, ts=f"{day}T10:00:01-04:00", signal="Buy",
+                     intent="buy", status="dry_run")
+
+_Cg = _cfg_cons()
+_today = _market.trading_day_et()
+# random reversal (no basis, quote above stop) -> SUPPRESSED
+_lr = _tmp_ledger(); _seed_buy(_lr, "AAPL", _today)
+_pl = {"run_id": "G1", "now_iso": _today + "T11:00:00-04:00", "equity": 100.0, "buying_power": 100.0,
+       "positions": {"AAPL": {"quantity": 1.0, "market_value": 105.0}}, "quotes": {"AAPL": 105.0},
+       "analyses": [{"ticker": "AAPL", "signal": "Sell"}]}
+_lr.clear_day(_today)  # simulate a later day (lift the per-day dedup)
+_op = _tick._run_plan(_Cg, _lr, _copy.deepcopy(_pl))
+check("cons-plan: ungrounded reversal places NO order", [o for o in _op["orders"] if o["ticker"] == "AAPL"], [])
+check_true("cons-plan: decision marked ungrounded_reversal",
+           any(d.get("detail") == "consistency:ungrounded_reversal" for d in _op["decisions"]))
+# stop-hit reversal (quote below stop) -> ALLOWED
+_lr2 = _tmp_ledger(); _seed_buy(_lr2, "AAPL", _today)
+_pl2 = _copy.deepcopy(_pl); _pl2["quotes"] = {"AAPL": 85.0}; _pl2["positions"] = {"AAPL": {"quantity": 1.0, "market_value": 85.0}}
+_lr2.clear_day(_today)
+_op2 = _tick._run_plan(_Cg, _lr2, _pl2)
+check_true("cons-plan: stop-hit reversal IS allowed (plan trigger)",
+           any(o["ticker"] == "AAPL" and o["intent"] == "sell" for o in _op2["orders"]))
+# basis-change reversal -> ALLOWED
+_lr3 = _tmp_ledger(); _seed_buy(_lr3, "AAPL", _today)
+_pl3 = _copy.deepcopy(_pl); _pl3["analyses"] = [{"ticker": "AAPL", "signal": "Sell", "basis": "thesis_broken"}]
+_lr3.clear_day(_today)
+_op3 = _tick._run_plan(_Cg, _lr3, _pl3)
+check_true("cons-plan: basis-change reversal IS allowed", any(o["ticker"] == "AAPL" for o in _op3["orders"]))
+# disabled gate -> the same random reversal goes through (byte-compatible classic)
+_Cgoff = _cfg_cons(consistency={"enabled": False})
+_lr4 = _tmp_ledger(); _seed_buy(_lr4, "AAPL", _today)
+_lr4.clear_day(_today)
+_op4 = _tick._run_plan(_Cgoff, _lr4, _copy.deepcopy(_pl))
+check_true("cons-plan: gate disabled -> reversal allowed (classic)", any(o["ticker"] == "AAPL" for o in _op4["orders"]))
+# proof token persisted on the suppressed decision
+_dprows = _lr.decisions_with_outcomes("AAPL", limit=3)
+check_true("cons-plan: a proof_json was persisted with the decision",
+           any(r.get("proof_json") for r in _dprows))
+
+# --- REGRESSION: adversarial-review bug fixes ---
+# (1) recent_completed_trades must NOT fan out on duplicate decision rows. Multiple
+# decisions for the same (day,ticker,intent) + one completed event = exactly ONE row.
+_lf = _tmp_ledger()
+for _i in range(3):  # 3 decision rows for the SAME (day,ticker,buy)
+    _lf.record_decision(trade_date="2026-06-10", ticker="DUP", decided_at=f"2026-06-10T1{_i}:00:00",
+                        signal="Buy", intent="buy", decision_price=100.0)
+_lf.record_event(trade_date="2026-06-10", ticker="DUP", ts="2026-06-10T13:00:00", signal="Buy",
+                 intent="buy", status="dry_run")
+check("regr: recent_completed_trades does NOT fan out on duplicate decisions",
+      len(_lf.recent_completed_trades("DUP", 6)), 1)
+# flip budget stays correct despite duplicate decisions: buy,sell,buy,sell = 3 reversals
+_lf2 = _tmp_ledger()
+for _d, _intent in [("2026-06-01", "buy"), ("2026-06-02", "sell"), ("2026-06-03", "buy"), ("2026-06-04", "sell")]:
+    for _k in range(2):  # 2 duplicate decisions per (day,intent)
+        _lf2.record_decision(trade_date=_d, ticker="FLP", decided_at=f"{_d}T1{_k}:00:00",
+                             signal=("Buy" if _intent == "buy" else "Sell"), intent=_intent, decision_price=100.0)
+    _lf2.record_event(trade_date=_d, ticker="FLP", ts=f"{_d}T13:00:00",
+                      signal=("Buy" if _intent == "buy" else "Sell"), intent=_intent, status="dry_run")
+_recent = list(reversed(_lf2.recent_completed_trades("FLP", 6)))
+check("regr: flip count correct (3) despite duplicate decision rows",
+      signals.count_discretionary_reversals(_recent), 3)
+
+# (2) reconcile/rebalance SYSTEM sells must NOT be read as a discretionary stance.
+_ls = _tmp_ledger()
+_ls.record_event(trade_date="2026-06-10", ticker="SYS", ts="2026-06-10T13:00:00", signal="RECONCILE",
+                 intent="sell", status="placed")
+check("regr: a RECONCILE sell is NOT a prior discretionary stance", _ls.last_completed_trade("SYS"), None)
+_ls.record_event(trade_date="2026-06-10", ticker="SYS2", ts="2026-06-10T13:00:00", signal="REBALANCE",
+                 intent="sell", status="dry_run")
+check("regr: REBALANCE sells excluded from recent_completed_trades", _ls.recent_completed_trades("SYS2", 6), [])
+
+# (3) regime confirmation: a missing/None macro_reading holds the current regime (no erosion).
+_lc3 = _tmp_ledger()
+_g3 = _lc3.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12, benchmark="SGOV",
+    benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v", macro_thesis_json="{}",
+    active_book="dial_up_63_37", as_of="x", start_date="2026-01-01", start_equity=100.0)
+_lc3.upsert_thesis_state(goal_id=_g3, as_of="2026-06-01", regime="deploy", active_book="dial_up_63_37",
+                         last_trigger="DEPLOY", last_macro_json="{}", updated_at="t", regime_since="2026-06-01")
+_cfg_s3b = _cfg_rebal(True, strategy_path=str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml"))
+_goalrow = _lc3.get_active_goal()
+_eff_none = _tick._confirm_and_persist_regime(_cfg_s3b, _lc3, _goalrow, None, "2026-06-15T10:00:00-04:00", "2026-06-15")
+check("regr: a None macro_reading HOLDS the current regime (no erosion to HOLD)", _eff_none, _strat.REGIME_DEPLOY)
+check_true("regr: a None reading logs NO regime change",
+           len(_lc3.strategy_change_history(_g3, change_type="regime")) == 0)
+
+# (4) dwell-lock clamp: a FUTURE regime_since (clock skew) must LOCK, not pin forever / skip.
+_dw_future = _strat.regime_with_confirmation(
+    {"regime": "standdown", "pending_regime": "deploy", "confirm_count": 2, "regime_since": "2026-12-31"},
+    _strat.REGIME_DEPLOY, confirm_n=2, min_dwell_days=5, today="2026-06-07")
+check_true("regr: a future regime_since dwell-LOCKS (clamped), does not flip", not _dw_future["changed"])
+_dw_bad = _strat.regime_with_confirmation(
+    {"regime": "standdown", "pending_regime": "deploy", "confirm_count": 2, "regime_since": "not-a-date"},
+    _strat.REGIME_DEPLOY, confirm_n=2, min_dwell_days=5, today="2026-06-07")
+check_true("regr: an unparseable regime_since dwell-LOCKS (never skips the lock)", not _dw_bad["changed"])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

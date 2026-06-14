@@ -36,6 +36,23 @@ class RiskConfig:
     rebalance_enabled: bool = False
     rebalance_drift_band_pct: float = 5.0
     cash_sleeve_ticker: str = "SGOV"      # the residual ballast; never churned like an engine name
+    # Self-reconciliation: when a strategy goal is active, SELL any held position that
+    # is NOT in the book (and not the cash sleeve) down to zero — the bot heals its own
+    # drift from a book edit / a prior watchlist. Long-only (only ever sells; de-risks
+    # to cash) and independent of rebalance_enabled. Dormant with no active goal, so the
+    # validated classic path is unchanged. Default ON; set false to keep off-book holdings.
+    reconcile_unmanaged: bool = True
+    # --- Memory-grounded strategy-consistency gate (Component A) ----------
+    # Suppresses RANDOM cross-day buy<->sell reversals while allowing those grounded in
+    # a consistent recorded strategy (a stop/target/review trigger firing, or a genuine
+    # basis change within the churn budget). NOT a calendar dwell. Default ON because it
+    # only ever SUPPRESSES a reversal (strictly more conservative); a fresh ledger never
+    # reverses, so the validated path is unchanged. consistency_enabled=false restores
+    # byte-identical classic behavior.
+    consistency_enabled: bool = True
+    max_discretionary_reversals: int = 1   # ungrounded "changed my mind" flips tolerated per window
+    consistency_flip_window: int = 6       # how many recent COMPLETED trades the budget looks back over
+    loss_catalyst_pct: float = 8.0         # a sell within the window is grounded if the position is down >= this
 
 
 @dataclass(frozen=True)
@@ -227,6 +244,26 @@ def load_config(path) -> Config:
     if rebalance_band <= 0:
         raise ConfigError("config.yaml: risk.rebalance_drift_band_pct must be > 0")
     cash_sleeve_ticker = str(risk_d.get("cash_sleeve_ticker", "SGOV") or "SGOV").strip().upper()
+    # Default ON (only an explicit false disables): selling off-book holdings to cash is
+    # the safe de-risking direction, and it only acts when a strategy goal is active.
+    reconcile_unmanaged = risk_d.get("reconcile_unmanaged", True) is not False
+    # Strategy-consistency gate (Component A). A nested `consistency` block; all keys
+    # optional with safe defaults. Fail-safe ON; an explicit false disables.
+    cons_d = risk_d.get("consistency", {}) or {}
+    consistency_enabled = cons_d.get("enabled", True) is not False
+    try:
+        max_discretionary_reversals = int(cons_d.get("max_discretionary_reversals", 1))
+        consistency_flip_window = int(cons_d.get("flip_window", 6))
+        loss_catalyst_pct = float(cons_d.get("loss_catalyst_pct", 8.0))
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: risk.consistency.{max_discretionary_reversals,"
+                          "flip_window,loss_catalyst_pct} must be numbers")
+    if max_discretionary_reversals < 0:
+        raise ConfigError("config.yaml: risk.consistency.max_discretionary_reversals must be >= 0")
+    if consistency_flip_window <= 0:
+        raise ConfigError("config.yaml: risk.consistency.flip_window must be > 0")
+    if loss_catalyst_pct < 0:
+        raise ConfigError("config.yaml: risk.consistency.loss_catalyst_pct must be >= 0")
     risk = RiskConfig(
         max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
@@ -238,6 +275,11 @@ def load_config(path) -> Config:
         rebalance_enabled=rebalance_enabled,
         rebalance_drift_band_pct=rebalance_band,
         cash_sleeve_ticker=cash_sleeve_ticker,
+        reconcile_unmanaged=reconcile_unmanaged,
+        consistency_enabled=consistency_enabled,
+        max_discretionary_reversals=max_discretionary_reversals,
+        consistency_flip_window=consistency_flip_window,
+        loss_catalyst_pct=loss_catalyst_pct,
     )
 
     ds = d.get("deepseek", {}) or {}

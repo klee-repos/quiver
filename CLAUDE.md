@@ -46,6 +46,16 @@ Built and validated end-to-end; in **dry-run**, pending one live session.
 # Run the unit tests (pure decision logic; no pytest, plain asserts, exits non-zero on failure)
 .venv/bin/python tests/test_units.py
 
+# Run the WHOLE suite (unit + all deterministic e2e) — one command, exits non-zero on any fail
+tests/run_e2e.sh
+# ...plus the LIVE real-DeepSeek e2e (costs tokens, ~minutes; needs DEEPSEEK_API_KEY): proves
+# a real analyze.py run emits the consistency fields (basis/catalyst/target_price), that the
+# decision-memory (incl. the stance-consistency block) is injected, and that the real model
+# output flows through the plan gate with the proof persisted. Gated; self-skips without --live.
+tests/run_e2e.sh --live
+# or just the live one against an isolated seeded ledger (the live db is never touched):
+QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_e2e_live.py [TICKER]
+
 # Smoke-test the decision path for one ticker (prints exactly one JSON line to stdout)
 .venv/bin/python analyze.py AAPL [--date YYYY-MM-DD]
 
@@ -65,6 +75,11 @@ Built and validated end-to-end; in **dry-run**, pending one live session.
 .venv/bin/python tick.py protect  --input state/tmp/protect_input.json
 # Age out bulky logs past storage.retention_days (best-effort housekeeping; never blocks a tick)
 .venv/bin/python tick.py prune
+
+# Consistency-layer observability (read-only; never trade): the auditable proof bundle for
+# one decision, and the append-only strategic-change audit trail (regime/book/weight/status).
+.venv/bin/python tick.py decision-proof --id <decision_id>
+.venv/bin/python tick.py strategy-history --limit 20 [--type regime|book|weight|status]
 
 # Market-hours status (XNYS calendar, holiday/half-day aware)
 .venv/bin/python -m lib.market
@@ -156,7 +171,13 @@ describes the exact JSON shapes `plan`/`commit`/`reflect`/`protect` consume.
   unparseable prose size falls back to `min(ceiling, 100)`. Also: the cooldown / action-cap /
   on-change gates, the cadence clamp (`clamp_review_minutes`), and limit/stop pricing
   (`marketable_limit_price`, `whole_shares_for_dollars`, `resolve_stop_price` — Python owns every
-  price; the model only seeds the stop).
+  price; the model only seeds the stop). Also the **memory-grounded strategy-consistency gate**
+  (`direction_of`/`is_reversal`/`count_discretionary_reversals`/`strategy_consistency_verdict`):
+  a cross-DAY buy↔sell REVERSAL is allowed only when it is grounded — a Python-verified
+  plan_trigger (the recorded stop/loss/target firing, assembled in `tick.py:_plan_trigger`) OR a
+  genuine basis change within the churn budget — else it is suppressed as a random flip. NOT a
+  hardcoded dwell; the budget is computed from the decision memory. Stays on the binding side of
+  the wall (never imports `lib.risk`; the proof is assembled in `tick.py` glue).
 - **`lib/memory.py`** — pure distilled-scorecard builder (`build_scorecard`, `directional_return`,
   `is_hit`) + a thin ledger-reading `scorecard(led, ticker)`. Read-only; it sees past decisions +
   real outcomes but **never trading limits or the broker** — the one bit of memory the analysis
@@ -221,6 +242,26 @@ ledger rollups — all offline.
 - **Limit entries / protective stops:** `order.buy_type: limit` and `order.protective_stop.enabled`
   are OFF by default; both are Python-priced (the model only seeds the stop). Note a limit buy uses
   whole shares, so a sub-one-share budget skips. Validate the full lifecycle live before enabling.
+- **Strategy-consistency gate (cross-day buy/sell coherence):** `risk.consistency.enabled: true`
+  (default). A buy↔sell REVERSAL across days is allowed only when grounded — the recorded
+  stop/loss/target firing (Python-verified vs the live quote) OR a named new catalyst within
+  `max_discretionary_reversals` per `flip_window` completed trades — otherwise it is SUPPRESSED
+  (the plan records `status:"skipped"`, `detail:"consistency:ungrounded_reversal"|"basis_churn"`;
+  just log it like any skip). It is NOT a calendar dwell and can only ever suppress a reversal,
+  never add a trade; `enabled: false` (or `max_discretionary_reversals: 0` for stop/target-only)
+  restores byte-identical classic behavior. The model declares its stance via the Trader's
+  `Strategy Basis` + (on a reversal) `Catalyst` fields. Inspect any decision's reasoning with
+  `tick.py decision-proof --id N`.
+- **Strategic-change consistency (portfolio construction):** the macro REGIME that drives the book
+  recommendation + the DERISK proposal only flips after a dead-banded reading is CONFIRMED
+  `strategy.consistency.regime_confirm_n` times and a `regime_min_dwell_days` lock has elapsed
+  (`thesis_state` carries the confirmation state); an AUTO universe REMOVE/DERISK must recur on
+  `universe_confirm_days` distinct days + re-validate its underperformance proof at apply time, and
+  a recently-decided change is suppressed for `proposal_cooldown_days` (no propose→reject→propose
+  churn). A human `tick.py universe-apply --approve` is the deliberate confirmation and bypasses the
+  recurrence/freshness gates (but still conserves the book to ~100%). Every strategic change
+  (regime/book/weight/status) is logged to `strategy_change_log` — read it with `tick.py
+  strategy-history`.
 
 ## Layout
 
@@ -240,13 +281,14 @@ ledger rollups — all offline.
   `notify` (email digest + alerts — off unless `enabled: true`). **No watchlist** — the analysis
   universe is derived from the active portfolio book (`strategy.yaml` / the ledger goal) via
   `tick.py:_analysis_universe` + `lib/universe.tradable_universe` (cash + non-quotable excluded).
-  **Per-user + gitignored** (copy `config.yaml.example`) so a public repo never exposes your live
-  posture; carries NO secrets (those are in `.env`).
+  **Committed** — it carries NO secrets (those are in `.env`), so it ships in the repo and is the
+  single config source of truth (the box uses it directly; it is no longer SSM-seeded).
 - `strategy.yaml` — the macro book + goal as DATA; it IS the trading universe (the book's
-  holdings, minus cash/non-quotable). Also **per-user + gitignored** (copy `strategy.yaml.example`)
+  holdings, minus cash/non-quotable). **Per-user + gitignored** (copy `strategy.yaml.example`)
   — it reveals your allocations. Fails SAFE: absent/empty book → nothing to analyze, no trades.
-- `config.yaml.example` / `strategy.yaml.example` — committed templates (SAFE: `dry_run: true`,
-  illustrative book). `cp *.example` to start; on the box both are pulled from SSM (see DEPLOY.md).
+- `strategy.yaml.example` — the committed template (SAFE: illustrative book). `cp` it to start; on
+  the box `strategy.yaml` is pulled from SSM (see DEPLOY.md). `config.yaml` needs no template — it
+  is committed directly.
 - `TICK.md` — the per-tick runbook the orchestrator follows verbatim.
 - `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored from upstream;
   tracked, pruned; provenance in `tradingagents/UPSTREAM.md`, Apache-2.0 `tradingagents/LICENSE`).
@@ -256,6 +298,6 @@ ledger rollups — all offline.
 - `logs/` — `orchestrator.log` (one line per tick) + `reasoning/` (teed live thinking). Gitignored.
 - `.env` — per-user/secret values (gitignored, `chmod 600`): `DEEPSEEK_API_KEY`,
   `RH_ACCOUNT_NUMBER` (the agentic_allowed account), and `NOTIFY_TO` (digest recipients,
-  comma-separated). `config.yaml` + `strategy.yaml` are gitignored (copy from the `*.example`
-  templates) and carry none of these. MCP credentials (Robinhood, Resend) live in the operator's
-  Claude config (`claude mcp add`), NOT in this repo.
+  comma-separated). `config.yaml` is committed and `strategy.yaml` is gitignored (copy from
+  `strategy.yaml.example`); both carry none of these secrets. MCP credentials (Robinhood, Resend)
+  live in the operator's Claude config (`claude mcp add`), NOT in this repo.

@@ -17,6 +17,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import re
 import sys
 import traceback
@@ -26,6 +27,10 @@ REPO = Path(__file__).resolve().parent
 STATE = REPO / "state"
 LOGDIR = STATE / "analyze_logs"
 REASONDIR = REPO / "logs" / "reasoning"
+# The decision-memory ledger the past_context is read from. Defaults to the live db;
+# QUIVER_LEDGER_DB points it at an isolated db (e.g. an e2e test with seeded history)
+# WITHOUT touching live state. analyze.py only READS the ledger here (it writes no rows).
+LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (STATE / "ledger.db"))
 
 
 class _Tee:
@@ -131,6 +136,14 @@ def parse_trader_plan(plan_text: str) -> dict:
         "stop_loss": grab_float("Stop Loss"),
         "position_sizing": grab("Position Sizing"),
         "position_pct": grab_float("Position Pct"),
+        # Consistency layer (Component A): the declared strategy/thesis tag the call
+        # rests on, an optional take-profit target, and (on a reversal) the named new
+        # catalyst. Python's consistency gate reads these to tell a strategy-grounded
+        # reversal from a random one — it never trusts them blindly (the binding part
+        # is always Python-verified against the quote or rate-limited by memory).
+        "basis": grab("Strategy Basis"),
+        "catalyst": grab("Catalyst"),
+        "target_price": grab_float("Target Price"),
     }
 
 
@@ -153,6 +166,14 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         "position_pct": plan["position_pct"],   # structured sizing (% of equity); preferred over prose
         "entry_price": plan["entry_price"],
         "stop_loss": plan["stop_loss"],
+        # Consistency layer (Component A): the declared strategy basis + any take-profit
+        # target + named catalyst. The plan's gate reads these to distinguish a
+        # strategy-grounded reversal from a random one. Optional (None when the model
+        # didn't render the field) -> a basis-less reversal with no Python trigger is
+        # treated as ungrounded and suppressed (fail-safe).
+        "basis": plan["basis"],
+        "target_price": plan["target_price"],
+        "catalyst": plan["catalyst"],
         # Model-proposed re-check cadence (hours); Python clamps it. Optional.
         "next_review_hours": parse_pm_field_float(final_decision, "Next Review Hours"),
         "rationale_summary": summary,
@@ -236,7 +257,7 @@ def main(argv) -> int:
         from lib import reflect_memory
         try:
             from lib.ledger import Ledger
-            ctx = reflect_memory.safe_build_context(Ledger(STATE / "ledger.db"), ticker, cfg)
+            ctx = reflect_memory.safe_build_context(Ledger(LEDGER_DB), ticker, cfg)
         except Exception:  # noqa: BLE001 — even ledger-open failure must not block analysis
             ctx = reflect_memory.ContextResult("", "", None, "empty")
         result = run_analysis(ticker, date, cfg, ctx.full, ctx.compact)
