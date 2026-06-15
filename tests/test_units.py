@@ -1291,10 +1291,12 @@ check("plan: BYTE-IDENTICAL when rebalance OFF (target_weights ignored)", _out_b
 check("plan: classic buy clamps to ceiling 25",
       next(o for o in _out_base["orders"] if o["ticker"] == "SMH")["dollar_amount"], 25.0)
 
-# rebalance ON: a small target binds the buy (one more clamp, never widens)
+# rebalance ON: the deterministic buy-to-target pass OWNS the book name (the LLM's
+# dribble buy is suppressed) and deploys it to its target dollars, clamped by the caps.
 _out_on = _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_tw))
-check("plan: target room binds the buy (9 < ceiling 25)",
-      next(o for o in _out_on["orders"] if o["ticker"] == "SMH")["dollar_amount"], 9.0)
+_smh_on = next(o for o in _out_on["orders"] if o["ticker"] == "SMH")
+check("plan: rebalance deploys book name to target (9 < ceiling 25)", _smh_on["dollar_amount"], 9.0)
+check("plan: book-name buy routed through the rebalance pass", _smh_on["order_kind"], "rebalance_buy")
 _p_big = _copy.deepcopy(_p_base)
 _p_big["target_weights"] = {"SMH": {"intent": "buy", "target_dollars": 1000.0}}
 check("plan: target NEVER overrides the per-trade ceiling",
@@ -1327,6 +1329,65 @@ check("plan: rebalance exit sells all held", _xlv_x["quantity"], 2.0)
 check("plan: rebalance exit order kind", _xlv_x["order_kind"], "rebalance_exit")
 check("plan: NO trim/exit when rebalance OFF",
       _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_trim))["orders"], [])
+
+# --- rebalance BUY-TO-TARGET pass: the book deploys deterministically -------------
+# An underweight book name the LLM did NOT buy (it merely HELD it) is still deployed to
+# its target weight by the deterministic pass — the book owns sizing, not the model.
+_p_dep = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+          "buying_power": 100.0, "positions": {}, "quotes": {"SMH": 50.0},
+          "analyses": [{"ticker": "SMH", "signal": "Hold", "position_pct": 0.0}],
+          "target_weights": {"SMH": {"intent": "buy", "target_dollars": 9.0}}}
+_smh_dep = next(o for o in _tick._run_plan(_cfg_rebal(True), _tmp_ledger(),
+                                           _copy.deepcopy(_p_dep))["orders"] if o["ticker"] == "SMH")
+check("plan: rebalance buy deploys an underweight book name the LLM HELD", _smh_dep["dollar_amount"], 9.0)
+check("plan: rebalance buy order kind", _smh_dep["order_kind"], "rebalance_buy")
+check("plan: rebalance buy signal tag", _smh_dep["signal"], "REBALANCE")
+# rebalance OFF: the held name is NOT deployed (classic path; no buy-to-target).
+check("plan: rebalance OFF -> held book name not deployed",
+      [o for o in _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_dep))["orders"]
+       if o["ticker"] == "SMH"], [])
+# Running cash pool bounds total buys: avail = buying_power(15.5) - buffer(5) = 10.5; SMH takes
+# its $10 target, leaving $0.5 — below the $1 broker minimum, so SOXX is skipped (not bounced).
+_p_x = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+        "buying_power": 15.5, "positions": {}, "quotes": {"SMH": 50.0, "SOXX": 50.0}, "analyses": [],
+        "target_weights": {"SMH": {"intent": "buy", "target_dollars": 10.0},
+                           "SOXX": {"intent": "buy", "target_dollars": 10.0}}}
+_o_x = _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_x))["orders"]
+check("plan: cash pool — first name deploys to target",
+      next(o["dollar_amount"] for o in _o_x if o["ticker"] == "SMH"), 10.0)
+check("plan: cash pool exhausted — second name skipped (no sub-$1 bounce)",
+      [o for o in _o_x if o["ticker"] == "SOXX"], [])
+# The cash sleeve (intent cash_residual) is never bought — stays as idle cash ballast.
+_p_cash = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
+           "buying_power": 100.0, "positions": {}, "quotes": {}, "analyses": [],
+           "target_weights": {"SGOV": {"intent": "cash_residual", "target_dollars": 23.0}}}
+check("plan: cash sleeve (cash_residual) is never bought",
+      _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_cash))["orders"], [])
+
+# --- AUTH_ERROR detector: collision-free vs TICK.md prose -------------------------
+# The supervisor must NOT fire on the literal "AUTH_ERROR" that TICK.md legitimately
+# contains (the bug), but MUST fire on the unique sentinel `tick.py auth-stop` emits, OR
+# on the ledger auth_error marker (which survives a failed alert email).
+_SENTINEL = _tick.AUTH_STOP_SENTINEL
+
+
+def _detect_auth(combined, marked):  # mirrors run_tick.py's detector (pure form)
+    return (_SENTINEL in combined) or bool(marked)
+
+
+_tickmd_text = (_REPO / "TICK.md").read_text(encoding="utf-8")
+check_true("auth: sentinel is ABSENT from TICK.md (collision-free)", _SENTINEL not in _tickmd_text)
+check_true("auth: literal AUTH_ERROR still present in TICK.md (the trap we route around)",
+           "AUTH_ERROR" in _tickmd_text)
+_tickmd_like = ('log `AUTH_ERROR`, fire the alert kind:"auth_error" stage:"broker_auth" '
+                '... run `tick.py auth-stop` ... and STOP.')
+check("auth: TICK.md-like prose (AUTH_ERROR, no sentinel) does NOT false-positive",
+      _detect_auth(_tickmd_like, marked=False), False)
+check("auth: real auth-stop sentinel in stdout fires",
+      _detect_auth('{"event": "%s", "stage": "broker_auth"}' % _SENTINEL, marked=False), True)
+check("auth: ledger marker fires even when sentinel absent (failed-email path)",
+      _detect_auth(_tickmd_like, marked="somehash"), True)
+check("auth: cmd_auth_stop emits the sentinel", _tick.cmd_auth_stop(None)["event"], _SENTINEL)
 
 # strategy-set -> construct -> goal-track lifecycle (offline, real strategy.yaml)
 _cfg_s3 = _cfg_rebal(True, strategy_path=str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml"))

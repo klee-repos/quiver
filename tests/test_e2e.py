@@ -85,6 +85,7 @@ def main() -> int:
     # --- STEP C: construct (deterministic target book today) ---
     print("\n[C] construct — what the book should look like today")
     con = T._run_construct(cfg, led, {"equity": snapshot["equity"],
+                                      "buying_power": snapshot["buying_power"],
                                       "positions": snapshot["positions"], "macro_reading": None})
     ok("construct proceeds with an active goal", con["proceed"] is True)
     tw = con["target_weights"]
@@ -115,8 +116,12 @@ def main() -> int:
         amt = f"${o.get('dollar_amount')}" if o.get("dollar_amount") is not None else f"{o.get('quantity')} sh"
         print(f"      {o['intent']:5} {o['ticker']:5} {amt:10} kind={o.get('order_kind')}  ref_id={o['ref_id']}")
     smh = next((o for o in plan["orders"] if o["ticker"] == "SMH"), None)
-    ok("SMH buy clamped to its $9 target (target binds under the $25 ceiling)",
-       smh is not None and smh["dollar_amount"] == 9.0)
+    # SMH is a book name: the deterministic buy-to-target pass OWNS it (the LLM's dribble buy
+    # is suppressed) and deploys it to its full target weight = 9% of total deployable capital
+    # (positions $20 + cash $100 = $120 -> $10.80), which is under the $25 per-trade ceiling.
+    ok("SMH deployed to its target via the rebalance buy pass (target < $25 ceiling)",
+       smh is not None and smh["order_kind"] == "rebalance_buy"
+       and smh["dollar_amount"] == tw["SMH"]["target_dollars"])
     ok("XLV got a clamped rebalance_trim from the overweight",
        any(o["ticker"] == "XLV" and o["order_kind"] == "rebalance_trim" for o in plan["orders"]))
     # THE central safety invariant:

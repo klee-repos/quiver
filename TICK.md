@@ -76,10 +76,13 @@ Parse the JSON.
 
 Call the Robinhood MCP with the `account_number` from preflight:
 1. `get_portfolio(account_number)` → read total **equity** and cash **buying_power**.
-   - If this returns an auth / 401 / expired-token error → log `AUTH_ERROR`, then
-     **fire the alert** with `kind:"auth_error"`, `stage:"broker_auth"` (severity is
-     critical; the email's "what to do" block carries the Chrome Remote Desktop re-auth
-     steps), `event_detail`=the error text, and **STOP** (never trade on stale auth).
+   - If this returns an auth / 401 / expired-token error → FIRST run
+     `~/dev/quiver/.venv/bin/python tick.py auth-stop` (it prints a machine sentinel to
+     stdout that the headless supervisor keys on — just run it; do NOT transcribe or quote
+     its output). Then log `AUTH_ERROR`, **fire the alert** with `kind:"auth_error"`,
+     `stage:"broker_auth"` (severity is critical; the email's "what to do" block carries
+     the Chrome Remote Desktop re-auth steps), `event_detail`=the error text, and **STOP**
+     (never trade on stale auth).
      Recovery: a human connects to the box's Chrome Remote Desktop
      (remotedesktop.google.com/access), opens a terminal, and runs `claude` then `/mcp`
      to re-authenticate Robinhood in the on-box browser — trading auto-resumes next wake
@@ -124,10 +127,15 @@ Write `state/tmp/construct_input.json`:
 ```json
 {
   "equity": <from get_portfolio>,
+  "buying_power": <from get_portfolio>,
   "positions": { "AAPL": {"market_value": 600.0}, ... },   // ALL held positions
   "macro_reading": { "core_pce_pct": <latest core-PCE % or null>, "fed_hike": <true|false> }
 }
 ```
+The book is sized against TOTAL DEPLOYABLE capital = sum(held positions' market value) +
+`buying_power` (idle cash), so the bot deploys its cash toward target weights rather than
+sizing against held equity alone. `buying_power` is the SAME value you pass STEP 4 below;
+omitting it makes construct fall back to positions-only sizing (the old undersized behavior).
 `macro_reading` is OPERATOR DATA you maintain (the bot cannot fetch macro within
 the invariant); omit it / use null to hold the conservative default book. Run:
 ```

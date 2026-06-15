@@ -31,6 +31,16 @@ from lib.config import load_config  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 from lib.prompts import load_prompt  # noqa: E402
 
+# The unique sentinel `tick.py auth-stop` prints on a real broker 401 (tick.AUTH_STOP_SENTINEL).
+# It is NOT in TICK.md prose, so its presence in the orchestrator's captured stdout means an
+# auth hard-stop ACTUALLY happened — unlike the literal "AUTH_ERROR" the runbook legitimately
+# contains. Imported with a string fallback so the supervisor never fails to start against an
+# older tick.py.
+try:
+    from tick import AUTH_STOP_SENTINEL  # noqa: E402
+except Exception:  # noqa: BLE001 — keep the supervisor importable regardless
+    AUTH_STOP_SENTINEL = "QUIVER_AUTH_STOP"
+
 VENV_PY = os.environ.get("QUIVER_PYTHON", str(_REPO / ".venv" / "bin" / "python"))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 MCP_CONFIG = os.environ.get("QUIVER_MCP_CONFIG", str(_REPO / "deploy" / "runner" / "mcp.json"))
@@ -221,7 +231,19 @@ def main() -> int:
                 # recorded by Python in the ledger (tick.py plan -> mark_halted). The raw
                 # transcript itself is never shipped — that keeps secrets/positions out
                 # of the shipped logs and the plan-error ("error") filter precise.
-                auth_error = "AUTH_ERROR" in combined
+                # Collision-free auth hard-stop detection. The literal "AUTH_ERROR" appears
+                # in TICK.md prose (the orchestrator Reads the runbook into stdout) and would
+                # false-positive on EVERY healthy tick. Match instead on the UNIQUE sentinel
+                # the orchestrator emits ONLY by running `tick.py auth-stop` on a real 401. OR
+                # with the ledger marker so a 401 whose (best-effort) in-tick email FAILED to
+                # send — leaving no notifications row — is still caught (no silent miss). The
+                # ledger read is wrapped: a DB hiccup must never crash the supervisor.
+                try:
+                    auth_marked = bool(
+                        led.last_notified_hash(day, "auth_error", notify.AUTH_STAGE))
+                except Exception:  # noqa: BLE001 — observability only; never block
+                    auth_marked = False
+                auth_error = (AUTH_STOP_SENTINEL in combined) or auth_marked
                 try:
                     halted = bool(led.is_halted(day))
                 except Exception:  # noqa: BLE001 — observability only, never block a tick

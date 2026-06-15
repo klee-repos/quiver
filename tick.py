@@ -48,6 +48,13 @@ from lib import universe  # noqa: E402
 LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (REPO / "state" / "ledger.db"))
 CONFIG_PATH = Path(os.environ.get("QUIVER_CONFIG") or (REPO / "config.yaml"))
 ANALYZE_LOGS = REPO / "state" / "analyze_logs"
+
+# Unique machine sentinel emitted by `auth-stop` ONLY. It must never appear in
+# TICK.md prose (the runbook names the COMMAND, never echoes this token), so it
+# lands in the supervisor's captured stdout (run_tick.py `combined`) only when the
+# command actually executed on a real broker 401 — making the AUTH_ERROR detector
+# collision-free with the literal "AUTH_ERROR" that TICK.md legitimately contains.
+AUTH_STOP_SENTINEL = "QUIVER_AUTH_STOP"
 # Bulky, reconstructable artifacts the retention sweep ages out (state of record
 # is the ledger, never these). Kept here so `prune` and any future caller agree.
 PRUNE_TARGETS = [
@@ -515,6 +522,19 @@ def _run_plan(cfg, led, data) -> dict:
             continue
 
         if intent == "buy":
+            # Book-driven allocation: when the rebalance layer is active and this name is
+            # in the book, the deterministic buy-to-target pass below OWNS its sizing — it
+            # deploys to the full target weight in Python, not the model's per-tick
+            # position_pct (which dribbles a fraction of equity). Suppress the model's buy
+            # here so the name is deployed ONCE, to target, by the rebalance pass. Only fires
+            # when rebalance is on AND a goal seeded target_weights (else target_weights is
+            # None -> classic path byte-identical).
+            if target_weights and ticker in target_weights:
+                led.record_action(day, ticker, signal=signal, intent="buy", status="skipped",
+                                  detail="deferred_to_rebalance_buy", now_iso=now_iso)
+                decision.update(status="skipped", intent="buy", detail="deferred_to_rebalance_buy")
+                result["decisions"].append(decision)
+                continue
             dollars, src = signals.resolve_buy_dollars(
                 a.get("position_sizing"), baseline.baseline_equity, frac,
                 ceiling=cfg.risk.max_dollars_per_trade,
@@ -670,6 +690,72 @@ def _run_plan(cfg, led, data) -> dict:
                 "ticker": ticker, "signal": signal, "status": "order",
                 "intent": "sell", "quantity": qty, "detail": order_kind})
 
+    # Rebalance BUY-TO-TARGET pass (Stage 3, the buy mirror of the SELL pass above).
+    # The DETERMINISTIC deploy: for every book name construct flagged underweight
+    # (intent=="buy"), buy toward its target weight in ONE pass — the book owns sizing,
+    # not the model. Runs ONLY when rebalance is enabled AND construct emitted a target
+    # map (target_weights is None when rebalance is off -> this block is skipped and plan
+    # is BYTE-IDENTICAL to the classic path). Dedup is on names ACTUALLY ORDERED this
+    # tick (LLM sells, reconcile/rebalance exits) so a name is never bought and sold at
+    # once; a name the model merely HELD is NOT excluded (that is the whole point — it
+    # still gets deployed to target). Idempotent across ticks: a name already at target
+    # has room_under_target == 0 and is skipped. Sizing is clamped by the per-trade
+    # ceiling, the remaining daily deploy cap, and a RUNNING available-cash figure, so the
+    # SUM of every buy planned this tick can never exceed buying_power - buffer.
+    if target_weights and not result["halt"] and cfg.risk.rebalance_enabled:
+        cash_tk = (cfg.risk.cash_sleeve_ticker or "SGOV").upper()
+        ordered = {o.get("ticker") for o in result["orders"]}
+        spent = sum(float(o.get("dollar_amount") or 0.0)
+                    for o in result["orders"] if o.get("side") == "buy")
+        avail_cash = buying_power - cfg.risk.min_buying_power_buffer - spent
+        for raw_ticker, tw in target_weights.items():
+            ticker = str(raw_ticker).upper()
+            if ticker in ordered or ticker == cash_tk or tw.get("orphan"):
+                continue
+            if tw.get("intent") != "buy" or not tw.get("quotable", True):
+                continue
+            pos = positions.get(ticker) or {}
+            held_qty = float(pos.get("quantity", 0) or 0)
+            held_mv = float(pos.get("market_value", 0) or 0)
+            quote = _to_float(quotes.get(ticker))
+            if held_mv == 0 and quote and held_qty:
+                held_mv = quote * held_qty
+            td = _to_float(tw.get("target_dollars")) or 0.0
+            # Dollars to buy = room before this name hits its target weight (>=0), clamped
+            # by the per-trade ceiling, the remaining daily cap, and the running cash pool.
+            delta = signals.room_under_target(td, held_mv)
+            dollars = round(min(delta, cfg.risk.max_dollars_per_trade,
+                                remaining_daily_cap, avail_cash), 2)
+            if dollars < 1.0:
+                # <$1 is Robinhood's fractional minimum (also covers <=0). Skip pre-submit
+                # rather than send an order the broker bounces. At full deployment no book
+                # weight lands here; this only guards a genuinely tiny/at-target name.
+                led.record_action(day, ticker, signal="REBALANCE", intent="buy",
+                                  status="skipped", detail="rebalance_buy_below_min", now_iso=now_iso)
+                result["decisions"].append({
+                    "ticker": ticker, "signal": "REBALANCE", "status": "skipped",
+                    "intent": "buy", "detail": "rebalance_buy_below_min"})
+                continue
+            remaining_daily_cap -= dollars
+            avail_cash -= dollars
+            ref_id = None
+            if not cfg.dry_run:
+                ref_id = led.new_ref_id()
+                led.reserve_order(ref_id, day, ticker, side="buy", type="market",
+                                  dollar_amount=dollars, quantity=None, now_iso=now_iso,
+                                  order_kind="rebalance_buy")
+            result["orders"].append({
+                "ticker": ticker, "signal": "REBALANCE", "intent": "buy",
+                "ref_id": ref_id, "side": "buy", "type": "market",
+                "dollar_amount": dollars, "quantity": None,
+                "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                "sizing_source": "rebalance_target", "order_kind": "rebalance_buy"})
+            led.record_action(day, ticker, signal="REBALANCE", intent="buy",
+                              status="order", detail="rebalance_buy", now_iso=now_iso)
+            result["decisions"].append({
+                "ticker": ticker, "signal": "REBALANCE", "status": "order",
+                "intent": "buy", "dollar_amount": dollars, "detail": "rebalance_buy"})
+
     # Loop cadence: wake at the soonest re-look the model asked for (clamped),
     # snapped to market hours. The orchestrator schedules the next tick at this.
     if review_minutes:
@@ -821,10 +907,24 @@ def _run_construct(cfg, led, data) -> dict:
     goal = led.get_active_goal()
     if not goal:
         return {"proceed": False, "reason": "no active strategy goal", "target_weights": {}}
-    equity = _to_float(data.get("equity")) or 0.0
     positions_in = data.get("positions", {}) or {}
     positions_mv = {str(tk).upper(): (_to_float((pos or {}).get("market_value")) or 0.0)
                     for tk, pos in positions_in.items()}
+    # Size the book against TOTAL DEPLOYABLE capital, not just held equity. The broker's
+    # `equity` is positions-only (sum of holdings' market value) and excludes idle cash, so
+    # sizing targets against it makes every target_dollars a fraction of the true base and the
+    # bot can never deploy its cash toward the book. Deployable = held positions + buying_power
+    # (idle cash). Reached ONLY past the proceed:false early-return above, i.e. only with an
+    # active goal — the classic path is unaffected. The cash sleeve (SGOV) is the residual:
+    # it is never bought/trimmed (intent=cash_residual), so the cash backing its target weight
+    # naturally stays as uninvested buying power.
+    buying_power = _to_float(data.get("buying_power")) or 0.0
+    deployable = sum(positions_mv.values()) + buying_power
+    if deployable <= 0:
+        # Backward-compatible fallback: an equity-only caller (no itemized positions/cash)
+        # sizes against the passed `equity` as the base. Also avoids a div-by-zero in
+        # weight_drift (current_mv/equity) when nothing is itemized as deployable.
+        deployable = _to_float(data.get("equity")) or 0.0
     now_iso = data.get("now_iso") or market.now_et().isoformat()
     day = market.trading_day_et()
     # Component C: advance + persist the CONFIRMED regime HERE (the in-runbook step) so the
@@ -851,7 +951,7 @@ def _run_construct(cfg, led, data) -> dict:
             book_name, book_reason = strategy.select_active_book(cfg.strategy, data.get("macro_reading"))
     targets = led.active_target_portfolio(goal["id"], statuses=("active", "exiting"))
     rows = portfolio.construct_target_book(
-        targets, positions_mv, equity, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
+        targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
     target_weights = {r["ticker"]: {"intent": r["intent"], "target_dollars": r["target_dollars"],
                                     "target_weight": r["target_weight"],
                                     "delta_dollars": r.get("delta_dollars"),
@@ -1389,6 +1489,19 @@ def cmd_send_test(args) -> dict:
             "from": from_addr, "kind": kind, "stage": notify.stage_of(model)}
 
 
+def cmd_auth_stop(_args) -> dict:
+    """Emit the unique AUTH-STOP sentinel for the headless supervisor.
+
+    The orchestrator (TICK.md STEP 2) runs this on a confirmed Robinhood 401 BEFORE
+    firing the in-tick auth alert and STOPPING. It places/decides nothing and touches
+    no broker — it only prints AUTH_STOP_SENTINEL into the supervisor's captured stdout
+    so run_tick.py recognises the hard-stop INDEPENDENTLY of whether the (best-effort)
+    auth email actually sent. The token is unique and absent from TICK.md prose, so it
+    cannot be produced by the orchestrator merely reading the runbook — only by running
+    this command on a real auth failure."""
+    return {"event": AUTH_STOP_SENTINEL, "stage": notify.AUTH_STAGE}
+
+
 # --- protective stop (Phase 5) -----------------------------------------------
 # After an entry FILLS, the orchestrator calls this with the fill price + qty; we
 # return a Python-clamped gtc stop_market sell to place (the model's stop_loss only
@@ -1597,6 +1710,7 @@ def main(argv) -> int:
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
     sub.add_parser("prune")
+    sub.add_parser("auth-stop")
     p_ms = sub.add_parser("memory-show")
     p_ms.add_argument("--ticker", default="")
     sub.add_parser("memory-rebuild")
@@ -1636,6 +1750,8 @@ def main(argv) -> int:
             out = cmd_universe_apply(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
+        elif args.cmd == "auth-stop":
+            out = cmd_auth_stop(args)
         elif args.cmd == "memory-show":
             out = cmd_memory_show(args)
         elif args.cmd == "memory-rebuild":
