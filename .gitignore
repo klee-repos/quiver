@@ -30,4 +30,9 @@ deploy/terraform/*.tfstate
 deploy/terraform/*.tfstate.*
 deploy/terraform/.terraform/
 deploy/terraform/.terraform.lock.hcl
+deploy/gcp/terraform/terraform.tfvars
+deploy/gcp/terraform/*.tfstate
+deploy/gcp/terraform/*.tfstate.*
+deploy/gcp/terraform/.terraform/
+deploy/gcp/terraform/.terraform.lock.hcl
 .claude/
