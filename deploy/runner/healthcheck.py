@@ -34,6 +34,10 @@ def run_healthcheck() -> dict:
     def _market():
         import lib.market as market
         market.trading_day_et()
+        # Exercise the XNYS calendar (pandas_market_calendars) — preflight calls this on every
+        # tick. trading_day_et() alone does NOT trigger the lazy import, so a missing
+        # pandas-market-calendars would pass the check yet break the first real tick.
+        market.is_regular_session_open()
 
     def _ledger():
         from lib.ledger import Ledger

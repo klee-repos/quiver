@@ -35,7 +35,12 @@ echo "[5/9] service user + venv (repo already cloned by the startup-script; publ
 id -u "$QUIVER_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin "$QUIVER_USER"
 mkdir -p "$QUIVER_HOME" /etc/quiver /var/log/quiver
 python3 -m venv "$QUIVER_HOME/.venv"
-"$QUIVER_HOME/.venv/bin/pip" install -q -e "$QUIVER_HOME"
+# Install the FULL locked env (parity with the validated local venv), THEN the package itself.
+# `pip install -e .` alone resolves only pyproject `dependencies` and MISSES anything imported
+# but not declared there (e.g. pandas-market-calendars, which lib/market needs for preflight) —
+# that gap bricked preflight on the first box. The lock file is the source of truth for the env.
+"$QUIVER_HOME/.venv/bin/pip" install -q -r "$QUIVER_HOME/requirements.lock.txt"
+"$QUIVER_HOME/.venv/bin/pip" install -q -e "$QUIVER_HOME" --no-deps
 chown -R "$QUIVER_USER:$QUIVER_USER" "$QUIVER_HOME" /var/log/quiver
 
 echo "[6/9] secrets: Secret Manager -> /etc/quiver/quiver.env (instance SA via metadata token)"
