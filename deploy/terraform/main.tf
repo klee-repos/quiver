@@ -135,7 +135,7 @@ resource "aws_cloudwatch_metric_alarm" "f" {
 # shared, mutable default security group.
 resource "aws_security_group" "quiver" {
   name        = "${var.name}-sg"
-  description = "Quiver box — no inbound; egress only"
+  description = "Quiver box - no inbound, egress only"
   egress {
     from_port   = 0
     to_port     = 0
