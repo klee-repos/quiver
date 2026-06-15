@@ -31,3 +31,6 @@ deploy/gcp/terraform/*.tfstate.*
 deploy/gcp/terraform/.terraform/
 deploy/gcp/terraform/.terraform.lock.hcl
 .claude/
+# CLAUDE.md is kept LOCAL-ONLY — it carries the live ops runbook incl. the desktop PIN +
+# quiver password. The repo is public, so it must never be committed.
+CLAUDE.md
