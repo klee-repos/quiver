@@ -45,8 +45,13 @@ VENV_PY = os.environ.get("QUIVER_PYTHON", str(_REPO / ".venv" / "bin" / "python"
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 MCP_CONFIG = os.environ.get("QUIVER_MCP_CONFIG", str(_REPO / "deploy" / "runner" / "mcp.json"))
 SETTINGS = os.environ.get("QUIVER_CLAUDE_SETTINGS", str(_REPO / "deploy" / "runner" / "settings.json"))
-# Cheapest reliable tool-using model (decision D11) — the pass only shuttles JSON.
-MODEL = os.environ.get("QUIVER_MODEL", "claude-haiku-4-5-20251001")
+# Orchestrator model. Python does ALL the thinking; this pass only shuttles JSON and
+# invokes the broker MCP. It MUST reliably invoke deferred MCP tools (ToolSearch-load then
+# native tool-call) on a full rebalance tick — haiku-4-5 could not (it tried to call the
+# Robinhood MCP via Bash/python and gave up, blocking the tick), so we use Sonnet, which
+# handles deferred-tool invocation + the multi-order rebalance tick reliably. Override via
+# QUIVER_MODEL if a cheaper model proves reliable for the now-simpler classic path.
+MODEL = os.environ.get("QUIVER_MODEL", "claude-sonnet-4-6")
 EFFORT = os.environ.get("QUIVER_EFFORT", "low")  # ultracode OFF; Python does the thinking
 TICK_TIMEOUT_SEC = int(os.environ.get("QUIVER_TICK_TIMEOUT_SEC", "2400"))  # ~40 min ceiling
 # Clean per-tick status lines are appended here too (best-effort) so the log agent

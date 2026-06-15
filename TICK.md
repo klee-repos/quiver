@@ -74,6 +74,17 @@ Parse the JSON.
 
 ## STEP 2 — Broker snapshot (MCP, read-only)
 
+The Robinhood (and Resend) MCP tools may be **deferred** — listed by name but not
+directly callable until loaded. If `get_portfolio` / `get_equity_positions` /
+`get_equity_quotes` / `review_equity_order` / `place_equity_order` /
+`cancel_equity_order` aren't directly available, FIRST load them with ToolSearch
+(`select:mcp__robinhood-trading__get_portfolio,mcp__robinhood-trading__get_equity_positions,mcp__robinhood-trading__get_equity_quotes,mcp__robinhood-trading__review_equity_order,mcp__robinhood-trading__place_equity_order,mcp__robinhood-trading__cancel_equity_order`),
+then invoke them as **native tool calls**. NEVER try to reach the broker via Bash or a
+`python`/`robinhood_trading` import — there is no such module; the broker is reachable
+ONLY as MCP tool calls. If after loading you still cannot invoke a broker tool, treat it
+exactly like an auth failure (run `tick.py auth-stop`, fire the alert, STOP) — never
+invent broker data.
+
 Call the Robinhood MCP with the `account_number` from preflight:
 1. `get_portfolio(account_number)` → read total **equity** and cash **buying_power**.
    - If this returns an auth / 401 / expired-token error → FIRST run
