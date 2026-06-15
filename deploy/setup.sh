@@ -13,6 +13,14 @@ echo "[1/9] apt deps"
 apt-get update -y
 apt-get install -y curl ca-certificates gnupg jq git python3-venv build-essential unzip
 
+echo "[1b/9] 2G swapfile backstop (a transient tick+desktop memory peak swaps, not OOM-kills)"
+if ! swapon --show 2>/dev/null | grep -q .; then
+  { fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048; } \
+    && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile \
+    && { grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; } \
+    || echo "  NOTE: swap setup skipped/failed (non-fatal)"
+fi
+
 echo "[2/9] Node 20 (the claude CLI runtime)"
 command -v node >/dev/null || { curl -fsSL https://deb.nodesource.com/setup_20.x | bash - ; apt-get install -y nodejs ; }
 
@@ -53,31 +61,45 @@ fetch_opt() { aws ssm get-parameter --region "$AWS_REGION" --name "$SSM_PREFIX/$
 # missing param. A failing `$(fetch K)` *inside* `echo "K=$(...)"` does NOT trip set -e
 # (echo exits 0), which would silently write an empty value — including a dead pager
 # RESEND_API_KEY. The assignment form `_v=$(...)` does propagate the failure.
-for _k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RH_OAUTH_TOKEN RESEND_API_KEY NOTIFY_TO; do
+# NOTE: RH_OAUTH_TOKEN is GONE from the required set — the Robinhood MCP now authenticates
+# via OAuth done once in the on-box browser (Chrome Remote Desktop) and stored under
+# CLAUDE_CONFIG_DIR, NOT a static bearer in the env. See setup-desktop.sh / DEPLOY.md.
+for _k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO; do
   _v=$(fetch "$_k") || { echo "FATAL: required SSM param $SSM_PREFIX/$_k is missing" >&2; exit 1; }
   { [ -n "$_v" ] && [ "$_v" != "None" ]; } || { echo "FATAL: required SSM param $SSM_PREFIX/$_k is empty" >&2; exit 1; }
   printf -v "$_k" '%s' "$_v"
 done
-# Claude Code auth for the headless orchestrator: EITHER a subscription token
-# (CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token` — uses your Pro/Max plan, no API
-# billing) OR an ANTHROPIC_API_KEY. Prefer the subscription token, and write ONLY one —
-# an ANTHROPIC_API_KEY in the env would override the token and bill the API instead.
+# Claude Code auth is now OPTIONAL at provision time. If an SSM token is present we use it;
+# otherwise the headless tick relies on an interactive `claude login` done ONCE in the
+# on-box desktop (same CLAUDE_CONFIG_DIR). So this NEVER FATALs — a token-less box simply
+# AUTH-fails safe on each tick until the operator logs in. Write ONLY one auth line (an
+# ANTHROPIC_API_KEY would override a subscription token and bill the API).
 _CCOT=$(fetch_opt CLAUDE_CODE_OAUTH_TOKEN)
 _AAK=$(fetch_opt ANTHROPIC_API_KEY)
+CLAUDE_AUTH_LINE=""
 if [ -n "$_CCOT" ] && [ "$_CCOT" != "None" ]; then
   CLAUDE_AUTH_LINE="CLAUDE_CODE_OAUTH_TOKEN=$_CCOT"
 elif [ -n "$_AAK" ] && [ "$_AAK" != "None" ]; then
   CLAUDE_AUTH_LINE="ANTHROPIC_API_KEY=$_AAK"
 else
-  echo "FATAL: no Claude auth — set SSM $SSM_PREFIX/CLAUDE_CODE_OAUTH_TOKEN (run 'claude" >&2
-  echo "       setup-token' on your subscription) OR $SSM_PREFIX/ANTHROPIC_API_KEY" >&2
-  exit 1
+  echo "  NOTE: no Claude auth in SSM — the box will rely on an interactive 'claude login'"
+  echo "        in the on-box desktop. Until then, ticks AUTH-fail safe (place nothing)."
 fi
+# All claude + MCP credential / OAuth state lives here: writable, refreshable, and under
+# /opt/quiver/state so it survives the service's ProtectHome=read-only. BOTH the systemd
+# service (via this quiver.env) and the desktop login session (via /etc/environment, set
+# in setup-desktop.sh) point at the same dir, so the OAuth the operator does in the browser
+# is the OAuth the headless tick reuses.
+CLAUDE_CONFIG_DIR="$QUIVER_HOME/state/claude-config"
+install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$CLAUDE_CONFIG_DIR"
+# Pre-create npx's writable cache (quiver.service redirects npm_config_cache here so the
+# resend MCP digest send works under ProtectHome=read-only) — owned by quiver up front.
+install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/.npm-cache"
 {
-  echo "$CLAUDE_AUTH_LINE"
+  [ -n "$CLAUDE_AUTH_LINE" ] && echo "$CLAUDE_AUTH_LINE"
+  echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
   echo "DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY"
   echo "RH_ACCOUNT_NUMBER=$RH_ACCOUNT_NUMBER"
-  echo "RH_OAUTH_TOKEN=$RH_OAUTH_TOKEN"
   echo "RESEND_API_KEY=$RESEND_API_KEY"
   echo "NOTIFY_TO=$NOTIFY_TO"
   # Python last-resort alert sender (run_tick.py). RESEND_FROM must be a verified
@@ -88,6 +110,20 @@ fi
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
 [ -f "$QUIVER_HOME/deploy/runner/mcp.json" ] || cp "$QUIVER_HOME/deploy/runner/mcp.json.example" "$QUIVER_HOME/deploy/runner/mcp.json"
+
+# Register the Robinhood MCP at USER scope (no header -> the CLI does the OAuth dance when
+# the operator authenticates it via `/mcp` in the on-box browser). run_tick.py drops
+# --strict-mcp-config so the headless tick reuses this user-scope server + its stored OAuth;
+# resend stays in mcp.json (static key, no OAuth). Best-effort: `claude mcp add` flags vary
+# by CLI version and this is re-doable via `/mcp`, so a failure here must NOT abort the box.
+_QHOME="$(getent passwd "$QUIVER_USER" | cut -d: -f6)"
+if sudo -u "$QUIVER_USER" env HOME="$_QHOME" CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
+     claude mcp add robinhood-trading --scope user --transport http \
+     https://agent.robinhood.com/mcp/trading >/dev/null 2>&1; then
+  echo "  registered robinhood-trading (user scope) — authenticate it via /mcp in the desktop"
+else
+  echo "  NOTE: 'claude mcp add robinhood-trading' skipped/failed — add it via /mcp on the box"
+fi
 # config.yaml carries no secrets and IS committed, so it ships in the clone — nothing to
 # seed. strategy.yaml is per-user + gitignored (it reveals your macro book), so it is NOT
 # in the clone: pull the REAL file from SSM if present (keeps the box reproducible from
@@ -129,14 +165,19 @@ touch /var/log/quiver/tick.log                       # give the agent a file to 
 chown "$QUIVER_USER:$QUIVER_USER" /var/log/quiver/tick.log
 "$CWCTL" -a fetch-config -m ec2 -s -c "file:$QUIVER_HOME/deploy/cloudwatch-agent.json"
 
-echo "[9/9] offline healthcheck"
-sudo -u "$QUIVER_USER" "$QUIVER_HOME/.venv/bin/python" "$QUIVER_HOME/deploy/runner/healthcheck.py"
+echo "[9/9] offline healthcheck (env sourced so load_config sees RH_ACCOUNT_NUMBER/NOTIFY_TO)"
+# Non-fatal: a healthcheck hiccup must not abort provisioning after the timer is enabled.
+sudo -u "$QUIVER_USER" bash -c 'set -a; . /etc/quiver/quiver.env; set +a; exec "'"$QUIVER_HOME"'/.venv/bin/python" "'"$QUIVER_HOME"'/deploy/runner/healthcheck.py"' \
+  || echo "  NOTE: healthcheck reported issues (see above) — inspect before trusting a live tick"
 
 cat <<'NOTE'
-DONE. Two steps that CANNOT be automated:
-  1) Robinhood MCP auth (the token has NO refresh — re-auth is interactive): as the
-     quiver user run `claude` then `/mcp` to authenticate, and push the resulting
-     token to SSM ($SSM_PREFIX/RH_OAUTH_TOKEN). On expiry, repeat and re-run setup.
-  2) Soak in dry_run first: set config.yaml dry_run=true, then flip to false on a FRESH
-     trading day only after a clean dry-run validation (clear that day's ledger rows first).
+DONE. The only steps left are interactive, done ONCE in the on-box browser (Chrome
+Remote Desktop) — see DEPLOY.md:
+  1) Claude login: in the desktop, run `claude` and sign into your Pro/Max plan (unless
+     a CLAUDE_CODE_OAUTH_TOKEN was provided via SSM).
+  2) Robinhood auth: run `/mcp` -> robinhood-trading -> authenticate in the browser.
+     Re-auth roughly every ~3.8 days (Robinhood's OAuth fully expires; no headless refresh).
+Both persist under CLAUDE_CONFIG_DIR (/opt/quiver/state/claude-config), which the headless
+tick reuses. config.yaml ships dry_run:false (LIVE) by design — straight-to-live per the
+operator; touch /opt/quiver/KILL to halt.
 NOTE

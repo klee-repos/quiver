@@ -77,12 +77,14 @@ def action_steps(model: dict):
         return []
     if kind == "auth_error" or stage == AUTH_STAGE:
         return [
-            f"SSH into {host}.",
-            "Re-auth the broker: cd /opt/quiver && sudo -u quiver -H claude, then run /mcp.",
-            "Push the refreshed token to SSM and re-run deploy/setup.sh so the HEADLESS "
-            "tick picks it up — the interactive /mcp alone does NOT update the systemd run "
-            "(see docs/DEPLOY.md).",
-            "Trading resumes automatically on the next wake once the token is live.",
+            "Connect to the box's desktop: https://remotedesktop.google.com/access "
+            "(enter your PIN).",
+            "Open a terminal there and run: claude  then  /mcp  -> robinhood-trading -> "
+            "authenticate in the browser that opens.",
+            "Robinhood's OAuth fully expires ~every 3.8 days with no headless refresh — this "
+            "is the routine re-auth, done in the on-box browser (NOT over SSH/SSM: the "
+            "localhost OAuth redirect needs the box's own browser).",
+            "Trading resumes automatically on the next wake once the OAuth is refreshed.",
         ]
     if kind == "halt" or stage == HALT_STAGE:
         return [
@@ -332,7 +334,8 @@ def _preheader(model: dict) -> str:
     doesn't preview as 'Quiver — <date>'."""
     kind = model.get("kind", "digest")
     if kind == "auth_error":
-        return "Broker auth expired — no orders placed. SSH in and run /mcp."
+        return ("Broker auth expired — no orders placed. Re-auth via the box's Chrome "
+                "Remote Desktop (run /mcp).")
     if kind == "halt":
         return f"Daily-loss halt fired: {model.get('halt_reason') or 'daily loss'}. Trading stopped."
     if kind == "error":

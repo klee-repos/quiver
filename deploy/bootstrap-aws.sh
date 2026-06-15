@@ -40,8 +40,8 @@ done
 echo "[2] your private strategy book -> SSM (Intelligent-Tiering)"
 put_big STRATEGY_YAML "$(cat strategy.yaml)"
 
-echo "[3] RH_OAUTH_TOKEN placeholder (the real token comes from the interactive /mcp)"
-have RH_OAUTH_TOKEN || put RH_OAUTH_TOKEN "PENDING"
+echo "[3] (no RH_OAUTH_TOKEN) — Robinhood now authenticates via OAuth in the on-box browser"
+echo "    (Chrome Remote Desktop), stored under CLAUDE_CONFIG_DIR; there is no bearer in SSM."
 
 echo "[4] Claude Code auth for the headless orchestrator (subscription token OR API key)"
 if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then put CLAUDE_CODE_OAUTH_TOKEN "$CLAUDE_CODE_OAUTH_TOKEN";
@@ -73,8 +73,9 @@ fi
 
 echo
 echo "DONE. Still human-only (cannot be automated):"
-echo "  1. Claude auth -> SSM (above): 'claude setup-token' -> CLAUDE_CODE_OAUTH_TOKEN (subscription),"
-echo "     or ANTHROPIC_API_KEY (API billing). Whichever, if not done above."
-echo "  2. cd deploy/terraform && terraform apply   (spins up the paid box)."
-echo "  3. Confirm the SNS subscription email AWS sends you."
-echo "  4. One-time Robinhood /mcp on the box, then push RH_OAUTH_TOKEN to SSM + re-run setup.sh."
+echo "  1. cd deploy/terraform && terraform apply   (spins up the paid box)."
+echo "  2. Confirm the SNS subscription email AWS sends you."
+echo "  3. Link Chrome Remote Desktop (remotedesktop.google.com/headless -> run start-host on"
+echo "     the box) — see docs/DEPLOY.md step 4."
+echo "  4. In the on-box desktop: 'claude' (sign in) then '/mcp' (Robinhood). Re-auth ~every 3.8d."
+echo "  (Claude auth via SSM is OPTIONAL — the on-box 'claude' login in step 4 covers it.)"

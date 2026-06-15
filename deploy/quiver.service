@@ -13,14 +13,23 @@ EnvironmentFile=/etc/quiver/quiver.env
 # so the CloudWatch agent can tail it and the metric-filter alarms have data. It sits
 # under ReadWritePaths below; locally run_tick.py defaults to logs/tick.log instead.
 Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
+# CLAUDE_CONFIG_DIR comes from quiver.env (=/opt/quiver/state/claude-config) — a writable
+# ReadWritePath, so claude/MCP OAuth state is readable+refreshable even under ProtectHome.
+# Keep npx's cache (the resend MCP runs `npx -y resend-mcp`) off the read-only HOME too,
+# else the in-tick digest send silently fails.
+Environment=npm_config_cache=/opt/quiver/state/.npm-cache
 ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_tick.py
 TimeoutStartSec=3000
 StandardOutput=journal
 StandardError=journal
-# Hardening (mirrors BRAX): the tick may only write its own state/logs.
+# Hardening (mirrors BRAX): the tick may only write its own state/logs. ProtectHome stays
+# read-only — all writable claude/MCP/npm state is redirected under /opt/quiver/state above.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/opt/quiver/state /opt/quiver/logs /var/log/quiver
-MemoryMax=1500M
+# 4 GiB box (t3.medium); the tick spawns claude + analyze.py subprocesses. The XFCE/Chrome
+# desktop runs OUTSIDE this unit and can be ~1.5 GiB during a re-auth, so cap the tick at
+# 2500M to leave physical headroom (a 2G swapfile, added in setup.sh, absorbs any spike).
+MemoryMax=2500M

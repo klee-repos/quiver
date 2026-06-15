@@ -197,7 +197,12 @@ def main() -> int:
                 CLAUDE_BIN, "-p", "--output-format", "stream-json",
                 "--include-partial-messages", "--verbose",
                 "--model", MODEL, "--effort", EFFORT,
-                "--mcp-config", MCP_CONFIG, "--strict-mcp-config",
+                # NO --strict-mcp-config: the Robinhood MCP is registered at USER scope and
+                # carries its OAuth (done once in the on-box browser); strict mode would
+                # ignore user-scope servers + their stored OAuth. --mcp-config still layers
+                # in resend (static key). The box's quiver user has no other MCP servers, so
+                # dropping strict mode adds no stray servers.
+                "--mcp-config", MCP_CONFIG,
                 "--settings", SETTINGS, "--add-dir", str(_REPO),
                 "--max-turns", "80", "--append-system-prompt", SYSTEM_PROMPT,
                 "--dangerously-skip-permissions",  # unattended; the order guard is the real gate

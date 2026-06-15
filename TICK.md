@@ -78,10 +78,12 @@ Call the Robinhood MCP with the `account_number` from preflight:
 1. `get_portfolio(account_number)` → read total **equity** and cash **buying_power**.
    - If this returns an auth / 401 / expired-token error → log `AUTH_ERROR`, then
      **fire the alert** with `kind:"auth_error"`, `stage:"broker_auth"` (severity is
-     critical; the email's "what to do" block carries the full re-auth + SSM + setup.sh
-     recovery), `event_detail`=the error text, and **STOP** (never trade on stale auth).
-     Recovery: a human re-runs `/mcp` on the box, pushes the token to SSM, and re-runs
-     `deploy/setup.sh` (see docs/DEPLOY.md).
+     critical; the email's "what to do" block carries the Chrome Remote Desktop re-auth
+     steps), `event_detail`=the error text, and **STOP** (never trade on stale auth).
+     Recovery: a human connects to the box's Chrome Remote Desktop
+     (remotedesktop.google.com/access), opens a terminal, and runs `claude` then `/mcp`
+     to re-authenticate Robinhood in the on-box browser — trading auto-resumes next wake
+     (see docs/DEPLOY.md). Robinhood's OAuth expires ~every 3.8 days, no headless refresh.
 2. `get_equity_positions(account_number)` → for each held ticker record
    `{quantity, market_value}`.
 3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>

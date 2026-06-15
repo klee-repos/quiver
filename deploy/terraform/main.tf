@@ -14,16 +14,19 @@ provider "aws" {
   region = var.aws_region
 }
 
-data "aws_ami" "ubuntu_arm" {
+# x86_64 (NOT arm64): Chrome Remote Desktop's Linux host package and Google Chrome are
+# amd64-only, and the on-server browser OAuth is the whole point of this box. So we run an
+# x86_64 Ubuntu + a t3-class instance rather than the cheaper t4g/arm64.
+data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"] # Canonical
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"]
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
   filter {
     name   = "architecture"
-    values = ["arm64"]
+    values = ["x86_64"]
   }
 }
 
@@ -60,6 +63,14 @@ resource "aws_iam_role_policy" "quiver" {
   name   = "${var.name}-policy"
   role   = aws_iam_role.quiver.id
   policy = data.aws_iam_policy_document.perms.json
+}
+
+# SSM Session Manager — operator shell access with NO inbound port (the box runs no
+# sshd-facing rule). The only human admin path; Chrome Remote Desktop (the desktop) is
+# likewise outbound-only, so the box needs zero inbound security-group rules.
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.quiver.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "quiver" {
@@ -118,12 +129,29 @@ resource "aws_cloudwatch_metric_alarm" "f" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
 }
 
+# Dedicated security group: ZERO inbound (Chrome Remote Desktop dials OUT to Google's relay;
+# operator shell is SSM Session Manager, also outbound) + all egress. This ENFORCES the
+# "no inbound on a live-broker box" posture in IaC rather than inheriting the account's
+# shared, mutable default security group.
+resource "aws_security_group" "quiver" {
+  name        = "${var.name}-sg"
+  description = "Quiver box — no inbound; egress only"
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  tags = { Name = var.name }
+}
+
 # --- the box ---
 resource "aws_instance" "quiver" {
-  ami                  = data.aws_ami.ubuntu_arm.id
-  instance_type        = var.instance_type
-  iam_instance_profile = aws_iam_instance_profile.quiver.name
-  key_name             = var.key_name
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = var.instance_type
+  iam_instance_profile   = aws_iam_instance_profile.quiver.name
+  key_name               = var.key_name
+  vpc_security_group_ids = [aws_security_group.quiver.id]
 
   metadata_options {
     http_tokens = "required" # IMDSv2 only
@@ -149,6 +177,9 @@ resource "aws_instance" "quiver" {
     echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > /root/.ssh/known_hosts
     git clone "$QUIVER_REPO_URL" /opt/quiver
     bash /opt/quiver/deploy/setup.sh
+    # Desktop + Chrome Remote Desktop layer for the on-server Robinhood/Claude OAuth.
+    # Best-effort: a desktop hiccup must NOT undo the (already-provisioned) trading stack.
+    bash /opt/quiver/deploy/setup-desktop.sh || echo "setup-desktop.sh had issues; trading stack is up, finish CRD via SSM"
   EOF
   tags      = { Name = var.name }
 }

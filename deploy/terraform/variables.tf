@@ -11,9 +11,9 @@ variable "name" {
 }
 
 variable "instance_type" {
-  description = "t4g.small is ~$12/mo and fits node+python+claude; bump to t4g.medium if 2 GiB is tight"
+  description = "t3.medium (x86_64, 4 GiB) — Chrome Remote Desktop + Chrome are amd64-only, so NOT a t4g/arm64. 4 GiB gives headroom to run XFCE + Chrome for the on-server OAuth alongside the tick; ~$30/mo."
   type        = string
-  default     = "t4g.small"
+  default     = "t3.medium"
 }
 
 variable "ssm_prefix" {

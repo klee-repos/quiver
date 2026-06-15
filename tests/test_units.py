@@ -266,8 +266,10 @@ check_true("error html escapes + shows detail", "daily cap math" in _de["text"])
 _m_a2 = {"date": "2026-05-30", "now_iso": "t", "kind": "auth_error", "dry_run": False,
          "event_detail": "401", "subject_prefix": "[Quiver]", "tickers": []}
 _da2 = notify.build_digest(_m_a2)
-check_true("auth_error text has /mcp + SSH", "/mcp" in _da2["text"] and "SSH" in _da2["text"])
-check_true("auth_error html has /mcp + SSH", "/mcp" in _da2["html"] and "SSH" in _da2["html"])
+check_true("auth_error text has /mcp + remote desktop",
+           "/mcp" in _da2["text"] and "remotedesktop.google.com" in _da2["text"])
+check_true("auth_error html has /mcp + remote desktop",
+           "/mcp" in _da2["html"] and "remotedesktop.google.com" in _da2["html"])
 check("auth_error stage derived", notify.stage_of(_m_a2), "broker_auth")
 check("halt stage derived", notify.stage_of({"kind": "halt"}), "daily_loss_halt")
 # warning severity: no alarmist CTA, self-heal copy

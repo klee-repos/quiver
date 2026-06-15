@@ -195,8 +195,8 @@ def main() -> int:
     rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
                     event_detail="401", send=lambda **k: sent.append(k) or {"ok": True, "id": "1"})
     ok("last-resort sends once", len(sent) == 1)
-    ok("alert copy is actionable (/mcp + SSH in html & text)",
-       "/mcp" in sent[0]["text"] and "SSH" in sent[0]["html"])
+    ok("alert copy is actionable (/mcp + remote desktop in html & text)",
+       "/mcp" in sent[0]["text"] and "remotedesktop.google.com" in sent[0]["html"])
     rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
                     event_detail="different", send=lambda **k: sent.append(k) or {"ok": True})
     ok("last-resort dedups against the shared row (no double page)", len(sent) == 1)
