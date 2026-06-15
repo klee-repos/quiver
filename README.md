@@ -169,7 +169,6 @@ account. If you fund it with more, raise the dollar limits to match.
 | `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
 | `max_dollars_per_trade` | `25` | The most it can spend on any single buy. |
 | `daily_capital_deploy_cap` | `75` | The most it can spend buying in one day, total. |
-| `max_open_position_per_ticker` | `50` | The most it will ever hold in one stock. |
 | `daily_loss_halt_pct` | `5.0` | If you're down this much in a day, it stops everything. |
 | `min_buying_power_buffer` | `5` | Always leave at least this much cash untouched. |
 | `intraday_enabled` | `false` | `false` = trade once a day. `true` = let it check a few times a day. |

@@ -22,7 +22,6 @@ class RiskConfig:
     max_dollars_per_trade: float
     daily_loss_halt_pct: float
     daily_capital_deploy_cap: float
-    max_open_position_per_ticker: float
     min_buying_power_buffer: float
     # Intraday-only caps (default 1 == classic once-a-day behavior). max_actions
     # bounds repeat TRADES per ticker/day; max_analyses is the LLM-cost circuit
@@ -268,7 +267,6 @@ def load_config(path) -> Config:
         max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
         daily_capital_deploy_cap=_pos_num(risk_d, "daily_capital_deploy_cap"),
-        max_open_position_per_ticker=_pos_num(risk_d, "max_open_position_per_ticker"),
         min_buying_power_buffer=float(risk_d.get("min_buying_power_buffer", 0) or 0),
         max_actions_per_ticker_per_day=_pos_int(risk_d, "max_actions_per_ticker_per_day", 1),
         max_analyses_per_ticker_per_day=_pos_int(risk_d, "max_analyses_per_ticker_per_day", 1),

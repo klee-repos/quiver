@@ -163,7 +163,6 @@ def _run_preflight(cfg, led) -> dict:
             "max_dollars_per_trade": cfg.risk.max_dollars_per_trade,
             "daily_loss_halt_pct": cfg.risk.daily_loss_halt_pct,
             "daily_capital_deploy_cap": cfg.risk.daily_capital_deploy_cap,
-            "max_open_position_per_ticker": cfg.risk.max_open_position_per_ticker,
             "min_buying_power_buffer": cfg.risk.min_buying_power_buffer,
         },
         "order": {
@@ -516,14 +515,12 @@ def _run_plan(cfg, led, data) -> dict:
             continue
 
         if intent == "buy":
-            room = max(0.0, cfg.risk.max_open_position_per_ticker - held_mv)
             dollars, src = signals.resolve_buy_dollars(
                 a.get("position_sizing"), baseline.baseline_equity, frac,
                 ceiling=cfg.risk.max_dollars_per_trade,
                 remaining_daily_cap=remaining_daily_cap,
                 buying_power=buying_power,
                 buffer=cfg.risk.min_buying_power_buffer,
-                room_under_ticker_cap=room,
                 position_pct=_to_float(a.get("position_pct")),
                 room_under_target=_target_room(target_weights, ticker, held_mv),
             )

@@ -14,7 +14,6 @@ risk:
   max_dollars_per_trade: 100           # hard per-trade ceiling
   daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
   daily_capital_deploy_cap: 1000       # max total $ of BUYS across all tickers per day
-  max_open_position_per_ticker: 50     # max $ market value held in any one ticker
   min_buying_power_buffer: 5           # never spend below this much remaining buying power
   max_actions_per_ticker_per_day: 10   # intraday-only: repeat TRADES/ticker/day
   max_analyses_per_ticker_per_day: 10  # intraday-only: LLM-cost circuit breaker

@@ -59,7 +59,6 @@ class Box:
             "  max_dollars_per_trade: 25\n"
             "  daily_loss_halt_pct: 50.0\n"
             "  daily_capital_deploy_cap: 1000\n"
-            "  max_open_position_per_ticker: 100\n"
             "  min_buying_power_buffer: 5\n"
             "  rebalance_enabled: true\n"
             "  consistency:\n"

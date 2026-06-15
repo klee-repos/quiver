@@ -53,7 +53,7 @@ def _cfg(notify_block):
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/alerts_kill",
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
         "notify": notify_block,

@@ -70,44 +70,38 @@ check("empty -> None", signals.parse_sizing_to_dollars(None, 10000), None)
 # 5% of 10k = 500, ceiling 500 -> 500
 d, src = signals.resolve_buy_dollars("5%", 10000, 1.0, ceiling=500,
                                      remaining_daily_cap=1500, buying_power=5000,
-                                     buffer=200, room_under_ticker_cap=1000)
+                                     buffer=200)
 check("buy clamps to ceiling", (d, src), (500.0, "parsed"))
 
 # ceiling lower than parsed size
 d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=300,
                                    remaining_daily_cap=1500, buying_power=5000,
-                                   buffer=200, room_under_ticker_cap=1000)
+                                   buffer=200)
 check("ceiling wins", d, 300.0)
 
 # buying power - buffer is the binding constraint
 d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
                                    remaining_daily_cap=9000, buying_power=450,
-                                   buffer=200, room_under_ticker_cap=9000)
+                                   buffer=200)
 check("buying-power buffer binds", d, 250.0)
-
-# per-ticker room binds
-d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
-                                   remaining_daily_cap=9000, buying_power=9000,
-                                   buffer=0, room_under_ticker_cap=120)
-check("per-ticker room binds", d, 120.0)
 
 # Overweight tilt halves the parsed size
 d, _ = signals.resolve_buy_dollars("4%", 10000, 0.5, ceiling=5000,
                                    remaining_daily_cap=9000, buying_power=9000,
-                                   buffer=0, room_under_ticker_cap=9000)
+                                   buffer=0)
 check("overweight halves (4% of 10k = 400 -> 200)", d, 200.0)
 
 # unparseable sizing -> conservative fallback (min(ceiling, 100)), never fails open
 d, src = signals.resolve_buy_dollars("a small starter", 10000, 1.0, ceiling=500,
                                      remaining_daily_cap=1500, buying_power=5000,
-                                     buffer=200, room_under_ticker_cap=1000)
+                                     buffer=200)
 check("fallback amount", d, 100.0)
 check("fallback source tagged", src, "fallback")
 
-# no room -> zero -> skip
+# daily cap exhausted -> zero -> skip
 d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
                                    remaining_daily_cap=0, buying_power=9000,
-                                   buffer=0, room_under_ticker_cap=9000)
+                                   buffer=0)
 check("daily cap exhausted -> 0", d, 0.0)
 
 # --- resolve_sell_quantity ---
@@ -137,7 +131,7 @@ def make_config(notify_block=None):
         "dry_run": True,
         "kill_switch_file": "/tmp/bw_kill_test",
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
     }
@@ -415,7 +409,7 @@ def make_storage_config(storage_block):
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
     }
@@ -554,7 +548,7 @@ def make_loop_config(loop_block=None, risk_extra=None):
     d = {
         "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                 "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                 "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
     }
@@ -586,23 +580,23 @@ check_raises("analysis cap <= 0 raises",
 # Structured position_pct (% of equity) takes precedence over prose, tagged 'structured'.
 _d, _src = signals.resolve_buy_dollars("ignored prose", 1000, 1.0, ceiling=500,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
-                                       room_under_ticker_cap=900, position_pct=10)
+                                       position_pct=10)
 check("structured pct used (10% of 1000)", (_d, _src), (100.0, "structured"))
 _d, _ = signals.resolve_buy_dollars(None, 1000, 1.0, ceiling=50,
                                     remaining_daily_cap=500, buying_power=900, buffer=0,
-                                    room_under_ticker_cap=900, position_pct=20)
+                                    position_pct=20)
 check("structured pct still clamped by ceiling", _d, 50.0)
 _d, _ = signals.resolve_buy_dollars(None, 1000, 0.5, ceiling=500,
                                     remaining_daily_cap=500, buying_power=900, buffer=0,
-                                    room_under_ticker_cap=900, position_pct=10)
+                                    position_pct=10)
 check("structured pct * overweight tilt", _d, 50.0)
 _d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
-                                       room_under_ticker_cap=900, position_pct=None)
+                                       position_pct=None)
 check("prose path unchanged when no position_pct", (_d, _src), (50.0, "parsed"))
 _d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
-                                       room_under_ticker_cap=900, position_pct=0)
+                                       position_pct=0)
 check("non-positive position_pct -> prose fallback", (_d, _src), (50.0, "parsed"))
 
 
@@ -625,7 +619,7 @@ check_true("stop is strictly below fill", signals.resolve_stop_price(100.0, None
 def make_order_config(order_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
-                  "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
+                  "min_buying_power_buffer": 5},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
     if order_block is not None:
         d["order"] = order_block
@@ -779,7 +773,7 @@ check("baseline_equity_series date order",
 def make_memory_config(memory_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
-                  "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5},
+                  "min_buying_power_buffer": 5},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
     if memory_block is not None:
         d["memory"] = memory_block
@@ -1071,7 +1065,7 @@ def _safe_strategy(path):  # mirrors the load_config wrapper: garbled -> None
 check("config: garbled strategy.yaml -> None (fail-safe contract)",
       _safe_strategy(_write_tmp("schema: 2\nnonsense: [")), None)
 _rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capital_deploy_cap=1000,
-                  max_open_position_per_ticker=50, min_buying_power_buffer=5,
+                  min_buying_power_buffer=5,
                   max_actions_per_ticker_per_day=1, max_analyses_per_ticker_per_day=1)
 check("config: RiskConfig rebalance knobs default to today's behavior",
       (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.reconcile_unmanaged),
@@ -1172,7 +1166,7 @@ check("sig: target sell never oversells", signals.resolve_target_sell_quantity(1
 check("sig: target sell no quote -> 0", signals.resolve_target_sell_quantity(10.0, 0.0, 60.0, 45.0), 0.0)
 _buy_args = dict(position_sizing=None, baseline_equity=100.0, buy_fraction=1.0, ceiling=25.0,
                  remaining_daily_cap=75.0, buying_power=100.0, buffer=5.0,
-                 room_under_ticker_cap=50.0, position_pct=10.0)
+                 position_pct=10.0)
 check("sig: resolve_buy_dollars room=None == omitted (byte-identical)",
       signals.resolve_buy_dollars(**_buy_args),
       signals.resolve_buy_dollars(**_buy_args, room_under_target=None))
@@ -1276,7 +1270,7 @@ import lib.market as _market  # noqa: E402
 def _cfg_rebal(enabled, strategy_path=None):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_s3",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                  "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5, "rebalance_enabled": enabled},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
     if strategy_path:
@@ -1372,7 +1366,7 @@ check("plan: reconcile sell is long-only (a SELL)", _aapl["side"], "sell")
 _cfg_norec = load_config(_write_config({
     "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_norec",
     "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
-             "max_open_position_per_ticker": 50, "min_buying_power_buffer": 5,
+             "min_buying_power_buffer": 5,
              "rebalance_enabled": False, "reconcile_unmanaged": False},
     "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
     "strategy_path": str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml")}))
@@ -1808,7 +1802,7 @@ check_true("cons: migrations idempotent on re-open", _reopen.get_active_goal() i
 def _cfg_with_consistency(cons_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kcons",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                  "daily_capital_deploy_cap": 75, "max_open_position_per_ticker": 50,
+                  "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5, "consistency": cons_block},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
     return load_config(_write_config(d))
@@ -1827,7 +1821,7 @@ check_raises("cons-cfg: zero flip_window raises",
 def _cfg_cons(**risk):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kc_int",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 50.0, "daily_capital_deploy_cap": 1000,
-                  "max_open_position_per_ticker": 100, "min_buying_power_buffer": 5, **risk},
+                  "min_buying_power_buffer": 5, **risk},
          "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
     return load_config(_write_config(d))
 

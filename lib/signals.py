@@ -71,7 +71,6 @@ def resolve_buy_dollars(
     remaining_daily_cap: float,
     buying_power: float,
     buffer: float,
-    room_under_ticker_cap: float,
     fallback: float = 100.0,
     position_pct: Optional[float] = None,
     room_under_target: Optional[float] = None,
@@ -81,7 +80,7 @@ def resolve_buy_dollars(
     Sizing source preference: the model's STRUCTURED ``position_pct`` (% of equity)
     wins when present; otherwise the prose ``position_sizing`` is parsed; otherwise
     a conservative fallback. Final amount = min(that size, per-trade ceiling,
-    remaining daily deploy cap, buying_power - buffer, room under per-ticker cap).
+    remaining daily deploy cap, buying_power - buffer).
 
     ``room_under_target`` is the strategy layer's extra clamp (Stage 3): the room
     left before this name hits its target weight. It is folded into the SAME min()
@@ -103,7 +102,7 @@ def resolve_buy_dollars(
 
     # The classic clamp stack. room_under_target is appended ONLY when supplied,
     # so with it None the min() args are identical to before (byte-identical output).
-    clamps = [base, ceiling, remaining_daily_cap, buying_power - buffer, room_under_ticker_cap]
+    clamps = [base, ceiling, remaining_daily_cap, buying_power - buffer]
     if room_under_target is not None:
         clamps.append(room_under_target)
     capped = min(clamps)
