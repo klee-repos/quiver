@@ -1,5 +1,7 @@
 # Plan — Unified email alerts: run-complete + on-error (defense-in-depth)
 
+> **Note (2026-06):** the deploy moved from AWS to GCP — see `docs/DEPLOY.md` and `deploy/gcp/`. AWS/EC2/SSM/CloudWatch references below are historical design notes.
+
 **Status:** proposed (pending /autoplan review → implement e2e)
 **Branch:** `feat/macro-strategy-layer`
 **Author:** Claude (ultracode) · 2026-06-14

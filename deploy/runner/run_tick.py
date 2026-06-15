@@ -39,8 +39,8 @@ SETTINGS = os.environ.get("QUIVER_CLAUDE_SETTINGS", str(_REPO / "deploy" / "runn
 MODEL = os.environ.get("QUIVER_MODEL", "claude-haiku-4-5-20251001")
 EFFORT = os.environ.get("QUIVER_EFFORT", "low")  # ultracode OFF; Python does the thinking
 TICK_TIMEOUT_SEC = int(os.environ.get("QUIVER_TICK_TIMEOUT_SEC", "2400"))  # ~40 min ceiling
-# Clean per-tick status lines are appended here too (best-effort) so the CloudWatch
-# agent on the box can tail a stable file and the metric-filter alarms have data to
+# Clean per-tick status lines are appended here too (best-effort) so the log agent
+# on the box can tail a stable file and the log-based metric alarms have data to
 # fire on. Defaults to a repo-relative, gitignored path so LOCAL runs are unaffected;
 # the box overrides it to /var/log/quiver/tick.log (see deploy/quiver.service).
 TICK_LOG = os.environ.get("QUIVER_TICK_LOG", str(_REPO / "logs" / "tick.log"))
@@ -216,11 +216,11 @@ def main() -> int:
                 _emit({"stage": "tick", "ok": ok, "returncode": proc.returncode,
                        "tail": combined[-400:]})
                 # Surface the deterministic alarm signals into the shipped tick log as
-                # clean lines the CloudWatch metric filters key on. AUTH_ERROR is logged
+                # clean lines the log-based metric filters key on. AUTH_ERROR is logged
                 # by the orchestrator (TICK.md) in its transcript; a daily-loss halt is
                 # recorded by Python in the ledger (tick.py plan -> mark_halted). The raw
                 # transcript itself is never shipped — that keeps secrets/positions out
-                # of CloudWatch and the plan-error ("error") filter precise.
+                # of the shipped logs and the plan-error ("error") filter precise.
                 auth_error = "AUTH_ERROR" in combined
                 try:
                     halted = bool(led.is_halted(day))

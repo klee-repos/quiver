@@ -282,12 +282,12 @@ ledger rollups — all offline.
   universe is derived from the active portfolio book (`strategy.yaml` / the ledger goal) via
   `tick.py:_analysis_universe` + `lib/universe.tradable_universe` (cash + non-quotable excluded).
   **Committed** — it carries NO secrets (those are in `.env`), so it ships in the repo and is the
-  single config source of truth (the box uses it directly; it is no longer SSM-seeded).
+  single config source of truth (the box uses it directly; it is not fetched from a cloud secret store).
 - `strategy.yaml` — the macro book + goal as DATA; it IS the trading universe (the book's
   holdings, minus cash/non-quotable). **Per-user + gitignored** (copy `strategy.yaml.example`)
   — it reveals your allocations. Fails SAFE: absent/empty book → nothing to analyze, no trades.
 - `strategy.yaml.example` — the committed template (SAFE: illustrative book). `cp` it to start; on
-  the box `strategy.yaml` is pulled from SSM (see DEPLOY.md). `config.yaml` needs no template — it
+  the box `strategy.yaml` is pulled from Google Secret Manager (see docs/DEPLOY.md). `config.yaml` needs no template — it
   is committed directly.
 - `TICK.md` — the per-tick runbook the orchestrator follows verbatim.
 - `tradingagents/` — the multi-agent framework, **owned in-tree** (de-vendored from upstream;

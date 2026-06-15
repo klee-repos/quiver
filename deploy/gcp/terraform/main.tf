@@ -1,5 +1,5 @@
 # Quiver headless trader — GCP (Compute Engine) infrastructure.
-# Mirrors the AWS stack: one hardened e2-medium running the systemd timer; secrets in
+# One hardened e2-medium running the systemd timer; secrets in
 # Secret Manager; a desktop + Chrome + Chrome Remote Desktop for the on-server Robinhood
 # OAuth; Cloud Logging metrics -> Monitoring alert policies -> email; no public inbound
 # (admin via IAP-tunneled SSH; CRD dials out to Google's relay). Secret VALUES are created
@@ -156,7 +156,7 @@ resource "google_compute_instance" "quiver" {
   ]
 }
 
-# --- Cloud Logging metrics + Monitoring alerts (mirror the CloudWatch metric filters) ---
+# --- Cloud Logging metrics + Monitoring alerts (log-based metric -> alert policy -> email) ---
 # The Ops Agent ships /var/log/quiver/tick.log to the log "quiver_tick" (see setup.sh).
 # NOTE: these filters are validated/tuned against the real log structure on first boot;
 # the Resend pager (run_tick.py / in-tick MCP) is the PRIMARY, cloud-agnostic alert path.

@@ -1622,7 +1622,7 @@ check("ledger: run_lock steals a STALE lock", _ledL.try_acquire_run_lock("h2", "
 # ============================================================================
 # Stage 5 — deploy harness: run-lock wrapper + order-authorization guard +
 # offline healthcheck. (The Agent-SDK supervisor + IaC are exercised by the
-# AWS e2e drills documented in docs/DEPLOY.md, not the offline suite.)
+# deploy e2e drills documented in docs/DEPLOY.md, not the offline suite.)
 # ============================================================================
 import lib.runlock as _runlock  # noqa: E402
 import deploy.runner.order_guard as _og  # noqa: E402

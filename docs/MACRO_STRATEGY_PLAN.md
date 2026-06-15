@@ -1,5 +1,7 @@
 # Quiver Goal-Strategy Layer — Formal Plan
 
+> **Note (2026-06):** the deploy moved from AWS to GCP — see `docs/DEPLOY.md` and `deploy/gcp/`. AWS/EC2/SSM/CloudWatch references below are historical design notes.
+
 **A macro-driven, self-learning portfolio engine targeting +15% / 12 months, hosted continuously on AWS.**
 
 Status: DRAFT (pending `/plan-eng-review` + the decisions in §1)

@@ -82,7 +82,7 @@ def action_steps(model: dict):
             "Open a terminal there and run: claude  then  /mcp  -> robinhood-trading -> "
             "authenticate in the browser that opens.",
             "Robinhood's OAuth fully expires ~every 3.8 days with no headless refresh — this "
-            "is the routine re-auth, done in the on-box browser (NOT over SSH/SSM: the "
+            "is the routine re-auth, done in the on-box browser (NOT over a remote shell: the "
             "localhost OAuth redirect needs the box's own browser).",
             "Trading resumes automatically on the next wake once the OAuth is refreshed.",
         ]
@@ -93,7 +93,7 @@ def action_steps(model: dict):
             "When ready to resume: sudo -u quiver rm /opt/quiver/KILL.",
         ]
     return [
-        f"SSH into {host}; check logs/orchestrator.log + /var/log/quiver/tick.log.",
+        f"Open a shell on {host} (IAP SSH); check logs/orchestrator.log + /var/log/quiver/tick.log.",
         f"The tick stopped at the '{stage or 'unknown'}' stage — detail below.",
         "Trading is paused for this wake; the next wake retries from preflight.",
     ]

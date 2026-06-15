@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to mcp.json at provision time. Resend ONLY — it is a static-key stdio server (no OAuth). The Robinhood MCP is NOT here: it is an OAuth http server registered at USER scope (setup.sh: `claude mcp add robinhood-trading --scope user`) and authenticated once in the on-box browser via /mcp; run_tick.py drops --strict-mcp-config so the headless tick layers that user-scope server + its stored OAuth on top of this file. The claude CLI interpolates ${ENV} from the process env (loaded from /etc/quiver/quiver.env).",
+  "_comment": "Copy to mcp.json at provision time. Resend ONLY — it is a static-key stdio server (no OAuth). The Robinhood MCP is NOT here: it is an OAuth http server registered at USER scope (deploy/gcp/setup.sh: `claude mcp add robinhood-trading --scope user`) and authenticated once in the on-box browser via /mcp; run_tick.py drops --strict-mcp-config so the headless tick layers that user-scope server + its stored OAuth on top of this file. The claude CLI interpolates ${ENV} from the process env (loaded from /etc/quiver/quiver.env).",
   "mcpServers": {
     "resend": {
       "command": "npx",

@@ -1,150 +1,109 @@
-# Quiver — AWS deployment (headless box with an on-server browser for OAuth)
+# Quiver — GCP deployment (Compute Engine, on-server-browser OAuth)
 
-The pattern: a single hardened **x86_64 `t3.medium` Ubuntu 24.04** box runs a **systemd
-timer** that, on each weekday market-hours wake, drives **one tick** by running the
-`claude` CLI headless over `TICK.md`. Secrets live in **SSM Parameter Store** (free); the
-box runs the **CloudWatch agent** to ship the per-tick log, metric-filter alarms page via
-**SNS**, and **EC2 auto-recovery** reboots-in-place on host failure. ~**$30/mo**
-(t3.medium + EBS + CloudWatch), plus your Claude Pro/Max subscription and DeepSeek usage.
+The Quiver deploy, on GCP Compute Engine. A single hardened **`e2-medium` Ubuntu 24.04 (x86_64)**
+Compute Engine VM runs a **systemd timer** that drives one tick per weekday market-hours
+wake by running the `claude` CLI headless over `TICK.md`. Secrets live in **Secret
+Manager**; the **Google Cloud Ops Agent** ships the per-tick log to Cloud Logging where
+**log-based metrics → Monitoring alert policies** page an email channel. GCE **auto-restart
++ live-migration** is the host-failure recovery. ~**$25–30/mo** + your Claude subscription
++ DeepSeek usage.
 
-The box also runs a **lightweight desktop (XFCE) + Chrome + Chrome Remote Desktop**, used
-only for the periodic interactive OAuth (below). Execution-only by construction: the Python
-brain owns every decision, and the **PreToolUse order guard**
-(`deploy/runner/order_guard.py`) mechanically denies any order whose `ref_id` the Python
-`plan` did not reserve in the ledger.
+The box runs **XFCE + Chrome + Chrome Remote Desktop** for the periodic Robinhood/Claude
+OAuth (Robinhood's token fully expires ~every 3.8 days, no headless refresh — re-auth in the
+on-box browser). Execution-only: Python owns every decision, and the **PreToolUse order
+guard** denies any order whose `ref_id` the Python `plan` did not reserve.
 
-> **The defining constraint (Robinhood OAuth):** Robinhood's agentic MCP authenticates via
-> **OAuth with a localhost browser redirect**, and the token **fully expires ~every 3.8
-> days with no headless refresh**. So re-auth is interactive on *any* host. We solve it by
-> giving the box its own browser: you connect via **Chrome Remote Desktop**, do the login
-> **on the box**, and the headless tick reuses the stored OAuth. Expect a ~1-minute re-auth
-> every ~4 days; that is a Robinhood platform limit, not a deploy bug.
-
-> **No inbound ports.** Chrome Remote Desktop dials *out* to Google's relay, and operator
-> shell is via **SSM Session Manager** — so the box needs zero inbound security-group rules.
+> **No public inbound.** The custom VPC default-denies ingress; the ONLY inbound rule is
+> SSH from Google's IAP range (`35.235.240.0/20`) scoped to the box's service account. Admin
+> is `gcloud compute ssh --tunnel-through-iap`; Chrome Remote Desktop dials OUT to Google's
+> relay. The external IP is egress-only.
 
 ---
 
-## 0. Prerequisites (you provide)
-- An AWS account + region (`us-east-1`), AWS CLI configured locally, Terraform ≥ 1.5, `gh`.
-- An EC2 key pair (`bootstrap-aws.sh` creates `quiver-box`) — optional now that admin is via
-  SSM Session Manager, but kept for break-glass.
-- The box clones over SSH with a **read-only deploy key** (created by `bootstrap-aws.sh`);
-  `repo_url` is the SSH form `git@github.com:<you>/quiver.git`.
-- API keys/values pushed to SSM: `DEEPSEEK_API_KEY`, `RESEND_API_KEY`, `RH_ACCOUNT_NUMBER`,
-  `NOTIFY_TO`, and a **Resend-verified** `RESEND_FROM` (powers the Python last-resort pager).
-  Optional `NOTIFY_ALERTS_TO`.
-- **Claude Code auth is OPTIONAL up front** — either push `CLAUDE_CODE_OAUTH_TOKEN`
-  (`claude setup-token`) / `ANTHROPIC_API_KEY` to SSM, **or** just `claude login` once in the
-  on-box desktop (recommended — keeps everything in the same browser flow as Robinhood).
-- **There is NO `RH_OAUTH_TOKEN`** any more — Robinhood auth is the on-box browser OAuth.
+## 0. Prerequisites
+- `gcloud` authed (`gcloud auth login`) and a project with **billing enabled**
+  (default `your-gcp-project-id`). Terraform ≥ 1.5.
+- Required APIs enabled (compute, secretmanager, iap, logging, monitoring,
+  cloudresourcemanager) — `gcloud services enable ...`.
+- The repo is **public**, so the box clones over HTTPS — no deploy key / SSH / `gh` needed.
+- Terraform auth: either `gcloud auth application-default login`, OR (no browser) export a
+  short-lived token: `export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token)`.
 
-> **`./deploy/bootstrap-aws.sh`** pushes every SSM secret from your local `.env` + the
-> private `strategy.yaml`, creates the read-only GitHub deploy key, and makes the EC2 key
-> pair. It is idempotent. (For this account that is already done.)
-
-## 1. Secrets in SSM (out-of-band — never in tfstate)
-`bootstrap-aws.sh` handles this. Manual equivalent:
+## 1. Seed Secret Manager (out-of-band — never in tfstate)
 ```bash
-P=/quiver
-for k in DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO RESEND_FROM; do
-  read -rs -p "$k: " v; echo
-  aws ssm put-parameter --name "$P/$k" --type SecureString --value "$v" --overwrite
-done
-# Your private strategy book (the trading universe); config.yaml is committed, so not needed:
-aws ssm put-parameter --name "$P/STRATEGY_YAML" --type SecureString \
-  --tier Intelligent-Tiering --value "$(cat strategy.yaml)" --overwrite
-# Optional Claude auth (else do `claude login` on the box):
-# aws ssm put-parameter --name "$P/CLAUDE_CODE_OAUTH_TOKEN" --type SecureString --value "<sk-ant-oat...>" --overwrite
+./deploy/gcp/bootstrap-gcp.sh      # pushes .env + strategy.yaml -> quiver-<KEY> secrets
 ```
+Creates `quiver-DEEPSEEK_API_KEY`, `quiver-RH_ACCOUNT_NUMBER`, `quiver-RESEND_API_KEY`,
+`quiver-NOTIFY_TO`, `quiver-RESEND_FROM`, `quiver-STRATEGY_YAML` (+ optional
+`quiver-NOTIFY_ALERTS_TO` / `quiver-CLAUDE_CODE_OAUTH_TOKEN` if set in `.env`). Claude auth
+is OPTIONAL — the on-box `claude login` (step 4) covers it.
 
 ## 2. Provision with Terraform
 ```bash
-cd deploy/terraform
-# terraform.tfvars is already filled (alert_email, key_name, repo_url, t3.medium).
+cd deploy/gcp/terraform
+export GOOGLE_OAUTH_ACCESS_TOKEN=$(gcloud auth print-access-token)   # or ADC login
 terraform init && terraform apply
 ```
-`user_data` runs `setup.sh` (trading stack) then `setup-desktop.sh` (XFCE + Chrome + CRD).
-Confirm the **SNS email subscription** AWS sends you (until confirmed, no alarm pages).
-Note the `instance_id` / `public_ip` outputs.
+The instance `startup-script` clones the public repo and runs `deploy/gcp/setup.sh` (trading
+stack: venv, claude CLI, secrets→`/etc/quiver/quiver.env`, systemd timer, Ops Agent) then
+`deploy/setup-desktop.sh` (XFCE + Chrome + CRD).
 
-## 3. Verify the box (via SSM Session Manager — no SSH needed)
+**Click the GCP Monitoring verification email** Google sends to `alert_email` — the email
+notification channel is created UNVERIFIED and delivers nothing until confirmed. (The Resend
+pager — in-tick + last-resort — is the primary, cloud-agnostic alert path; these Cloud
+Monitoring policies are a secondary net.)
+
+## 3. Verify the box (admin via IAP — no public inbound)
+IAP-tunneled SSH is the ONLY shell (no public SSH). The principal running it needs
+**`roles/iap.tunnelResourceAccessor`** + an OS Login role — a project **Owner** has both
+implicitly (so `ops@yourdomain.com` works out of the box); a non-owner operator must be granted
+them, or they're locked out.
 ```bash
-aws ssm start-session --target <instance_id>
+gcloud compute ssh quiver --zone us-central1-a --tunnel-through-iap
+sudo tail -50 /var/log/quiver-startup.log          # provisioning log
 sudo -u quiver bash -c 'set -a; . /etc/quiver/quiver.env; set +a; \
   /opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/healthcheck.py'   # -> ok:true
 systemctl status quiver.timer
-/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status # -> "running"
-# PAGER ACCEPTANCE GATE — really sends via the box's RESEND_API_KEY + RESEND_FROM:
+# PAGER ACCEPTANCE GATE (really sends via Resend):
 sudo -u quiver bash -c 'set -a; . /etc/quiver/quiver.env; set +a; \
   /opt/quiver/.venv/bin/python /opt/quiver/tick.py send-test --kind auth_error'  # -> sent:true
 ```
 
 ## 4. Link Chrome Remote Desktop (one-time, human — tied to YOUR Google account)
 1. Open <https://remotedesktop.google.com/headless> → "Set up another computer" → Debian
-   Linux, and copy the `start-host` command (it carries a one-time `--code="4/..."`).
-2. Run it on the box as the `quiver` user, then set a 6-digit PIN:
+   Linux, copy the `start-host` command (has a one-time `--code="4/..."`).
+2. Run it on the box as `quiver` (over IAP SSH), then set a 6-digit PIN:
    ```bash
    sudo -u quiver env HOME=/home/quiver CLAUDE_CONFIG_DIR=/opt/quiver/state/claude-config \
      /opt/google/chrome-remote-desktop/start-host --code="4/PASTE" \
      --redirect-url="https://remotedesktop.google.com/_/oauthredirect" --name=quiver-box
    ```
-3. The box appears at <https://remotedesktop.google.com/access>. Connect with the PIN.
+3. Connect at <https://remotedesktop.google.com/access> with the PIN.
 
 ## 5. On-box logins (one-time, then ~every 3.8 days for Robinhood)
-In the Chrome Remote Desktop session, open a terminal:
+In the CRD desktop, open a terminal:
 ```bash
-claude            # sign into your Pro/Max plan (skip if a token was set in SSM)
-# then inside claude:
-/mcp              # -> robinhood-trading -> authenticate in the browser that opens
+claude            # sign into your Pro/Max plan (skip if a token was set in Secret Manager)
+/mcp              # -> robinhood-trading -> authenticate in the browser
 ```
-Both credentials persist under `CLAUDE_CONFIG_DIR` (`/opt/quiver/state/claude-config`) —
-the quiver desktop shells export this via `~/.bashrc`/`~/.profile` (set by
-`setup-desktop.sh`), so the OAuth lands exactly where the headless tick reads it. **Re-auth
-Robinhood (`/mcp`) every ~3.8 days** — you'll be paged (`AUTH_ERROR`) when it lapses; the
-bot stops, never trades blind.
-
-> Before a re-auth, optionally `sudo systemctl stop quiver.timer` and `start` it after, so a
-> tick can't read the credential mid-rewrite. Not required — a tick that hits a half-written
-> cred just AUTH-fails safe and retries next wake — but it avoids a spurious page.
+Both persist under `CLAUDE_CONFIG_DIR` (`/opt/quiver/state/claude-config`); the quiver
+desktop shells export it via `~/.bashrc`/`~/.profile`. **Re-auth Robinhood (`/mcp`) every
+~3.8 days** — you're paged (`AUTH_ERROR`) when it lapses; the bot stops, never trades blind.
 
 ## 6. Validate broker auth, then live
 ```bash
-# Prove the headless tick can actually reach the broker on the stored OAuth (read-only):
-aws ssm start-session --target <instance_id>
-sudo systemctl start quiver.service     # off-hours: preflight no-ops, but confirms auth path
-journalctl -u quiver.service -n 80      # look for a clean broker read, no AUTH_ERROR
+gcloud compute ssh quiver --zone us-central1-a --tunnel-through-iap
+sudo systemctl start quiver.service     # off-hours: confirms the broker read path
+sudo journalctl -u quiver.service -n 80 # expect a clean get_portfolio, no AUTH_ERROR
 ```
-`config.yaml` ships **`dry_run: false` (LIVE)** by design — **straight to live** per the
-operator. The trading universe is your `strategy.yaml` book; the first eligible
-market-hours tick deploys real capital via the validated per-ticker path. To halt at any
-time: `sudo -u quiver touch /opt/quiver/KILL`.
-
-> **Config on the box** comes from the committed `config.yaml` in the clone (NOT SSM —
-> there is no `CONFIG_YAML` seed). To change it on a running box, edit
-> `/opt/quiver/config.yaml` directly (`sudo -u quiver vi ...`); setup.sh re-runs never
-> clobber it. `rebalance_enabled`/`reconcile_unmanaged` only activate after a `strategy-set`
-> goal is seeded — until then the first ticks are buys-only, not liquidations.
-
----
-
-## E2E drills (run before trusting it with money)
-- **AUTH_ERROR:** let the Robinhood OAuth lapse (or revoke it) → a tick must place nothing,
-  fire the `AUTH_ERROR` CloudWatch alarm, and exit non-zero.
-- **Order guard:** the offline suite proves `order_guard.evaluate` denies an unreserved
-  `ref_id`; on the box, confirm the PreToolUse hook is wired (`--settings
-  deploy/runner/settings.json`) in a tick's tool-use log.
-- **Crash recovery:** `aws ec2 reboot-instances`; on reboot, `preflight` reconciles any
-  reserved-but-unfinalized order via `get_equity_orders` without minting a new `ref_id`.
-- **Halt / KILL:** `sudo -u quiver touch /opt/quiver/KILL` → next tick no-ops; a daily-loss
-  breach writes `KILL` and pages you.
+`config.yaml` ships **`dry_run: false` (LIVE)** — straight to live per the operator. Halt
+anytime: `sudo -u quiver touch /opt/quiver/KILL`.
 
 ## Controls
-- **Stop trading now:** SSM in, `sudo -u quiver touch /opt/quiver/KILL` (or `sudo systemctl
-  stop quiver.timer`).
-- **Logs:** `journalctl -u quiver.service -f` (full detail) or `tail -f
-  /var/log/quiver/tick.log` (clean status lines the CloudWatch alarms key on).
-- **Admin shell:** `aws ssm start-session --target <instance_id>` (no inbound port).
-- **Desktop:** <https://remotedesktop.google.com/access> + PIN (no inbound port).
-- **Cost:** EC2 t3.medium ~$30 + EBS ~$2 + CloudWatch ~$1–3 + SSM $0 ≈ **$33/mo**; a
-  Savings Plan trims the EC2 floor.
+- **Stop trading now:** IAP SSH in, `sudo -u quiver touch /opt/quiver/KILL` (or `sudo
+  systemctl stop quiver.timer`).
+- **Logs:** `journalctl -u quiver.service -f` / `tail -f /var/log/quiver/tick.log`; Cloud
+  Logging log `quiver_tick` (where the alert policies key).
+- **Admin shell:** `gcloud compute ssh quiver --zone us-central1-a --tunnel-through-iap`.
+- **Desktop:** <https://remotedesktop.google.com/access> + PIN.
+- **Cost:** e2-medium ~$25 + disk ~$2 + logging ~$1 ≈ **~$28/mo**; a CUD trims the floor.

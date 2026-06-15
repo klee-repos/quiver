@@ -4,7 +4,7 @@ Description=Quiver tick schedule (weekday market-hours)
 [Timer]
 # Weekdays, on the half-hour through the US session. The XNYS calendar in lib/market
 # makes preflight a cheap no-op outside the real session / on holidays, so a coarse
-# weekday-hours schedule is enough. Hours are UTC (EC2 default TZ); 13..21 UTC covers
+# weekday-hours schedule is enough. Hours are UTC (the box's default TZ); 13..21 UTC covers
 # ~9:00-17:00 ET across DST. Serial by construction (oneshot) + the ledger run_lock.
 OnCalendar=Mon..Fri 13..21:30:00 UTC
 Persistent=false

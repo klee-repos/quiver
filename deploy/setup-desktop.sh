@@ -3,12 +3,12 @@
 #
 # This adds the ON-SERVER browser the operator uses for the periodic Robinhood + Claude
 # OAuth (~every 3.8 days — Robinhood's token fully expires, no headless refresh). It runs
-# AFTER setup.sh, which already stood up the trading stack. BEST-EFFORT BY DESIGN: a
+# AFTER deploy/gcp/setup.sh, which already stood up the trading stack. BEST-EFFORT BY DESIGN: a
 # desktop/network hiccup here must never undo a working trading box, so we do NOT use
 # `set -e` and every step is guarded. Re-runnable (idempotent-ish).
 #
-# Why x86_64 (not the cheaper t4g/arm64): Chrome Remote Desktop's Linux host and Google
-# Chrome are amd64-only. The Terraform pins an x86_64 AMI + t3.medium for exactly this.
+# Why x86_64 (not the cheaper arm64): Chrome Remote Desktop's Linux host and Google
+# Chrome are amd64-only. The Terraform pins an x86_64 image + e2-medium for exactly this.
 set -uo pipefail
 
 QUIVER_USER="${QUIVER_USER:-quiver}"
@@ -23,7 +23,7 @@ usermod -s /bin/bash "$QUIVER_USER" || true
 echo "[desktop 2/6] XFCE + session deps"
 apt-get update -y || true
 apt-get install -y xfce4 xfce4-terminal dbus-x11 x11-xserver-utils || \
-  echo "  NOTE: XFCE install had issues — re-run this script via SSM"
+  echo "  NOTE: XFCE install had issues — re-run this script over IAP SSH"
 
 echo "[desktop 3/6] Google Chrome (amd64)"
 if ! command -v google-chrome >/dev/null 2>&1; then
@@ -58,8 +58,8 @@ echo "[desktop 6/6] CLAUDE_CONFIG_DIR for the quiver desktop shells (NOT global 
 # SAME dir the headless systemd tick reads (the service gets it via quiver.env). A Chrome
 # Remote Desktop terminal is an interactive shell that does NOT reliably inherit
 # /etc/environment (CRD execs the session outside pam_env), so export it directly in the
-# quiver user's shell rc files. Keeping it OUT of /etc/environment also avoids pointing an
-# SSM/root debug shell at quiver's 700 credential dir.
+# quiver user's shell rc files. Keeping it OUT of /etc/environment also avoids pointing a
+# root debug shell at quiver's 700 credential dir.
 for _rc in "$QHOME/.bashrc" "$QHOME/.profile"; do
   touch "$_rc"
   grep -q 'CLAUDE_CONFIG_DIR=' "$_rc" 2>/dev/null \

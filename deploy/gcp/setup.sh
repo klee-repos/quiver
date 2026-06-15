@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Quiver headless trader — GCP (Compute Engine) provisioning, Ubuntu 24.04 x86_64.
 # Idempotent. Run as root by the instance startup-script AFTER the PUBLIC repo is cloned
-# to /opt/quiver. The only real differences from deploy/setup.sh (AWS) are the secret
-# backend (AWS SSM -> GCP Secret Manager, read with the instance service account's metadata
-# token) and the log agent (CloudWatch -> Google Cloud Ops Agent). The trading stack, the
-# systemd units, and the CLAUDE_CONFIG_DIR / on-server-OAuth wiring are identical.
+# to /opt/quiver. It reads secrets from GCP Secret Manager (via the instance SA's metadata
+# token) and ships logs via the Google Cloud Ops Agent. The trading stack, the systemd
+# units, and the CLAUDE_CONFIG_DIR / on-server-OAuth wiring are unchanged.
 set -euo pipefail
 
 QUIVER_USER="${QUIVER_USER:-quiver}"
@@ -82,6 +81,10 @@ else echo "  NOTE: no Claude auth secret — relying on an on-box 'claude login'
 # All claude + MCP credential/OAuth state under /opt/quiver/state (writable; survives the
 # service's ProtectHome=read-only). Same dir the desktop OAuth writes and the tick reads.
 CLAUDE_CONFIG_DIR="$QUIVER_HOME/state/claude-config"
+# Create state/ ITSELF as quiver FIRST: `install -d a/b` gives the intermediate `a` default
+# (root) ownership and only chowns the named leaf — which would leave /opt/quiver/state
+# root-owned and make the ledger (state/ledger.db) unwritable by the quiver tick.
+install -d -m 755 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state"
 install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$CLAUDE_CONFIG_DIR"
 install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/.npm-cache"
 {
@@ -153,7 +156,7 @@ sudo -u "$QUIVER_USER" bash -c 'set -a; . /etc/quiver/quiver.env; set +a; exec "
 
 cat <<'NOTE'
 DONE (GCP trading stack). The only steps left are interactive, done ONCE in the on-box
-browser (Chrome Remote Desktop) — see docs/DEPLOY-GCP.md:
+browser (Chrome Remote Desktop) — see docs/DEPLOY.md:
   1) claude   (sign into your Pro/Max plan, unless a Claude token was set in Secret Manager)
   2) /mcp -> robinhood-trading -> authenticate. Re-auth ~every 3.8 days (Robinhood OAuth,
      no headless refresh).

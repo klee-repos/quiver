@@ -3,7 +3,7 @@
 
 # Per-user strategy book — your macro allocations + the derived trading universe. Kept
 # private so a public repo never exposes your holdings. Copy strategy.yaml.example to
-# start; on the box it's pulled from SSM (see DEPLOY.md). config.yaml carries NO secrets
+# start; on the box it's pulled from Secret Manager (see DEPLOY.md). config.yaml carries NO secrets
 # (those are in .env) and IS committed.
 strategy.yaml
 
@@ -25,11 +25,6 @@ __pycache__/
 # Deploy secrets / local state (only the *.example + IaC are tracked)
 deploy/runner/runner.env
 deploy/runner/mcp.json
-deploy/terraform/terraform.tfvars
-deploy/terraform/*.tfstate
-deploy/terraform/*.tfstate.*
-deploy/terraform/.terraform/
-deploy/terraform/.terraform.lock.hcl
 deploy/gcp/terraform/terraform.tfvars
 deploy/gcp/terraform/*.tfstate
 deploy/gcp/terraform/*.tfstate.*

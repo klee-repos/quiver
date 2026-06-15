@@ -36,4 +36,4 @@ echo
 echo "DONE. Secrets live in Secret Manager (project $PROJECT). Next:"
 echo "  1. gcloud auth application-default login         # terraform uses ADC"
 echo "  2. cd deploy/gcp/terraform && terraform init && terraform apply"
-echo "  3. Link Chrome Remote Desktop + the on-box claude/mcp login (docs/DEPLOY-GCP.md)"
+echo "  3. Link Chrome Remote Desktop + the on-box claude/mcp login (docs/DEPLOY.md)"
