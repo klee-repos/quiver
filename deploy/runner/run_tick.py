@@ -53,7 +53,13 @@ SETTINGS = os.environ.get("QUIVER_CLAUDE_SETTINGS", str(_REPO / "deploy" / "runn
 # QUIVER_MODEL if a cheaper model proves reliable for the now-simpler classic path.
 MODEL = os.environ.get("QUIVER_MODEL", "claude-sonnet-4-6")
 EFFORT = os.environ.get("QUIVER_EFFORT", "low")  # ultracode OFF; Python does the thinking
-TICK_TIMEOUT_SEC = int(os.environ.get("QUIVER_TICK_TIMEOUT_SEC", "2400"))  # ~40 min ceiling
+# Wall-clock ceiling for one orchestrator tick. Set DELIBERATELY HIGH (4h) so it is
+# essentially never hit by a legitimate tick: a full rebalance analyzes the whole book
+# (~11 DeepSeek analyze.py runs) and ran ~40 min live on the e2-medium; a slow day with
+# retries could be 60-90 min. The timeout is ONLY a last-resort backstop for a genuinely
+# wedged orchestrator (MCP hang / infinite loop) — overlapping hourly timer fires no-op
+# via the run_lock, so a long-but-legit tick is harmless. Override with QUIVER_TICK_TIMEOUT_SEC.
+TICK_TIMEOUT_SEC = int(os.environ.get("QUIVER_TICK_TIMEOUT_SEC", "14400"))  # 4h backstop
 # Clean per-tick status lines are appended here too (best-effort) so the log agent
 # on the box can tail a stable file and the log-based metric alarms have data to
 # fire on. Defaults to a repo-relative, gitignored path so LOCAL runs are unaffected;
