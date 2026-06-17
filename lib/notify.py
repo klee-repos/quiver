@@ -36,6 +36,7 @@ HALT_STAGE = "daily_loss_halt"  # daily-loss kill-switch fired
 # critical = hard stop (the tick did/should STOP); warning = best-effort hiccup.
 _CRITICAL_STAGES = frozenset({
     AUTH_STAGE, HALT_STAGE, "preflight", "analyze", "plan", "commit", "orchestrator",
+    "no_decisions",  # tick proceeded with pending tickers but recorded 0 decisions
 })
 _WARNING_STAGES = frozenset({"report", "prune", "reflect", "protect"})
 STAGES = _CRITICAL_STAGES | _WARNING_STAGES

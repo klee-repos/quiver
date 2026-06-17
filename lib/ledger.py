@@ -518,6 +518,30 @@ class Ledger:
             row = c.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
             return dict(row) if row else None
 
+    def count_decisions(self, trade_date: str) -> int:
+        """How many decision rows exist for a trading day. `plan` records a decision
+        for every VALID signal (hold/skip included) but NOT for an ERROR analysis (that
+        records only a ticker_action). Paired with count_ticker_actions by the headless
+        supervisor's silent-noop guard."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM decisions WHERE trade_date=?", (trade_date,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def count_ticker_actions(self, trade_date: str) -> int:
+        """How many ticker_action rows exist for a trading day. `plan` writes one for
+        EVERY analysis it processes — a real action, a skip, OR an error — so this is >0
+        whenever plan ran over a non-empty analyses list. The supervisor pairs this with
+        count_decisions: BOTH zero (with pending tickers) means plan never ran at all —
+        the 2026-06-17 silent-noop (analyses backgrounded then reaped). A DeepSeek-outage
+        day records error actions, so it has ticker_actions > 0 and does NOT false-trip."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT COUNT(*) FROM ticker_action WHERE trade_date=?", (trade_date,)
+            ).fetchone()
+            return int(row[0]) if row else 0
+
     def pending_outcome_decisions(self, resolve_on_or_before_date: str) -> list:
         """Decisions with no outcome yet whose trade_date is old enough to score.
 

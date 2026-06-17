@@ -19,7 +19,11 @@ Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
 # else the in-tick digest send silently fails.
 Environment=npm_config_cache=/opt/quiver/state/.npm-cache
 ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_tick.py
-TimeoutStartSec=3000
+# Outer guard only. STEP 3 now BLOCKS on the full-book analysis (~11 DeepSeek runs; a slow,
+# retry-heavy day can run 60-90 min — see run_tick.py). Keep this ABOVE run_tick.py's own 4h
+# (14400s) internal backstop so run_tick's timeout fires first and pages a clean alert rather
+# than systemd SIGTERM-ing a legit slow tick. Overlapping hourly fires no-op via the run_lock.
+TimeoutStartSec=15000
 StandardOutput=journal
 StandardError=journal
 # Hardening (mirrors BRAX): the tick may only write its own state/logs. ProtectHome stays

@@ -108,15 +108,25 @@ Call the Robinhood MCP with the `account_number` from preflight:
    of positions that are no longer in the book (a full exit still sells without a
    quote, but include them so a trim is priced correctly).
 
-## STEP 3 — Analyze each pending ticker (DeepSeek, slow)
+## STEP 3 — Analyze every pending ticker (DeepSeek, slow) — ONE blocking command
 
-For each ticker in `pending`, run (with a generous timeout, ~15 min):
+Analyze ALL `pending` tickers with the SINGLE command below — pass every ticker from
+`pending` as an argument. Run it in the FOREGROUND and WAIT for it to return; it
+blocks until every analysis has finished (give it a generous timeout, ~2h):
 ```
-~/dev/quiver/.venv/bin/python analyze.py <TICKER>
+~/dev/quiver/.venv/bin/python scripts/run_analyses.py <TICKER1> <TICKER2> ... <TICKERN>
 ```
-Collect each one-line JSON result. If a run errors / exits non-zero / prints
-`"signal":"ERROR"`, keep that JSON as-is (tick.py will record it as an error and
-skip it). NEVER invent or guess a signal.
+It fans the per-ticker `analyze.py` runs out in parallel (Python-capped to stay under
+the box memory limit), waits for them all, and prints a SINGLE JSON array to stdout —
+one element per ticker, in the order you passed them. That array IS the `analyses`
+value for STEP 4: capture it verbatim. The command always exits 0; a ticker that
+errored / timed out appears as `{"signal":"ERROR",...}` and `plan` records it as a
+skip. NEVER invent or guess a signal.
+
+**CRITICAL — do NOT background this.** Do not launch `analyze.py` yourself, do not use
+`run_in_background` / `&`, and do not end your turn before `run_analyses.py` returns.
+In headless mode, backgrounding the analyses and ending the turn REAPS the jobs and the
+tick silently trades nothing — this was the 2026-06-17 failure. One blocking call only.
 
 `analyze.py` automatically reads the reflective-memory context (deterministic
 risk/return metrics + guidance, with proof) into the agents AND writes a
@@ -376,6 +386,9 @@ End the tick.
   frequency limit — classic mode: ≤1 action/ticker/day; intraday mode: a per-ticker
   cooldown + a daily action cap + an on-change gate. Never place a ticker that isn't
   in `orders`.
+- NEVER run `analyze.py` (or any slow step) with `run_in_background` / `&` and then
+  end your turn — in headless mode that kills the job and the tick does nothing. STEP 3
+  is ONE blocking `scripts/run_analyses.py` call; wait for it before STEP 4.
 - Never exceed any dollar cap — tick.py already clamps; never hand-edit amounts.
 - Never hand-edit a `limit_price` or `stop_price` — tick.py decides and clamps them
   (the model only seeds the stop). Place exactly what `orders` / `protect` return.

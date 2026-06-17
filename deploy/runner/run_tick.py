@@ -139,6 +139,21 @@ def _alert_target():
     return recips, from_addr, on_error, dry_run
 
 
+def _is_silent_noop(pending, recorded_before, recorded_after) -> bool:
+    """True iff a PROCEEDED tick recorded NOTHING NEW this run despite pending tickers.
+
+    Pure (unit-tested offline). ``recorded_*`` are ``count_decisions + count_ticker_actions``
+    snapshots taken either side of the orchestrator run. Run-scoped via the delta, so it is
+    correct in intraday mode (earlier ticks already wrote rows) and never false-trips a
+    DeepSeek-outage day (error analyses still add ticker_action rows -> delta > 0). A None
+    snapshot (a DB read hiccup) -> not a noop (never false-trip)."""
+    if not pending:
+        return False
+    if recorded_before is None or recorded_after is None:
+        return False
+    return (recorded_after - recorded_before) == 0
+
+
 def _in_tick_error_paged(led, day) -> bool:
     """True if the in-tick orchestrator already paged a hard-stop error this day
     (preflight/plan/commit). Used to suppress the generic 'orchestrator' last-resort
@@ -202,7 +217,12 @@ def main() -> int:
     led = Ledger(_REPO / "state" / "ledger.db")
     holder = f"run-{now_iso}"
     try:
-        with runlock.run_lock(led, holder, now_iso):
+        # TTL must EXCEED the max tick wall-clock so a legit long tick (STEP 3 now blocks
+        # on the full-book analysis; a slow retry-heavy day can run toward TICK_TIMEOUT_SEC)
+        # is never seen as "stale" and stolen by the next hourly fire — that would start a
+        # second overlapping tick and race the dedup/ref_id machinery. +600s grace past the
+        # subprocess timeout (which itself releases the lock via the context manager on exit).
+        with runlock.run_lock(led, holder, now_iso, ttl_seconds=TICK_TIMEOUT_SEC + 600):
             pre = _tick_json(["preflight"])
             if pre.get("error"):
                 _emit({"stage": "preflight", "stopped": True, **pre})
@@ -229,6 +249,14 @@ def main() -> int:
                 "--dangerously-skip-permissions",  # unattended; the order guard is the real gate
                 "Follow ./TICK.md exactly for today's tick.",
             ]
+            # Snapshot how much the ledger has recorded for today BEFORE the orchestrator
+            # runs, so the silent-noop guard below can measure a RUN-SCOPED delta (correct
+            # even in intraday mode, where earlier ticks already wrote rows). Best-effort:
+            # a read hiccup -> None -> the guard simply won't fire (never false-trip).
+            try:
+                recorded_before = led.count_decisions(day) + led.count_ticker_actions(day)
+            except Exception:  # noqa: BLE001 — observability only; never block a tick
+                recorded_before = None
             try:
                 proc = subprocess.run(cmd, cwd=str(_REPO), timeout=TICK_TIMEOUT_SEC,
                                       capture_output=True, text=True)
@@ -285,9 +313,38 @@ def main() -> int:
                                  now_iso=now_iso,
                                  event_detail=f"orchestrator exited {proc.returncode}; "
                                               f"tail: {combined[-300:]}")
+                # Silent-noop guard: a tick that preflight let PROCEED with pending tickers
+                # but recorded NOTHING NEW this run did no analysis — the 2026-06-17 failure
+                # (analyses backgrounded then reaped when the orchestrator ended its turn).
+                # The orchestrator exits 0, so without this it would page nothing. `plan`
+                # writes a ticker_action for EVERY analysis it processes (real/skip/error)
+                # and a decision for every valid (non-ERROR) signal, so a zero before->after
+                # DELTA with a non-empty `pending` is an unambiguous "plan never ran". Using
+                # the delta (not an absolute count) makes it RUN-SCOPED — correct in intraday
+                # mode where earlier ticks already wrote rows — and a DeepSeek-outage day still
+                # adds error ticker_actions (delta > 0), so it won't false-trip. Only checked
+                # on an otherwise-clean tick (auth/halt/crash already paged above).
+                no_decisions = False
+                try:
+                    recorded_after = led.count_decisions(day) + led.count_ticker_actions(day)
+                except Exception:  # noqa: BLE001 — observability only; never false-trip
+                    recorded_after = None
+                if ok and not auth_error and not halted and _is_silent_noop(
+                        pre.get("pending"), recorded_before, recorded_after):
+                    no_decisions = True
+                    n = len(pre.get("pending") or [])
+                    _emit({"stage": "tick", "event": "NO_DECISIONS",
+                           "detail": f"proceeded with {n} pending tickers but recorded 0 new "
+                                     "decisions/actions — analyses never ran (silent no-op)"})
+                    _maybe_alert(led, kind="error", stage="no_decisions", day=day,
+                                 now_iso=now_iso,
+                                 event_detail=(f"Tick proceeded with {n} pending tickers but "
+                                               "recorded nothing new (0 decisions, 0 actions) "
+                                               "— the analysis step did not run (likely "
+                                               "backgrounded + reaped). No trades placed."))
                 # AUTH_ERROR is a hard-stop posture: exit non-zero so systemd + the
                 # documented drill see a failed run even if the orchestrator exited 0.
-                return 0 if (ok and not auth_error) else 1
+                return 0 if (ok and not auth_error and not no_decisions) else 1
             except subprocess.TimeoutExpired:
                 _emit({"stage": "tick", "ok": False, "error": "tick exceeded the timeout"})
                 # The subprocess wedged past the wall-clock — it certainly never reached
