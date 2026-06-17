@@ -31,6 +31,13 @@ from lib.config import load_config  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 from lib.prompts import load_prompt  # noqa: E402
 
+# The Python-driven STEP 3 analysis fan-out (scripts/ is not a package). Run HERE, not in
+# the headless orchestrator: the claude harness auto-backgrounds a long Bash command and the
+# -p session then ends its turn, reaping the job (the 2026-06-17 + first-fix failures). Plain
+# Python has no such harness, so it can block on the full-book analysis reliably.
+sys.path.insert(0, str(_REPO / "scripts"))
+import run_analyses  # noqa: E402
+
 # The unique sentinel `tick.py auth-stop` prints on a real broker 401 (tick.AUTH_STOP_SENTINEL).
 # It is NOT in TICK.md prose, so its presence in the orchestrator's captured stdout means an
 # auth hard-stop ACTUALLY happened — unlike the literal "AUTH_ERROR" the runbook legitimately
@@ -233,6 +240,38 @@ def main() -> int:
             if not pre.get("proceed"):
                 _emit({"stage": "preflight", "proceed": False, "reason": pre.get("reason", "")})
                 return 0  # cheap no-op wake — nothing to do (NOT a failure; never page)
+
+            # --- STEP 3: analysis fan-out (Python-driven; NOT the orchestrator) -------
+            # Run the slow (~20-30 min) per-ticker analyze.py fan-out HERE, blocking, and
+            # write the results to state/tmp/analyses.json. The orchestrator's STEP 3 then
+            # just READS that file. This keeps the long job off the LLM, which cannot hold a
+            # blocking call in headless -p mode (the harness auto-backgrounds it and the turn
+            # ends -> reaped). analyze.py is still the decision-maker; only the INVOKER moves
+            # from the LLM to Python. Always write the file (even []), so the orchestrator
+            # always has a definite input. Best-effort on the fan-out itself: a crash yields
+            # an empty list -> plan makes no buys (sells/reconcile still run) and the
+            # silent-noop guard pages; never crash the supervisor here.
+            pending = pre.get("pending") or []
+            analyses = []
+            if pending:
+                try:
+                    analyses = run_analyses.run(pending)
+                except Exception as e:  # noqa: BLE001 — never crash the supervisor on analysis
+                    _emit({"stage": "analyze", "error": f"{type(e).__name__}: {e}"})
+                    analyses = []
+                n_err = sum(1 for a in analyses if (a or {}).get("signal") == "ERROR")
+                _emit({"stage": "analyze", "count": len(analyses), "errors": n_err})
+            try:
+                _tmp = _REPO / "state" / "tmp"
+                _tmp.mkdir(parents=True, exist_ok=True)
+                (_tmp / "analyses.json").write_text(json.dumps(analyses))
+            except Exception as e:  # noqa: BLE001 — OSError (fs) OR a json.dumps error: either
+                # way the orchestrator's STEP 3 read fails and it STOPs — page it here too.
+                _emit({"stage": "analyze", "error": f"could not write analyses.json: {e}"})
+                _maybe_alert(led, kind="error", stage="analyze", day=day, now_iso=now_iso,
+                             event_detail=f"could not write state/tmp/analyses.json: {e}")
+                return 1
+
             # Drive ONE tick through the claude CLI over TICK.md (execution only).
             cmd = [
                 CLAUDE_BIN, "-p", "--output-format", "stream-json",
@@ -353,6 +392,14 @@ def main() -> int:
                              now_iso=now_iso,
                              event_detail=f"tick exceeded the {TICK_TIMEOUT_SEC}s timeout "
                                           "(orchestrator wedged).")
+                return 1
+            except Exception as e:  # noqa: BLE001 — a spawn failure (e.g. claude binary
+                # missing/not executable) can't reach the orchestrator's own pager; page here.
+                # The run_lock is still released by the context manager as this propagates out.
+                _emit({"stage": "tick", "ok": False, "error": f"{type(e).__name__}: {e}"})
+                _maybe_alert(led, kind="error", stage="orchestrator", day=day, now_iso=now_iso,
+                             event_detail=f"orchestrator subprocess failed to launch: "
+                                          f"{type(e).__name__}: {e}")
                 return 1
     except runlock.RunLockError as e:
         _emit({"stage": "lock", "skipped": True, "reason": str(e)})

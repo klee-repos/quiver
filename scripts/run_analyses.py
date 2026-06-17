@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """Deterministic, blocking, parallel-capped analysis fan-out for ONE tick (STEP 3).
 
-This factors the per-ticker `analyze.py` fan-out OUT of the orchestrator's
-discretion. The orchestrator (a headless `claude -p` run) must NOT launch the
-analyses itself: on 2026-06-17 it ran each `analyze.py` with
-``run_in_background: true`` and then ended its turn — in headless mode that ends
-the session and REAPS every background job, so the whole book went un-analyzed and
-the tick silently traded nothing while reporting success.
+This runs the per-ticker `analyze.py` fan-out OFF the LLM. The headless orchestrator
+(`claude -p`) CANNOT run this step: the analysis takes ~20-30 min, and a headless run
+cannot hold a blocking Bash call that long — the claude harness auto-backgrounds it and
+the -p turn then ends, REAPING the job (the 2026-06-17 failure: analyses backgrounded,
+0 decisions, a silent false success; and again when the first fix made it ONE foreground
+call — the harness still auto-backgrounded it).
 
-The fix: STEP 3 is ONE foreground command. This script runs `analyze.py <TICKER>`
-for every pending ticker IN PARALLEL (capped to stay under the service MemoryMax),
-BLOCKS until they all finish, and prints a single JSON array of the per-ticker
-result objects to stdout — exactly the ``analyses`` list ``tick.py plan`` consumes.
-Because it is one blocking process, the orchestrator physically cannot proceed (or
-end its turn) until every analysis is done.
+So the supervisor (`deploy/runner/run_tick.py`, plain Python with no harness/turn) calls
+``run(pending)`` directly, BLOCKS until every analysis finishes, and writes the result to
+``state/tmp/analyses.json``; the orchestrator's STEP 3 just READS that file. analyze.py is
+still the decision-maker — this only moves the INVOKER off the LLM and onto Python. The
+``__main__`` CLI is retained for manual/debug use (e.g. ``run_analyses.py AAPL`` on the box).
 
-Contract (mirrors analyze.py): each array element is the one-line JSON `analyze.py`
-prints on stdout; a crash / non-zero exit / timeout / unparseable line becomes
-``{"ticker": T, "signal": "ERROR", "error": "...", "schema": 1}`` so `plan` records
-it as a skip. Output order matches the input ticker order. The exit code is ALWAYS
-0 — a failed ticker is data (an ERROR element), never a process failure, so the
-orchestrator always receives the full array.
+Each ``analyze.py <TICKER>`` runs IN PARALLEL (capped to stay under the service MemoryMax).
+Contract (mirrors analyze.py): each result is the one-line JSON `analyze.py` prints on
+stdout; a crash / non-zero exit / timeout / unparseable line becomes
+``{"ticker": T, "signal": "ERROR", "error": "...", "schema": 1}`` so `plan` records it as a
+skip. Output order matches the input ticker order. The CLI exit code is ALWAYS 0 — a failed
+ticker is data (an ERROR element), never a process failure.
 
 Env:
   QUIVER_ANALYZE_CONCURRENCY  max parallel analyze.py procs (default 2; the

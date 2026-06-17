@@ -7,6 +7,7 @@ Plain asserts, prints "<n> checks passed, <m> failed", exits non-zero on any fai
 (matches tests/run_e2e.sh's summary grep)."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -72,6 +73,12 @@ def main() -> int:
     # Every element is a dict with a ticker (the contract plan consumes).
     check(all(isinstance(r, dict) and r.get("ticker") for r in res),
           "every result is a dict carrying its ticker")
+
+    # --- result is JSON-serializable + round-trips (run_tick.py writes analyses.json) ---
+    blob = json.dumps(res)
+    back = json.loads(blob)
+    check(isinstance(back, list) and len(back) == 4 and back[0]["ticker"] == "AAPL",
+          "run() output round-trips through json (as written to state/tmp/analyses.json)")
 
     # --- per-ticker timeout becomes an ERROR datum, not a crash ---
     slow = ra.run(["SLOW"], concurrency=1, timeout=1)
