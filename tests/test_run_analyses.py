@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline spec for scripts/run_analyses.py (the STEP 3 blocking fan-out) +
-Ledger.count_decisions (the silent-noop guard's signal). No network / no DeepSeek:
+Ledger.count_decisions (the silent-noop guard's signal). No network / no GLM:
 analyze.py is stubbed via QUIVER_ANALYZE_SCRIPT, so this is fast and deterministic.
 
 Plain asserts, prints "<n> checks passed, <m> failed", exits non-zero on any failure
@@ -104,12 +104,12 @@ def main() -> int:
     check(led.count_decisions("2026-06-17") == 2, "two decisions recorded -> count 2")
     check(led.count_decisions("2026-06-16") == 0, "other day unaffected -> 0")
 
-    # The DeepSeek-outage case the guard must NOT false-trip on: an ERROR analysis records
+    # The GLM-outage case the guard must NOT false-trip on: an ERROR analysis records
     # a ticker_action but NO decision (mirrors tick.py:418). On such a day the guard sees
     # 0 decisions but >0 actions -> sum > 0 -> no false page.
     led2 = Ledger(tmp / "ledger2.db")
     led2.record_action("2026-06-17", "NVDA", signal="ERROR", intent="skip",
-                       status="error", detail="deepseek down", now_iso="2026-06-17T10:00:00-04:00")
+                       status="error", detail="glm down", now_iso="2026-06-17T10:00:00-04:00")
     check(led2.count_decisions("2026-06-17") == 0, "all-ERROR day -> 0 decisions")
     check(led2.count_ticker_actions("2026-06-17") == 1, "all-ERROR day -> 1 error action")
     check(led2.count_decisions("2026-06-17") + led2.count_ticker_actions("2026-06-17") > 0,

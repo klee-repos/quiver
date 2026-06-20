@@ -95,7 +95,14 @@ CREATE TABLE IF NOT EXISTS decisions (
     basis             TEXT,
     plan_trigger      TEXT,
     target_price      REAL,
-    proof_json        TEXT
+    proof_json        TEXT,
+    -- Conviction layer (back-filled on old dbs via _migrate_decisions):
+    --   conviction   = the model's binding 0-100 conviction the allocator sizes on
+    --   uncertainty  = the model's self-reported 0-100 uncertainty (damps sizing)
+    --   data_quality = JSON of per-decision data-quality flags (bars_n, sources, ...)
+    conviction        REAL,
+    uncertainty       REAL,
+    data_quality      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ticker ON decisions(ticker, decided_at);
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -296,6 +303,9 @@ class Ledger:
             "plan_trigger": "TEXT",
             "target_price": "REAL",
             "proof_json": "TEXT",
+            "conviction": "REAL",
+            "uncertainty": "REAL",
+            "data_quality": "TEXT",
         }
         for col, decl in additions.items():
             if col not in existing:
@@ -489,24 +499,29 @@ class Ledger:
         decision_price: Optional[float] = None, rationale: Optional[str] = None,
         run_id: Optional[str] = None, basis: Optional[str] = None,
         plan_trigger: Optional[str] = None, target_price: Optional[float] = None,
-        proof_json: Optional[str] = None,
+        proof_json: Optional[str] = None, conviction: Optional[float] = None,
+        uncertainty: Optional[float] = None, data_quality: Optional[str] = None,
     ) -> int:
         """Persist one analysis decision; returns its id (the outcome FK).
 
         ``basis``/``plan_trigger``/``target_price``/``proof_json`` are the
         consistency-layer fields (the declared strategy tag, the Python-verified
         plan-execution trigger, the take-profit seed, and the auditable proof bundle).
-        All optional — older callers and back-filled rows leave them NULL.
+        ``conviction``/``uncertainty`` are the model's binding 0-100 sizing inputs (the
+        allocation engine reads them); ``data_quality`` is a JSON of per-decision data
+        flags. All optional — older callers and back-filled rows leave them NULL.
         """
         with self._conn() as c:
             cur = c.execute(
                 "INSERT INTO decisions (trade_date, ticker, run_id, decided_at, signal, "
                 "intent, position_pct, entry_price, stop_loss, next_review_hours, "
-                "decision_price, rationale, basis, plan_trigger, target_price, proof_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "decision_price, rationale, basis, plan_trigger, target_price, proof_json, "
+                "conviction, uncertainty, data_quality) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (trade_date, ticker, run_id, decided_at, signal, intent, position_pct,
                  entry_price, stop_loss, next_review_hours, decision_price, rationale,
-                 basis, plan_trigger, target_price, proof_json),
+                 basis, plan_trigger, target_price, proof_json, conviction, uncertainty,
+                 data_quality),
             )
             rid = cur.lastrowid
             if rid is None:  # never happens after a successful INSERT, but be explicit
@@ -534,7 +549,7 @@ class Ledger:
         EVERY analysis it processes — a real action, a skip, OR an error — so this is >0
         whenever plan ran over a non-empty analyses list. The supervisor pairs this with
         count_decisions: BOTH zero (with pending tickers) means plan never ran at all —
-        the 2026-06-17 silent-noop (analyses backgrounded then reaped). A DeepSeek-outage
+        the 2026-06-17 silent-noop (analyses backgrounded then reaped). A GLM-outage
         day records error actions, so it has ticker_actions > 0 and does NOT false-trip."""
         with self._conn() as c:
             row = c.execute(
@@ -665,26 +680,33 @@ class Ledger:
     # newest-first ordering — because the risk/trend math expects oldest->newest.
     # Only rows with a scored directional_return; never touch broker/limits.
 
-    def ticker_return_series(self, ticker: str) -> list:
-        """Resolved directional returns for one ticker, OLDEST first."""
+    def ticker_return_series(self, ticker: str, *, exclude_skips: bool = True) -> list:
+        """Resolved returns for one ticker, OLDEST first. Carries ``intent`` + ``alpha``
+        so the metrics/calibration can grade on SKILL (excess-vs-benchmark) and exclude
+        SKIP decisions (no capital at risk). ``exclude_skips`` defaults True — a skip is
+        not a position we held, so it must not pollute the risk metrics."""
+        skip_clause = "AND COALESCE(d.intent,'') != 'skip' " if exclude_skips else ""
         with self._conn() as c:
             return [dict(r) for r in c.execute(
-                "SELECT d.id, d.trade_date, d.signal, d.decision_price, "
-                "o.directional_return, o.holding_days, o.realized_pnl "
+                "SELECT d.id, d.trade_date, d.signal, d.intent, d.decision_price, "
+                "o.directional_return, o.alpha, o.holding_days, o.realized_pnl "
                 "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
-                "WHERE d.ticker = ? AND o.directional_return IS NOT NULL "
+                "WHERE d.ticker = ? AND o.directional_return IS NOT NULL " + skip_clause +
                 "ORDER BY d.decided_at ASC, d.id ASC",
                 (ticker,),
             ).fetchall()]
 
-    def all_return_series(self) -> list:
-        """Portfolio-level: every resolved directional return across all tickers, OLDEST first."""
+    def all_return_series(self, *, exclude_skips: bool = True) -> list:
+        """Portfolio-level: every resolved return across all tickers, OLDEST first.
+        Carries ``intent`` + ``alpha`` and excludes SKIP decisions by default (see
+        ``ticker_return_series``)."""
+        skip_clause = "AND COALESCE(d.intent,'') != 'skip' " if exclude_skips else ""
         with self._conn() as c:
             return [dict(r) for r in c.execute(
-                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.decision_price, "
-                "o.directional_return, o.holding_days, o.realized_pnl "
+                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.intent, d.decision_price, "
+                "o.directional_return, o.alpha, o.holding_days, o.realized_pnl "
                 "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
-                "WHERE o.directional_return IS NOT NULL "
+                "WHERE o.directional_return IS NOT NULL " + skip_clause +
                 "ORDER BY d.decided_at ASC, d.id ASC"
             ).fetchall()]
 

@@ -11,7 +11,7 @@ It proves the stages hand off correctly AND the central safety invariant: in
 dry-run, the plan produces reviewable orders but RESERVES NOTHING — zero rows in
 the orders table, every ref_id None — so nothing would ever reach the broker.
 
-Not covered here (by design): the live DeepSeek `analyze.py` signal call and the
+Not covered here (by design): the live GLM `analyze.py` signal call and the
 live MCP broker execution. Run: .venv/bin/python tests/test_e2e.py
 """
 
@@ -50,7 +50,7 @@ def _cfg():
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 20.0,
                  "daily_capital_deploy_cap": 1000,
                  "min_buying_power_buffer": 5, "rebalance_enabled": True},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     }
     p = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     yaml.safe_dump(d, p)
@@ -99,8 +99,8 @@ def main() -> int:
     ok("XLV overweight -> trim", tw["XLV"]["intent"] == "trim")
     ok("SGOV is the cash residual", tw["SGOV"]["intent"] == "cash_residual")
 
-    # --- STEP D: analyze (SYNTHETIC signals — DeepSeek leg stubbed here) ---
-    print("\n[D] analyze (synthetic): SMH=Buy, IBIT=Buy  (real run = analyze.py -> DeepSeek)")
+    # --- STEP D: analyze (SYNTHETIC signals — GLM leg stubbed here) ---
+    print("\n[D] analyze (synthetic): SMH=Buy, IBIT=Buy  (real run = analyze.py -> GLM)")
     analyses = [
         {"ticker": "SMH", "signal": "Buy", "position_pct": 9.0, "rationale_summary": "synthetic"},
         {"ticker": "IBIT", "signal": "Buy", "position_pct": 4.0, "rationale_summary": "synthetic"},

@@ -29,8 +29,11 @@ Env:
                               after profiling real analyze.py RSS shows headroom. The 4h
                               tick budget means even sequential (cap 1) finishes in time,
                               so memory safety wins over speed here).
-  QUIVER_ANALYZE_TIMEOUT      per-ticker wall-clock seconds (default 900, matching
-                              config loop.analyze_timeout_sec).
+  QUIVER_ANALYZE_TIMEOUT      per-ticker wall-clock seconds. Precedence: this env
+                              var (if set) OVERRIDES the caller-passed value; else
+                              the supervisor passes config loop.analyze_timeout_sec;
+                              else a 3600s default. Set very high so a normal
+                              max-reasoning GLM run never hits it.
   QUIVER_ANALYZE_SCRIPT       path to the analyzer (default <repo>/analyze.py);
                               overridable so the harness is testable offline.
   QUIVER_PYTHON               interpreter for analyze.py (default: this interpreter).
@@ -97,7 +100,11 @@ def run(tickers, *, concurrency: int | None = None, timeout: int | None = None) 
     if not tickers:
         return []
     concurrency = concurrency or _int_env("QUIVER_ANALYZE_CONCURRENCY", 2)
-    timeout = timeout or _int_env("QUIVER_ANALYZE_TIMEOUT", 900)
+    # Per-ticker timeout precedence: env override > caller (config) > 3600s default.
+    if os.environ.get("QUIVER_ANALYZE_TIMEOUT"):
+        timeout = _int_env("QUIVER_ANALYZE_TIMEOUT", 3600)
+    elif timeout is None:
+        timeout = 3600
     results: list = [None] * len(tickers)
     workers = min(concurrency, len(tickers))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -126,7 +133,7 @@ def main(argv) -> int:
     sys.stderr.write(
         f"[run_analyses] analyzing {len(tickers)} tickers "
         f"(concurrency={_int_env('QUIVER_ANALYZE_CONCURRENCY', 2)}, "
-        f"timeout={_int_env('QUIVER_ANALYZE_TIMEOUT', 900)}s): {', '.join(tickers)}\n")
+        f"timeout={_int_env('QUIVER_ANALYZE_TIMEOUT', 3600)}s): {', '.join(tickers)}\n")
     results = run(tickers)
     print(json.dumps(results))
     return 0

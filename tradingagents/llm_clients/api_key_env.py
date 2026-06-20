@@ -25,7 +25,7 @@ PROVIDER_API_KEY_ENV: dict[str, Optional[str]] = {
     # interchangeable between the international and China endpoints.
     "qwen":       "DASHSCOPE_API_KEY",
     "qwen-cn":    "DASHSCOPE_CN_API_KEY",
-    "glm":        "ZHIPU_API_KEY",
+    "glm":        "GLM_API_KEY",
     "glm-cn":     "ZHIPU_CN_API_KEY",
     "minimax":    "MINIMAX_API_KEY",
     "minimax-cn": "MINIMAX_CN_API_KEY",

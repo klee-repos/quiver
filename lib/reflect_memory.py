@@ -74,9 +74,16 @@ def _metrics_for(returns: Sequence[float],
 
 
 def _part(label: str, rows: List[dict], cfg_memory) -> dict:
-    """Assemble one scope (ticker or portfolio): metrics + guidance + trend + rows."""
-    returns = [r["directional_return"] for r in rows]
-    graded = [(r["signal"], r["directional_return"]) for r in rows]
+    """Assemble one scope (ticker or portfolio): metrics + guidance + trend + rows.
+
+    Metrics grade on ``memory.score_return`` (excess-vs-benchmark alpha when present,
+    else absolute directional) so the risk/return numbers and the conviction
+    calibration measure SKILL, not market beta. The ledger return-series already
+    excludes SKIP decisions (no capital at risk), so the hit-rate is not poisoned.
+    """
+    scored = [(r["signal"], sr) for r in rows if (sr := memory.score_return(r)) is not None]
+    returns = [sr for (_sig, sr) in scored]
+    graded = scored
     th = cfg_memory.thresholds()
     metrics = _metrics_for(returns, graded, cfg_memory)
     return {

@@ -54,44 +54,73 @@ def _fmt_pct(x: Optional[float]) -> str:
     return f"{x * 100:+.1f}%" if x is not None else "n/a"
 
 
+def _is_skip(row: dict) -> bool:
+    """A decision that put NO capital at risk (Underweight/Sell with no position, or
+    any explicit skip). Grading these directionally poisons the hit-rate: an
+    Underweight-skip into a +9% move is recorded as a 'miss' on a trade we never made.
+    They stay in the recent-decisions list for context but never count toward skill.
+    """
+    return (row.get("intent") or "").strip().lower() == "skip"
+
+
+def score_return(row: dict) -> Optional[float]:
+    """The return we LEARN from: excess-vs-benchmark (alpha) when present — the bot's
+    SKILL — else the absolute directional return (which is mostly market beta). In a
+    bull tape every long 'hits' on absolute return, so alpha is what makes the loop
+    measure the decision, not the market."""
+    a = row.get("alpha")
+    return a if a is not None else row.get("directional_return")
+
+
 def build_scorecard(ticker: str, rows: List[dict], recent: int = 6) -> str:
     """Render a compact memory scorecard from decision+outcome rows (newest first).
 
     PURE: takes already-fetched dicts (as from Ledger.decisions_with_outcomes),
     returns a string (empty when there's no history). Each row may carry
-    directional_return / holding_days / realized_pnl / signal / rationale.
+    directional_return / alpha / intent / holding_days / realized_pnl / signal /
+    basis / rationale.
+
+    Two corrections vs. a naive hit-rate (both ground the learning loop in truth):
+      * SKIP decisions (no capital at risk) are excluded from the graded set.
+      * grading + avg use ``score_return`` (alpha-when-present), so a bull-tape long
+        is not an automatic 'hit' — the loop measures skill, not beta.
     """
     if not rows:
         return ""
 
-    resolved = [r for r in rows if r.get("directional_return") is not None]
-    graded = [(r.get("signal"), r["directional_return"]) for r in resolved]
-    graded = [(s, ret, is_hit(s, ret)) for (s, ret) in graded]
+    positioned = [r for r in rows if not _is_skip(r)]
+    resolved = [(r, sr) for r in positioned if (sr := score_return(r)) is not None]
+    graded = [(r.get("signal"), sr, is_hit(r.get("signal"), sr)) for (r, sr) in resolved]
     gradeable = [g for g in graded if g[2] is not None]
     n_hit = sum(1 for g in gradeable if g[2])
-    avg_dir = (sum(r["directional_return"] for r in resolved) / len(resolved)) if resolved else None
+    scores = [sr for (_r, sr) in resolved]
+    avg_dir = (sum(scores) / len(scores)) if scores else None
     realized_vals = [r["realized_pnl"] for r in rows if r.get("realized_pnl") is not None]
     realized_sum = sum(realized_vals) if realized_vals else None
+    metric_basis = "excess-vs-benchmark" if any(r.get("alpha") is not None for (r, _sr) in resolved) else "absolute"
 
-    lines = [f"Your prior calls on {ticker}: {len(rows)} decision(s), {len(resolved)} resolved."]
+    lines = [f"Your prior calls on {ticker}: {len(rows)} decision(s), "
+             f"{len(resolved)} resolved on position-taking calls (skips excluded)."]
     if gradeable:
         pct = n_hit / len(gradeable) * 100.0
-        tail = f", avg move {_fmt_pct(avg_dir)}." if avg_dir is not None else "."
+        tail = f", avg move {_fmt_pct(avg_dir)} ({metric_basis})." if avg_dir is not None else "."
         lines.append(f"Directional hit-rate: {n_hit}/{len(gradeable)} ({pct:.0f}%){tail}")
     elif resolved:
-        lines.append(f"Avg move {_fmt_pct(avg_dir)} (no directional bets to grade).")
+        lines.append(f"Avg move {_fmt_pct(avg_dir)} ({metric_basis}; no directional bets to grade).")
     if realized_sum is not None:
         lines.append(f"Realized P&L on closed positions: ${realized_sum:+.2f}.")
 
     lines.append("Recent decisions (newest first):")
     for r in rows[:recent]:
-        dr = r.get("directional_return")
-        outcome = f"{_fmt_pct(dr)} / {r.get('holding_days') or '?'}d" if dr is not None else "pending"
+        sr = score_return(r)
+        outcome = f"{_fmt_pct(sr)} / {r.get('holding_days') or '?'}d" if sr is not None else "pending"
+        basis = (r.get("basis") or "").strip()
+        basis_tok = f" [{basis}]" if basis else ""
         rationale = (r.get("rationale") or "").strip().replace("\n", " ")
         if len(rationale) > 140:
             rationale = rationale[:140] + "…"
         quote = f' | "{rationale}"' if rationale else ""
-        lines.append(f"- {r.get('trade_date')} {r.get('signal')} -> {outcome}{quote}")
+        lines.append(f"- {r.get('trade_date')} {r.get('signal')}{basis_tok} -> {outcome}{quote}")
     return "\n".join(lines)
 
 

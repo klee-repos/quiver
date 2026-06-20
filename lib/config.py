@@ -206,7 +206,7 @@ def load_config(path) -> Config:
     d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
     # Per-user/secret values are NOT committed: they come from .env (gitignored),
-    # alongside DEEPSEEK_API_KEY. Load it here so every entrypoint (tick.py,
+    # alongside GLM_API_KEY. Load it here so every entrypoint (tick.py,
     # analyze.py) sees the same values via load_config. Missing python-dotenv or
     # a missing .env is fine — the vars may already be set in the real environment.
     try:
@@ -280,13 +280,15 @@ def load_config(path) -> Config:
         loss_catalyst_pct=loss_catalyst_pct,
     )
 
-    ds = d.get("deepseek", {}) or {}
-    chat_model = str(_require(ds, "chat_model")).strip()
-    reasoner_model = str(_require(ds, "reasoner_model")).strip()
+    # Model IDs live under a `glm:` block. Fall back to the legacy `deepseek:` key
+    # so an older config.yaml never hard-crashes a tick (fail-safe back-compat).
+    models = d.get("glm") or d.get("deepseek") or {}
+    chat_model = str(_require(models, "chat_model")).strip()
+    reasoner_model = str(_require(models, "reasoner_model")).strip()
     if "verify" in chat_model.lower() or "verify" in reasoner_model.lower():
         raise ConfigError(
-            "config.yaml: deepseek model IDs are still placeholders — verify the "
-            "current IDs via the DeepSeek /v1/models endpoint and set them."
+            "config.yaml: glm model IDs are still placeholders — verify the "
+            "current IDs in the z.ai model list and set them."
         )
 
     order = d.get("order", {}) or {}

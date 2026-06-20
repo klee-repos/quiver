@@ -66,9 +66,9 @@ class Box:
             "    max_discretionary_reversals: 1\n"
             "    flip_window: 6\n"
             "    loss_catalyst_pct: 8.0\n"
-            "deepseek:\n"
-            "  chat_model: deepseek-v4-flash\n"
-            "  reasoner_model: deepseek-v4-pro\n"
+            "glm:\n"
+            "  chat_model: glm-5.2\n"
+            "  reasoner_model: glm-5.2\n"
             "notify:\n  enabled: false\n",
             encoding="utf-8",
         )

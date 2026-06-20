@@ -42,7 +42,7 @@ def create_llm_client(
         from .openai_client import OpenAIClient
         return OpenAIClient(model, base_url, provider=provider_lower, **kwargs)
 
-    # Quiver fork is DeepSeek-only (an OpenAI-compatible provider). The
+    # Quiver fork uses GLM (an OpenAI-compatible provider). The
     # Anthropic / Google / Azure clients were removed when de-vendoring; if you
     # ever need them, restore from upstream (see tradingagents/UPSTREAM.md).
     raise ValueError(

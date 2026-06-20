@@ -55,7 +55,7 @@ def _cfg(notify_block):
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
         "notify": notify_block,
     }
     p = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)

@@ -13,13 +13,15 @@ ProviderModeOptions = Dict[str, Dict[str, List[ModelOption]]]
 # All GLM 4.7+ entries support thinking mode via thinking={"type":"enabled"}.
 _GLM_MODELS: Dict[str, List[ModelOption]] = {
     "quick": [
+        ("GLM-5.2 - Latest flagship, thinking + tool use, 1M ctx", "glm-5.2"),
         ("GLM-5-Turbo - Fast, switchable thinking modes", "glm-5-turbo"),
         ("GLM-4.7 - Previous-gen flagship", "glm-4.7"),
         ("GLM-4.5-Air - Lightweight, cost-efficient", "glm-4.5-air"),
         ("Custom model ID", "custom"),
     ],
     "deep": [
-        ("GLM-5.1 - Latest flagship, 204K ctx", "glm-5.1"),
+        ("GLM-5.2 - Latest flagship, thinking + tool use, 1M ctx", "glm-5.2"),
+        ("GLM-5.1 - Previous flagship, 204K ctx", "glm-5.1"),
         ("GLM-5 - Flagship, 204K ctx", "glm-5"),
         ("GLM-4.7 - Previous-gen flagship", "glm-4.7"),
         ("Custom model ID", "custom"),

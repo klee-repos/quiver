@@ -66,7 +66,7 @@ trigger. Quiver splits that into three separate jobs, and puts a wall between th
    It just does exactly what the rule-keeper said.
 ```
 
-- **The thinker** is a team of AI analysts (running on a model called DeepSeek). They argue
+- **The thinker** is a team of AI analysts (running on a model called GLM 5.2). They argue
   it out — a bull case, a bear case, a final call — and produce one opinion per stock.
 - **The rule-keeper** is plain code. It takes that opinion and works out the real order, while
   obeying every limit you set (how much per trade, per day, per stock). The AI never gets to
@@ -255,7 +255,7 @@ fails to send, trading carries on as normal.
 
 - **What data does it use?** Stock prices, charts, company numbers, and news all come from a
   free source — **no paid data key needed**. The only key you must have is one for the AI
-  (DeepSeek).
+  (GLM 5.2).
 - **What does it cost to run?** The AI is cheap — a full run is a few cents, roughly
   **$5–20 a month** if you watch three stocks a day.
 - **One small gap:** it can't read Reddit (the site blocks it), so it just skips that and uses

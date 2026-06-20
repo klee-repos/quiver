@@ -13,7 +13,7 @@ name = "quiver"
 version = "0.2.5"
 description = "Quiver — an autonomous trading desk that executes a multi-agent LLM signal on Robinhood's agentic trading platform"
 requires-python = ">=3.10"
-# Pared to what the kept DeepSeek signal path actually imports. Dropped from
+# Pared to what the kept GLM signal path actually imports. Dropped from
 # upstream: backtrader, redis, parsel, questionary, rich, typer,
 # langchain-anthropic, langchain-google-genai, langchain-experimental
 # (no import of any of these survives in the kept package — verified by grep).

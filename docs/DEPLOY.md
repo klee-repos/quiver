@@ -6,7 +6,7 @@ wake by running the `claude` CLI headless over `TICK.md`. Secrets live in **Secr
 Manager**; the **Google Cloud Ops Agent** ships the per-tick log to Cloud Logging where
 **log-based metrics → Monitoring alert policies** page an email channel. GCE **auto-restart
 + live-migration** is the host-failure recovery. ~**$25–30/mo** + your Claude subscription
-+ DeepSeek usage.
++ GLM usage.
 
 The box runs **XFCE + Chrome + Chrome Remote Desktop** for the periodic Robinhood/Claude
 OAuth (Robinhood's token fully expires ~every 3.8 days, no headless refresh — re-auth in the
@@ -33,7 +33,7 @@ guard** denies any order whose `ref_id` the Python `plan` did not reserve.
 ```bash
 ./deploy/gcp/bootstrap-gcp.sh      # pushes .env + strategy.yaml -> quiver-<KEY> secrets
 ```
-Creates `quiver-DEEPSEEK_API_KEY`, `quiver-RH_ACCOUNT_NUMBER`, `quiver-RESEND_API_KEY`,
+Creates `quiver-GLM_API_KEY`, `quiver-RH_ACCOUNT_NUMBER`, `quiver-RESEND_API_KEY`,
 `quiver-NOTIFY_TO`, `quiver-RESEND_FROM`, `quiver-STRATEGY_YAML` (+ optional
 `quiver-NOTIFY_ALERTS_TO` / `quiver-CLAUDE_CODE_OAUTH_TOKEN` if set in `.env`). Claude auth
 is OPTIONAL — the on-box `claude login` (step 4) covers it.

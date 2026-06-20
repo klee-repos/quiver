@@ -13,9 +13,9 @@ the tracked repo so Quiver can modify it freely.
 
 - Pruned non-runtime weight: `cli/`, `tests/`, `assets/`, `scripts/`, the nested upstream
   `.git/`, and `*.egg-info/`.
-- Trimmed `llm_clients/` to the DeepSeek / OpenAI-compatible path only; removed the
+- Trimmed `llm_clients/` to the OpenAI-compatible path only; removed the
   Anthropic, Google, and Azure provider clients and their `factory.py` dispatch branches
-  (DeepSeek routes through `openai_client` as an OpenAI-compatible provider).
+  (GLM and DeepSeek route through `openai_client` as OpenAI-compatible providers).
 - Slimmed dependencies in the repo-root `pyproject.toml` accordingly.
 
 This is no longer tracked against upstream; treat it as first-class Quiver source.

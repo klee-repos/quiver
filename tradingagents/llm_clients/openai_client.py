@@ -65,48 +65,116 @@ def _input_to_messages(input_: Any) -> list:
     return []
 
 
+def _merge_extra_body(payload: dict, extra: dict) -> dict:
+    """Merge ``extra`` into ``payload['extra_body']`` without clobbering existing keys.
+
+    The openai>=2 SDK's ``chat.completions.create`` is strict keyword-only with no
+    ``**kwargs``, so a non-standard TOP-LEVEL request param raises TypeError. The
+    SDK's ``extra_body`` argument is the supported escape hatch: it is shallow-merged
+    into the top level of the wire JSON body. This is the correct channel for
+    provider-specific params (GLM ``thinking``/``reasoning_effort``, MiniMax
+    ``reasoning_split``). ``setdefault`` semantics preserve any caller-set value.
+    """
+    current = dict(payload.get("extra_body") or {})
+    for key, value in extra.items():
+        current.setdefault(key, value)
+    payload["extra_body"] = current
+    return payload
+
+
+# --- Shared thinking-mode reasoning_content round-trip (DeepSeek + GLM) ----------
+# Thinking models (DeepSeek reasoner/V4, GLM 5.x with thinking enabled) return a
+# ``reasoning_content`` field that must be echoed back as part of the assistant
+# message on the NEXT turn of a multi-turn (tool-calling) conversation, or the API
+# rejects it with HTTP 400. ``_reattach_reasoning_content`` re-attaches it on send and
+# ``_capture_reasoning_content`` stashes it on receive. Both are module-level helpers
+# (not a mixin) so each provider subclass stays a direct ``NormalizedChatOpenAI`` and
+# the logic lives in exactly one place. Gated on
+# ``ModelCapabilities.requires_reasoning_content_roundtrip`` so non-thinking models on
+# the same provider path are untouched (the loops are no-ops for them).
+def _reattach_reasoning_content(payload, input_, model_name):
+    if not get_capabilities(model_name).requires_reasoning_content_roundtrip:
+        return payload
+    outgoing = payload.get("messages", [])
+    for message_dict, message in zip(outgoing, _input_to_messages(input_)):
+        if not isinstance(message, AIMessage):
+            continue
+        reasoning = message.additional_kwargs.get("reasoning_content")
+        if reasoning is not None:
+            message_dict["reasoning_content"] = reasoning
+    return payload
+
+
+def _capture_reasoning_content(chat_result, response, model_name):
+    if not get_capabilities(model_name).requires_reasoning_content_roundtrip:
+        return chat_result
+    response_dict = (
+        response
+        if isinstance(response, dict)
+        else response.model_dump(
+            exclude={"choices": {"__all__": {"message": {"parsed"}}}}
+        )
+    )
+    for generation, choice in zip(
+        chat_result.generations, response_dict.get("choices", [])
+    ):
+        reasoning = choice.get("message", {}).get("reasoning_content")
+        if reasoning is not None:
+            generation.message.additional_kwargs["reasoning_content"] = reasoning
+    return chat_result
+
+
 class DeepSeekChatOpenAI(NormalizedChatOpenAI):
     """DeepSeek-specific overrides on top of the OpenAI-compatible client.
 
-    Thinking-mode round-trip is the only DeepSeek-specific behavior that
-    stays here. When DeepSeek's thinking models return a response with
-    ``reasoning_content``, that field must be echoed back as part of the
-    assistant message on the next turn or the API fails with HTTP 400.
-    ``_create_chat_result`` captures it on receive and
-    ``_get_request_payload`` re-attaches it on send.
-
-    Tool-choice handling for V4 and reasoner — those models reject the
-    ``tool_choice`` parameter — is handled by the capability dispatch in
-    ``NormalizedChatOpenAI.with_structured_output``, not here.
+    The thinking-mode ``reasoning_content`` round-trip (DeepSeek V4/reasoner 400 if
+    the prior turn's reasoning is not echoed back) is the only DeepSeek quirk, and it
+    is shared with GLM via the ``_reattach_reasoning_content`` /
+    ``_capture_reasoning_content`` helpers. Tool-choice handling for V4 and reasoner —
+    those models reject the ``tool_choice`` parameter — is handled by the capability
+    dispatch in ``NormalizedChatOpenAI.with_structured_output``.
     """
 
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
-        outgoing = payload.get("messages", [])
-        for message_dict, message in zip(outgoing, _input_to_messages(input_)):
-            if not isinstance(message, AIMessage):
-                continue
-            reasoning = message.additional_kwargs.get("reasoning_content")
-            if reasoning is not None:
-                message_dict["reasoning_content"] = reasoning
-        return payload
+        return _reattach_reasoning_content(payload, input_, self.model_name)
 
     def _create_chat_result(self, response, generation_info=None):
         chat_result = super()._create_chat_result(response, generation_info)
-        response_dict = (
-            response
-            if isinstance(response, dict)
-            else response.model_dump(
-                exclude={"choices": {"__all__": {"message": {"parsed"}}}}
-            )
-        )
-        for generation, choice in zip(
-            chat_result.generations, response_dict.get("choices", [])
-        ):
-            reasoning = choice.get("message", {}).get("reasoning_content")
-            if reasoning is not None:
-                generation.message.additional_kwargs["reasoning_content"] = reasoning
-        return chat_result
+        return _capture_reasoning_content(chat_result, response, self.model_name)
+
+
+class GLMChatOpenAI(NormalizedChatOpenAI):
+    """GLM (z.ai / BigModel) overrides on top of the OpenAI-compatible client.
+
+    GLM 5.x exposes "thinking" mode via a non-standard request body —
+    ``{"thinking": {"type": "enabled"}, "reasoning_effort": "max"}`` (docs.z.ai).
+    Because openai>=2's ``create()`` is strict keyword-only, both params are routed
+    through ``extra_body`` (see ``_merge_extra_body``) rather than as top-level keys.
+    ``reasoning_effort`` goes through ``extra_body`` too, so its value (``"max"``) is
+    not constrained by the SDK's ``ReasoningEffort`` Literal. Thinking-enabled GLM
+    also returns ``reasoning_content`` requiring the next-turn echo — shared with
+    DeepSeek via the round-trip helpers. Whether to enable thinking, the effort level,
+    and the round-trip are all driven by the per-model capability row
+    (``capabilities.py``).
+    """
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        caps = get_capabilities(self.model_name)
+        if caps.requires_thinking_enabled:
+            extra: dict = {"thinking": {"type": "enabled"}}
+            if caps.reasoning_effort is not None:
+                extra["reasoning_effort"] = caps.reasoning_effort
+            _merge_extra_body(payload, extra)
+            # Single source of truth: reasoning_effort is also a passthrough kwarg, so
+            # drop any top-level copy (its value "max" is outside the SDK Literal).
+            payload.pop("reasoning_effort", None)
+        return _reattach_reasoning_content(payload, input_, self.model_name)
+
+    def _create_chat_result(self, response, generation_info=None):
+        chat_result = super()._create_chat_result(response, generation_info)
+        return _capture_reasoning_content(chat_result, response, self.model_name)
 
 
 class MinimaxChatOpenAI(NormalizedChatOpenAI):
@@ -132,7 +200,9 @@ class MinimaxChatOpenAI(NormalizedChatOpenAI):
     def _get_request_payload(self, input_, *, stop=None, **kwargs):
         payload = super()._get_request_payload(input_, stop=stop, **kwargs)
         if get_capabilities(self.model_name).requires_reasoning_split:
-            payload.setdefault("reasoning_split", True)
+            # extra_body, NOT a top-level key: openai>=2 create() is strict
+            # keyword-only and would TypeError on an unknown top-level param.
+            _merge_extra_body(payload, {"reasoning_split": True})
         return payload
 
 
@@ -238,6 +308,8 @@ class OpenAIClient(BaseLLMClient):
             chat_cls = DeepSeekChatOpenAI
         elif self.provider in ("minimax", "minimax-cn"):
             chat_cls = MinimaxChatOpenAI
+        elif self.provider in ("glm", "glm-cn"):
+            chat_cls = GLMChatOpenAI
         else:
             chat_cls = NormalizedChatOpenAI
         return chat_cls(**llm_kwargs)

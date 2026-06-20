@@ -110,7 +110,7 @@ Call the Robinhood MCP with the `account_number` from preflight:
 
 ## STEP 3 — Read the pre-computed analyses (already done by Python)
 
-The per-ticker analysis (DeepSeek, slow) has ALREADY been run for you by Python
+The per-ticker analysis (GLM, slow) has ALREADY been run for you by Python
 (`run_tick.py` ran the whole book BEFORE launching you) and written to a file. Do NOT
 run `analyze.py` or `scripts/run_analyses.py` yourself — just READ the file (a RELATIVE
 path; you are already in the repo dir, same as the `state/tmp/...` files below):

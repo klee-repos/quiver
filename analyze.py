@@ -176,6 +176,12 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         "catalyst": plan["catalyst"],
         # Model-proposed re-check cadence (hours); Python clamps it. Optional.
         "next_review_hours": parse_pm_field_float(final_decision, "Next Review Hours"),
+        # Conviction layer: the binding numeric conviction (0-100) the allocation
+        # engine uses to size the position, plus the model's self-reported uncertainty
+        # (0-100) which damps sizing. Optional -> None when the model didn't render
+        # them (the allocator then falls back to a rating-implied default).
+        "conviction": parse_pm_field_float(final_decision, "Conviction"),
+        "uncertainty": parse_pm_field_float(final_decision, "Uncertainty"),
         "rationale_summary": summary,
         "schema": 1,
     }
@@ -196,10 +202,10 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
 
 def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
                  past_context_compact: str = "") -> dict:
-    from lib.ds_config import build_deepseek_config
+    from lib.ds_config import build_glm_config
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-    ta_cfg = build_deepseek_config(cfg.chat_model, cfg.reasoner_model, state_dir=str(STATE))
+    ta_cfg = build_glm_config(cfg.chat_model, cfg.reasoner_model, state_dir=str(STATE))
     # Send all framework stdout noise to stderr (so our stdout stays JSON-only)
     # AND tee it to logs/reasoning/<date>_<TICKER>.log so the live thinking is
     # watchable (`tail -f`) and durable. The tee is best-effort; stdout is never

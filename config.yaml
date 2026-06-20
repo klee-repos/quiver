@@ -1,6 +1,6 @@
 schema: 1
 
-# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, DEEPSEEK_API_KEY,
+# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, GLM_API_KEY,
 # NOTIFY_TO and the Resend key all live in .env / the MCP registration, never here.
 # What the bot TRADES is derived from strategy.yaml's book, not this file.
 
@@ -45,17 +45,20 @@ order:
     stop_pct: 8.0                      # target distance below fill; clamped to a safe band
     time_in_force: "gtc"
 
-# --- Models (DeepSeek) -----------------------------------------------------
-# chat (flash) does the analysts' tool-calling (must support function calling);
-# reasoner (pro) does the debates. Verify IDs at /v1/models if a call rejects them.
-deepseek:
-  chat_model: "deepseek-v4-flash"
-  reasoner_model: "deepseek-v4-pro"
+# --- Models (GLM 5.2 via z.ai) ---------------------------------------------
+# Both roles use glm-5.2 (OpenAI-compatible, full tool calling, thinking mode).
+# chat_model does the analysts' tool-calling; reasoner_model does the debates/
+# judgment. Thinking is enabled at MAX reasoning effort for both — see the
+# glm-5.2 row in tradingagents/llm_clients/capabilities.py. Verify IDs at the
+# z.ai model list if a call rejects them.
+glm:
+  chat_model: "glm-5.2"
+  reasoner_model: "glm-5.2"
 
 # --- Loop timing -----------------------------------------------------------
 loop:
   act_after_open_minutes: 5            # wait N min after the open before acting
-  analyze_timeout_sec: 900             # per-ticker analyze.py subprocess timeout
+  analyze_timeout_sec: 3600            # per-ticker analyze.py subprocess timeout — very high so a normal max-reasoning GLM run never hits it
   # intraday_enabled OFF = the validated once-a-day path (the cadence code stays dormant).
   intraday_enabled: false
   per_ticker_cooldown_min: 60          # min minutes between repeat trades on a ticker

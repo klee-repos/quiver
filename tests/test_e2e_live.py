@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""LIVE end-to-end test of the memory-grounded consistency feature — REAL DeepSeek.
+"""LIVE end-to-end test of the memory-grounded consistency feature — REAL GLM 5.2.
 
 This is the only test that exercises the FULL real path the synthetic e2e can't:
-  seed a decision-memory history  ->  REAL `analyze.py` (DeepSeek multi-agent run)
+  seed a decision-memory history  ->  REAL `analyze.py` (GLM 5.2 multi-agent run)
   ->  confirm it emits the consistency fields (basis/catalyst/target_price)
   ->  confirm the seeded memory (incl. the stance-consistency block) is what gets injected
   ->  feed the REAL model output through the REAL `tick.py plan` gate
   ->  confirm the gate's verdict is internally consistent + the proof is persisted.
 
-It costs money + tokens, needs DEEPSEEK_API_KEY, takes a few minutes, and the model's
+It costs money + tokens, needs GLM_API_KEY, takes a few minutes, and the model's
 SIGNAL is non-deterministic — so it is GATED behind QUIVER_LIVE_E2E=1 and asserts on
 STRUCTURE + internal consistency, never on a specific signal value. Without the flag it
 is a no-op PASS (safe to leave in any runner / CI).
@@ -47,17 +47,17 @@ def ok(name, cond, detail=""):
 
 def main() -> int:
     if os.environ.get("QUIVER_LIVE_E2E") != "1":
-        print("LIVE E2E skipped (set QUIVER_LIVE_E2E=1 to run the real DeepSeek path). PASS (no-op).")
+        print("LIVE E2E skipped (set QUIVER_LIVE_E2E=1 to run the real GLM 5.2 path). PASS (no-op).")
         return 0
-    if not (REPO / ".env").exists():
-        print("LIVE E2E: no .env (need DEEPSEEK_API_KEY). FAIL.")
+    if not (REPO / ".env").exists() and not os.environ.get("GLM_API_KEY"):
+        print("LIVE E2E: need GLM_API_KEY (in .env or the environment). FAIL.")
         return 1
 
     ticker = (sys.argv[1] if len(sys.argv) > 1 else
               os.environ.get("QUIVER_LIVE_E2E_TICKER", "NVDA")).strip().upper()
     date = os.environ.get("QUIVER_LIVE_E2E_DATE", "2026-06-12")
     print("=" * 72)
-    print(f"LIVE E2E — REAL DeepSeek consistency path  (ticker={ticker}, date={date})")
+    print(f"LIVE E2E — REAL GLM 5.2 consistency path  (ticker={ticker}, date={date})")
     print("=" * 72)
 
     from lib.ledger import Ledger
@@ -90,11 +90,11 @@ def main() -> int:
     ok("memory: scorecard injected (prior calls + hit-rate)",
        f"prior calls on {ticker}" in ctx.full and "hit-rate" in ctx.full)
 
-    # --- (ii) REAL analyze.py: a live DeepSeek multi-agent run on the seeded memory ---
+    # --- (ii) REAL analyze.py: a live GLM 5.2 multi-agent run on the seeded memory ---
     print(f"\n[running REAL analyze.py {ticker} — a few minutes; reading the seeded memory]")
     env = {**os.environ, "QUIVER_LEDGER_DB": db}
     proc = subprocess.run([PY, "analyze.py", ticker, "--date", date], cwd=str(REPO), env=env,
-                          capture_output=True, text=True, timeout=1500)
+                          capture_output=True, text=True, timeout=3600)
     line = next((ln for ln in proc.stdout.splitlines() if ln.strip().startswith("{")), None)
     ok("analyze: produced one JSON line", line is not None, proc.stdout[-300:] + proc.stderr[-300:])
     if not line:

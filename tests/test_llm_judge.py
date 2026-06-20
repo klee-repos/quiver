@@ -40,7 +40,7 @@ def _cfg():
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 20.0,
                  "daily_capital_deploy_cap": 1000,
                  "min_buying_power_buffer": 5, "rebalance_enabled": True},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     }
     p = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     yaml.safe_dump(d, p)

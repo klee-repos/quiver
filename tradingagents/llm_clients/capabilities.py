@@ -44,6 +44,13 @@ class ModelCapabilities:
     # (Coding Plan, MiniMax-Text-01, etc.), so we only set it where the
     # model actually consumes it. (#826)
     requires_reasoning_split: bool = False
+    # GLM 5.x exposes thinking mode via the request body ``{"thinking":
+    # {"type": "enabled"}}`` (docs.z.ai). When True, GLMChatOpenAI injects it
+    # via extra_body. Off for every non-GLM model.
+    requires_thinking_enabled: bool = False
+    # Reasoning effort to send when thinking is enabled (GLM accepts "max",
+    # higher than the OpenAI SDK's "xhigh"). None means "do not send it".
+    reasoning_effort: str | None = None
 
 
 # DeepSeek's thinking models accept the ``tools`` array but reject the
@@ -91,6 +98,23 @@ _DEFAULT = ModelCapabilities(
 )
 
 
+# GLM 5.x with thinking enabled. Like DeepSeek thinking models, GLM-with-thinking
+# is expected to reject the tool_choice dict and to require the reasoning_content
+# round-trip on multi-turn tool loops, so both are set conservatively (safe: the
+# schema still binds as a tool; echoing reasoning_content is harmless if unneeded).
+# requires_thinking_enabled drives GLMChatOpenAI to inject {"thinking":
+# {"type":"enabled"}} + reasoning_effort via extra_body. (docs.z.ai)
+_GLM_THINKING = ModelCapabilities(
+    supports_tool_choice=False,
+    supports_json_mode=True,
+    supports_json_schema=False,
+    preferred_structured_method="function_calling",
+    requires_reasoning_content_roundtrip=True,
+    requires_thinking_enabled=True,
+    reasoning_effort="max",
+)
+
+
 # Exact-ID matches take precedence over pattern matches.
 _BY_ID: dict[str, ModelCapabilities] = {
     "deepseek-chat": _DEEPSEEK_CHAT,
@@ -106,6 +130,8 @@ _BY_ID: dict[str, ModelCapabilities] = {
     "MiniMax-M2.1": _MINIMAX_THINKING,
     "MiniMax-M2.1-highspeed": _MINIMAX_THINKING,
     "MiniMax-M2": _MINIMAX_THINKING,
+    # GLM — z.ai / BigModel flagship (thinking enabled at max effort).
+    "glm-5.2": _GLM_THINKING,
 }
 
 # Forward-compat patterns. New ``deepseek-v5-*`` / ``deepseek-reasoner-*``
@@ -114,6 +140,8 @@ _BY_PATTERN: list[tuple[re.Pattern[str], ModelCapabilities]] = [
     (re.compile(r"^deepseek-v\d"), _DEEPSEEK_THINKING),
     (re.compile(r"^deepseek-reasoner"), _DEEPSEEK_THINKING),
     (re.compile(r"^MiniMax-M\d"), _MINIMAX_THINKING),
+    # GLM 5.x (glm-5, glm-5.1, glm-5.2, glm-5-turbo, ...) all support thinking mode.
+    (re.compile(r"^glm-5"), _GLM_THINKING),
 ]
 
 

@@ -133,7 +133,7 @@ def make_config(notify_block=None):
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     }
     if notify_block is not None:
         d["notify"] = notify_block
@@ -411,7 +411,7 @@ def make_storage_config(storage_block):
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     }
     if storage_block is not None:
         d["storage"] = storage_block
@@ -488,6 +488,85 @@ check("pending row directional is None", _dw[0]["directional_return"], None)
 check_true("integrated scorecard reflects 1 resolved",
            "2 decision(s), 1 resolved" in memory.build_scorecard("AAPL", _dw))
 
+# --- T1 REGRESSION: un-poison the scorecard --------------------------------
+# A SKIP decision puts no capital at risk; grading it directionally was the live
+# poison (CBRS Underweight/skip into a +9% move scored as a MISS -> fictitious low
+# hit-rate -> the loop steers AWAY from working names). It must be excluded.
+_poison_rows = [
+    {"trade_date": "2026-06-02", "signal": "Buy", "intent": "buy",
+     "directional_return": 0.02, "holding_days": 5, "rationale": "real long"},
+    {"trade_date": "2026-06-01", "signal": "Underweight", "intent": "skip",
+     "directional_return": 0.09, "holding_days": 5, "rationale": "no position"},
+]
+_psc = memory.build_scorecard("CBRS", _poison_rows)
+check_true("REGRESSION: skip excluded from hit-rate (1/1 not 1/2)", "1/1" in _psc and "1/2" not in _psc)
+check_true("REGRESSION: skip-into-rising-price is not a miss",
+           "(100%)" in _psc)
+check("is_hit still pure (skip filtering is scorecard-level, not is_hit)",
+      memory.is_hit("Underweight", 0.09), False)
+
+# --- T1: benchmark-relative (alpha) grading, not absolute beta --------------
+# A long that rose +10% absolute but UNDERPERFORMED the benchmark (alpha -2%) is a
+# SKILL miss; absolute grading would call it a hit (pure market beta).
+_alpha_rows = [
+    {"trade_date": "2026-06-03", "signal": "Buy", "intent": "buy",
+     "directional_return": 0.10, "alpha": -0.02, "holding_days": 5, "rationale": "lagged QQQ"},
+]
+_asc = memory.build_scorecard("SMH", _alpha_rows)
+check("score_return prefers alpha when present", memory.score_return(_alpha_rows[0]), -0.02)
+check("score_return falls back to directional", memory.score_return({"directional_return": 0.05}), 0.05)
+check_true("alpha-graded Buy that lagged benchmark is a MISS (0/1)", "0/1" in _asc)
+check_true("scorecard labels metric basis excess-vs-benchmark", "excess-vs-benchmark" in _asc)
+
+# --- T1: basis surfaced per recent decision (cross-day learning) ------------
+_basis_rows = [
+    {"trade_date": "2026-06-04", "signal": "Buy", "intent": "buy", "basis": "power_bottleneck",
+     "directional_return": 0.03, "holding_days": 5, "rationale": "CEG PPA"},
+]
+check_true("scorecard surfaces the strategy basis tag", "[power_bottleneck]" in memory.build_scorecard("CEG", _basis_rows))
+
+# --- T1: ledger return-series excludes skips + carries alpha/intent ---------
+_skled = _tmp_ledger()
+_sk_buy = _skled.record_decision(trade_date="2026-06-01", ticker="NVDA",
+                                 decided_at="2026-06-01T10:00:00-04:00", signal="Buy", intent="buy",
+                                 decision_price=100.0)
+_sk_skip = _skled.record_decision(trade_date="2026-06-02", ticker="NVDA",
+                                  decided_at="2026-06-02T10:00:00-04:00", signal="Underweight",
+                                  intent="skip", decision_price=100.0)
+_skled.record_outcome(_sk_buy, resolved_at="2026-06-06T10:00:00-04:00", holding_days=5,
+                      directional_return=0.04, alpha=0.01)
+_skled.record_outcome(_sk_skip, resolved_at="2026-06-07T10:00:00-04:00", holding_days=5,
+                      directional_return=0.09)
+_ser = _skled.ticker_return_series("NVDA")
+check("return-series excludes skip rows", [r["id"] for r in _ser], [_sk_buy])
+check("return-series carries alpha", _ser[0]["alpha"], 0.01)
+check("return-series can opt back into skips", len(_skled.ticker_return_series("NVDA", exclude_skips=False)), 2)
+
+# --- T3: conviction primitive (schema render + parse + persist) -------------
+from tradingagents.agents.schemas import (PortfolioDecision, render_pm_decision,  # noqa: E402
+                                          PortfolioRating)
+import analyze as _analyze  # noqa: E402
+_pd = PortfolioDecision(rating=PortfolioRating.BUY, conviction=82, uncertainty=15,
+                        executive_summary="strong", investment_thesis="thesis")
+_pmd = render_pm_decision(_pd)
+check_true("render_pm_decision emits Conviction", "**Conviction**: 82" in _pmd)
+check_true("render_pm_decision emits Uncertainty", "**Uncertainty**: 15" in _pmd)
+check("parse conviction from PM markdown", _analyze.parse_pm_field_float(_pmd, "Conviction"), 82.0)
+_ef = _analyze.extract_fields({"trader_investment_plan": "**Action**: Buy", "final_trade_decision": _pmd}, "Buy", "SMH")
+check("extract_fields surfaces conviction", _ef["conviction"], 82.0)
+check("extract_fields surfaces uncertainty", _ef["uncertainty"], 15.0)
+_pd_none = PortfolioDecision(rating=PortfolioRating.HOLD, executive_summary="x", investment_thesis="y")
+check_true("conviction omitted when model gives none", "**Conviction**" not in render_pm_decision(_pd_none))
+# persistence + migration round-trip
+_cvled = _tmp_ledger()
+_cvid = _cvled.record_decision(trade_date="2026-06-20", ticker="SMH",
+                               decided_at="2026-06-20T10:00:00-04:00", signal="Buy", intent="buy",
+                               conviction=82.0, uncertainty=15.0, data_quality='{"bars_n":250}')
+_cvrow = _cvled.get_decision(_cvid)
+check("ledger persists conviction", _cvrow["conviction"], 82.0)
+check("ledger persists uncertainty", _cvrow["uncertainty"], 15.0)
+check("ledger persists data_quality json", _cvrow["data_quality"], '{"bars_n":250}')
+
 
 # ======================= MULTI-RUN + MODEL-DRIVEN CADENCE ===================
 
@@ -550,7 +629,7 @@ def make_loop_config(loop_block=None, risk_extra=None):
         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                  "daily_capital_deploy_cap": 75,
                  "min_buying_power_buffer": 5},
-        "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     }
     if loop_block is not None:
         d["loop"] = loop_block
@@ -620,7 +699,7 @@ def make_order_config(order_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5},
-         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
     if order_block is not None:
         d["order"] = order_block
     return load_config(_write_config(d))
@@ -774,7 +853,7 @@ def make_memory_config(memory_block):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5},
-         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
     if memory_block is not None:
         d["memory"] = memory_block
     return load_config(_write_config(d))
@@ -1272,7 +1351,7 @@ def _cfg_rebal(enabled, strategy_path=None):
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                   "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5, "rebalance_enabled": enabled},
-         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
     if strategy_path:
         d["strategy_path"] = strategy_path
     return load_config(_write_config(d))
@@ -1429,7 +1508,7 @@ _cfg_norec = load_config(_write_config({
     "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0, "daily_capital_deploy_cap": 75,
              "min_buying_power_buffer": 5,
              "rebalance_enabled": False, "reconcile_unmanaged": False},
-    "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+    "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
     "strategy_path": str(_REPO / "tests" / "fixtures" / "strategy_fixture.yaml")}))
 _out_norec = _tick._run_plan(_cfg_norec, _tmp_ledger(), _copy.deepcopy(_p_rec))
 check("plan: reconcile OFF leaves the off-book holding untouched",
@@ -1865,7 +1944,7 @@ def _cfg_with_consistency(cons_block):
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
                   "daily_capital_deploy_cap": 75,
                   "min_buying_power_buffer": 5, "consistency": cons_block},
-         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
     return load_config(_write_config(d))
 
 _cc = _cfg_with_consistency({"enabled": False, "max_discretionary_reversals": 2, "flip_window": 4, "loss_catalyst_pct": 10.0})
@@ -1883,7 +1962,7 @@ def _cfg_cons(**risk):
     d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kc_int",
          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 50.0, "daily_capital_deploy_cap": 1000,
                   "min_buying_power_buffer": 5, **risk},
-         "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"}}
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
     return load_config(_write_config(d))
 
 def _seed_buy(led, ticker, day, *, stop=90.0, basis="momentum", price=100.0):
@@ -1983,6 +2062,201 @@ _dw_bad = _strat.regime_with_confirmation(
     {"regime": "standdown", "pending_regime": "deploy", "confirm_count": 2, "regime_since": "not-a-date"},
     _strat.REGIME_DEPLOY, confirm_n=2, min_dwell_days=5, today="2026-06-07")
 check_true("regr: an unparseable regime_since dwell-LOCKS (never skips the lock)", not _dw_bad["changed"])
+
+
+# ---------------------------------------------------------------------------
+# GLM 5.2 (z.ai) provider wiring — the DeepSeek->GLM swap.
+# Pure/offline: constructing the langchain client does NOT call the API; we only
+# inspect the request payload it WOULD send (extra_body shaping, roundtrip, routing).
+# ---------------------------------------------------------------------------
+import os as _os  # noqa: E402
+_os.environ.setdefault("GLM_API_KEY", "dummy-key-for-tests")
+from langchain_core.messages import AIMessage as _AIMessage, HumanMessage as _HumanMessage  # noqa: E402
+from lib.ds_config import build_glm_config  # noqa: E402
+from tradingagents.llm_clients.capabilities import get_capabilities as _get_caps  # noqa: E402
+from tradingagents.llm_clients.api_key_env import get_api_key_env as _get_key_env  # noqa: E402
+from tradingagents.llm_clients.validators import validate_model as _validate_model  # noqa: E402
+from tradingagents.llm_clients.factory import create_llm_client as _create_llm_client  # noqa: E402
+from tradingagents.llm_clients.openai_client import (  # noqa: E402
+    GLMChatOpenAI as _GLMChat, MinimaxChatOpenAI as _MiniMaxChat, _merge_extra_body,
+)
+
+# build_glm_config points the framework at GLM (provider literal + provider-default URL).
+_glm_cfg = build_glm_config("glm-5.2", "glm-5.2", state_dir="/tmp/quiver_test_state")
+check("build_glm_config provider=glm", _glm_cfg["llm_provider"], "glm")
+check("build_glm_config backend_url=None (provider default applies)", _glm_cfg["backend_url"], None)
+check("build_glm_config quick_think=chat_model", _glm_cfg["quick_think_llm"], "glm-5.2")
+check("build_glm_config deep_think=reasoner_model", _glm_cfg["deep_think_llm"], "glm-5.2")
+
+# Provider->key env map + model catalog.
+check("glm provider -> GLM_API_KEY env", _get_key_env("glm"), "GLM_API_KEY")
+check_true("glm-5.2 is a known model (no unknown-model warning)", _validate_model("glm", "glm-5.2"))
+
+# Capability row: thinking ON at max effort; conservative tool_choice + roundtrip.
+_gc = _get_caps("glm-5.2")
+check_true("glm-5.2 caps: thinking enabled", _gc.requires_thinking_enabled)
+check("glm-5.2 caps: reasoning_effort=max", _gc.reasoning_effort, "max")
+check_true("glm-5.2 caps: reasoning_content roundtrip", _gc.requires_reasoning_content_roundtrip)
+check("glm-5.2 caps: tool_choice suppressed (False)", _gc.supports_tool_choice, False)
+check_true("^glm-5 pattern: glm-5.1 inherits thinking", _get_caps("glm-5.1").requires_thinking_enabled)
+check_true("^glm-5 pattern: glm-5-turbo inherits thinking", _get_caps("glm-5-turbo").requires_thinking_enabled)
+check("non-GLM unaffected: deepseek has no thinking-enabled flag",
+      _get_caps("deepseek-v4-pro").requires_thinking_enabled, False)
+
+# _merge_extra_body: additive into extra_body, preserves existing keys.
+_p = {"extra_body": {"keep": 1}}
+_merge_extra_body(_p, {"thinking": {"type": "enabled"}, "reasoning_effort": "max"})
+check("merge_extra_body preserves existing key", _p["extra_body"]["keep"], 1)
+check("merge_extra_body adds thinking", _p["extra_body"]["thinking"], {"type": "enabled"})
+check("merge_extra_body adds reasoning_effort", _p["extra_body"]["reasoning_effort"], "max")
+
+# factory routes glm -> GLMChatOpenAI.
+check("factory glm -> GLMChatOpenAI",
+      type(_create_llm_client("glm", "glm-5.2").get_llm()).__name__, "GLMChatOpenAI")
+
+# GLMChatOpenAI request shaping (offline): thinking + reasoning_effort go via
+# extra_body (NOT top-level — openai>=2 create() is strict keyword-only).
+_glm = _GLMChat(model="glm-5.2", api_key="dummy", base_url="https://api.z.ai/api/paas/v4/")
+_pl = _glm._get_request_payload([_HumanMessage("hi")])
+check("GLM payload: thinking in extra_body", (_pl.get("extra_body") or {}).get("thinking"), {"type": "enabled"})
+check("GLM payload: reasoning_effort in extra_body", (_pl.get("extra_body") or {}).get("reasoning_effort"), "max")
+check_true("GLM payload: thinking NOT top-level (would TypeError on openai>=2)", "thinking" not in _pl)
+check_true("GLM payload: reasoning_effort NOT top-level", not _pl.get("reasoning_effort"))
+
+# reasoning_content roundtrip: a prior assistant turn's reasoning is echoed back on send.
+_pl2 = _glm._get_request_payload(
+    [_AIMessage(content="prev", additional_kwargs={"reasoning_content": "because X"}), _HumanMessage("next")])
+check_true("GLM roundtrip: prior reasoning_content re-attached on send",
+           any(m.get("reasoning_content") == "because X" for m in _pl2.get("messages", [])))
+
+# MiniMax fix (D4): reasoning_split now rides extra_body, not a top-level key.
+_mm = _MiniMaxChat(model="MiniMax-M2", api_key="dummy", base_url="https://api.minimax.io/v1")
+_mp = _mm._get_request_payload([_HumanMessage("hi")])
+check("MiniMax reasoning_split in extra_body", (_mp.get("extra_body") or {}).get("reasoning_split"), True)
+check_true("MiniMax reasoning_split NOT top-level", "reasoning_split" not in _mp)
+
+# lib/config.py reads the glm: block; legacy deepseek: still loads (fail-safe back-compat).
+check("config reads glm: block", make_config().chat_model, "glm-5.2")
+_legacy_d = {
+    "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+    "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+             "daily_capital_deploy_cap": 75, "min_buying_power_buffer": 5},
+    "deepseek": {"chat_model": "deepseek-v4-flash", "reasoner_model": "deepseek-v4-pro"},
+}
+check("config back-compat: legacy deepseek: block still loads",
+      load_config(_write_config(_legacy_d)).chat_model, "deepseek-v4-flash")
+
+
+# ======================= T5: ANALYSIS-DRIVEN ALLOCATION ENGINE ==============
+from lib import allocate as _alloc  # noqa: E402
+
+# --- effective_conviction (pure rating x conviction x uncertainty mapping) ---
+check("conv: Buy default 0.70", _alloc.effective_conviction({"signal": "Buy"}), 0.70)
+check("conv: Overweight default 0.55", _alloc.effective_conviction({"signal": "Overweight"}), 0.55)
+check("conv: explicit conviction wins", _alloc.effective_conviction({"signal": "Buy", "conviction": 90}), 0.90)
+check("conv: Hold -> None (keep prior)", _alloc.effective_conviction({"signal": "Hold"}), None)
+check("conv: Sell -> 0.0 (exit signal)", _alloc.effective_conviction({"signal": "Sell"}), 0.0)
+check("conv: ERROR -> None (D2 hold prior)", _alloc.effective_conviction({"signal": "ERROR"}), None)
+check("conv: missing analysis -> None", _alloc.effective_conviction(None), None)
+check("conv: Underweight halved", _alloc.effective_conviction({"signal": "Underweight", "conviction": 40}), 0.20)
+check("conv: uncertainty damps", round(_alloc.effective_conviction(
+    {"signal": "Buy", "conviction": 80, "uncertainty": 50}), 4), 0.6)  # 0.8 * (1 - 0.5*0.5)
+
+# --- allocate_targets: conviction scales weight; cash is the residual --------
+_POL = {"per_name_max_pct": 80, "sleeve_max_pct": 90, "cash_floor_pct": 10,
+        "smoothing_alpha": 1.0, "min_weight_floor_pct": 0.1}  # alpha=1 -> no smoothing (test fresh)
+_cands2 = [{"ticker": "AAA", "sleeve": "x", "prior_weight": 0}, {"ticker": "BBB", "sleeve": "y", "prior_weight": 0}]
+_al = _alloc.allocate_targets(_cands2, {"AAA": {"signal": "Buy", "conviction": 90},
+                                        "BBB": {"signal": "Buy", "conviction": 30}}, policy=_POL)
+check_true("alloc: higher conviction gets more weight", _al.weights["AAA"] > _al.weights["BBB"])
+check_true("alloc: engine sums to deployable budget (90)", abs(sum(_al.weights.values()) - 90.0) < 0.01)
+check_true("alloc: cash is the residual (~10)", abs(_al.cash_pct - 10.0) < 0.01)
+
+# --- D2: ERROR / missing HOLDS prior weight, never sells to cash -------------
+_alD2 = _alloc.allocate_targets(
+    [{"ticker": "SMH", "sleeve": "c", "prior_weight": 15}, {"ticker": "CEG", "sleeve": "p", "prior_weight": 9}],
+    {"SMH": {"signal": "ERROR"}, "CEG": {"signal": "Buy", "conviction": 80}}, policy=_POL)
+check("D2: ERROR name holds its prior weight (no sell)", _alD2.weights["SMH"], 15.0)
+check_true("D2: a healthy name still gets allocated alongside", _alD2.weights["CEG"] > 0)
+_alMiss = _alloc.allocate_targets([{"ticker": "BOT", "sleeve": "r", "prior_weight": 5}], {}, policy=_POL)
+check("D2: missing analysis holds prior", _alMiss.weights.get("BOT"), 5.0)
+
+# --- Hold keeps prior; Sell goes to 0 ---------------------------------------
+_alHold = _alloc.allocate_targets(
+    [{"ticker": "QQQ", "sleeve": "h", "prior_weight": 8}, {"ticker": "ANET", "sleeve": "n", "prior_weight": 6}],
+    {"QQQ": {"signal": "Hold"}, "ANET": {"signal": "Sell", "conviction": 70}}, policy=_POL)
+check("Hold keeps prior weight", _alHold.weights.get("QQQ"), 8.0)
+check("Sell drops the name to 0", _alHold.weights.get("ANET", 0.0), 0.0)
+
+# --- cash floor is a HARD floor even with many max-conviction names ----------
+_alFloor = _alloc.allocate_targets(
+    [{"ticker": t, "sleeve": t, "prior_weight": 0} for t in ("A", "B", "C", "D")],
+    {t: {"signal": "Buy", "conviction": 100} for t in ("A", "B", "C", "D")},
+    policy={"per_name_max_pct": 50, "sleeve_max_pct": 100, "cash_floor_pct": 10, "smoothing_alpha": 1.0})
+check_true("cash floor: engine never exceeds 100 - cash_floor", sum(_alFloor.weights.values()) <= 90.0 + 1e-6)
+
+# --- per-name cap clips a dominant conviction; excess water-fills others -----
+_alCap = _alloc.allocate_targets(
+    [{"ticker": "BIG", "sleeve": "a", "prior_weight": 0}, {"ticker": "SM1", "sleeve": "b", "prior_weight": 0},
+     {"ticker": "SM2", "sleeve": "c", "prior_weight": 0}],
+    {"BIG": {"signal": "Buy", "conviction": 100}, "SM1": {"signal": "Buy", "conviction": 10},
+     "SM2": {"signal": "Buy", "conviction": 10}},
+    policy={"per_name_max_pct": 30, "sleeve_max_pct": 100, "cash_floor_pct": 0, "smoothing_alpha": 1.0})
+check_true("per-name cap clips the dominant name to <=30", _alCap.weights["BIG"] <= 30.0 + 1e-6)
+check_true("water-fill pushes excess onto the smaller names", _alCap.weights["SM1"] > 10.0)
+
+# --- per-sleeve cap limits concentration into one sleeve --------------------
+_alSleeve = _alloc.allocate_targets(
+    [{"ticker": "P1", "sleeve": "Power", "prior_weight": 0}, {"ticker": "P2", "sleeve": "Power", "prior_weight": 0},
+     {"ticker": "C1", "sleeve": "Compute", "prior_weight": 0}],
+    {"P1": {"signal": "Buy", "conviction": 90}, "P2": {"signal": "Buy", "conviction": 90},
+     "C1": {"signal": "Buy", "conviction": 20}},
+    policy={"per_name_max_pct": 100, "sleeve_max_pct": 40, "cash_floor_pct": 0, "smoothing_alpha": 1.0})
+check_true("sleeve cap: Power sleeve total <= 40",
+           _alSleeve.weights.get("P1", 0) + _alSleeve.weights.get("P2", 0) <= 40.0 + 1e-6)
+
+# --- EWMA smoothing: a big fresh change is damped toward prior (stickiness) --
+_alSmooth = _alloc.allocate_targets(
+    [{"ticker": "X", "sleeve": "x", "prior_weight": 20}],
+    {"X": {"signal": "Underweight", "conviction": 1}},  # fresh wants ~0
+    policy={"per_name_max_pct": 100, "sleeve_max_pct": 100, "cash_floor_pct": 0, "smoothing_alpha": 0.4})
+check_true("EWMA: a one-day collapse is damped (stays well above 0)", _alSmooth.weights["X"] > 10.0)
+
+# --- calibration multiplier: a learned-winner gets more than an equal peer ---
+_alCal = _alloc.allocate_targets(
+    [{"ticker": "W", "sleeve": "a", "prior_weight": 0}, {"ticker": "L", "sleeve": "b", "prior_weight": 0}],
+    {"W": {"signal": "Buy", "conviction": 60}, "L": {"signal": "Buy", "conviction": 60}},
+    calibration={"W": 1.5, "L": 1.0}, policy={"per_name_max_pct": 100, "sleeve_max_pct": 100,
+                                              "cash_floor_pct": 0, "smoothing_alpha": 1.0})
+check_true("calibration: the learned winner gets more weight", _alCal.weights["W"] > _alCal.weights["L"])
+
+# --- regime scalar: STAND_DOWN derisks (more cash) --------------------------
+_alRegime = _alloc.allocate_targets(
+    [{"ticker": "R", "sleeve": "a", "prior_weight": 0}], {"R": {"signal": "Buy", "conviction": 100}},
+    regime_scalar=0.5, policy={"per_name_max_pct": 100, "sleeve_max_pct": 100, "cash_floor_pct": 10,
+                               "smoothing_alpha": 1.0, "regime_min_factor": 0.5})
+check_true("regime: derisk deploys less -> more cash", _alRegime.cash_pct > 10.0)
+
+# --- D3: a hold_floor (suppressed reversal) can't be cut below prior ---------
+_alD3 = _alloc.allocate_targets(
+    [{"ticker": "SMH", "sleeve": "c", "prior_weight": 15}],
+    {"SMH": {"signal": "Sell", "conviction": 80}},   # wants 0, but the gate suppressed the reversal
+    hold_floors={"SMH": 15.0}, policy={"per_name_max_pct": 40, "sleeve_max_pct": 100,
+                                       "cash_floor_pct": 0, "smoothing_alpha": 1.0})
+check("D3: suppressed reversal holds prior weight (not sold)", _alD3.weights.get("SMH"), 15.0)
+
+# --- conviction curve k>1 sharpens (concentrates into the best idea) ---------
+_eqpol = {"per_name_max_pct": 100, "sleeve_max_pct": 100, "cash_floor_pct": 0, "smoothing_alpha": 1.0}
+_lin = _alloc.allocate_targets(
+    [{"ticker": "H", "sleeve": "a", "prior_weight": 0}, {"ticker": "Lo", "sleeve": "b", "prior_weight": 0}],
+    {"H": {"signal": "Buy", "conviction": 80}, "Lo": {"signal": "Buy", "conviction": 40}},
+    policy={**_eqpol, "conviction_curve_k": 1.0})
+_sharp = _alloc.allocate_targets(
+    [{"ticker": "H", "sleeve": "a", "prior_weight": 0}, {"ticker": "Lo", "sleeve": "b", "prior_weight": 0}],
+    {"H": {"signal": "Buy", "conviction": 80}, "Lo": {"signal": "Buy", "conviction": 40}},
+    policy={**_eqpol, "conviction_curve_k": 2.0})
+check_true("conviction curve k>1 concentrates into the higher-conviction name",
+           _sharp.weights["H"] > _lin.weights["H"])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

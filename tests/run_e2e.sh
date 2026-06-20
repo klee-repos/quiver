@@ -2,8 +2,8 @@
 # Run the full Quiver test + e2e suite. One command, clean summary, non-zero on any failure.
 #
 #   tests/run_e2e.sh           # unit + all DETERMINISTIC e2e (fast, free, no network/LLM)
-#   tests/run_e2e.sh --live    # ALSO the REAL DeepSeek e2e (test_e2e_live.py) — costs tokens,
-#                              #   needs DEEPSEEK_API_KEY, takes a few minutes
+#   tests/run_e2e.sh --live    # ALSO the REAL GLM e2e (test_e2e_live.py) — costs tokens,
+#                              #   needs GLM_API_KEY, takes a few minutes
 #
 # The live suite is gated behind QUIVER_LIVE_E2E=1; without --live it self-skips (PASS), so
 # this script is safe to run constantly / on a schedule. Everything runs against temp ledgers —
@@ -25,14 +25,14 @@ SUITES=(
   "e2e-consistency|tests/test_e2e_consistency.py"
   "llm-judge|tests/test_llm_judge.py"
 )
-[ "$LIVE" = "1" ] && SUITES+=("e2e-live(DeepSeek)|tests/test_e2e_live.py")
+[ "$LIVE" = "1" ] && SUITES+=("e2e-live(GLM)|tests/test_e2e_live.py")
 
-echo "================ Quiver test suite ($([ "$LIVE" = "1" ] && echo "incl. LIVE DeepSeek" || echo "deterministic only")) ================"
+echo "================ Quiver test suite ($([ "$LIVE" = "1" ] && echo "incl. LIVE GLM" || echo "deterministic only")) ================"
 FAILED=()
 for entry in "${SUITES[@]}"; do
   name="${entry%%|*}"; file="${entry##*|}"
   printf '%-26s ' "$name"
-  if [ "$name" = "e2e-live(DeepSeek)" ]; then
+  if [ "$name" = "e2e-live(GLM)" ]; then
     QUIVER_LIVE_E2E=1 "$PY" "$file" >"/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" 2>&1
   else
     "$PY" "$file" >"/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" 2>&1

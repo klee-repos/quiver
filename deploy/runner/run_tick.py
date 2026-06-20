@@ -62,7 +62,7 @@ MODEL = os.environ.get("QUIVER_MODEL", "claude-sonnet-4-6")
 EFFORT = os.environ.get("QUIVER_EFFORT", "low")  # ultracode OFF; Python does the thinking
 # Wall-clock ceiling for one orchestrator tick. Set DELIBERATELY HIGH (4h) so it is
 # essentially never hit by a legitimate tick: a full rebalance analyzes the whole book
-# (~11 DeepSeek analyze.py runs) and ran ~40 min live on the e2-medium; a slow day with
+# (~11 GLM analyze.py runs) and ran ~40 min live on the e2-medium; a slow day with
 # retries could be 60-90 min. The timeout is ONLY a last-resort backstop for a genuinely
 # wedged orchestrator (MCP hang / infinite loop) — overlapping hourly timer fires no-op
 # via the run_lock, so a long-but-legit tick is harmless. Override with QUIVER_TICK_TIMEOUT_SEC.
@@ -152,7 +152,7 @@ def _is_silent_noop(pending, recorded_before, recorded_after) -> bool:
     Pure (unit-tested offline). ``recorded_*`` are ``count_decisions + count_ticker_actions``
     snapshots taken either side of the orchestrator run. Run-scoped via the delta, so it is
     correct in intraday mode (earlier ticks already wrote rows) and never false-trips a
-    DeepSeek-outage day (error analyses still add ticker_action rows -> delta > 0). A None
+    GLM-outage day (error analyses still add ticker_action rows -> delta > 0). A None
     snapshot (a DB read hiccup) -> not a noop (never false-trip)."""
     if not pending:
         return False
@@ -254,8 +254,17 @@ def main() -> int:
             pending = pre.get("pending") or []
             analyses = []
             if pending:
+                # Per-ticker analyze timeout comes from config.yaml
+                # (loop.analyze_timeout_sec — set very high so a normal max-reasoning
+                # GLM run never hits it). QUIVER_ANALYZE_TIMEOUT still overrides inside
+                # run_analyses. Best-effort: a config read hiccup falls back to
+                # run_analyses' own default rather than blocking the fan-out.
                 try:
-                    analyses = run_analyses.run(pending)
+                    _analyze_timeout = load_config(_REPO / "config.yaml").analyze_timeout_sec
+                except Exception:  # noqa: BLE001 — never block the fan-out on a config read
+                    _analyze_timeout = None
+                try:
+                    analyses = run_analyses.run(pending, timeout=_analyze_timeout)
                 except Exception as e:  # noqa: BLE001 — never crash the supervisor on analysis
                     _emit({"stage": "analyze", "error": f"{type(e).__name__}: {e}"})
                     analyses = []
@@ -360,7 +369,7 @@ def main() -> int:
                 # and a decision for every valid (non-ERROR) signal, so a zero before->after
                 # DELTA with a non-empty `pending` is an unambiguous "plan never ran". Using
                 # the delta (not an absolute count) makes it RUN-SCOPED — correct in intraday
-                # mode where earlier ticks already wrote rows — and a DeepSeek-outage day still
+                # mode where earlier ticks already wrote rows — and a GLM-outage day still
                 # adds error ticker_actions (delta > 0), so it won't false-trip. Only checked
                 # on an otherwise-clean tick (auth/halt/crash already paged above).
                 no_decisions = False

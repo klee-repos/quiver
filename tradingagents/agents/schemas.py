@@ -231,6 +231,28 @@ class PortfolioDecision(BaseModel):
             "Underweight / Sell, picked based on the analysts' debate."
         ),
     )
+    conviction: Optional[float] = Field(
+        default=None,
+        description=(
+            "Your numeric conviction in this call, 0-100 (a plain number). This is the "
+            "BINDING strength the execution layer uses to size the position: a higher "
+            "number deploys more capital to this name, a lower number less. Ground it in "
+            "how strongly the analysts AGREE, how decisive the bull/bear debate was, and "
+            "how solid the underlying data is. Guide: 80-100 = high-conviction, evidence "
+            "all points one way; 50-65 = a real but contested lean; 30-45 = weak/marginal; "
+            "0-25 = avoid/exit. A Hold should carry your conviction in HOLDING the current "
+            "position. Do not inflate — a marginal Buy must score lower than a strong Buy."
+        ),
+    )
+    uncertainty: Optional[float] = Field(
+        default=None,
+        description=(
+            "How uncertain you are about this call, 0-100 (a plain number): 0 = the data "
+            "is clean and the analysts agree; 100 = thin/conflicting data or a genuine "
+            "toss-up. The execution layer damps sizing when uncertainty is high, so report "
+            "it honestly rather than projecting false confidence."
+        ),
+    )
     executive_summary: str = Field(
         description=(
             "A concise action plan covering entry strategy, position sizing, "
@@ -273,6 +295,12 @@ def render_pm_decision(decision: PortfolioDecision) -> str:
     """
     parts = [
         f"**Rating**: {decision.rating.value}",
+    ]
+    if decision.conviction is not None:
+        parts.append(f"**Conviction**: {decision.conviction}")
+    if decision.uncertainty is not None:
+        parts.append(f"**Uncertainty**: {decision.uncertainty}")
+    parts += [
         "",
         f"**Executive Summary**: {decision.executive_summary}",
         "",
