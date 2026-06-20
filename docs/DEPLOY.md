@@ -99,6 +99,39 @@ sudo journalctl -u quiver.service -n 80 # expect a clean get_portfolio, no AUTH_
 `config.yaml` ships **`dry_run: false` (LIVE)** — straight to live per the operator. Halt
 anytime: `sudo -u quiver touch /opt/quiver/KILL`.
 
+## Updating the running box (code / secrets)
+**Code:** `./deploy/gcp/sync.sh` from your laptop — pushes `origin/main`, then runs
+`deploy/gcp/update.sh` on the box (ff-only pull, conditional pip/systemd reinstall, offline
+healthcheck gate, timer restart). Only committed + pushed `main` deploys; a box-side
+`config.yaml` edit blocks the pull until reconciled.
+
+**A new/rotated secret (e.g. the GLM key):** `update.sh` does **NOT** touch
+`/etc/quiver/quiver.env` — that file is written only at provision (`setup.sh`). So a secret
+*change* on a live box is three steps:
+1. `./deploy/gcp/bootstrap-gcp.sh` — push the new value to `quiver-<KEY>` in Secret Manager.
+2. Grant the box SA read access **if the key is new** (add it to `locals.secrets` for IaC truth,
+   but see the terraform note before `apply`; for a live box do the grant out-of-band):
+   `gcloud secrets add-iam-policy-binding quiver-<KEY> --role=roles/secretmanager.secretAccessor \
+     --member=serviceAccount:quiver-box@<proj>.iam.gserviceaccount.com`
+3. Refresh `quiver.env` **on the box** (over IAP SSH) — never re-run the whole `setup.sh` on a
+   live box (it re-touches the MCP/OAuth layer):
+   ```bash
+   sudo bash -c 'K=$(gcloud secrets versions access latest --secret=quiver-<KEY>); \
+     F=/etc/quiver/quiver.env; grep -v "^<KEY>=" "$F" > "$F.t"; echo "<KEY>=$K" >> "$F.t"; \
+     chmod 600 "$F.t"; chown quiver:quiver "$F.t"; mv "$F.t" "$F"'
+   ```
+   The next tick (or `sync.sh`) then runs with the new env.
+
+**⚠️ Terraform & the LIVE box — do not casually `apply`:** the instance carries
+`lifecycle { prevent_destroy = true, ignore_changes = [boot image, shielded_instance_config] }`.
+The boot image resolves from the `ubuntu-2404-lts-amd64` *family* (= latest), so without
+`ignore_changes` every new Ubuntu image GCP publishes **forces a full instance replace** on the
+next `apply` — wiping the ledger + the on-box Robinhood/Claude OAuth. `prevent_destroy` makes
+`apply` **error** rather than recreate. To intentionally rebuild, remove those guards
+deliberately (and migrate state first). Secret IAM bindings live in `locals.secrets`; if you
+grant one out-of-band with `gcloud`, `terraform import` it (and `terraform state rm` a retired
+one whose GCP binding you want to keep as a rollback) so `terraform plan` stays "No changes".
+
 ## Controls
 - **Stop trading now:** IAP SSH in, `sudo -u quiver touch /opt/quiver/KILL` (or `sudo
   systemctl stop quiver.timer`).

@@ -146,6 +146,25 @@ resource "google_compute_instance" "quiver" {
 
   tags = ["quiver"]
 
+  # SAFETY for a LIVE, stateful box (holds the ledger + the on-box Robinhood OAuth +
+  # claude/MCP login — none of which survive a recreate):
+  #   - prevent_destroy: terraform ERRORS rather than ever destroying/replacing this
+  #     instance. A real recreate must be deliberate (temporarily remove this).
+  #   - ignore_changes[image]: the boot image comes from the ubuntu-2404-lts-amd64 FAMILY
+  #     data source, which resolves to *latest*. Without this, every new Ubuntu image GCP
+  #     publishes flips data.google_compute_image.ubuntu.self_link and FORCES a replace on
+  #     the next apply (the 2026-06 GLM-deploy near-miss: v20260517 -> v20260615). Pinning
+  #     the running image here keeps the family for fresh provisions while protecting THIS box.
+  #   - ignore_changes[shielded_instance_config]: GCP fills in default shielded-VM settings
+  #     the config doesn't declare; ignore them so they never read as drift / force a replace.
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes = [
+      boot_disk[0].initialize_params[0].image,
+      shielded_instance_config,
+    ]
+  }
+
   # The box reads its secrets + writes logs/metrics the instant it boots, so the IAM grants
   # MUST exist first. depends_on removes the create-order race; the fetch() retry in setup.sh
   # covers the residual eventual-consistency propagation lag.
