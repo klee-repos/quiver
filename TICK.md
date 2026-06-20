@@ -158,10 +158,10 @@ Write `state/tmp/construct_input.json`:
   "analyses": [ <each analyze.py JSON from STEP 3> ]         // SAME list you pass STEP 4
 }
 ```
-Include `analyses` (the verbatim STEP 3 list) so that, when `config.yaml:
-risk.conviction_weights_enabled` is `true`, construct can let the pipeline's CONVICTION
-set each name's target weight (Q1). With the flag `false` (default) `analyses` is ignored
-and the static book weights are used — pass it regardless; it's harmless when unused.
+Include `analyses` (the verbatim STEP 3 list): construct uses the pipeline's CONVICTION to
+set each name's target weight (Q1, ALWAYS ON), clamped by `strategy.yaml: risk_policy` + the
+dollar caps. An all-Hold / no-conviction tick falls back to the static book exactly, so
+passing `analyses` is always correct (and required for conviction sizing to engage).
 The book is sized against TOTAL DEPLOYABLE capital = sum(held positions' market value) +
 `buying_power` (idle cash), so the bot deploys its cash toward target weights rather than
 sizing against held equity alone. `buying_power` is the SAME value you pass STEP 4 below;

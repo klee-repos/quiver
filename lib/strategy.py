@@ -98,7 +98,6 @@ class LearningConfig:
     auto_apply_universe_changes: bool
     goal_gap_derisk_pct: float
     proposal_expiry_days: int
-    auto_propose_adds: bool = False   # Q3: run the screener to PROPOSE new names (OFF by default)
 
 
 @dataclass(frozen=True)
@@ -291,7 +290,6 @@ def load_strategy(path) -> StrategyConfig:
         auto_apply_universe_changes=bool(lr.get("auto_apply_universe_changes", False)),
         goal_gap_derisk_pct=_num(lr.get("goal_gap_derisk_pct", -5.0), "learning.goal_gap_derisk_pct"),
         proposal_expiry_days=int(_num(lr.get("proposal_expiry_days", 5), "learning.proposal_expiry_days")),
-        auto_propose_adds=bool(lr.get("auto_propose_adds", False)),
     )
 
     cons = raw.get("consistency") or {}

@@ -35,9 +35,6 @@ class RiskConfig:
     rebalance_enabled: bool = False
     rebalance_drift_band_pct: float = 5.0
     cash_sleeve_ticker: str = "SGOV"      # the residual ballast; never churned like an engine name
-    # Q1: when true, the PIPELINE's conviction (via lib.allocate) sets each name's target weight
-    # in construct, instead of the static book weight. Default OFF -> static book (validated path).
-    conviction_weights_enabled: bool = False
     # Self-reconciliation: when a strategy goal is active, SELL any held position that
     # is NOT in the book (and not the cash sleeve) down to zero — the bot heals its own
     # drift from a book edit / a prior watchlist. Long-only (only ever sells; de-risks
@@ -239,7 +236,6 @@ def load_config(path) -> Config:
     # Strategy-layer rebalance knobs. Default to TODAY's behavior so the validated
     # path is unchanged until rebalance_enabled is explicitly true.
     rebalance_enabled = risk_d.get("rebalance_enabled", False) is True
-    conviction_weights_enabled = risk_d.get("conviction_weights_enabled", False) is True
     try:
         rebalance_band = float(risk_d.get("rebalance_drift_band_pct", 5.0) or 5.0)
     except (TypeError, ValueError):
@@ -277,7 +273,6 @@ def load_config(path) -> Config:
         rebalance_enabled=rebalance_enabled,
         rebalance_drift_band_pct=rebalance_band,
         cash_sleeve_ticker=cash_sleeve_ticker,
-        conviction_weights_enabled=conviction_weights_enabled,
         reconcile_unmanaged=reconcile_unmanaged,
         consistency_enabled=consistency_enabled,
         max_discretionary_reversals=max_discretionary_reversals,

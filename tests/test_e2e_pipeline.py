@@ -35,9 +35,8 @@ def ok(name, cond, detail=""):
         print(f"  ✗ FAIL: {name}{(' — ' + str(detail)) if detail else ''}")
 
 
-def _mk(tmp: Path, *, conviction: bool, per_name=80, sleeve_max=100, cash_floor=10,
-        auto_propose=False, auto_apply=False, rh="[AAA, BBB, NVDA, SGOV]",
-        sleeves="", holdings=None):
+def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
+        auto_apply=False, rh="[AAA, BBB, NVDA, SGOV]", sleeves="", holdings=None):
     """Write a strategy + config and return a loaded Config + a freshly-seeded Ledger."""
     from lib.config import load_config
     from lib.strategy import load_strategy
@@ -55,8 +54,7 @@ def _mk(tmp: Path, *, conviction: bool, per_name=80, sleeve_max=100, cash_floor=
         f"risk_policy: {{per_name_max_pct: {per_name}, sleeve_max_pct: {sleeve_max}, "
         f"cash_floor_pct: {cash_floor}, smoothing_alpha: 1.0}}\n"
         + (sleeves or "")
-        + f"learning: {{auto_propose_adds: {str(auto_propose).lower()}, "
-        f"auto_apply_universe_changes: {str(auto_apply).lower()}}}\n"
+        + f"learning: {{auto_apply_universe_changes: {str(auto_apply).lower()}}}\n"
         "books:\n  core:\n    default: true\n    holdings:\n" + "\n".join(holdings) + "\n",
         encoding="utf-8")
     cfg_path = tmp / "config.yaml"
@@ -66,8 +64,7 @@ def _mk(tmp: Path, *, conviction: bool, per_name=80, sleeve_max=100, cash_floor=
         "glm: {chat_model: glm-5.2, reasoner_model: glm-5.2}\n"
         "risk: {max_dollars_per_trade: 100, daily_loss_halt_pct: 20, daily_capital_deploy_cap: 1000, "
         "min_buying_power_buffer: 5, max_actions_per_ticker_per_day: 1, max_analyses_per_ticker_per_day: 1, "
-        f"rebalance_enabled: true, conviction_weights_enabled: {str(conviction).lower()}, "
-        "cash_sleeve_ticker: SGOV}\nnotify: {enabled: false}\n",
+        "rebalance_enabled: true, cash_sleeve_ticker: SGOV}\nnotify: {enabled: false}\n",
         encoding="utf-8")
     cfg = load_config(str(cfg_path))
     sc = load_strategy(str(strat))
@@ -92,41 +89,44 @@ def main() -> int:
     base = {"equity": 1000.0, "buying_power": 1000.0, "positions": {},
             "now_iso": "2026-06-20T11:00:00-04:00"}
 
-    # --- Q1: flag OFF -> byte-identical static book (the iron regression guard) ---
+    # --- Q1 (always on): no analyses -> static book, byte-identical (the iron regression guard) ---
     with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=False)
+        cfg, led = _mk(Path(d))
         out = tick._run_construct(cfg, led, dict(base))
         w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
-        ok("Q1 flag OFF -> static book weights (byte-identical)",
+        ok("Q1 no-conviction tick -> static book (byte-identical)",
            w == {"AAA": 30.0, "BBB": 30.0, "SGOV": 40.0} and out["conviction_weights"] is False, w)
 
-    # --- Q1: flag ON -> conviction differentiates same-sleeve names ---
+    # --- Q1: an all-Hold tick -> allocation skipped -> static book (the common production case) ---
     with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=True, per_name=80)
+        cfg, led = _mk(Path(d))
+        an = [{"ticker": "AAA", "signal": "Hold", "conviction": 60, "uncertainty": 50},
+              {"ticker": "BBB", "signal": "Hold", "conviction": 55, "uncertainty": 50}]
+        out = tick._run_construct(cfg, led, {**base, "analyses": an})
+        w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
+        ok("Q1 all-Hold analyses -> static book (skip alloc; never sells to cash)",
+           w == {"AAA": 30.0, "BBB": 30.0, "SGOV": 40.0} and out["conviction_weights"] is False, w)
+
+    # --- Q1: conviction differentiates same-sleeve names ---
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), per_name=80)
         an = [{"ticker": "AAA", "signal": "Buy", "conviction": 90, "uncertainty": 10},
               {"ticker": "BBB", "signal": "Buy", "conviction": 30, "uncertainty": 10}]
         out = tick._run_construct(cfg, led, {**base, "analyses": an})
         w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
-        ok("Q1 flag ON -> higher conviction => higher weight", w["AAA"] > w["BBB"], w)
+        ok("Q1 higher conviction => higher weight", w["AAA"] > w["BBB"], w)
+        ok("Q1 conviction allocation engaged", out["conviction_weights"] is True, out.get("conviction_weights"))
         ok("Q1 cash floor respected (>= 10%)", w["SGOV"] >= 10.0, w)
         ok("Q1 book conserves to ~100%", abs(sum(w.values()) - 100.0) < 0.5, sum(w.values()))
 
     # --- Q1: per-name cap binds (both pinned at the cap) ---
     with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=True, per_name=40)
+        cfg, led = _mk(Path(d), per_name=40)
         an = [{"ticker": "AAA", "signal": "Buy", "conviction": 90, "uncertainty": 10},
               {"ticker": "BBB", "signal": "Buy", "conviction": 30, "uncertainty": 10}]
         out = tick._run_construct(cfg, led, {**base, "analyses": an})
         w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
         ok("Q1 per-name cap binds (both <= 40)", w["AAA"] <= 40.01 and w["BBB"] <= 40.01, w)
-
-    # --- Q1: flag ON, no analyses -> D2 holds prior book weights (never sells to cash) ---
-    with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=True)
-        out = tick._run_construct(cfg, led, dict(base))
-        w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
-        ok("Q1 D2: no analyses -> holds prior weights",
-           abs(w["AAA"] - 30.0) < 1.0 and abs(w["BBB"] - 30.0) < 1.0, w)
 
     # --- Q3: screener ADD -> human-approve -> apply_add conserves -> in universe ---
     _sleeves = ('sleeves:\n  "US large cap": {screen: {sector: Technology, '
@@ -141,7 +141,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         import lib.learn as learn
         import lib.universe as universe
-        cfg, led = _mk(Path(d), conviction=False, auto_propose=True, rh="[AAA, NVDA, SGOV]",
+        cfg, led = _mk(Path(d), rh="[AAA, NVDA, SGOV]",
                        sleeves=_sleeves, holdings=_holds)
         gid = led.get_active_goal()["id"]
         ps = learn.build_proposals(led, gid, cfg.strategy.learning, "HOLD", None,
@@ -168,7 +168,7 @@ def main() -> int:
 
     # --- Q3: AUTO path refuses on insufficient recurrence ---
     with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=False, auto_propose=True, auto_apply=True,
+        cfg, led = _mk(Path(d), auto_apply=True,
                        rh="[AAA, NVDA, SGOV]", sleeves=_sleeves, holdings=_holds)
         gid = led.get_active_goal()["id"]
         rid = led.record_universe_proposal(
@@ -181,7 +181,7 @@ def main() -> int:
 
     # --- Q3: a non-allow-listed candidate is blocked at apply by validate_add ---
     with tempfile.TemporaryDirectory() as d:
-        cfg, led = _mk(Path(d), conviction=False, rh="[AAA, SGOV]", sleeves=_sleeves, holdings=_holds)
+        cfg, led = _mk(Path(d), rh="[AAA, SGOV]", sleeves=_sleeves, holdings=_holds)
         gid = led.get_active_goal()["id"]
         rid = led.record_universe_proposal(
             goal_id=gid, proposed_at="2026-06-20T10:00:00", kind="PROPOSE_ADD", ticker="TSLA",

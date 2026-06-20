@@ -19,8 +19,10 @@ risk:
   max_analyses_per_ticker_per_day: 10  # intraday-only: LLM-cost circuit breaker
 
   # Strategy/portfolio layer (active only once `tick.py strategy-set` seeds a goal):
-  rebalance_enabled: true              # target weights drive buys + trim/exit (only ever REDUCES a buy)
-  conviction_weights_enabled: false    # Q1: pipeline conviction sets target weights (vs static book). OFF = validated path; validate live before flipping.
+  rebalance_enabled: true              # target weights drive buys + trim/exit
+  # Q1 sizing is ALWAYS ON: the pipeline's conviction (via lib/allocate, calibrated by the
+  # ledger's hit-rate, clamped by strategy.yaml risk_policy + the dollar caps) sets target
+  # weights. An all-Hold / no-conviction tick falls back to the static book exactly.
   reconcile_unmanaged: true            # sell any HELD position not in the book down to cash
   rebalance_drift_band_pct: 5.0        # default no-trade dead-band (per-holding `band` overrides)
   cash_sleeve_ticker: "SGOV"           # the residual ballast; never churned like an engine name

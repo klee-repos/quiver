@@ -125,10 +125,12 @@ def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_pro
         proposals.append(Proposal(DERISK, None, None, TIER_DERISK,
                                   "macro STAND_DOWN reading -> de-risk the engine toward cash",
                                   goal_gap_pct=goal_gap))
-    # Q3 — grow the universe (gated): screener ADD proposals (human-approved by default).
-    if getattr(learning_cfg, "auto_propose_adds", False):
-        proposals.extend(build_add_proposals(led, goal_id, strategy_cfg, candidate_provider,
-                                             goal_gap=goal_gap))
+    # Q3 — grow the universe: screener ADD proposals. Always run; build_add_proposals is a
+    # no-op unless a candidate provider + sleeve `screen` criteria exist (so discovery is
+    # enabled by DATA — define a sleeve `screen` — not a flag). APPLYING an ADD still goes
+    # through the recurrence/cooldown/validate_add/human-approve gates downstream.
+    proposals.extend(build_add_proposals(led, goal_id, strategy_cfg, candidate_provider,
+                                         goal_gap=goal_gap))
     auto: List[Proposal] = []
     needs: List[Proposal] = []
     for p in proposals:
