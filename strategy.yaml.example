@@ -80,6 +80,38 @@ books:
       - {sleeve: "Crypto ETH",       ticker: ETHA, weight: 4,  band: 2}
       - {sleeve: "Cash",             ticker: SGOV, weight: 28}
 
+# --- Sleeves: the STRATEGY (durable) vs the STOCKS (evolvable) ---------------
+# SEED-THEN-EVOLVE (owner decision): a sleeve is a slot in the strategy — its target
+# weight + band (in `books` above) and its `screen` criteria here ARE the strategy.
+# WHICH ticker fills a sleeve is the evolvable universe: SEEDED by the `books` holdings,
+# then OWNED by the ledger and rotated over time by the screener (PROPOSE_ADD within
+# these criteria) + the underperformer REMOVE path. So "same strategy != same stocks".
+# `screen` is read by lib/screener to discover candidates (yfinance, no new API key);
+# a sleeve with no `screen` is never auto-discovered (its seeded ticker stays). ALL
+# discovery is OFF until learning.auto_propose_adds: true, and ADDs are human-approved
+# by default. market_cap in USD; pe_max / momentum_window optional.
+sleeves:
+  "US large cap":
+    screen: {sector: "Technology", market_cap_min: 50000000000, pe_max: 60, momentum_window: 60}
+  "Value/Defensive":
+    screen: {sector: "Healthcare", market_cap_min: 20000000000, pe_max: 30}
+  # Cash / Crypto / broad-ETF sleeves intentionally omit `screen` -> no auto-discovery.
+
+# --- Allocation policy (Q1): how CONVICTION becomes target weight ------------
+# Read by lib/allocate ONLY when risk.conviction_weights_enabled: true (config.yaml).
+# These are the operator's sizing guardrails (the strategy, not the stocks). Every key
+# is optional (lib/allocate has safe fallbacks); with the flag OFF the static book
+# weights above are used unchanged (byte-identical to today). Conviction can tilt a
+# name UP only within per_name_max_pct/sleeve_max_pct and never past the dollar caps.
+risk_policy:
+  per_name_max_pct: 20         # no single name above this % of the book (conviction can't breach it)
+  sleeve_max_pct: 45           # no single sleeve above this %
+  cash_floor_pct: 5            # always hold >= this % cash (a HARD floor)
+  conviction_curve_k: 1.0      # >1 sharpens into best ideas; 1.0 = linear
+  smoothing_alpha: 0.4         # EWMA weight on TODAY's target (lower = stickier day-to-day)
+  uncertainty_damp: 0.5        # how much self-reported uncertainty shrinks conviction
+  regime_min_factor: 0.5       # most a STAND_DOWN regime can cut deployment toward cash
+
 # --- Continual-learning gates (Stage 4) -------------------------------------
 # Every universe-touching gate defaults SAFE; both auto_apply_* default FALSE (the
 # investable universe stays human-gated unless explicitly opened).
@@ -91,7 +123,9 @@ learning:
   sleeve_review_min_n: 6
   derisk_on_standdown: true
   auto_apply_derisk: false              # safe direction; still OFF by default
-  auto_apply_universe_changes: false    # risky direction; human-gated
+  auto_apply_universe_changes: false    # risky direction (incl. ADDs); human-gated
+  auto_propose_adds: false              # Q3: run the screener to PROPOSE new names (OFF by default;
+                                        #   even ON, an ADD still needs approval via auto_apply_universe_changes)
   goal_gap_derisk_pct: -5.0
   proposal_expiry_days: 5
 

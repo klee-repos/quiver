@@ -995,6 +995,27 @@ _sigsrc = Path(_sigmod.__file__).read_text(encoding="utf-8")
 check_true("signals.py never imports risk/reflect_memory (use-case-1/2 wall)",
            "import risk" not in _sigsrc and "reflect_memory" not in _sigsrc)
 
+# The pipeline-sizing + universe-discovery modules (Q1/Q3) stay on the right side of the
+# decision wall: the sizing engines + the screener never IMPORT the limit/broker-carrying
+# modules (lib.risk / lib.signals / lib.config). They take policy/values as args (pure) and
+# read only market data + the ledger's own decision memory. Checked via AST on the ACTUAL
+# import nodes (the modules describe the wall in their docstrings, so a text scan would
+# false-positive on "never import lib.risk").
+import ast as _ast  # noqa: E402
+_WALL_FORBIDDEN = {"lib.risk", "lib.signals", "lib.config"}
+def _imported_modules(src: str) -> set:
+    mods = set()
+    for _node in _ast.walk(_ast.parse(src)):
+        if isinstance(_node, _ast.Import):
+            mods.update(a.name for a in _node.names)
+        elif isinstance(_node, _ast.ImportFrom) and _node.module:
+            mods.add(_node.module)
+    return mods
+for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py", "lib/screener.py"):
+    _src = (Path(__file__).resolve().parent.parent / _mod).read_text(encoding="utf-8")
+    _bad = _imported_modules(_src) & _WALL_FORBIDDEN
+    check_true(f"{_mod}: imports none of lib.risk/signals/config (decision wall)", not _bad)
+
 
 # --- D7: offline stub-LLM prompt injection (block present iff context) ---
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher  # noqa: E402
@@ -2257,6 +2278,59 @@ _sharp = _alloc.allocate_targets(
     policy={**_eqpol, "conviction_curve_k": 2.0})
 check_true("conviction curve k>1 concentrates into the higher-conviction name",
            _sharp.weights["H"] > _lin.weights["H"])
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-decided sizing + dynamic universe (Q1/Q3). Pure offline units; the
+# tick-level construct/ADD flows live in tests/test_e2e_pipeline.py.
+# ---------------------------------------------------------------------------
+from lib import calibrate as _calib  # noqa: E402
+from lib import universe as _univ  # noqa: E402
+from lib import screener as _scr  # noqa: E402
+
+# --- calibration multiplier (Q1): directionally correct, low-N -> 1.0, clamped ---
+def _crows(ret, n, intent="buy", signal="Buy"):
+    return [{"intent": intent, "signal": signal, "directional_return": ret} for _ in range(n)]
+check_true("calib: all-hit (n>=min) -> multiplier > 1", _calib.calibration_multiplier(_crows(0.05, 6)) > 1.0)
+check_true("calib: all-miss -> multiplier < 1", _calib.calibration_multiplier(_crows(-0.05, 6)) < 1.0)
+check("calib: low-N (< min_n) -> exactly 1.0", _calib.calibration_multiplier(_crows(0.05, 3)), 1.0)
+check("calib: skips excluded -> 1.0", _calib.calibration_multiplier(_crows(0.05, 6, intent="skip")), 1.0)
+check_true("calib: perfect record clamped to <= hi", _calib.calibration_multiplier(_crows(0.05, 100)) <= 1.5)
+check_true("calib: terrible record clamped to >= lo", _calib.calibration_multiplier(_crows(-0.05, 100)) >= 0.5)
+
+# --- universe apply_add / conserve_to_cash / validate_book guard (Q3) ---
+_ubook = [{"sleeve": "Tech", "ticker": "AAA", "target_weight": 30, "band": 5, "status": "active", "quotable": 1},
+          {"sleeve": "Cash", "ticker": "SGOV", "target_weight": 70, "band": 0, "status": "active", "quotable": 1}]
+_rows_add, _applied, _why = _univ.apply_add(_ubook, "BBB", "Tech", 10, 4)
+check("apply_add: applies the proposed weight", _applied, 10.0)
+check("apply_add: conserves book to ~100", round(sum(r["target_weight"] for r in _rows_add if r["status"] != "removed"), 2), 100.0)
+check("apply_add: funds from cash (70 -> 60)", [r for r in _rows_add if r["ticker"] == "SGOV"][0]["target_weight"], 60.0)
+check_true("apply_add: new ticker is now in the analysis universe", "BBB" in _univ.tradable_universe(_rows_add))
+_rows_no, _applied_no, _why_no = _univ.apply_add(_ubook, "BBB", "Tech", 90, 4)  # cash only 70
+check("apply_add: insufficient cash -> applied 0 (refused)", _applied_no, 0.0)
+check_true("apply_add: insufficient cash -> reason explains", "insufficient" in _why_no)
+check("conserve_to_cash: +delta frees to cash", _univ.conserve_to_cash(_ubook, 5)[1]["target_weight"], 75.0)
+check("conserve_to_cash: -delta funds from cash", _univ.conserve_to_cash(_ubook, -5)[1]["target_weight"], 65.0)
+_negbook = [{"ticker": "AAA", "target_weight": 60, "band": 5, "status": "active", "sleeve": "Tech"},
+            {"ticker": "BBB", "target_weight": 45, "band": 5, "status": "active", "sleeve": "Tech"},
+            {"ticker": "SGOV", "target_weight": -5, "band": 0, "status": "active", "sleeve": "Cash"}]
+check_true("validate_book: rejects a negative weight (sum ~100)", _univ.validate_book(_negbook)[0] is False)
+
+# --- screener (Q3): allow-list/held/sector/mcap/pe filter + momentum rank + fail-safe ---
+def _prov(screen):
+    return [{"ticker": "NVDA", "sector": "Technology", "market_cap": 2e12, "pe": 45, "momentum": 0.3},
+            {"ticker": "AMD", "sector": "Technology", "market_cap": 2e11, "pe": 50, "momentum": 0.1},
+            {"ticker": "HELD", "sector": "Technology", "market_cap": 3e11, "pe": 30, "momentum": 0.9},
+            {"ticker": "SMALL", "sector": "Technology", "market_cap": 1e9, "pe": 10, "momentum": 0.9},
+            {"ticker": "NOTLIST", "sector": "Technology", "market_cap": 9e11, "pe": 20, "momentum": 0.9}]
+_sleeves = {"Tech": {"screen": {"sector": "Technology", "market_cap_min": 50e9, "pe_max": 60}}, "Cash": {}}
+_cands = _scr.screen_book(_sleeves, ["NVDA", "AMD", "HELD"], ["HELD"], _prov, top_n_per_sleeve=3)
+check("screener: keeps allow-listed, unheld, screen-passing; ranked by momentum",
+      [c["ticker"] for c in _cands], ["NVDA", "AMD"])
+check("screener: provider error -> [] (fail-safe, universe never grows on bad data)",
+      _scr.screen_book(_sleeves, ["NVDA"], [], (lambda s: (_ for _ in ()).throw(RuntimeError("down")))), [])
+check("screener: a sleeve with no `screen` is skipped",
+      _scr.screen_book({"Cash": {}}, ["NVDA"], [], _prov), [])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

@@ -463,6 +463,9 @@ def _run_plan(cfg, led, data) -> dict:
             run_id=run_id, basis=new_basis, plan_trigger=c_plan_trigger,
             target_price=_to_float(a.get("target_price")),
             proof_json=json.dumps(c_proof),
+            conviction=_to_float(a.get("conviction")),
+            uncertainty=_to_float(a.get("uncertainty")),
+            data_quality=a.get("data_quality"),
         )
 
         # Cadence (intraday only): schedule this ticker's next look and count the
@@ -950,6 +953,54 @@ def _run_construct(cfg, led, data) -> dict:
         else:
             book_name, book_reason = strategy.select_active_book(cfg.strategy, data.get("macro_reading"))
     targets = led.active_target_portfolio(goal["id"], statuses=("active", "exiting"))
+
+    # Q1 — conviction-driven sizing. When enabled, the PIPELINE's conviction (not the
+    # static book weight) sets each engine name's target weight: lib.allocate turns
+    # conviction + the ledger-learned calibration + the confirmed-regime scalar into a
+    # clamped, smoothed weight vector (per-name/sleeve caps + hard cash floor from the
+    # strategy.yaml risk_policy), which we write onto the book rows; cash takes the
+    # residual. construct_target_book / plan / the dollar caps then run UNCHANGED. Flag
+    # OFF -> the static book weights are used verbatim (byte-identical to the validated
+    # path). Pure + read-only here (allocate + calibrate touch no broker, no limits) so
+    # the decision wall holds. Candidates = the FULL active engine book, so a name with
+    # no fresh analysis this tick holds its prior weight (allocate's D2 guarantee).
+    conviction_detail = None
+    if cfg.risk.conviction_weights_enabled and cfg.strategy is not None:
+        import lib.allocate as allocate
+        import lib.calibrate as calibrate
+        cash_tk = (cfg.risk.cash_sleeve_ticker or "SGOV").upper()
+        analyses_map = {str(a.get("ticker") or "").upper(): a
+                        for a in (data.get("analyses") or []) if a.get("ticker")}
+        candidates = [
+            {"ticker": str(t["ticker"]).upper(), "sleeve": t.get("sleeve"),
+             "prior_weight": float(t.get("target_weight", 0) or 0),
+             "quotable": bool(t.get("quotable", True))}
+            for t in targets
+            if str(t.get("status", "active")) == "active"
+            and str(t["ticker"]).upper() != cash_tk
+            and (t.get("sleeve") or "") != strategy.CASH_SLEEVE
+        ]
+        policy = dict(cfg.strategy.risk_policy or {})
+        rscalar = strategy.regime_scalar(
+            effective_regime, min_factor=float(policy.get("regime_min_factor", 0.5) or 0.5))
+        calib = calibrate.build_calibration(
+            led, [c["ticker"] for c in candidates],
+            min_n=int(cfg.strategy.learning.min_resolved_n))
+        alloc = allocate.allocate_targets(
+            candidates, analyses_map, calibration=calib, regime_scalar=rscalar, policy=policy)
+        new_targets = []
+        for t in targets:
+            tk = str(t["ticker"]).upper()
+            nt = dict(t)
+            if tk == cash_tk or (t.get("sleeve") or "") == strategy.CASH_SLEEVE:
+                nt["target_weight"] = alloc.cash_pct          # cash takes the residual
+            elif str(t.get("status", "active")) == "active":
+                nt["target_weight"] = alloc.weights.get(tk, 0.0)   # exiting rows keep their 0
+            new_targets.append(nt)
+        targets = new_targets
+        conviction_detail = {"regime_scalar": rscalar, "cash_pct": alloc.cash_pct,
+                             "weights": alloc.weights, "calibration": calib}
+
     rows = portfolio.construct_target_book(
         targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
     target_weights = {r["ticker"]: {"intent": r["intent"], "target_dollars": r["target_dollars"],
@@ -981,6 +1032,8 @@ def _run_construct(cfg, led, data) -> dict:
     return {"proceed": True, "goal_id": goal["id"], "active_book": goal["active_book"],
             "recommended_book": book_name, "book_reason": book_reason,
             "reconcile_unmanaged": cfg.risk.reconcile_unmanaged, "unmanaged": unmanaged,
+            "conviction_weights": bool(cfg.risk.conviction_weights_enabled),
+            "conviction_detail": conviction_detail,
             "target_weights": target_weights}
 
 
@@ -1042,7 +1095,17 @@ def _run_learn_review(cfg, led, data) -> dict:
         macro_regime = strategy.regime_label_banded(
             cfg.strategy, data.get("macro_reading"), cons.regime_deadband_pce)
     progress = goal_mod.compute_from_ledger(led, goal)
-    ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress)
+    # Q3 — the screener's live candidate provider (yfinance) is imported lazily and ONLY
+    # when discovery is enabled, so a normal tick never touches yfinance for this and the
+    # import graph stays clean. A missing provider degrades to no ADDs (best-effort).
+    add_provider = None
+    if getattr(learning, "auto_propose_adds", False):
+        try:
+            from tradingagents.dataflows.screener_data import yfinance_candidate_provider as add_provider
+        except Exception:  # noqa: BLE001 — discovery is optional; never break the review
+            add_provider = None
+    ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress,
+                               strategy_cfg=cfg.strategy, candidate_provider=add_provider)
     recorded = []
     new_proposals = []
     cooled = []  # E1: hashes suppressed because they were recently decided
@@ -1121,7 +1184,7 @@ def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
     # E2 — confirm-over-N: an AUTO REMOVE/DERISK is actionable only after it has recurred
     # on >= universe_confirm_days distinct days, so one bad crossing can't evict a sleeve.
     recurrence = led.count_proposal_recurrence(goal["id"], change["content_hash"]) if goal else 0
-    if auto and change["kind"] in ("PROPOSE_REMOVE", "PROPOSE_DERISK"):
+    if auto and change["kind"] in ("PROPOSE_REMOVE", "PROPOSE_DERISK", "PROPOSE_ADD"):
         if recurrence < cons.universe_confirm_days:
             return {"applied": False, "change": change,
                     "reason": f"not yet confirmed: seen on {recurrence}/{cons.universe_confirm_days} "
@@ -1174,6 +1237,48 @@ def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
             pass
         effect = (f"holding set to exiting; {round(freed, 2)}%% freed weight -> cash; "
                   "book re-validated to ~100% (rebalancer winds the position to zero)")
+    elif change["kind"] == "PROPOSE_ADD" and change.get("ticker") and goal:
+        import lib.universe as universe
+        # E3b(add) — allow-list + quotable gate AT APPLY TIME. The allow-list is the
+        # human-confirmed RH-tradable set; the screener already filtered quotable at
+        # propose time, so the allow-list doubles as the quotable set here.
+        allow = cfg.strategy.rh_tradable_confirmed if cfg.strategy is not None else set()
+        ok, why = universe.validate_add(change["ticker"], allow, allow)
+        if not ok:
+            return {"applied": False, "change": change, "reason": f"refusing add: {why}"}
+        # Fund the new name FROM cash + conserve the book to ~100% (apply_add REFUSES if
+        # cash is insufficient — never creates a negative cash weight). The AUTO path
+        # refuses a resulting malformed book; a human --approve owns the call.
+        w = float(change.get("target_weight") or 0.0)
+        band = round(min(max(w * 0.2, 0.5), w * 0.5), 2) if w > 0 else 0.0
+        current = led.active_target_portfolio(goal["id"], statuses=("active", "exiting", "removed"))
+        new_rows, applied_w, add_reason = universe.apply_add(
+            current, change["ticker"], change.get("sleeve"), w, band,
+            cash_ticker=cfg.risk.cash_sleeve_ticker)
+        if applied_w <= 0:
+            return {"applied": False, "change": change, "reason": f"refusing add: {add_reason}"}
+        ok2, why2 = universe.validate_book(new_rows)
+        if not ok2 and auto:
+            return {"applied": False, "change": change,
+                    "reason": f"refusing add: resulting book invalid ({why2})"}
+        for r in new_rows:
+            led.upsert_target_holding(
+                goal_id=goal["id"], sleeve=r.get("sleeve"), ticker=r["ticker"],
+                target_weight=r.get("target_weight"), band=r.get("band", 0) or 0,
+                status=r.get("status", "active"), book=r.get("book"),
+                quotable=bool(r.get("quotable", 1)), proxy_ticker=r.get("proxy_ticker"),
+                updated_at=now_iso)
+        try:
+            led.record_strategy_change(
+                goal_id=goal["id"], changed_at=now_iso, change_type="status",
+                ticker=change["ticker"], from_value=None, to_value="active",
+                trigger="universe-apply", reason=change.get("reason"),
+                proof_json=json.dumps({"recurrence": recurrence, "added_weight": round(applied_w, 2),
+                                       "funded_from": "cash", "book_check": why2}))
+        except Exception:  # noqa: BLE001
+            pass
+        effect = (f"{change['ticker']} added to '{change.get('sleeve')}' at {round(applied_w, 2)}%% "
+                  "(funded from cash); book re-validated to ~100% (next tick analyzes it)")
     led.mark_universe_change(change_id, "applied", now_iso, "operator" if approve else "auto")
     return {"applied": True, "change_id": change_id, "kind": change["kind"],
             "ticker": change.get("ticker"), "effect": effect,

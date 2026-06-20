@@ -23,6 +23,7 @@ SUITES=(
   "e2e-dryrun|tests/test_e2e.py"
   "e2e-alerts|tests/test_e2e_alerts.py"
   "e2e-consistency|tests/test_e2e_consistency.py"
+  "e2e-pipeline|tests/test_e2e_pipeline.py"
   "llm-judge|tests/test_llm_judge.py"
 )
 [ "$LIVE" = "1" ] && SUITES+=("e2e-live(GLM)|tests/test_e2e_live.py")

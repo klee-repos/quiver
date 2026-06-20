@@ -154,9 +154,14 @@ Write `state/tmp/construct_input.json`:
   "equity": <from get_portfolio>,
   "buying_power": <from get_portfolio>,
   "positions": { "AAPL": {"market_value": 600.0}, ... },   // ALL held positions
-  "macro_reading": { "core_pce_pct": <latest core-PCE % or null>, "fed_hike": <true|false> }
+  "macro_reading": { "core_pce_pct": <latest core-PCE % or null>, "fed_hike": <true|false> },
+  "analyses": [ <each analyze.py JSON from STEP 3> ]         // SAME list you pass STEP 4
 }
 ```
+Include `analyses` (the verbatim STEP 3 list) so that, when `config.yaml:
+risk.conviction_weights_enabled` is `true`, construct can let the pipeline's CONVICTION
+set each name's target weight (Q1). With the flag `false` (default) `analyses` is ignored
+and the static book weights are used — pass it regardless; it's harmless when unused.
 The book is sized against TOTAL DEPLOYABLE capital = sum(held positions' market value) +
 `buying_power` (idle cash), so the bot deploys its cash toward target weights rather than
 sizing against held equity alone. `buying_power` is the SAME value you pass STEP 4 below;

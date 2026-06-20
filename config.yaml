@@ -20,6 +20,7 @@ risk:
 
   # Strategy/portfolio layer (active only once `tick.py strategy-set` seeds a goal):
   rebalance_enabled: true              # target weights drive buys + trim/exit (only ever REDUCES a buy)
+  conviction_weights_enabled: false    # Q1: pipeline conviction sets target weights (vs static book). OFF = validated path; validate live before flipping.
   reconcile_unmanaged: true            # sell any HELD position not in the book down to cash
   rebalance_drift_band_pct: 5.0        # default no-trade dead-band (per-holding `band` overrides)
   cash_sleeve_ticker: "SGOV"           # the residual ballast; never churned like an engine name

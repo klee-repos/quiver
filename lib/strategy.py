@@ -20,7 +20,7 @@ dial-up requires both a DEPLOY macro reading AND dial_up_63_37.enabled: true.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -98,6 +98,7 @@ class LearningConfig:
     auto_apply_universe_changes: bool
     goal_gap_derisk_pct: float
     proposal_expiry_days: int
+    auto_propose_adds: bool = False   # Q3: run the screener to PROPOSE new names (OFF by default)
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,16 @@ class StrategyConfig:
     learning: LearningConfig
     default_book: str
     consistency: "ConsistencyConfig" = None  # type: ignore[assignment]
+    # The allocation POLICY (Q1): per-name/sleeve caps, cash floor, conviction curve,
+    # smoothing, uncertainty damp, regime floor — the operator's strategy knobs that
+    # lib.allocate consumes as `policy`. Passed through as a dict; lib.allocate defaults
+    # every missing key, so an absent risk_policy is the safe (fallback) behavior.
+    risk_policy: Dict[str, object] = field(default_factory=dict)
+    # Per-SLEEVE screen criteria (Q3): {sleeve_name: {"screen": {sector, market_cap_min,
+    # pe_max, momentum_window, ...}}}. The strategy (a sleeve + its screen) is durable;
+    # the specific ticker filling a sleeve is the evolvable universe (seed-then-evolve).
+    # Read by lib.screener; absent -> no auto-discovery for that sleeve.
+    sleeves: Dict[str, dict] = field(default_factory=dict)
 
     def book(self, name: str) -> Book:
         if name not in self.books:
@@ -280,6 +291,7 @@ def load_strategy(path) -> StrategyConfig:
         auto_apply_universe_changes=bool(lr.get("auto_apply_universe_changes", False)),
         goal_gap_derisk_pct=_num(lr.get("goal_gap_derisk_pct", -5.0), "learning.goal_gap_derisk_pct"),
         proposal_expiry_days=int(_num(lr.get("proposal_expiry_days", 5), "learning.proposal_expiry_days")),
+        auto_propose_adds=bool(lr.get("auto_propose_adds", False)),
     )
 
     cons = raw.get("consistency") or {}
@@ -293,6 +305,25 @@ def load_strategy(path) -> StrategyConfig:
                                                 "consistency.min_strategy_set_interval_days")),
     )
 
+    # Allocation policy (Q1). Coerce the known scalar knobs to float at LOAD time so a
+    # bad value fails loudly here (strict load), not mid-tick inside the allocator.
+    # default_conviction (a nested {rating: number} dict) and any other key pass through.
+    rp_raw = raw.get("risk_policy") or {}
+    if not isinstance(rp_raw, dict):
+        raise StrategyError("strategy.yaml: risk_policy must be a mapping")
+    _RP_NUM = ("per_name_max_pct", "sleeve_max_pct", "cash_floor_pct", "conviction_curve_k",
+               "smoothing_alpha", "uncertainty_damp", "regime_min_factor", "min_weight_floor_pct")
+    risk_policy: Dict[str, object] = {}
+    for rk, rv in rp_raw.items():
+        risk_policy[rk] = _num(rv, f"risk_policy.{rk}") if rk in _RP_NUM else rv
+
+    # Per-sleeve screen criteria (Q3). Optional; the screener interprets each `screen` block.
+    sleeves_raw = raw.get("sleeves") or {}
+    if not isinstance(sleeves_raw, dict):
+        raise StrategyError("strategy.yaml: sleeves must be a mapping")
+    sleeves = {str(name): (spec if isinstance(spec, dict) else {})
+               for name, spec in sleeves_raw.items()}
+
     return StrategyConfig(
         goal=goal,
         macro_thesis=macro,
@@ -301,6 +332,8 @@ def load_strategy(path) -> StrategyConfig:
         learning=learning,
         default_book=default_book,
         consistency=consistency,
+        risk_policy=risk_policy,
+        sleeves=sleeves,
     )
 
 
@@ -393,6 +426,16 @@ def normalize_regime(r: Optional[str]) -> str:
         "DEPLOY": REGIME_DEPLOY,
         "STAND_DOWN": REGIME_STAND_DOWN, "STANDDOWN": REGIME_STAND_DOWN,
     }.get(u, REGIME_HOLD)
+
+
+def regime_scalar(regime: Optional[str], *, min_factor: float = 0.5) -> float:
+    """Deployment scalar the conviction allocator applies (lib.allocate regime_scalar).
+
+    STAND_DOWN derisks the engine toward cash (returns ``min_factor``); DEPLOY/HOLD
+    deploy the full base. The allocator clamps to [regime_min_factor, 1.0] itself, so
+    this only needs to signal the cut. Fed from the CONFIRMED regime in thesis_state,
+    never a single raw macro reading, so one noisy print can't shrink the book."""
+    return float(min_factor) if normalize_regime(regime) == REGIME_STAND_DOWN else 1.0
 
 
 def _regime_days_between(since: Optional[str], today: Optional[str]) -> Optional[int]:

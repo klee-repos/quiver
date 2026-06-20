@@ -182,6 +182,16 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         # them (the allocator then falls back to a rating-implied default).
         "conviction": parse_pm_field_float(final_decision, "Conviction"),
         "uncertainty": parse_pm_field_float(final_decision, "Uncertainty"),
+        # Per-decision data-completeness flags (which analyst reports were produced this
+        # run). Deterministic, derived from the curated report set — NOT a model field.
+        # Persisted on the decision row so a thin-data call is auditable; the allocator
+        # may later damp conviction when key reports are missing.
+        "data_quality": json.dumps({
+            "market": bool(final_state.get("market_report")),
+            "sentiment": bool(final_state.get("sentiment_report")),
+            "news": bool(final_state.get("news_report")),
+            "fundamentals": bool(final_state.get("fundamentals_report")),
+        }),
         "rationale_summary": summary,
         "schema": 1,
     }

@@ -75,7 +75,33 @@ def classify_holding(returns, target_weight: float, *, goal_behind: bool,
                     f"sustained underperformance, book not behind glidepath [{m.proof()}]")
 
 
-def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_progress) -> dict:
+def build_add_proposals(led, goal_id: int, strategy_cfg, candidate_provider,
+                        *, goal_gap=None) -> List[Proposal]:
+    """Q3 — screener-discovered ADD proposals for sleeves that define a `screen`.
+
+    Reuses lib.screener (pure; the candidate_provider is the only I/O) to rank tickers
+    NOT already held that match each sleeve's criteria + the RH allow-list. Each becomes
+    a PROPOSE_ADD (TIER_UNIVERSE), so it flows through the SAME confirm/cooldown/approve
+    gates as a REMOVE. The initial weight is the sleeve's `screen.add_weight` (default 5%),
+    funded from cash at apply time (universe.apply_add). Degrades to [] on any problem —
+    the universe never grows on bad data."""
+    if strategy_cfg is None or candidate_provider is None or not getattr(strategy_cfg, "sleeves", None):
+        return []
+    import lib.screener as screener
+    held = [h["ticker"] for h in led.active_target_portfolio(goal_id, statuses=("active", "exiting"))]
+    out: List[Proposal] = []
+    for c in screener.screen_book(strategy_cfg.sleeves, strategy_cfg.rh_tradable_confirmed,
+                                  held, candidate_provider, top_n_per_sleeve=1):
+        screen = ((strategy_cfg.sleeves.get(c["sleeve"]) or {}).get("screen")) or {}
+        add_w = float(screen.get("add_weight", 5.0) or 5.0)
+        out.append(Proposal(ADD, c["ticker"], c["sleeve"], TIER_UNIVERSE,
+                            f"screener candidate for '{c['sleeve']}': {c['reason']}",
+                            goal_gap_pct=goal_gap, target_weight=add_w))
+    return out
+
+
+def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_progress,
+                    *, strategy_cfg=None, candidate_provider=None) -> dict:
     """All proposals for the active goal, split into auto_apply vs needs_approval."""
     goal_behind = bool(goal_progress and goal_progress.get("regime") == "BEHIND")
     goal_gap = goal_progress.get("ahead_behind_pct") if goal_progress else None
@@ -99,6 +125,10 @@ def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_pro
         proposals.append(Proposal(DERISK, None, None, TIER_DERISK,
                                   "macro STAND_DOWN reading -> de-risk the engine toward cash",
                                   goal_gap_pct=goal_gap))
+    # Q3 — grow the universe (gated): screener ADD proposals (human-approved by default).
+    if getattr(learning_cfg, "auto_propose_adds", False):
+        proposals.extend(build_add_proposals(led, goal_id, strategy_cfg, candidate_provider,
+                                             goal_gap=goal_gap))
     auto: List[Proposal] = []
     needs: List[Proposal] = []
     for p in proposals:
