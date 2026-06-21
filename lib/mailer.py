@@ -10,8 +10,8 @@ INVARIANT — read before importing this anywhere:
   * This is a DELIBERATE, narrow exception to the project rule "the trading path never
     sends; the orchestrator sends via the Resend MCP." It is scoped to the ops
     supervisor. ``lib/mailer`` MUST NEVER be imported by the trading brain
-    (``analyze.py`` / ``lib.signals`` / ``lib.memory`` / the plan path). A unit test
-    asserts that import graph.
+    (``analyze.py`` / ``lib.signals`` / ``lib.memory`` / the plan path). An e2e test
+    (``tests/test_e2e_alerts.py`` block J) asserts that import graph.
   * ``lib/notify`` stays a pure renderer (no network). This module is the only place
     that touches the network, and it is best-effort: ``send_email`` NEVER raises — a
     transport/DNS/TLS/4xx/5xx failure returns ``{"ok": False, "error": ...}`` so a

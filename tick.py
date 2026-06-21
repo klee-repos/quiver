@@ -205,13 +205,19 @@ def _run_preflight(cfg, led) -> dict:
         # tick alive ONLY if there is wind-down SELL work — a reconcile-exit of an
         # off-book holding or a rebalance `exiting` holding (include_reconcile=True);
         # otherwise it's a safe no-op, not an error.
-        if _has_winddown_work(cfg, led, include_reconcile=True):
+        if out["unfinalized"] or _has_winddown_work(cfg, led, include_reconcile=True):
             out["proceed"] = True
             out["pending"] = []
-            out["reason"] = "winddown_only (rebalance/reconcile sells; no analysis universe)"
+            out["reason"] = "winddown/reconcile_only (unfinalized orders / rebalance / reconcile sells; no analysis universe)"
             return out
         out["reason"] = "no_portfolio_universe (set strategy.yaml / run strategy-set)"
         return out
+
+    # A name with an order RESERVED but never finalized (a crash between place and
+    # commit) must NOT be re-analyzed/re-planned — that would mint a SECOND ref_id and
+    # double-place. It is reconciled by STEP 6 against its EXISTING ref_id instead, so
+    # exclude it from `pending` here (the `unfinalized` list still carries it to STEP 6).
+    unfinalized_tickers = {str(o["ticker"]).upper() for o in out["unfinalized"]}
 
     if cfg.intraday_enabled:
         # Per-ticker eligibility: a ticker is due when its cadence timer has
@@ -232,11 +238,12 @@ def _run_preflight(cfg, led) -> dict:
             except (TypeError, ValueError):
                 return True
 
-        pending = [t for t in book_universe if _due(t)]
+        pending = [t for t in book_universe if _due(t) and t not in unfinalized_tickers]
         no_pending = "no_tickers_due_yet (cooldown/cadence/analysis-budget)"
     else:
         # Classic once-a-day path: at most one action per ticker per day.
-        pending = [t for t in book_universe if not led.already_acted(day, t)]
+        pending = [t for t in book_universe
+                   if not led.already_acted(day, t) and t not in unfinalized_tickers]
         no_pending = "all_portfolio_tickers_already_acted_today"
 
     out["pending"] = pending
@@ -245,14 +252,17 @@ def _run_preflight(cfg, led) -> dict:
     # every later wake alive here (include_reconcile=False) — only a cheap-to-detect
     # rebalance `exiting` holding does. (An orphan introduced after all names acted
     # self-heals on the next session — the conservative, fails-to-sell direction.)
-    if not pending and not _has_winddown_work(cfg, led, include_reconcile=False):
+    if (not pending and not out["unfinalized"]
+            and not _has_winddown_work(cfg, led, include_reconcile=False)):
         out["reason"] = no_pending
         return out
 
     out["proceed"] = True
-    # An empty `pending` here means a rebalance `exiting` wind-down tick: nothing to
-    # analyze, but construct -> plan's sell pass still has exits to place.
-    out["reason"] = "ok" if pending else "winddown_only (rebalance exiting sells; no new analysis)"
+    # An empty `pending` here means a reconcile-only or rebalance `exiting` wind-down
+    # tick: nothing to analyze, but STEP 6 reconcile / construct -> plan's sell pass
+    # still has work (unfinalized orders to reconcile or exits to place).
+    out["reason"] = ("ok" if pending else
+                     "winddown/reconcile_only (unfinalized orders / rebalance exiting sells; no new analysis)")
     return out
 
 
@@ -588,8 +598,12 @@ def _run_plan(cfg, led, data) -> dict:
                 ref_id = None
                 if not cfg.dry_run:
                     ref_id = led.new_ref_id()
+                    # Persist the limit-buy NOTIONAL (shares*limit_price) so the cross-tick
+                    # daily-deploy-cap reseed (day_buys_total sums orders.dollar_amount) and
+                    # the digest rollups see it — a limit row left at NULL would make a
+                    # same-day limit buy invisible to a later tick's cap and over-deploy.
                     led.reserve_order(ref_id, day, ticker, side="buy", type="limit",
-                                      dollar_amount=None, quantity=shares, now_iso=now_iso,
+                                      dollar_amount=spend, quantity=shares, now_iso=now_iso,
                                       order_kind="entry", limit_price=limit_price)
                 result["orders"].append({
                     "ticker": ticker, "signal": signal, "intent": "buy",
@@ -725,12 +739,19 @@ def _run_plan(cfg, led, data) -> dict:
     if target_weights and not result["halt"] and cfg.risk.rebalance_enabled:
         cash_tk = (cfg.risk.cash_sleeve_ticker or "SGOV").upper()
         ordered = {o.get("ticker") for o in result["orders"]}
+        # Names the consistency gate SUPPRESSED this tick (an ungrounded reversal) are
+        # hands-off: the deterministic buy-to-target deploy must NOT re-buy a name whose
+        # buy the gate just blocked, or it would silently override the gate (which by
+        # invariant can only ever suppress a trade). A plain Hold (detail "hold") is NOT
+        # in this set, so the deploy still funds held book names to target as intended.
+        suppressed = {str(d.get("ticker")).upper() for d in result["decisions"]
+                      if str(d.get("detail") or "").startswith("consistency:")}
         spent = sum(float(o.get("dollar_amount") or 0.0)
                     for o in result["orders"] if o.get("side") == "buy")
         avail_cash = buying_power - cfg.risk.min_buying_power_buffer - spent
         for raw_ticker, tw in target_weights.items():
             ticker = str(raw_ticker).upper()
-            if ticker in ordered or ticker == cash_tk or tw.get("orphan"):
+            if ticker in ordered or ticker in suppressed or ticker == cash_tk or tw.get("orphan"):
                 continue
             if tw.get("intent") != "buy" or not tw.get("quotable", True):
                 continue
@@ -1058,7 +1079,17 @@ def _run_construct(cfg, led, data) -> dict:
                 if tk == cash_tk or (t.get("sleeve") or "") == strategy.CASH_SLEEVE:
                     nt["target_weight"] = alloc.cash_pct          # cash takes the residual
                 elif str(t.get("status", "active")) == "active":
-                    nt["target_weight"] = alloc.weights.get(tk, 0.0)   # exiting rows keep their 0
+                    w = alloc.weights.get(tk, 0.0)                # exiting rows keep their 0
+                    nt["target_weight"] = w
+                    # Keep the rebalance dead-band strictly INSIDE the (possibly shrunk)
+                    # conviction weight. Without this the band stays at the static
+                    # strategy.yaml value sized for the ORIGINAL weight, so a name
+                    # conviction-sized DOWN sits inside a now-too-wide band and never
+                    # rebalances toward its new target (conviction sizing wouldn't bind).
+                    # min(ob, w*0.5) preserves the b<w invariant validate_book enforces.
+                    ob = float(t.get("band", 0.0) or 0.0)
+                    if w > 0 and ob > 0:
+                        nt["band"] = round(min(ob, w * 0.5), 4)
                 new_targets.append(nt)
             targets = new_targets
             conviction_detail = {"regime_scalar": rscalar, "cash_pct": alloc.cash_pct,

@@ -7,10 +7,11 @@ result via the Resend MCP). It takes a fully-assembled ``model`` dict (built by
 returns ``{subject, html, text, content_hash, kind}``.
 
 ``content_hash`` is the dedup key. It hashes ONLY the semantic decision skeleton
-(kind, dry-run, halt, and each ticker's signal/intent/status/amount) and
-deliberately EXCLUDES timestamps, equity, and rendered prose — so the same day's
-repeat (no-op) wakes hash identically and never re-send, while a real change
-(e.g. a halt fires) yields a new hash that sends exactly once more.
+(kind, dry-run, halt + halt_reason, event_detail — a constant "" for real digests —
+and each ticker's signal/intent/status/amount/qty) and deliberately EXCLUDES
+timestamps, equity, and rendered prose — so the same day's repeat (no-op) wakes hash
+identically and never re-send, while a real change (e.g. a halt fires) yields a new
+hash that sends exactly once more.
 """
 
 from __future__ import annotations

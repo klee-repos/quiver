@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import yaml
 
@@ -507,11 +507,6 @@ def regime_with_confirmation(prior_state: Optional[dict], raw_regime: str, *,
                       f"confirmed {pending} but dwell-locked ({days}/{min_dwell_days}d)", pending_since)
 
     return result(pending, None, 0, today, True, f"confirmed -> {pending}")
-
-
-def active_targets_for_book(strategy_cfg: StrategyConfig, book_name: str) -> List[Holding]:
-    """The holdings of a book (the raw target weights, before drift/quote filtering)."""
-    return list(strategy_cfg.book(book_name).holdings)
 
 
 def sleeve_thesis(strategy_cfg: StrategyConfig, ticker: str) -> Optional[dict]:

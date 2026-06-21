@@ -254,8 +254,9 @@ fails to send, trading carries on as normal.
 ## Good to know
 
 - **What data does it use?** Stock prices, charts, company numbers, and news all come from a
-  free source — **no paid data key needed**. The only key you must have is one for the AI
-  (GLM 5.2).
+  free source — **no paid data key needed**. The keys you must have are the two AI keys: one
+  for GLM 5.2 (the deep reasoning/debate role) and one for DeepSeek (the quick analyst
+  tool-calling role) — the live setup runs a mixed-provider stack.
 - **What does it cost to run?** The AI is cheap — a full run is a few cents, roughly
   **$5–20 a month** if you watch three stocks a day.
 - **One small gap:** it can't read Reddit (the site blocks it), so it just skips that and uses

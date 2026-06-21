@@ -166,6 +166,62 @@ def main() -> int:
         wc = {t: out_c["target_weights"][t]["target_weight"] for t in out_c["target_weights"]}
         ok("D3 a GROUNDED Sell (named catalyst) IS allowed to exit (~0)", wc.get("AAA", 0) < 5.0, wc)
 
+    # --- FIX(HIGH): rebalance buy-to-target must NOT re-buy a consistency-SUPPRESSED name ---
+    # The consistency gate suppresses an ungrounded cross-day buy reversal (records a
+    # "consistency:" skip, NO order). The deterministic buy-to-target deploy must respect that
+    # — re-buying the same name the same tick would silently override the gate (which by
+    # invariant can only ever SUPPRESS a trade, never add one).
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d))
+        # a prior COMPLETED sell on AAA -> today's Buy is a cross-day reversal; a buy-after-sell
+        # has NO Python plan_trigger, and with no NEW catalyst it is an ungrounded reversal.
+        led.record_decision(trade_date="2026-06-18", ticker="AAA",
+                            decided_at="2026-06-18T10:00:00-04:00", signal="Sell", intent="sell",
+                            decision_price=100.0, basis="took_profit")
+        led.record_event(trade_date="2026-06-18", ticker="AAA", ts="2026-06-18T10:00:01-04:00",
+                         signal="Sell", intent="sell", status="dry_run")
+        out = tick._run_plan(cfg, led, {
+            "now_iso": "2026-06-19T11:00:00-04:00", "equity": 1000.0, "buying_power": 1000.0,
+            "positions": {}, "quotes": {"AAA": 50.0},
+            "analyses": [{"ticker": "AAA", "signal": "Buy", "position_pct": 20.0}],
+            "target_weights": {"AAA": {"intent": "buy", "target_dollars": 200.0, "quotable": True}}})
+        _sup = [dd for dd in out["decisions"] if dd.get("ticker") == "AAA"
+                and str(dd.get("detail") or "").startswith("consistency:")]
+        ok("HIGH-fix: ungrounded buy reversal IS consistency-suppressed", len(_sup) == 1, out["decisions"])
+        ok("HIGH-fix: rebalance buy-to-target does NOT re-buy the suppressed name",
+           [o for o in out["orders"] if o["ticker"] == "AAA"] == [], out["orders"])
+        # CONTROL: a non-suppressed underweight book name IS still deployed (fix is scoped).
+        out2 = tick._run_plan(cfg, led, {
+            "now_iso": "2026-06-19T11:00:00-04:00", "equity": 1000.0, "buying_power": 1000.0,
+            "positions": {}, "quotes": {"BBB": 50.0},
+            "analyses": [{"ticker": "BBB", "signal": "Hold", "position_pct": 0.0}],
+            "target_weights": {"BBB": {"intent": "buy", "target_dollars": 200.0, "quotable": True}}})
+        ok("HIGH-fix: a non-suppressed held book name is STILL deployed (scoped to suppression)",
+           any(o["ticker"] == "BBB" and o["side"] == "buy" for o in out2["orders"]), out2["orders"])
+
+    # --- FIX(MED): conviction must tighten the rebalance band to bind ----------------
+    # When conviction sizes a name DOWN, its rebalance dead-band must shrink to stay inside
+    # the new weight; otherwise the name sits inside a now-too-wide static band and never
+    # rebalances toward its conviction target (conviction sizing wouldn't bind).
+    with tempfile.TemporaryDirectory() as d:
+        # AAA carries a WIDE static band (12); conviction sizes it to ~13.3%, so the clamp
+        # tightens its band to ~6.6% (= 13.3 * 0.5). Held at $250 the drift is ~6.7% — INSIDE
+        # the static 12% band (would HOLD without the clamp) but OUTSIDE the tightened band,
+        # so it must TRIM. Reverting the clamp flips this back to "hold" and fails the test.
+        _wideband = ["      - {sleeve: Tech, ticker: AAA, weight: 30, band: 12}",
+                     "      - {sleeve: Fin, ticker: BBB, weight: 30, band: 5}",
+                     "      - {sleeve: Cash, ticker: SGOV, weight: 40}"]
+        cfg, led = _mk(Path(d), holdings=_wideband)
+        out = tick._run_construct(cfg, led, {
+            "now_iso": "2026-06-19T11:00:00-04:00", "equity": 1000.0, "buying_power": 1000.0,
+            "positions": {"AAA": {"market_value": 250.0, "quantity": 5.0}},
+            "quotes": {"AAA": 50.0, "BBB": 50.0},
+            "analyses": [{"ticker": "AAA", "signal": "Buy", "conviction": 20, "uncertainty": 40},
+                         {"ticker": "BBB", "signal": "Buy", "conviction": 95, "uncertainty": 5}]})
+        _aaa = out["target_weights"].get("AAA", {})
+        ok("MED-fix: conviction-shrunk name trims (tightened band binds, not stale wide band)",
+           _aaa.get("intent") == "trim" and _aaa.get("target_weight", 0) < 20.0, _aaa)
+
     # --- T9: multi-tranche buy-to-target ---------------------------------------
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d))

@@ -138,19 +138,3 @@ def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_pro
                    (p.tier == TIER_UNIVERSE and learning_cfg.auto_apply_universe_changes))
         (auto if is_auto else needs).append(p)
     return {"all": proposals, "auto_apply": auto, "needs_approval": needs}
-
-
-def render_learning_block(proposal_set: dict, goal_progress) -> str:
-    """Read-only digest section. Carries the 'requires approval' disclaimer."""
-    ps = proposal_set.get("all", [])
-    if not ps:
-        return ""
-    auto = proposal_set.get("auto_apply", [])
-    lines = ["Learning review (advisory — universe changes REQUIRE approval):"]
-    if goal_progress:
-        lines.append(f"  goal: {goal_progress.get('regime')} "
-                     f"({goal_progress.get('ahead_behind_pct')}% vs glidepath)")
-    for p in ps:
-        gate = "auto-eligible" if p in auto else "needs approval"
-        lines.append(f"  [{p.kind}] {p.ticker or 'BOOK'} ({p.tier}, {gate}): {p.reason}")
-    return "\n".join(lines)

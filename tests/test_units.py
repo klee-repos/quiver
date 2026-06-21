@@ -466,6 +466,30 @@ check_true("scorecard avg move shown", "avg move" in _sc)
 check_true("scorecard realized P&L line", "Realized P&L" in _sc and "$+1.50" in _sc)
 check_true("scorecard shows pending row", "pending" in _sc)
 
+# realized P&L is a NAME-level figure the orchestrator copies onto EVERY pending decision
+# for a ticker when it closes; with multi-tranche buys that lands the IDENTICAL value on
+# several rows. The scorecard must dedup the close (sum of DISTINCT values), not triple it.
+_dup_rows = [
+    {"trade_date": "2026-05-28", "signal": "Buy", "directional_return": 0.01, "holding_days": 3,
+     "realized_pnl": 50.0, "rationale": "tranche 3"},
+    {"trade_date": "2026-05-27", "signal": "Buy", "directional_return": 0.01, "holding_days": 4,
+     "realized_pnl": 50.0, "rationale": "tranche 2"},
+    {"trade_date": "2026-05-26", "signal": "Buy", "directional_return": 0.01, "holding_days": 5,
+     "realized_pnl": 50.0, "rationale": "tranche 1"},
+]
+_sc_dup = memory.build_scorecard("MSFT", _dup_rows)
+check_true("scorecard: one close across 3 tranches is NOT triple-counted ($50, not $150)",
+           "$+50.00" in _sc_dup and "$+150.00" not in _sc_dup)
+# genuinely-distinct closes still sum (two different realized values -> $80).
+_distinct_rows = [
+    {"trade_date": "2026-05-28", "signal": "Buy", "directional_return": 0.01, "holding_days": 3,
+     "realized_pnl": 50.0, "rationale": "close A"},
+    {"trade_date": "2026-05-20", "signal": "Buy", "directional_return": 0.01, "holding_days": 4,
+     "realized_pnl": 30.0, "rationale": "close B"},
+]
+check_true("scorecard: distinct closes still sum ($50 + $30 = $80)",
+           "$+80.00" in memory.build_scorecard("MSFT", _distinct_rows))
+
 # --- ledger decisions/outcomes round-trip + scorecard integration ---
 _mled = _tmp_ledger()
 _id1 = _mled.record_decision(trade_date="2026-05-20", ticker="AAPL",
@@ -1486,6 +1510,28 @@ _p_cash = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 10
 check("plan: cash sleeve (cash_residual) is never bought",
       _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_cash))["orders"], [])
 
+# --- FIX: a limit BUY persists its NOTIONAL (shares*limit_price) to the orders row, so the
+#     cross-tick daily-deploy-cap reseed (day_buys_total) sees it. A NULL dollar_amount was
+#     invisible -> a later same-day tick could re-deploy the same dollars past the cap.
+_cfg_lim = load_config(_write_config(
+    {"account_number": "12345678", "dry_run": False, "kill_switch_file": "/tmp/k_lim",
+     "risk": {"max_dollars_per_trade": 1000, "daily_loss_halt_pct": 50.0,
+              "daily_capital_deploy_cap": 1000, "min_buying_power_buffer": 5},
+     "order": {"buy_type": "limit"},
+     "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}))
+_led_lim = _tmp_ledger()
+_lim_day = _market.trading_day_et()
+_out_lim = _tick._run_plan(_cfg_lim, _led_lim, {
+    "run_id": "LIM", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 1000.0,
+    "buying_power": 1000.0, "positions": {}, "quotes": {"SMH": 50.0},
+    "analyses": [{"ticker": "SMH", "signal": "Buy", "position_pct": 10.0}]})
+_lim_order = next(o for o in _out_lim["orders"] if o["ticker"] == "SMH")
+check_true("plan: a limit buy actually reserved (whole shares >= 1)", _lim_order["type"] == "limit")
+check_true("limit buy NOTIONAL is counted by day_buys_total (cross-tick cap stays honest)",
+           abs(_led_lim.day_buys_total(_lim_day)
+               - round(_lim_order["quantity"] * _lim_order["limit_price"], 2)) < 0.01
+           and _led_lim.day_buys_total(_lim_day) > 0.0)
+
 # --- AUTH_ERROR detector: collision-free vs TICK.md prose -------------------------
 # The supervisor must NOT fire on the literal "AUTH_ERROR" that TICK.md legitimately
 # contains (the bug), but MUST fire on the unique sentinel `tick.py auth-stop` emits, OR
@@ -1668,6 +1714,30 @@ try:
     # (f) BOTH rebalance and reconcile OFF -> the wound-down book correctly no-ops
     check("preflight: rebalance+reconcile both OFF -> proceed False",
           _tick._run_preflight(_cfg_norec, _led_wound)["proceed"], False)
+    # (g) CRASH-RECOVERY guard: a name with an order RESERVED but never finalized (a crash
+    #     between broker place and commit) is EXCLUDED from `pending` so it is NOT re-analyzed
+    #     /re-planned (which would mint a SECOND ref_id -> a real double-buy). The tick still
+    #     PROCEEDS and carries the stuck order to STEP 6 reconcile (same ref_id).
+    _led_unf = _tmp_ledger()
+    _tick._run_strategy_set(_cfg_s3, _led_unf, {"equity": 100.0, "now_iso": "2026-06-13T10:00:00-04:00"})
+    _pf_pre = _tick._run_preflight(_cfg_s3, _led_unf)["pending"]
+    _stuck = _pf_pre[0]
+    _led_unf.reserve_order("UNF-1", _pf_day, _stuck, side="buy", type="market",
+                           dollar_amount=25.0, quantity=None, now_iso="t")
+    _pf_g = _tick._run_preflight(_cfg_s3, _led_unf)
+    check_true("preflight: unfinalized-order name EXCLUDED from pending (no re-plan/double-place)",
+               _stuck not in _pf_g["pending"] and len(_pf_g["pending"]) == len(_pf_pre) - 1)
+    check("preflight: a stuck-order tick still proceeds (for STEP 6 reconcile)", _pf_g["proceed"], True)
+    check_true("preflight: the stuck order is carried to STEP 6 reconcile",
+               any(o["ticker"] == _stuck for o in _pf_g["unfinalized"]))
+    # all engine names stuck -> empty pending, but reconcile-only keeps the tick alive
+    # even with rebalance+reconcile OFF (would have no-op'd + stranded the orders before the fix).
+    for _i, _t in enumerate(_pf_pre):
+        _led_unf.reserve_order(f"UNF-ALL-{_i}", _pf_day, _t, side="buy", type="market",
+                               dollar_amount=25.0, quantity=None, now_iso="t")
+    _pf_all = _tick._run_preflight(_cfg_norec, _led_unf)
+    check("preflight: all-names-stuck -> empty pending", _pf_all["pending"], [])
+    check("preflight: all-names-stuck still proceeds purely to reconcile", _pf_all["proceed"], True)
 finally:
     _market.is_regular_session_open, _market.minutes_since_open = _pf_saved
 

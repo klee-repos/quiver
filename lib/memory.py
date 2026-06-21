@@ -95,7 +95,12 @@ def build_scorecard(ticker: str, rows: List[dict], recent: int = 6) -> str:
     n_hit = sum(1 for g in gradeable if g[2])
     scores = [sr for (_r, sr) in resolved]
     avg_dir = (sum(scores) / len(scores)) if scores else None
-    realized_vals = [r["realized_pnl"] for r in rows if r.get("realized_pnl") is not None]
+    # Realized P&L is a NAME-level figure the orchestrator copies onto EVERY pending
+    # decision for the ticker when the position closes. With always-on multi-tranche
+    # buys a single close lands on several decision rows with the IDENTICAL value, so a
+    # naive sum double/triple-counts it. Dedup distinct close values (set) — one close
+    # collapses to one figure, while genuinely-distinct closes still sum.
+    realized_vals = {r["realized_pnl"] for r in rows if r.get("realized_pnl") is not None}
     realized_sum = sum(realized_vals) if realized_vals else None
     metric_basis = "excess-vs-benchmark" if any(r.get("alpha") is not None for (r, _sr) in resolved) else "absolute"
 

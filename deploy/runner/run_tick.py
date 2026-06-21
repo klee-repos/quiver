@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent.parent
@@ -230,6 +231,13 @@ def main() -> int:
         # second overlapping tick and race the dedup/ref_id machinery. +600s grace past the
         # subprocess timeout (which itself releases the lock via the context manager on exit).
         with runlock.run_lock(led, holder, now_iso, ttl_seconds=TICK_TIMEOUT_SEC + 600):
+            # ONE wall-clock budget for the whole locked section (fan-out + orchestrator).
+            # The slow analysis fan-out runs BEFORE the orchestrator subprocess, so a fixed
+            # per-each timeout lets fan-out + orchestrator SUM past systemd's TimeoutStartSec
+            # and get SIGTERM'd mid-tick. Anchoring both to a single deadline keeps the total
+            # within TICK_TIMEOUT_SEC (under the +600s systemd margin): whatever the fan-out
+            # consumes is subtracted from the orchestrator's share below.
+            _deadline = time.monotonic() + TICK_TIMEOUT_SEC
             pre = _tick_json(["preflight"])
             if pre.get("error"):
                 _emit({"stage": "preflight", "stopped": True, **pre})
@@ -305,8 +313,11 @@ def main() -> int:
                 recorded_before = led.count_decisions(day) + led.count_ticker_actions(day)
             except Exception:  # noqa: BLE001 — observability only; never block a tick
                 recorded_before = None
+            # The orchestrator gets whatever is LEFT of the shared budget after the fan-out
+            # (floored so a budget-exhausted tick fails fast rather than running unbounded).
+            _orch_timeout = max(60.0, _deadline - time.monotonic())
             try:
-                proc = subprocess.run(cmd, cwd=str(_REPO), timeout=TICK_TIMEOUT_SEC,
+                proc = subprocess.run(cmd, cwd=str(_REPO), timeout=_orch_timeout,
                                       capture_output=True, text=True)
                 ok = proc.returncode == 0
                 combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -420,8 +431,9 @@ def main() -> int:
                 # its own email step; last-resort page.
                 _maybe_alert(led, kind="error", stage="orchestrator", day=day,
                              now_iso=now_iso,
-                             event_detail=f"tick exceeded the {TICK_TIMEOUT_SEC}s timeout "
-                                          "(orchestrator wedged).")
+                             event_detail=f"tick exceeded its {int(_orch_timeout)}s orchestrator "
+                                          f"budget (of the {TICK_TIMEOUT_SEC}s tick deadline; "
+                                          "orchestrator wedged or fan-out consumed the budget).")
                 return 1
             except Exception as e:  # noqa: BLE001 — a spawn failure (e.g. claude binary
                 # missing/not executable) can't reach the orchestrator's own pager; page here.

@@ -178,9 +178,10 @@ the invariant); omit it / use null to hold the conservative default book. Run:
   exits; plan winds them to zero when `reconcile_unmanaged` is on. Long-only: sells only.)
 
 (One-time, off-tick: `tick.py strategy-set --input '{"equity": <equity>}'` writes the
-active goal + book from `strategy.yaml`. Best-effort `tick.py goal-track` in STEP 7
-records the day's goal-progress snapshot — a goal-track/construct error never stops
-the tick.)
+active goal + book from `strategy.yaml`. The day's goal-progress snapshot (`tick.py
+goal-track`) and the learning review run automatically in the Python ops supervisor
+(`run_tick.py`) AFTER the tick returns — they are NOT a STEP-7 orchestrator action —
+and are best-effort: a goal-track/construct error never stops the tick.)
 
 ## STEP 4 — Plan the orders (deterministic)
 

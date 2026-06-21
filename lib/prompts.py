@@ -7,8 +7,8 @@ the prompt is a Python ``.format`` template; agent prompts that carry langchain
 ``{placeholders}`` (filled downstream by ChatPromptTemplate) are loaded raw with no
 kwargs so their braces pass through untouched.
 
-Cached after first read; ``reload()`` drops the cache when a prompt file is edited
-live (e.g. the strategy doc the agent appends to).
+Cached after first read (the per-tick process is short-lived, so the cache never
+goes stale in practice).
 """
 
 from __future__ import annotations
@@ -32,8 +32,3 @@ def load_prompt(name: str, **kwargs) -> str:
     without, return it raw (so langchain placeholders survive)."""
     text = _read(name)
     return text.format(**kwargs) if kwargs else text
-
-
-def reload() -> None:
-    """Drop the cache so the next load re-reads from disk (after a live edit)."""
-    _read.cache_clear()
