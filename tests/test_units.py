@@ -525,6 +525,28 @@ _basis_rows = [
 ]
 check_true("scorecard surfaces the strategy basis tag", "[power_bottleneck]" in memory.build_scorecard("CEG", _basis_rows))
 
+# --- T8: cross-sectional sliced scorecard ("what KIND of call wins") --------
+_sliced_rows = [
+    # momentum_breakout: 3 calls, 2 hits (alpha-graded)
+    {"signal": "Buy", "intent": "buy", "basis": "momentum_breakout", "alpha": 0.03},
+    {"signal": "Buy", "intent": "buy", "basis": "momentum_breakout", "alpha": 0.02},
+    {"signal": "Buy", "intent": "buy", "basis": "momentum_breakout", "alpha": -0.04},
+    # mean_reversion: 3 calls, 0 hits (a losing thesis category)
+    {"signal": "Buy", "intent": "buy", "basis": "mean_reversion", "alpha": -0.02},
+    {"signal": "Buy", "intent": "buy", "basis": "mean_reversion", "alpha": -0.05},
+    {"signal": "Buy", "intent": "buy", "basis": "mean_reversion", "alpha": -0.01},
+    # a skip must NOT pollute the slice
+    {"signal": "Underweight", "intent": "skip", "basis": "momentum_breakout", "alpha": 0.20},
+    # a thin basis (1 call) is omitted (< min_n)
+    {"signal": "Buy", "intent": "buy", "basis": "rare_thesis", "alpha": 0.09},
+]
+_sliced = memory.build_sliced_scorecard(_sliced_rows, "basis", "strategy basis", min_n=3)
+check_true("sliced: momentum_breakout shows 2/3 (67%)", "momentum_breakout: 2/3 (67%)" in _sliced)
+check_true("sliced: mean_reversion shows 0/3 (0%)", "mean_reversion: 0/3 (0%)" in _sliced)
+check_true("sliced: thin basis (<min_n) omitted", "rare_thesis" not in _sliced)
+check_true("sliced: skip excluded from the slice (no +20% pollution)", "+20" not in _sliced)
+check("sliced: empty rows -> ''", memory.build_sliced_scorecard([], "basis", "x"), "")
+
 # --- T1: ledger return-series excludes skips + carries alpha/intent ---------
 _skled = _tmp_ledger()
 _sk_buy = _skled.record_decision(trade_date="2026-06-01", ticker="NVDA",
@@ -2093,7 +2115,7 @@ check_true("regr: an unparseable regime_since dwell-LOCKS (never skips the lock)
 import os as _os  # noqa: E402
 _os.environ.setdefault("GLM_API_KEY", "dummy-key-for-tests")
 from langchain_core.messages import AIMessage as _AIMessage, HumanMessage as _HumanMessage  # noqa: E402
-from lib.ds_config import build_glm_config  # noqa: E402
+from lib.ds_config import build_glm_config, build_agents_config  # noqa: E402
 from tradingagents.llm_clients.capabilities import get_capabilities as _get_caps  # noqa: E402
 from tradingagents.llm_clients.api_key_env import get_api_key_env as _get_key_env  # noqa: E402
 from tradingagents.llm_clients.validators import validate_model as _validate_model  # noqa: E402
@@ -2108,15 +2130,55 @@ check("build_glm_config provider=glm", _glm_cfg["llm_provider"], "glm")
 check("build_glm_config backend_url=None (provider default applies)", _glm_cfg["backend_url"], None)
 check("build_glm_config quick_think=chat_model", _glm_cfg["quick_think_llm"], "glm-5.2")
 check("build_glm_config deep_think=reasoner_model", _glm_cfg["deep_think_llm"], "glm-5.2")
+# Shim still sets BOTH roles to glm (single-provider back-compat).
+check("build_glm_config quick provider=glm", _glm_cfg["quick_think_provider"], "glm")
+check("build_glm_config deep provider=glm", _glm_cfg["deep_think_provider"], "glm")
+
+# build_agents_config: per-role providers (the live mixed setup: deepseek quick + glm deep).
+_mix_cfg = build_agents_config("deepseek-v4-flash", "deepseek", "glm-5.2", "glm",
+                               state_dir="/tmp/quiver_test_state")
+check("mixed: quick_think_provider=deepseek", _mix_cfg["quick_think_provider"], "deepseek")
+check("mixed: deep_think_provider=glm", _mix_cfg["deep_think_provider"], "glm")
+check("mixed: llm_provider defaults to deep provider (glm)", _mix_cfg["llm_provider"], "glm")
+check("mixed: quick_think_llm=deepseek-v4-flash", _mix_cfg["quick_think_llm"], "deepseek-v4-flash")
+check("mixed: deep_think_llm=glm-5.2", _mix_cfg["deep_think_llm"], "glm-5.2")
+check("mixed: backend_url=None (each provider resolves its own)", _mix_cfg["backend_url"], None)
+
+# Offline per-role routing: trading_graph._build_llm_clients routes each role to its
+# provider (deep first, then quick), falling back to llm_provider when keys are absent.
+# Monkeypatch create_llm_client so no API keys / network are touched.
+import tradingagents.graph.trading_graph as _tg  # noqa: E402
+_routed = []
+class _FakeLLMClient:
+    def __init__(self, provider, model): self._p, self._m = provider, model
+    def get_llm(self): return f"{self._p}:{self._m}"
+def _fake_create(provider, model, base_url=None, **kw):
+    _routed.append((provider, model)); return _FakeLLMClient(provider, model)
+_orig_create = _tg.create_llm_client
+_tg.create_llm_client = _fake_create
+try:
+    _g = _tg.TradingAgentsGraph.__new__(_tg.TradingAgentsGraph)
+    _g.config = _mix_cfg
+    _g._build_llm_clients({})
+    check("graph routes deep->glm, quick->deepseek (deep first)", _routed,
+          [("glm", "glm-5.2"), ("deepseek", "deepseek-v4-flash")])
+    _routed.clear()
+    _g.config = {"llm_provider": "glm", "deep_think_llm": "glm-5.2",
+                 "quick_think_llm": "glm-5.2", "backend_url": None}
+    _g._build_llm_clients({})
+    check("graph fallback: absent per-role keys -> both llm_provider", _routed,
+          [("glm", "glm-5.2"), ("glm", "glm-5.2")])
+finally:
+    _tg.create_llm_client = _orig_create
 
 # Provider->key env map + model catalog.
 check("glm provider -> GLM_API_KEY env", _get_key_env("glm"), "GLM_API_KEY")
 check_true("glm-5.2 is a known model (no unknown-model warning)", _validate_model("glm", "glm-5.2"))
 
-# Capability row: thinking ON at max effort; conservative tool_choice + roundtrip.
+# Capability row: thinking ON at high effort; conservative tool_choice + roundtrip.
 _gc = _get_caps("glm-5.2")
 check_true("glm-5.2 caps: thinking enabled", _gc.requires_thinking_enabled)
-check("glm-5.2 caps: reasoning_effort=max", _gc.reasoning_effort, "max")
+check("glm-5.2 caps: reasoning_effort=high", _gc.reasoning_effort, "high")
 check_true("glm-5.2 caps: reasoning_content roundtrip", _gc.requires_reasoning_content_roundtrip)
 check("glm-5.2 caps: tool_choice suppressed (False)", _gc.supports_tool_choice, False)
 check_true("^glm-5 pattern: glm-5.1 inherits thinking", _get_caps("glm-5.1").requires_thinking_enabled)
@@ -2140,7 +2202,7 @@ check("factory glm -> GLMChatOpenAI",
 _glm = _GLMChat(model="glm-5.2", api_key="dummy", base_url="https://api.z.ai/api/paas/v4/")
 _pl = _glm._get_request_payload([_HumanMessage("hi")])
 check("GLM payload: thinking in extra_body", (_pl.get("extra_body") or {}).get("thinking"), {"type": "enabled"})
-check("GLM payload: reasoning_effort in extra_body", (_pl.get("extra_body") or {}).get("reasoning_effort"), "max")
+check("GLM payload: reasoning_effort in extra_body", (_pl.get("extra_body") or {}).get("reasoning_effort"), "high")
 check_true("GLM payload: thinking NOT top-level (would TypeError on openai>=2)", "thinking" not in _pl)
 check_true("GLM payload: reasoning_effort NOT top-level", not _pl.get("reasoning_effort"))
 
@@ -2166,6 +2228,30 @@ _legacy_d = {
 }
 check("config back-compat: legacy deepseek: block still loads",
       load_config(_write_config(_legacy_d)).chat_model, "deepseek-v4-flash")
+
+# Per-role providers parse from config + survive validation (the live mixed setup).
+_mix_d = {
+    "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
+    "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+             "daily_capital_deploy_cap": 75, "min_buying_power_buffer": 5},
+    "glm": {"chat_model": "deepseek-v4-flash", "chat_provider": "deepseek",
+            "reasoner_model": "glm-5.2", "reasoner_provider": "glm"},
+}
+_mc = load_config(_write_config(_mix_d))
+check("config: chat_provider=deepseek", _mc.chat_provider, "deepseek")
+check("config: reasoner_provider=glm", _mc.reasoner_provider, "glm")
+check("config: chat_model=deepseek-v4-flash", _mc.chat_model, "deepseek-v4-flash")
+check("config: reasoner_model=glm-5.2", _mc.reasoner_model, "glm-5.2")
+# Block-default inference: absent provider keys -> both default to the block's provider.
+check("config: glm block, absent providers default to glm",
+      (make_config().chat_provider, make_config().reasoner_provider), ("glm", "glm"))
+check("config: legacy deepseek block, absent providers default to deepseek",
+      (load_config(_write_config(_legacy_d)).chat_provider,
+       load_config(_write_config(_legacy_d)).reasoner_provider), ("deepseek", "deepseek"))
+# Unknown provider is rejected at config load (fail-fast, fail-safe).
+_bad_prov_d = dict(_mix_d); _bad_prov_d["glm"] = dict(_mix_d["glm"], chat_provider="not-a-provider")
+check_raises("config: unknown provider raises",
+             lambda: load_config(_write_config(_bad_prov_d)), ConfigError)
 
 
 # ======================= T5: ANALYSIS-DRIVEN ALLOCATION ENGINE ==============

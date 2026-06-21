@@ -48,20 +48,26 @@ order:
     stop_pct: 8.0                      # target distance below fill; clamped to a safe band
     time_in_force: "gtc"
 
-# --- Models (GLM 5.2 via z.ai) ---------------------------------------------
-# Both roles use glm-5.2 (OpenAI-compatible, full tool calling, thinking mode).
-# chat_model does the analysts' tool-calling; reasoner_model does the debates/
-# judgment. Thinking is enabled at MAX reasoning effort for both — see the
-# glm-5.2 row in tradingagents/llm_clients/capabilities.py. Verify IDs at the
-# z.ai model list if a call rejects them.
+# --- Models (mixed providers) ----------------------------------------------
+# Per-role provider + model. The quick/chat role (the analysts' tool-calling, i.e.
+# "managing the agents") runs DeepSeek V4 Flash; the deep/reasoner role (debates/
+# judgment) runs GLM 5.2 with thinking at HIGH reasoning effort (one step below
+# GLM's MAX — see the glm-5.2 row in tradingagents/llm_clients/capabilities.py).
+# Both are OpenAI-compatible thinking models with full tool calling; each resolves
+# its own endpoint + API key (DEEPSEEK_API_KEY / GLM_API_KEY). The block name `glm:`
+# is historical (kept for back-compat); providers are per-role. To put a role back
+# on a single provider, just match its chat_provider/reasoner_provider. Verify IDs
+# at the provider's model list if a call rejects them.
 glm:
-  chat_model: "glm-5.2"
+  chat_model: "deepseek-v4-flash"
+  chat_provider: "deepseek"
   reasoner_model: "glm-5.2"
+  reasoner_provider: "glm"
 
 # --- Loop timing -----------------------------------------------------------
 loop:
   act_after_open_minutes: 5            # wait N min after the open before acting
-  analyze_timeout_sec: 3600            # per-ticker analyze.py subprocess timeout — very high so a normal max-reasoning GLM run never hits it
+  analyze_timeout_sec: 3600            # per-ticker analyze.py subprocess timeout — very high so a normal high-reasoning GLM run never hits it
   # intraday_enabled OFF = the validated once-a-day path (the cadence code stays dormant).
   intraday_enabled: false
   per_ticker_cooldown_min: 60          # min minutes between repeat trades on a ticker

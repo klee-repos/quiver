@@ -83,18 +83,7 @@ class TradingAgentsGraph:
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
 
-        deep_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["deep_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
-        quick_client = create_llm_client(
-            provider=self.config["llm_provider"],
-            model=self.config["quick_think_llm"],
-            base_url=self.config.get("backend_url"),
-            **llm_kwargs,
-        )
+        deep_client, quick_client = self._build_llm_clients(llm_kwargs)
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
@@ -132,6 +121,37 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+
+    def _build_llm_clients(self, llm_kwargs: Dict[str, Any]):
+        """Construct the (deep, quick) LLM clients, each off its per-role provider.
+
+        Per-role providers (``deep_think_provider`` / ``quick_think_provider``) let
+        the two roles use different providers (e.g. glm for deep reasoning, deepseek
+        for the analysts' tool-calling). Both fall back to ``llm_provider`` so a
+        config without the per-role keys constructs identically to before.
+
+        ``llm_kwargs`` is shared across both clients: ``_get_provider_kwargs()``
+        returns {} for both glm and deepseek (their thinking is wired via the
+        per-model capability rows, not constructor kwargs), and ``callbacks`` are
+        provider-agnostic. If you ever mix in google/openai/anthropic (which DO
+        return thinking kwargs), recompute kwargs per role — those are
+        provider-specific.
+        """
+        deep_provider = self.config.get("deep_think_provider") or self.config["llm_provider"]
+        quick_provider = self.config.get("quick_think_provider") or self.config["llm_provider"]
+        deep_client = create_llm_client(
+            provider=deep_provider,
+            model=self.config["deep_think_llm"],
+            base_url=self.config.get("backend_url"),
+            **llm_kwargs,
+        )
+        quick_client = create_llm_client(
+            provider=quick_provider,
+            model=self.config["quick_think_llm"],
+            base_url=self.config.get("backend_url"),
+            **llm_kwargs,
+        )
+        return deep_client, quick_client
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""

@@ -48,8 +48,9 @@ class ModelCapabilities:
     # {"type": "enabled"}}`` (docs.z.ai). When True, GLMChatOpenAI injects it
     # via extra_body. Off for every non-GLM model.
     requires_thinking_enabled: bool = False
-    # Reasoning effort to send when thinking is enabled (GLM accepts "max",
-    # higher than the OpenAI SDK's "xhigh"). None means "do not send it".
+    # Reasoning effort to send when thinking is enabled. GLM 5.2's scale is
+    # off < low < high < max (z.ai). "max" tops out higher than the OpenAI SDK's
+    # "xhigh"; "high" is the step directly below it. None means "do not send it".
     reasoning_effort: str | None = None
 
 
@@ -111,7 +112,7 @@ _GLM_THINKING = ModelCapabilities(
     preferred_structured_method="function_calling",
     requires_reasoning_content_roundtrip=True,
     requires_thinking_enabled=True,
-    reasoning_effort="max",
+    reasoning_effort="high",
 )
 
 
@@ -130,7 +131,7 @@ _BY_ID: dict[str, ModelCapabilities] = {
     "MiniMax-M2.1": _MINIMAX_THINKING,
     "MiniMax-M2.1-highspeed": _MINIMAX_THINKING,
     "MiniMax-M2": _MINIMAX_THINKING,
-    # GLM — z.ai / BigModel flagship (thinking enabled at max effort).
+    # GLM — z.ai / BigModel flagship (thinking enabled at high effort).
     "glm-5.2": _GLM_THINKING,
 }
 

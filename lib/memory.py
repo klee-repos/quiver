@@ -124,6 +124,39 @@ def build_scorecard(ticker: str, rows: List[dict], recent: int = 6) -> str:
     return "\n".join(lines)
 
 
+def build_sliced_scorecard(rows: List[dict], key: str, label: str, *, min_n: int = 3) -> str:
+    """Cross-sectional 'what KIND of call wins' scorecard: group resolved, position-taking
+    decisions by ``row[key]`` (e.g. 'basis' or 'sleeve') and show per-group hit-rate +
+    avg skill-return (alpha when present) + N. Answers the user's goal — "what kind of call
+    do I keep losing" — which per-ticker recall can't, because names rotate.
+
+    PURE over already-fetched rows. Groups with fewer than ``min_n`` graded bets are omitted
+    (too thin to learn from). Returns '' when nothing is gradeable yet.
+    """
+    groups: dict = {}
+    for r in rows:
+        if _is_skip(r):
+            continue
+        sr = score_return(r)
+        if sr is None:
+            continue
+        g = (r.get(key) or "").strip() or "(unlabeled)"
+        groups.setdefault(g, []).append((r.get("signal"), sr))
+    lines = []
+    for g in sorted(groups):
+        graded = [(s, ret, is_hit(s, ret)) for (s, ret) in groups[g]]
+        gradeable = [x for x in graded if x[2] is not None]
+        if len(gradeable) < min_n:
+            continue
+        n_hit = sum(1 for x in gradeable if x[2])
+        avg = sum(ret for (_s, ret, _h) in gradeable) / len(gradeable)
+        lines.append(f"- {g}: {n_hit}/{len(gradeable)} ({n_hit / len(gradeable) * 100:.0f}%) "
+                     f"hit, avg {_fmt_pct(avg)}")
+    if not lines:
+        return ""
+    return f"How your calls perform by {label} (skill = excess-vs-benchmark when scored):\n" + "\n".join(lines)
+
+
 def scorecard(led, ticker: str, limit: int = 8) -> str:
     """Ledger-reading wrapper: fetch recent decisions+outcomes and render them.
 

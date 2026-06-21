@@ -21,11 +21,13 @@ def get_YFin_data_online(
     # Fetch historical data for the specified date range
     data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
 
-    # Check if data is empty
+    # Check if data is empty — RAISE (don't return a string) so route_to_vendor advances
+    # to the next vendor and, if all fail, analyze.py fails SAFE to signal:ERROR instead of
+    # feeding "No data found" text to a confident, tradable Buy/Sell on real money.
     if data.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
-        )
+        from .errors import DataUnavailableError
+        raise DataUnavailableError(
+            f"No price data for '{symbol}' between {start_date} and {end_date}")
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:

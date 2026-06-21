@@ -16,6 +16,16 @@ import yaml
 
 _PLACEHOLDER_ACCOUNT = "XXXXXXXX"
 
+# Supported LLM providers for the per-role chat_provider/reasoner_provider keys.
+# Mirror of tradingagents.llm_clients.factory._OPENAI_COMPATIBLE, kept LOCAL on
+# purpose: config.py is a light leaf, and importing the framework here would run
+# tradingagents/__init__.py's load_dotenv() as a side effect mid-load — clobbering
+# the os.environ of env-isolated callers (tests, the notify-recipient resolution).
+_SUPPORTED_LLM_PROVIDERS = (
+    "openai", "xai", "deepseek", "qwen", "qwen-cn",
+    "glm", "glm-cn", "minimax", "minimax-cn", "ollama", "openrouter",
+)
+
 
 @dataclass(frozen=True)
 class RiskConfig:
@@ -157,6 +167,12 @@ class Config:
     storage: StorageConfig
     memory: MemoryConfig
     raw: dict
+    # Per-role LLM providers (mixed-provider support). Default to "glm" so an
+    # absent block/key keeps today's single-provider GLM behavior byte-identical.
+    # The quick/chat role (analysts' tool-calling) and the deep/reasoner role
+    # (debates/judgment) can name different providers (e.g. deepseek + glm).
+    chat_provider: str = "glm"
+    reasoner_provider: str = "glm"
     # --- Strategy layer (Stage 0) ----------------------------------------
     # strategy is Optional[lib.strategy.StrategyConfig] (typed as object to keep
     # config a light leaf with no heavy import). It is None when strategy.yaml is
@@ -280,16 +296,31 @@ def load_config(path) -> Config:
         loss_catalyst_pct=loss_catalyst_pct,
     )
 
-    # Model IDs live under a `glm:` block. Fall back to the legacy `deepseek:` key
-    # so an older config.yaml never hard-crashes a tick (fail-safe back-compat).
-    models = d.get("glm") or d.get("deepseek") or {}
+    # Model IDs live under a `glm:` block (the name is historical — providers are
+    # now per-role). Fall back to the legacy `deepseek:` key so an older config.yaml
+    # never hard-crashes a tick (fail-safe back-compat).
+    glm_block = d.get("glm")
+    models = glm_block or d.get("deepseek") or {}
     chat_model = str(_require(models, "chat_model")).strip()
     reasoner_model = str(_require(models, "reasoner_model")).strip()
     if "verify" in chat_model.lower() or "verify" in reasoner_model.lower():
         raise ConfigError(
-            "config.yaml: glm model IDs are still placeholders — verify the "
-            "current IDs in the z.ai model list and set them."
+            "config.yaml: model IDs are still placeholders — verify the current "
+            "IDs in the provider's model list and set them."
         )
+    # Per-role providers. The block-default provider (which block matched) is the
+    # fallback for any role that doesn't name its own, so absent keys keep today's
+    # behavior: a `glm:` block => both roles glm; a legacy `deepseek:` block => both
+    # deepseek. The live mixed setup names each role explicitly (deepseek + glm).
+    block_default = "glm" if glm_block else ("deepseek" if d.get("deepseek") else "glm")
+    chat_provider = str(models.get("chat_provider", block_default) or block_default).strip().lower()
+    reasoner_provider = str(models.get("reasoner_provider", block_default) or block_default).strip().lower()
+    for _role, _prov in (("chat_provider", chat_provider), ("reasoner_provider", reasoner_provider)):
+        if _prov not in _SUPPORTED_LLM_PROVIDERS:
+            raise ConfigError(
+                f"config.yaml: {_role}={_prov!r} is not a supported provider "
+                f"({', '.join(_SUPPORTED_LLM_PROVIDERS)})."
+            )
 
     order = d.get("order", {}) or {}
     loop = d.get("loop", {}) or {}
@@ -500,6 +531,8 @@ def load_config(path) -> Config:
         risk=risk,
         chat_model=chat_model,
         reasoner_model=reasoner_model,
+        chat_provider=chat_provider,
+        reasoner_provider=reasoner_provider,
         buy_type=buy_type,
         sell_mode=str(order.get("sell_mode", "close_position")),
         time_in_force=str(order.get("time_in_force", "gfd")),

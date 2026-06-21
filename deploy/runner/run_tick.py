@@ -255,7 +255,7 @@ def main() -> int:
             analyses = []
             if pending:
                 # Per-ticker analyze timeout comes from config.yaml
-                # (loop.analyze_timeout_sec — set very high so a normal max-reasoning
+                # (loop.analyze_timeout_sec — set very high so a normal high-reasoning
                 # GLM run never hits it). QUIVER_ANALYZE_TIMEOUT still overrides inside
                 # run_analyses. Best-effort: a config read hiccup falls back to
                 # run_analyses' own default rather than blocking the fan-out.
@@ -390,6 +390,27 @@ def main() -> int:
                                                "recorded nothing new (0 decisions, 0 actions) "
                                                "— the analysis step did not run (likely "
                                                "backgrounded + reaped). No trades placed."))
+                # --- Learning loop (Python best-effort; NOT a skippable LLM step) ----------
+                # After the orchestrator placed trades + recorded decisions, run the
+                # goal-progress snapshot and the learning review HERE in Python so they ALWAYS
+                # run — a TICK.md line the LLM can silently skip is not robust enough for the
+                # "learns smarter trades daily" mandate. Both are best-effort + human-gated for
+                # the risky direction (the screener PROPOSES adds; applying still needs
+                # universe-apply --approve); neither places an order or mutates the universe
+                # here. A hiccup is logged and never changes the tick's exit code.
+                if ok and not auth_error and not halted:
+                    for _step in ("goal-track", "learn-review"):
+                        try:
+                            _r = _tick_json([_step])
+                            if _r.get("error"):
+                                _emit({"stage": _step, "error": str(_r["error"])[:200]})
+                            else:
+                                _emit({"stage": _step, **{k: _r[k] for k in (
+                                    "reviewed", "recorded", "new_proposals", "regime",
+                                    "ahead_behind_pct", "cumulative_return_pct") if k in _r}})
+                        except Exception as e:  # noqa: BLE001 — learning is best-effort
+                            _emit({"stage": _step, "error": f"{type(e).__name__}: {e}"})
+
                 # AUTH_ERROR is a hard-stop posture: exit non-zero so systemd + the
                 # documented drill see a failed run even if the orchestrator exited 0.
                 return 0 if (ok and not auth_error and not no_decisions) else 1

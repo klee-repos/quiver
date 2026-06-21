@@ -33,7 +33,7 @@ Env:
                               var (if set) OVERRIDES the caller-passed value; else
                               the supervisor passes config loop.analyze_timeout_sec;
                               else a 3600s default. Set very high so a normal
-                              max-reasoning GLM run never hits it.
+                              high-reasoning GLM run never hits it.
   QUIVER_ANALYZE_SCRIPT       path to the analyzer (default <repo>/analyze.py);
                               overridable so the harness is testable offline.
   QUIVER_PYTHON               interpreter for analyze.py (default: this interpreter).

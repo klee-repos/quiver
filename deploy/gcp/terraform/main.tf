@@ -37,7 +37,7 @@ locals {
   # alerts fall back to NOTIFY_TO). To drive Claude auth from Secret Manager instead, create
   # that secret AND add its name here, then re-apply — for_each requires the secret to exist.
   secrets = [
-    "GLM_API_KEY", "RH_ACCOUNT_NUMBER", "RESEND_API_KEY",
+    "GLM_API_KEY", "DEEPSEEK_API_KEY", "RH_ACCOUNT_NUMBER", "RESEND_API_KEY",
     "NOTIFY_TO", "RESEND_FROM", "STRATEGY_YAML",
   ]
 }

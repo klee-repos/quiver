@@ -8,7 +8,8 @@ This is the only test that exercises the FULL real path the synthetic e2e can't:
   ->  feed the REAL model output through the REAL `tick.py plan` gate
   ->  confirm the gate's verdict is internally consistent + the proof is persisted.
 
-It costs money + tokens, needs GLM_API_KEY, takes a few minutes, and the model's
+It costs money + tokens, needs GLM_API_KEY + DEEPSEEK_API_KEY (the mixed deep+quick
+providers), takes a few minutes, and the model's
 SIGNAL is non-deterministic — so it is GATED behind QUIVER_LIVE_E2E=1 and asserts on
 STRUCTURE + internal consistency, never on a specific signal value. Without the flag it
 is a no-op PASS (safe to leave in any runner / CI).
@@ -49,9 +50,13 @@ def main() -> int:
     if os.environ.get("QUIVER_LIVE_E2E") != "1":
         print("LIVE E2E skipped (set QUIVER_LIVE_E2E=1 to run the real GLM 5.2 path). PASS (no-op).")
         return 0
-    if not (REPO / ".env").exists() and not os.environ.get("GLM_API_KEY"):
-        print("LIVE E2E: need GLM_API_KEY (in .env or the environment). FAIL.")
-        return 1
+    if not (REPO / ".env").exists():
+        # The mixed setup uses GLM (deep/reasoner) + DeepSeek (quick/analysts), so the
+        # real analyze.py needs BOTH keys; without a .env they must be in the env.
+        missing = [k for k in ("GLM_API_KEY", "DEEPSEEK_API_KEY") if not os.environ.get(k)]
+        if missing:
+            print(f"LIVE E2E: need {' + '.join(missing)} (in .env or the environment). FAIL.")
+            return 1
 
     ticker = (sys.argv[1] if len(sys.argv) > 1 else
               os.environ.get("QUIVER_LIVE_E2E_TICKER", "NVDA")).strip().upper()

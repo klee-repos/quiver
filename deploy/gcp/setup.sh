@@ -69,7 +69,7 @@ fetch() {  # $1 = secret id (sans prefix); prints decoded value; non-zero on abs
 }
 fetch_opt() { fetch "$1" 2>/dev/null || echo ""; }
 
-for _k in GLM_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO; do
+for _k in GLM_API_KEY DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESEND_API_KEY NOTIFY_TO; do
   _v=$(fetch "$_k") || { echo "FATAL: required secret $SECRET_PREFIX$_k missing/inaccessible" >&2; exit 1; }
   { [ -n "$_v" ] && [ "$_v" != "null" ]; } || { echo "FATAL: required secret $SECRET_PREFIX$_k empty" >&2; exit 1; }
   printf -v "$_k" '%s' "$_v"
@@ -96,6 +96,7 @@ install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/.npm-c
   [ -n "$CLAUDE_AUTH_LINE" ] && echo "$CLAUDE_AUTH_LINE"
   echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
   echo "GLM_API_KEY=$GLM_API_KEY"
+  echo "DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY"
   echo "RH_ACCOUNT_NUMBER=$RH_ACCOUNT_NUMBER"
   echo "RESEND_API_KEY=$RESEND_API_KEY"
   echo "NOTIFY_TO=$NOTIFY_TO"

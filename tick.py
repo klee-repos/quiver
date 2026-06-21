@@ -344,6 +344,13 @@ def _consistency_context(cfg, led, ticker, new_intent, quote, new_basis,
         return allowed, reason, plan_trigger, proof
     except Exception as e:  # noqa: BLE001 — a gate read error must never crash the tick
         proof["gate_error"] = str(e)
+        # Fail CLOSED on the dangerous direction: a SELL/close we can't verify might be the
+        # ungrounded reversal the gate exists to suppress ("don't randomly sell day 2 what we
+        # bought day 1"), so suppress it and retry next tick. Opens (buys) are allowed — a buy
+        # is not the random-flip risk and blocking it would wedge deployment on a transient
+        # read error; the daily $ caps + dedup still bound it.
+        if signals.direction_of(new_intent) == "close":
+            return False, "gate_error_suppressed_reversal", None, proof
         return True, "gate_error_degraded", None, proof
 
 
@@ -380,8 +387,18 @@ def _run_plan(cfg, led, data) -> dict:
     # Used as the one price source for sizing/decision_price (and Phase 5 limit/stop).
     quotes = data.get("quotes", {}) or {}
 
-    baseline = led.get_or_create_baseline(day, equity, now_iso)
-    drop_pct = (equity - baseline.baseline_equity) / baseline.baseline_equity * 100.0
+    # Daily-loss halt must measure TOTAL account value (positions + idle cash), NOT the
+    # broker's positions-only `equity`. With positions-only, a big rebalance-buy day
+    # (cash -> positions) inflates the base and can MASK a real loss, and a big sell can
+    # trip the halt on a flat account. When itemized positions are present we recompute
+    # total = sum(market_value) + buying_power (matching construct's `deployable`); with no
+    # itemized positions we fall back to the passed `equity` (back-compat, classic path).
+    positions_mv_sum = sum(_to_float((p or {}).get("market_value")) or 0.0
+                           for p in positions.values())
+    total_equity = (positions_mv_sum + buying_power) if positions else equity
+    baseline = led.get_or_create_baseline(day, total_equity, now_iso)
+    drop_pct = ((total_equity - baseline.baseline_equity) / baseline.baseline_equity * 100.0
+                if baseline.baseline_equity else 0.0)
 
     result = {
         "halt": False,
@@ -389,7 +406,7 @@ def _run_plan(cfg, led, data) -> dict:
         "run_id": run_id,
         "intraday": cfg.intraday_enabled,
         "baseline_equity": baseline.baseline_equity,
-        "equity": equity,
+        "equity": total_equity,
         "drop_pct": round(drop_pct, 3),
         "dry_run": cfg.dry_run,
         "orders": [],
@@ -724,12 +741,16 @@ def _run_plan(cfg, led, data) -> dict:
             if held_mv == 0 and quote and held_qty:
                 held_mv = quote * held_qty
             td = _to_float(tw.get("target_dollars")) or 0.0
-            # Dollars to buy = room before this name hits its target weight (>=0), clamped
-            # by the per-trade ceiling, the remaining daily cap, and the running cash pool.
-            delta = signals.room_under_target(td, held_mv)
-            dollars = round(min(delta, cfg.risk.max_dollars_per_trade,
-                                remaining_daily_cap, avail_cash), 2)
-            if dollars < 1.0:
+            # Room before this name hits its target weight (>=0), bounded by the remaining
+            # daily cap and the running cash pool. The per-trade ceiling is applied PER
+            # TRANCHE below: a name whose room exceeds the ceiling is filled with multiple
+            # child orders THIS tick (each its own ref_id, each <= the ceiling), so a funded
+            # account reaches its target weight the same day instead of dribbling toward it
+            # over many ticks. Every clamp (per-trade ceiling, daily cap, running cash) stays
+            # intact across the loop — the SUM still can't exceed buying_power - buffer.
+            name_budget = round(min(signals.room_under_target(td, held_mv),
+                                    remaining_daily_cap, avail_cash), 2)
+            if name_budget < 1.0:
                 # <$1 is Robinhood's fractional minimum (also covers <=0). Skip pre-submit
                 # rather than send an order the broker bounces. At full deployment no book
                 # weight lands here; this only guards a genuinely tiny/at-target name.
@@ -739,25 +760,37 @@ def _run_plan(cfg, led, data) -> dict:
                     "ticker": ticker, "signal": "REBALANCE", "status": "skipped",
                     "intent": "buy", "detail": "rebalance_buy_below_min"})
                 continue
-            remaining_daily_cap -= dollars
-            avail_cash -= dollars
-            ref_id = None
-            if not cfg.dry_run:
-                ref_id = led.new_ref_id()
-                led.reserve_order(ref_id, day, ticker, side="buy", type="market",
-                                  dollar_amount=dollars, quantity=None, now_iso=now_iso,
-                                  order_kind="rebalance_buy")
-            result["orders"].append({
-                "ticker": ticker, "signal": "REBALANCE", "intent": "buy",
-                "ref_id": ref_id, "side": "buy", "type": "market",
-                "dollar_amount": dollars, "quantity": None,
-                "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
-                "sizing_source": "rebalance_target", "order_kind": "rebalance_buy"})
-            led.record_action(day, ticker, signal="REBALANCE", intent="buy",
-                              status="order", detail="rebalance_buy", now_iso=now_iso)
+            ceiling = cfg.risk.max_dollars_per_trade
+            tranches = 0
+            spent_name = 0.0
+            while (name_budget - spent_name) >= 1.0 and remaining_daily_cap >= 1.0 and avail_cash >= 1.0:
+                chunk = round(min(ceiling, name_budget - spent_name,
+                                  remaining_daily_cap, avail_cash), 2)
+                if chunk < 1.0:
+                    break
+                remaining_daily_cap -= chunk
+                avail_cash -= chunk
+                spent_name = round(spent_name + chunk, 2)
+                tranches += 1
+                ref_id = None
+                if not cfg.dry_run:
+                    ref_id = led.new_ref_id()
+                    led.reserve_order(ref_id, day, ticker, side="buy", type="market",
+                                      dollar_amount=chunk, quantity=None, now_iso=now_iso,
+                                      order_kind="rebalance_buy")
+                result["orders"].append({
+                    "ticker": ticker, "signal": "REBALANCE", "intent": "buy",
+                    "ref_id": ref_id, "side": "buy", "type": "market",
+                    "dollar_amount": chunk, "quantity": None,
+                    "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                    "sizing_source": "rebalance_target", "order_kind": "rebalance_buy",
+                    "tranche": tranches})
+            # One latest-state ticker_action snapshot + one decision summarizing the fill.
+            led.record_action(day, ticker, signal="REBALANCE", intent="buy", status="order",
+                              detail=f"rebalance_buy x{tranches}", now_iso=now_iso)
             result["decisions"].append({
-                "ticker": ticker, "signal": "REBALANCE", "status": "order",
-                "intent": "buy", "dollar_amount": dollars, "detail": "rebalance_buy"})
+                "ticker": ticker, "signal": "REBALANCE", "status": "order", "intent": "buy",
+                "dollar_amount": spent_name, "tranches": tranches, "detail": "rebalance_buy"})
 
     # Loop cadence: wake at the soonest re-look the model asked for (clamped),
     # snapped to market hours. The orchestrator schedules the next tick at this.
@@ -911,6 +944,7 @@ def _run_construct(cfg, led, data) -> dict:
     if not goal:
         return {"proceed": False, "reason": "no active strategy goal", "target_weights": {}}
     positions_in = data.get("positions", {}) or {}
+    quotes = {str(k).upper(): _to_float(v) for k, v in (data.get("quotes") or {}).items()}
     positions_mv = {str(tk).upper(): (_to_float((pos or {}).get("market_value")) or 0.0)
                     for tk, pos in positions_in.items()}
     # Size the book against TOTAL DEPLOYABLE capital, not just held equity. The broker's
@@ -993,8 +1027,30 @@ def _run_construct(cfg, led, data) -> dict:
             calib = calibrate.build_calibration(
                 led, [c["ticker"] for c in candidates],
                 min_n=int(cfg.strategy.learning.min_resolved_n))
+            # D3 (temporal consistency): a conviction-driven EXIT (Sell) on a name we already
+            # hold is a potential cross-day REVERSAL ("bought day 1, sold day 2"). Route it
+            # through the SAME memory-grounded consistency gate the discrete path uses; when it
+            # is ungrounded (no verified stop/target firing and no budgeted new catalyst) the
+            # name is pinned at its prior weight (hold_floor) instead of being cut to 0. Large
+            # TRIMS are NOT gated here (per the Moderate-stickiness decision) — the allocator's
+            # EWMA smoothing damps those. Best-effort: a gate hiccup just omits the floor.
+            hold_floors: dict = {}
+            if cfg.risk.consistency_enabled:
+                for c in candidates:
+                    tk = c["ticker"]
+                    a = analyses_map.get(tk)
+                    if not a or str(a.get("signal") or "") != "Sell" or c["prior_weight"] <= 0:
+                        continue
+                    try:
+                        allowed, reason, _t, _p = _consistency_context(
+                            cfg, led, tk, "sell", quotes.get(tk), a.get("basis"), None, None)
+                        if not allowed:
+                            hold_floors[tk] = c["prior_weight"]
+                    except Exception:  # noqa: BLE001 — gate is best-effort; never blocks construct
+                        pass
             alloc = allocate.allocate_targets(
-                candidates, analyses_map, calibration=calib, regime_scalar=rscalar, policy=policy)
+                candidates, analyses_map, calibration=calib, regime_scalar=rscalar,
+                policy=policy, hold_floors=hold_floors)
             new_targets = []
             for t in targets:
                 tk = str(t["ticker"]).upper()

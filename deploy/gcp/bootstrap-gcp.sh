@@ -25,7 +25,7 @@ put() {  # $1 = key, $2 = value
 }
 
 echo "[1] secrets from .env -> Secret Manager"
-for k in GLM_API_KEY RH_ACCOUNT_NUMBER NOTIFY_TO RESEND_API_KEY RESEND_FROM NOTIFY_ALERTS_TO CLAUDE_CODE_OAUTH_TOKEN; do
+for k in GLM_API_KEY DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER NOTIFY_TO RESEND_API_KEY RESEND_FROM NOTIFY_ALERTS_TO CLAUDE_CODE_OAUTH_TOKEN; do
   v="${!k:-}"; { [ -n "$v" ] && put "$k" "$v"; } || echo "  $k: (empty in .env, skipped)"
 done
 

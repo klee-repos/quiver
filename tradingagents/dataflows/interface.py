@@ -23,6 +23,7 @@ from .alpha_vantage import (
     get_global_news as get_alpha_vantage_global_news,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from .errors import DataUnavailableError
 
 # Configuration and routing logic
 from .config import get_config
@@ -156,7 +157,7 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+        except (AlphaVantageRateLimitError, DataUnavailableError):
+            continue  # a rate limit OR a real data-unavailable failure -> try next vendor
 
     raise RuntimeError(f"No available vendor for '{method}'")

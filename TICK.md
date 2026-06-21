@@ -294,17 +294,26 @@ and look for one matching its `ref_id`. If it already exists at the broker → c
 ## STEP 6b — Resolve decision outcomes (memory; best-effort)
 
 Only if STEP 1 reported a non-empty `pending_outcomes`. For each entry, you already
-have its `ticker`; gather the current data you fetched in STEP 2 (and fetch
-`get_equity_quotes` for any pending-outcome ticker not in this wake's snapshot):
+have its `ticker` and its `trade_date`; gather the current data you fetched in STEP 2
+(and fetch `get_equity_quotes` for any pending-outcome ticker not in this wake's snapshot):
 - `price_now` = the ticker's latest quote price.
 - `position_market_value` + `position_cost_basis` from `get_equity_positions` IF the
   ticker is currently held (else omit — directional-only scoring).
+- `realized_pnl` = the broker's realized P&L for the name IF the position was CLOSED/reduced
+  since the decision (else omit). This closes the "did it actually make money" leg.
+- `benchmark_return` = the **market benchmark's** fractional return over the SAME window as
+  the decision (decision `trade_date` → now). Fetch `get_equity_historicals("SPY", ...)`
+  ONCE this wake, then for each resolution compute `(spy_now - spy_on_trade_date)/spy_on_trade_date`.
+  Passing this makes the memory loop score **alpha (skill), not market beta** — a long that
+  merely rode a rising tape is no longer counted as a "win." Omit only if SPY history is
+  unavailable (then it scores on absolute return, as before).
 
 Write `state/tmp/reflect_input.json`:
 ```json
 {"resolutions": [
-  {"decision_id": <id>, "price_now": <quote>,
-   "position_market_value": <or omit>, "position_cost_basis": <or omit>}
+  {"decision_id": <id>, "price_now": <quote>, "benchmark_return": <SPY window return or omit>,
+   "position_market_value": <or omit>, "position_cost_basis": <or omit>,
+   "realized_pnl": <or omit>}
 ]}
 ```
 Run (best-effort — a reflect error is NOT a tick error; log `REFLECT_SKIPPED <error>`):

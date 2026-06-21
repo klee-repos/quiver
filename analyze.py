@@ -153,14 +153,58 @@ def parse_pm_field_float(decision_text: str, label: str):
     return float(m.group(1)) if m else None
 
 
+# Sentinels a degraded fetcher leaves in a report. A report that merely CONTAINS one of
+# these (or is near-empty) is NOT usable data — treating it as present is the fail-OPEN bug.
+_DATA_ERROR_SENTINELS = ("error retrieving", "no data found", "no price data",
+                         "data unavailable", "dataunavailableerror", "could not retrieve",
+                         "no data for")
+
+
+def _report_available(report) -> bool:
+    """True only when a curated analyst report is real, usable data — not empty, not an
+    error sentinel. Used to decide data-quality + the fail-SAFE core-data ERROR override."""
+    t = str(report or "").strip().lower()
+    if len(t) < 40:                       # empty / near-empty -> unusable
+        return False
+    return not any(s in t for s in _DATA_ERROR_SENTINELS)
+
+
+def assess_data_quality(final_state: dict) -> dict:
+    """Per-decision data-completeness, sentinel-aware. CORE = market_report (prices +
+    indicators): without it you cannot even size, so a missing/errored market report
+    fails the analysis SAFE (signal:ERROR -> the allocator holds the prior weight, never
+    trades on garbage). Fundamentals/news/sentiment missing is recorded (the calibration
+    can later down-weight thin-data calls) but is NOT on its own a trade-blocker — many
+    book names are ETFs with intentionally sparse fundamentals."""
+    market = _report_available(final_state.get("market_report"))
+    sentiment = _report_available(final_state.get("sentiment_report"))
+    news = _report_available(final_state.get("news_report"))
+    fundamentals = _report_available(final_state.get("fundamentals_report"))
+    avail = {"market": market, "sentiment": sentiment, "news": news, "fundamentals": fundamentals}
+    return {
+        **avail,
+        "core_available": market,
+        "sources_unavailable": sorted(k for k, ok in avail.items() if not ok),
+    }
+
+
 def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
     plan_text = str(final_state.get("trader_investment_plan") or "")
     plan = parse_trader_plan(plan_text)
     final_decision = str(final_state.get("final_trade_decision") or "")
     summary = re.sub(r"\s+", " ", final_decision).strip()[:600]
-    return {
+    dq = assess_data_quality(final_state)
+    # FAIL SAFE: if the CORE market/price data was unavailable this run, refuse to emit a
+    # tradable signal no matter what the model said — downgrade to ERROR so the execution
+    # layer records a skip and the allocator holds the prior weight (never trades on garbage
+    # data dressed up as a confident Buy/Sell). Records why, for the audit trail.
+    out_signal, out_error = signal, None
+    if not dq["core_available"]:
+        out_signal = "ERROR"
+        out_error = f"core data unavailable: missing {','.join(dq['sources_unavailable']) or 'market'}"
+    fields = {
         "ticker": ticker,
-        "signal": signal,  # deterministic: Buy/Overweight/Hold/Underweight/Sell
+        "signal": out_signal,  # deterministic: Buy/Overweight/Hold/Underweight/Sell (or ERROR on bad data)
         "action": plan["action"],
         "position_sizing": plan["position_sizing"],
         "position_pct": plan["position_pct"],   # structured sizing (% of equity); preferred over prose
@@ -182,19 +226,17 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
         # them (the allocator then falls back to a rating-implied default).
         "conviction": parse_pm_field_float(final_decision, "Conviction"),
         "uncertainty": parse_pm_field_float(final_decision, "Uncertainty"),
-        # Per-decision data-completeness flags (which analyst reports were produced this
-        # run). Deterministic, derived from the curated report set — NOT a model field.
-        # Persisted on the decision row so a thin-data call is auditable; the allocator
-        # may later damp conviction when key reports are missing.
-        "data_quality": json.dumps({
-            "market": bool(final_state.get("market_report")),
-            "sentiment": bool(final_state.get("sentiment_report")),
-            "news": bool(final_state.get("news_report")),
-            "fundamentals": bool(final_state.get("fundamentals_report")),
-        }),
+        # Per-decision data-completeness flags (sentinel-aware: a report containing an
+        # "Error retrieving…" sentinel or near-empty counts as UNAVAILABLE, not present).
+        # Deterministic, derived from the curated report set — NOT a model field. Persisted
+        # on the decision row so a thin-data call is auditable; the allocator may damp
+        # conviction / hold prior when key reports are missing.
+        "data_quality": json.dumps(dq),
+        "error": out_error,   # populated only on the fail-SAFE core-data ERROR override
         "rationale_summary": summary,
         "schema": 1,
     }
+    return fields
 
 
 def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
@@ -212,10 +254,14 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
 
 def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
                  past_context_compact: str = "") -> dict:
-    from lib.ds_config import build_glm_config
+    from lib.ds_config import build_agents_config
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-    ta_cfg = build_glm_config(cfg.chat_model, cfg.reasoner_model, state_dir=str(STATE))
+    ta_cfg = build_agents_config(
+        cfg.chat_model, cfg.chat_provider,
+        cfg.reasoner_model, cfg.reasoner_provider,
+        state_dir=str(STATE),
+    )
     # Send all framework stdout noise to stderr (so our stdout stays JSON-only)
     # AND tee it to logs/reasoning/<date>_<TICKER>.log so the live thinking is
     # watchable (`tail -f`) and durable. The tee is best-effort; stdout is never

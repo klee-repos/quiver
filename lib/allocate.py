@@ -227,9 +227,12 @@ def allocate_targets(
         if t in smoothed:
             smoothed[t] = max(smoothed[t], fl)
 
-    # Per-name caps + water-fill — only conviction names absorb spillover (a held /
-    # hold-prior name must not be inflated by a capped peer's excess; it falls to cash).
-    capped = _apply_caps(smoothed, per_cap, hold_floors, recipients=set(conv_score))
+    # Per-name caps + water-fill — only names with POSITIVE conviction absorb spillover. A
+    # held / hold-prior name (no fresh opinion) and a Sell / zero-conviction name must NOT be
+    # inflated by a capped peer's excess (that would re-grow a name the analysis wants OUT);
+    # the unabsorbed excess falls to cash instead.
+    capped = _apply_caps(smoothed, per_cap, hold_floors,
+                         recipients={t for t, s in conv_score.items() if s > 0})
 
     # Per-sleeve cap: clip each sleeve's total, push excess to cash (do not water-fill
     # across sleeves — that would defeat the concentration limit).

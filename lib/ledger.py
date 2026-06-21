@@ -277,6 +277,9 @@ class Ledger:
     @contextmanager
     def _conn(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
+        # Wait up to 30s for a busy DB instead of erroring immediately, so two overlapping
+        # ticks (or the supervisor + a manual run) serialize cleanly rather than one crashing.
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
         try:
             yield conn
@@ -703,7 +706,7 @@ class Ledger:
         skip_clause = "AND COALESCE(d.intent,'') != 'skip' " if exclude_skips else ""
         with self._conn() as c:
             return [dict(r) for r in c.execute(
-                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.intent, d.decision_price, "
+                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.intent, d.basis, d.decision_price, "
                 "o.directional_return, o.alpha, o.holding_days, o.realized_pnl "
                 "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
                 "WHERE o.directional_return IS NOT NULL " + skip_clause +
@@ -1156,21 +1159,38 @@ class Ledger:
 
     def try_acquire_run_lock(self, holder: str, now_iso: str, ttl_seconds: int = 3600) -> bool:
         """Acquire the single-row run lock. Steals a STALE lock (held longer than
-        the TTL, which exceeds any real tick wall-clock). Returns True on acquire."""
-        with self._conn() as c:
-            row = c.execute("SELECT holder, acquired_at FROM run_lock WHERE id=1").fetchone()
+        the TTL, which exceeds any real tick wall-clock). Returns True on acquire.
+
+        ATOMIC: the read-check-write runs inside a ``BEGIN IMMEDIATE`` transaction, so the
+        DB write lock is taken BEFORE the SELECT. Without it, two overlapping ticks could
+        both read "stale/empty" and both steal/insert the lock (a check-then-act race) —
+        exactly the double-tick the lock exists to prevent. A process that can't get the
+        write lock within busy_timeout returns False (treated as "someone else holds it")."""
+        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT holder, acquired_at FROM run_lock WHERE id=1").fetchone()
             if row is not None:
                 try:
                     age = (datetime.fromisoformat(now_iso)
-                           - datetime.fromisoformat(row["acquired_at"])).total_seconds()
+                           - datetime.fromisoformat(row[1])).total_seconds()
                 except (TypeError, ValueError):
                     age = ttl_seconds + 1
                 if age < ttl_seconds:
+                    conn.execute("ROLLBACK")
                     return False
-                c.execute("UPDATE run_lock SET holder=?, acquired_at=? WHERE id=1", (holder, now_iso))
-                return True
-            c.execute("INSERT INTO run_lock (id, holder, acquired_at) VALUES (1, ?, ?)", (holder, now_iso))
+                conn.execute("UPDATE run_lock SET holder=?, acquired_at=? WHERE id=1", (holder, now_iso))
+            else:
+                conn.execute("INSERT INTO run_lock (id, holder, acquired_at) VALUES (1, ?, ?)",
+                             (holder, now_iso))
+            conn.execute("COMMIT")
             return True
+        except sqlite3.OperationalError:
+            # Couldn't take the write lock in time -> another tick holds it; not acquired.
+            return False
+        finally:
+            conn.close()
 
     def release_run_lock(self, holder: str) -> None:
         with self._conn() as c:

@@ -344,6 +344,31 @@ def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False)
             parts.append(render_metric_block(bundle[key]))
         except Exception:  # noqa: BLE001
             pass
+    # Cross-sectional 'what KIND of call wins' (T8): slice ALL resolved, position-taking
+    # decisions by strategy basis (and by sleeve/sector) so the model learns which thesis
+    # categories actually pay — per-ticker recall can't show this because names rotate. Read-
+    # only, portfolio-wide; its own try/except so a hiccup never shrinks the proven blocks
+    # above. Skipped in compact mode (upstream agents) to keep that prompt lean.
+    if not compact:
+        try:
+            rows = led.all_return_series()
+            basis_block = memory.build_sliced_scorecard(rows, "basis", "strategy basis")
+            if basis_block:
+                parts.append(basis_block)
+            try:
+                goal = led.get_active_goal()
+                if goal:
+                    sleeve_of = {r["ticker"]: r.get("sleeve") for r in led.active_target_portfolio(
+                        goal["id"], statuses=("active", "exiting", "removed"))}
+                    for r in rows:
+                        r["sleeve"] = sleeve_of.get(r.get("ticker"))
+                    sleeve_block = memory.build_sliced_scorecard(rows, "sleeve", "sleeve/sector")
+                    if sleeve_block:
+                        parts.append(sleeve_block)
+            except Exception:  # noqa: BLE001 — sleeve annotation is a courtesy
+                pass
+        except Exception:  # noqa: BLE001 — cross-sectional slice is best-effort
+            pass
     # 4th block: the read-only strategy/goal target context (decision D2). Its own
     # try/except, so a strategy hiccup can never shrink the proven scorecard/risk
     # context above. '' when there is no target (ticker not in book / layer inactive).
