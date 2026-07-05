@@ -7,6 +7,12 @@
 # (those are in .env) and IS committed.
 strategy.yaml
 
+# Per-box evolving strategy narrative — the bot appends dated learning notes to §7 on each
+# review, so the live copy diverges from the repo. Untracked so a code sync (update.sh's
+# clean-tree check) can never block on it or clobber it; a fresh box seeds it from the
+# committed STRATEGY.md.example (setup.sh). Not secret — just per-box, like strategy.yaml.
+STRATEGY.md
+
 # Runtime state & logs
 state/
 logs/

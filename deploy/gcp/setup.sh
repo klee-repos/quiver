@@ -129,6 +129,15 @@ seed_yaml() {  # $1=secret id  $2=dest  $3=example
 }
 seed_yaml STRATEGY_YAML "$QUIVER_HOME/strategy.yaml" "$QUIVER_HOME/strategy.yaml.example"
 
+# STRATEGY.md (the human-readable narrative the agent appends learnings to) is per-box +
+# gitignored like strategy.yaml, but it is NOT secret — seed it from the committed example if
+# absent so a fresh box starts with the "## 7. Agent learnings" section the append writer needs.
+[ -f "$QUIVER_HOME/STRATEGY.md" ] || {
+  cp "$QUIVER_HOME/STRATEGY.md.example" "$QUIVER_HOME/STRATEGY.md"
+  chown "$QUIVER_USER:$QUIVER_USER" "$QUIVER_HOME/STRATEGY.md"
+  echo "  STRATEGY.md <- seeded from example"
+}
+
 echo "[7/9] systemd units + timer"
 cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service
 cp "$QUIVER_HOME/deploy/quiver.timer" /etc/systemd/system/quiver.timer

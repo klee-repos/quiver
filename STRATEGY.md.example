@@ -29,18 +29,14 @@ powder, and size everything so a bad year is survivable, not terminal.
 
 - **Win small / lose less.** At a CAPE ~40 valuation the base case is modest; the
   edge is selection + a fat cash buffer, not leverage.
-- **De-concentrate.** Spread the engine across semis, AI-power/uranium, value/
-  defensive, emerging markets, and a capped crypto kicker — but know they're *one*
-  AI/rate/liquidity bet that moves together on a Fed hike.
+- **De-concentrate.** Spread the engine across the sleeves the book defines — but
+  know they're *one* AI/rate/liquidity bet that moves together on a Fed hike.
 - **Cash is the only ballast** (no bonds/TIPS/gold). It funds the dips the macro is
   likely to hand us.
 
 ## 3. Macro thesis (current regime view — edit as the world changes)
-- **As of 2026-06-13.** CAPE ~40 (2nd-highest in 140 years); hawkish Fed under Warsh
-  (0 cuts priced, ~45–57% odds of a 2026 hike); 10-yr ~4.5%; crypto mid-bear.
-- **Base case across all sleeves is only ~+6%.** +15% is reached *only* in a
-  bull-tilted, Fed-pivot year — the pivot is THE catalyst that lights semis +
-  uranium + EM + crypto at once.
+- Fill in the current CAPE / Fed / rates / regime read here.
+- State the base case across sleeves and what has to happen to clear +15%.
 - **Triggers (operator-supplied data; the bot can't fetch macro):**
   - **DEPLOY** when core PCE rolls toward **≤2.5%** → recommend the dial-up book.
   - **STAND DOWN** when core PCE breaks **≥3.5%**, or the Fed hikes → de-risk to the
@@ -48,13 +44,10 @@ powder, and size everything so a bad year is survivable, not terminal.
 - **Watch:** the FOMC dot plot, core PCE, CPI prints.
 
 ## 4. The books (exact weights in `strategy.yaml`)
-- **`core_55_45` (default, ~55% engine / 45% cash):** SMH, SOXX (semis); URA, GRID
-  (uranium/power); XLV, RSP (value/defensive); EEM (EM); IBIT, ETHA (crypto via spot
-  ETFs); SOL (held in cash — not MCP-tradable yet); SGOV (cash).
-- **`dial_up_63_37` (OFF by default):** the same engine dialed up, for a confirmed
+- **default book:** describe the engine sleeves + the cash anchor (mirrors the
+  default book in `strategy.yaml`).
+- **dial-up book (OFF by default):** the same engine dialed up, for a confirmed
   dovish-pivot regime. Activating it requires an explicit flag — fail-safe.
-- **Crypto rule:** exposure is the asset or a spot-ETF wrapper (IBIT/ETHA), **never**
-  a crypto-treasury or miner stock.
 
 ## 5. Allocation rules
 - Rebalance only when a holding drifts outside its band (no churn inside it).
@@ -76,8 +69,4 @@ holdings are pulling their weight vs. the thesis, and any add/remove/de-risk it 
 proposing. Risky universe changes still require your approval before they touch
 `strategy.yaml`.)*
 
-- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
-- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
-- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
-- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
-- **2026-06-14** — [PROPOSE_DERISK] BOOK (derisk) — macro STAND_DOWN reading -> de-risk the engine toward cash
+- _(none yet)_
