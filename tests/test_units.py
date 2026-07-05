@@ -124,8 +124,11 @@ def _write_config(d: dict) -> str:
 
 def make_config(notify_block=None):
     import os as _os  # env-isolate: ambient NOTIFY_TO/NOTIFY_ALERTS_TO take precedence
-    for _k in ("NOTIFY_TO", "NOTIFY_ALERTS_TO"):
-        _os.environ.pop(_k, None)
+    # Snapshot + restore so this isolation does not LEAK to later tests: the offline
+    # healthcheck (and any test that loads the real config.yaml with notify.enabled:true)
+    # resolves notify.to from NOTIFY_TO, so a permanent pop here would break it.
+    _saved = {_k: _os.environ.pop(_k) for _k in ("NOTIFY_TO", "NOTIFY_ALERTS_TO")
+              if _k in _os.environ}
     d = {
         "account_number": "12345678",
         "dry_run": True,
@@ -137,7 +140,10 @@ def make_config(notify_block=None):
     }
     if notify_block is not None:
         d["notify"] = notify_block
-    return load_config(_write_config(d))
+    try:
+        return load_config(_write_config(d))
+    finally:
+        _os.environ.update(_saved)
 
 
 def _tmp_ledger():
