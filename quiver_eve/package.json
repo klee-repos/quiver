@@ -1,0 +1,22 @@
+{
+  "name": "quiver-eve",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Quiver EVE deep-research brain: replaces the tradingagents framework. Emits the exact **Label**: value markdown contract analyze.py parses.",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "eve dev",
+    "start": "eve start",
+    "info": "eve info",
+    "test": "node test/contract.test.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.8",
+    "ai": "latest",
+    "eve": "latest",
+    "zod": "latest"
+  }
+}

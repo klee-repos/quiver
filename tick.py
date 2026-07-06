@@ -633,11 +633,32 @@ def _run_plan(cfg, led, data) -> dict:
                 result["decisions"].append(decision)
 
         elif intent == "sell":
-            qty = signals.resolve_sell_quantity(held_qty, frac)
+            # Book-driven trim: when the rebalance layer owns sizing and this name
+            # is in the book, the rebalance trim/exit pass below OWNS its sizing —
+            # it trims toward the allocator's target weight (which already lowered
+            # for this Underweight/Sell), not the model's blunt 0.5-half. Suppress
+            # the model trim here so a name is trimmed to its (lower) target, not
+            # to half, and isn't bought back next tick. Symmetric with
+            # deferred_to_rebalance_buy above. Only fires when rebalance is on AND
+            # a goal seeded target_weights (else target_weights is None -> classic
+            # path byte-identical). The consistency gate already ran above, so its
+            # verdict + proof are already persisted with this decision.
+            if target_weights and ticker in target_weights:
+                led.record_action(day, ticker, signal=signal, intent="sell", status="skipped",
+                                  detail="deferred_to_rebalance_trim", now_iso=now_iso)
+                decision.update(status="skipped", intent="sell", detail="deferred_to_rebalance_trim")
+                result["decisions"].append(decision)
+                continue
+            raw_qty = signals.resolve_sell_quantity(held_qty, frac)
+            qty, sreason = signals.resolve_sell_quantity_min_notional(held_qty, raw_qty, quote)
             if qty <= 0:
+                # Sub-$1 trim (RH rejects fractional orders under $1) or nothing to
+                # sell. Skip cleanly rather than send an order the broker bounces
+                # — mirror of the buy path's rebalance_buy_below_min guard.
+                detail = "nothing_to_sell" if sreason == "skip_nothing" else f"sell_below_min:{sreason}"
                 led.record_action(day, ticker, signal=signal, intent="sell",
-                                  status="skipped", detail="nothing to sell", now_iso=now_iso)
-                decision.update(status="skipped", intent="sell", detail="nothing_to_sell")
+                                  status="skipped", detail=detail, now_iso=now_iso)
+                decision.update(status="skipped", intent="sell", detail=detail)
                 result["decisions"].append(decision)
                 continue
             # Any resting GTC protective stop MUST be cancelled before selling, or
@@ -674,10 +695,25 @@ def _run_plan(cfg, led, data) -> dict:
     sell_map = data.get("target_weights") or {}
     if (sell_map and not result["halt"]
             and (cfg.risk.rebalance_enabled or cfg.risk.reconcile_unmanaged)):
-        handled = {d.get("ticker") for d in result["decisions"]}
+        # Dedup on names that actually got an ORDER this tick (not every analyzed
+        # decision). A deferred-to-rebalance LLM sell (detail deferred_to_rebalance_trim)
+        # records a SKIPPED decision but places NO order, so it must NOT block the
+        # rebalance trim pass below — the book owns that trim now. Keying on orders
+        # (like the buy pass's `ordered` set) keeps the classic double-sell guard: an
+        # LLM `exit` order already placed for a ticker stays excluded here. The
+        # (date,ticker) `already_acted` dedup is the second, cross-tick guard.
+        handled = {o.get("ticker") for o in result["orders"]}
+        # Names the consistency gate SUPPRESSED this tick (an ungrounded reversal) are
+        # hands-off for the SELL pass too: construct may have lowered this name's target
+        # (Underweight -> halved conviction -> trim) and that target would otherwise
+        # re-trim a name the gate just told to hold — silently overriding the gate (which
+        # by invariant can only ever suppress a trade). Symmetric with the buy pass's
+        # `suppressed` set. A plain Hold (detail "hold") is NOT in this set.
+        suppressed = {str(d.get("ticker")).upper() for d in result["decisions"]
+                      if str(d.get("detail") or "").startswith("consistency:")}
         for raw_ticker, tw in sell_map.items():
             ticker = str(raw_ticker).upper()
-            if ticker in handled or led.already_acted(day, ticker):
+            if ticker in handled or ticker in suppressed or led.has_trade_like_action(day, ticker):
                 continue
             is_orphan = bool(tw.get("orphan"))
             intent = tw.get("intent")
@@ -696,17 +732,28 @@ def _run_plan(cfg, led, data) -> dict:
             if held_mv == 0 and quote and held_qty:
                 held_mv = quote * held_qty
             full_exit = is_orphan or intent == "exit"
-            qty = signals.resolve_target_sell_quantity(
-                held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
-                full_exit=full_exit)
-            if qty <= 0:
-                continue
-            cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
             if is_orphan:
                 order_kind, signal = "reconcile_exit", "RECONCILE"
             else:
                 order_kind = "rebalance_exit" if full_exit else "rebalance_trim"
                 signal = "REBALANCE"
+            raw_qty = signals.resolve_target_sell_quantity(
+                held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
+                full_exit=full_exit)
+            qty, sreason = signals.resolve_sell_quantity_min_notional(held_qty, raw_qty, quote)
+            if qty <= 0:
+                # Sub-$1 trim/exit (RH rejects fractional orders under $1) — most
+                # often a whole position under the floor (unstoppable dust). Skip
+                # cleanly with an auditable row (and dedup-correct: already_acted
+                # becomes true, so we don't re-attempt the same dust every tick),
+                # mirroring the buy path's rebalance_buy_below_min. Never an error.
+                led.record_action(day, ticker, signal=signal, intent="sell", status="skipped",
+                                  detail=f"sell_below_min:{sreason}", now_iso=now_iso)
+                result["decisions"].append({
+                    "ticker": ticker, "signal": signal, "status": "skipped",
+                    "intent": "sell", "detail": f"sell_below_min:{sreason}"})
+                continue
+            cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
             ref_id = None
             if not cfg.dry_run:
                 ref_id = led.new_ref_id()
@@ -1194,7 +1241,7 @@ def _run_learn_review(cfg, led, data) -> dict:
     # no sleeve screens yields no ADDs: discovery is enabled by DATA (define a screen), not a
     # flag. A missing provider / yfinance error degrades to no ADDs.
     try:
-        from tradingagents.dataflows.screener_data import yfinance_candidate_provider as add_provider
+        from lib.screener_data import yfinance_candidate_provider as add_provider
     except Exception:  # noqa: BLE001 — discovery is optional; never break the review
         add_provider = None
     ps = learn.build_proposals(led, goal["id"], learning, macro_regime, progress,

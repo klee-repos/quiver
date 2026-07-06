@@ -294,6 +294,10 @@ class Ledger:
             self._migrate_notifications(c)
             self._migrate_decisions(c)
             self._migrate_thesis_state(c)
+            # Self-learning tail (lib/levers): eval-lever registry + uses. Owns
+            # its own schema so it can evolve independently of the core tables.
+            from lib import levers
+            levers.ensure_schema(c)
 
     @staticmethod
     def _migrate_decisions(c) -> None:
@@ -442,6 +446,23 @@ class Ledger:
         with self._conn() as c:
             row = c.execute(
                 "SELECT 1 FROM ticker_action WHERE trade_date=? AND ticker=?",
+                (trade_date, ticker),
+            ).fetchone()
+            return row is not None
+
+    # A "trade-like" action: one that actually moved the book (order/placed/dry_run),
+    # NOT a skip/defer/error. The rebalance SELL pass uses this (not the broader
+    # already_acted) so a name DEFERRED to it (status "skipped",
+    # detail "deferred_to_rebalance_trim") is NOT blocked from being trimmed by the
+    # book this tick — the deferral is a signal, not a placed trade. Preflight's
+    # per-day dedup still uses the broad already_acted (any row => acted).
+    _TRADE_LIKE_STATUSES = ("order", "placed", "dry_run")
+
+    def has_trade_like_action(self, trade_date: str, ticker: str) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM ticker_action WHERE trade_date=? AND ticker=? "
+                "AND status IN ('order','placed','dry_run')",
                 (trade_date, ticker),
             ).fetchone()
             return row is not None

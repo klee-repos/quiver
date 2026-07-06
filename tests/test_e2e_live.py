@@ -117,6 +117,15 @@ def main() -> int:
        bool(a.get("basis")), f"basis={a.get('basis')!r}")
     print(f"    -> signal={a.get('signal')}  basis={a.get('basis')!r}  "
           f"catalyst={a.get('catalyst')!r}  target_price={a.get('target_price')}")
+    # Thinking-mode regression guard (survivor #4): the EVE brain's deep role
+    # (GLM-5.2) MUST reason — the provider reports reasoning_tokens, which
+    # decide.mjs surfaces as reasoning_content_len. A silent thinking-OFF
+    # regression (an ai-SDK/OpenRouter change dropping reasoning) makes this 0;
+    # the bot would trade real money on a degraded reasoner with no alert.
+    # F8 made EVE the only brain, so this always asserts.
+    ok("live: GLM reasoning_content present for deep role (thinking ON)",
+       int(a.get("reasoning_content_len") or 0) > 0,
+       f"reasoning_content_len={a.get('reasoning_content_len')}")
 
     # --- (iv) the REAL output through the REAL plan gate; verdict is internally consistent ---
     intent, _ = signals.plan_action(a["signal"], has_position=True)

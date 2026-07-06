@@ -34,4 +34,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["tradingagents*"]
+include = ["lib*"]

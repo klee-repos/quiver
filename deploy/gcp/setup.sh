@@ -23,11 +23,24 @@ if ! swapon --show 2>/dev/null | grep -q .; then
     || echo "  NOTE: swap setup skipped/failed (non-fatal)"
 fi
 
-echo "[2/9] Node 20 (the claude CLI runtime)"
-command -v node >/dev/null || { curl -fsSL https://deb.nodesource.com/setup_20.x | bash - ; apt-get install -y nodejs ; }
+echo "[2/9] Node 24 (claude CLI runtime + the EVE brain runtime; eve engines.node>=24)"
+# Idempotent: ensure Node 24 is present (the EVE brain requires >=24; claude CLI runs on 24).
+# We do NOT gate on `command -v node` (that would keep an old Node 20 on an already-provisioned box).
+_ensure_node24() {
+  if command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 24 ] 2>/dev/null; then return 0; fi
+  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+  apt-get install -y nodejs
+}
+_ensure_node24
 
-echo "[3/9] claude CLI"
+echo "[3/9] claude CLI + EVE brain deps"
 npm i -g @anthropic-ai/claude-code
+# The EVE brain (quiver_eve/) is committed; install its deps at provision time.
+# node_modules/ is gitignored. npm ci = reproducible from the lockfile once it exists;
+# npm install (no lock yet) is fine for the first provision.
+if [ -f "$QUIVER_HOME/quiver_eve/package.json" ]; then
+  ( cd "$QUIVER_HOME/quiver_eve" && { npm ci 2>/dev/null || npm install --omit=dev; } )
+fi
 
 echo "[4/9] (no cloud CLI on the box — secrets read via the metadata token + Secret Manager REST)"
 

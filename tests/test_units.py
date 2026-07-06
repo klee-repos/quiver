@@ -111,6 +111,37 @@ check("never oversell", signals.resolve_sell_quantity(3.0, 2.0), 3.0)
 check("nothing held", signals.resolve_sell_quantity(0.0, 1.0), 0.0)
 
 
+# --- resolve_sell_quantity_min_notional (sub-$1 fractional sell guard) ---
+# RH rejects any fractional order with notional < $1. A model trim on a thin
+# position can land below that floor; we bump the qty UP to clear $1 (clamped to
+# held), or skip cleanly when the WHOLE position is under the floor (dust).
+_mn = signals.resolve_sell_quantity_min_notional
+# trim already clears $1 -> unchanged
+check("trim clears floor", _mn(2.0, 1.0, 140.0), (1.0, "trim"))
+# trim under $1 but whole position >= $1 -> bumped to 1/quote, clamped to held
+check("bumped to $1", _mn(0.02, 0.005, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+# bumped qty never exceeds held (long-only invariant): a $1 bump would need more
+# than held -> capped at held. Here held=0.008 (=$1.12, whole >= $1) but the
+# cheapest qty clearing $1 is 1/140=0.007143 (< held), so we bump to 0.007143.
+check("bump clamped to held", _mn(0.008, 0.004, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+# whole position under $1 (dust) -> skip_dust, no error
+check("dust whole pos <$1", _mn(0.004, 0.002, 140.0), (0.0, "skip_dust"))  # 0.004*140=$0.56
+# no usable quote -> defensive skip (never synthesize a price to force a sell)
+check("no quote -> skip", _mn(2.0, 1.0, None), (0.0, "skip_no_quote"))
+check("zero quote -> skip", _mn(2.0, 1.0, 0.0), (0.0, "skip_no_quote"))
+# nothing held / nothing to trim
+check("nothing held", _mn(0.0, 1.0, 140.0), (0.0, "skip_nothing"))
+check("nothing to trim", _mn(2.0, 0.0, 140.0), (0.0, "skip_nothing"))
+# custom floor ($2) respected
+check("custom $2 floor", _mn(0.02, 0.005, 140.0, min_notional=2.0),
+      (round(2.0 / 140.0, 6), "bumped_to_min"))
+# held just over the floor: whole pos >= $1 so not dust; bump to the cheapest qty
+# clearing $1 (1/140=0.007143), which is < held (0.0072) -> a sliver stays.
+check("bump leaves sliver", _mn(0.0072, 0.003, 140.0),
+      (round(1.0 / 140.0, 6), "bumped_to_min"))  # 0.007143*140=$1.00; 0.0072-0.007143 dust stays
+
+
+
 # ============================ EMAIL DIGEST ==================================
 import copy  # noqa: E402
 
@@ -594,21 +625,19 @@ check("return-series excludes skip rows", [r["id"] for r in _ser], [_sk_buy])
 check("return-series carries alpha", _ser[0]["alpha"], 0.01)
 check("return-series can opt back into skips", len(_skled.ticker_return_series("NVDA", exclude_skips=False)), 2)
 
-# --- T3: conviction primitive (schema render + parse + persist) -------------
-from tradingagents.agents.schemas import (PortfolioDecision, render_pm_decision,  # noqa: E402
-                                          PortfolioRating)
+# --- T3: conviction primitive (parse + persist) ----------------------------
+# (F8: the PortfolioDecision/render_pm_decision schema lived in tradingagents/,
+# now deleted. The same parse/extract/persist semantics are covered here against
+# a markdown fixture — the EVE brain emits the same **Label**: value lines.)
 import analyze as _analyze  # noqa: E402
-_pd = PortfolioDecision(rating=PortfolioRating.BUY, conviction=82, uncertainty=15,
-                        executive_summary="strong", investment_thesis="thesis")
-_pmd = render_pm_decision(_pd)
-check_true("render_pm_decision emits Conviction", "**Conviction**: 82" in _pmd)
-check_true("render_pm_decision emits Uncertainty", "**Uncertainty**: 15" in _pmd)
+_pmd = "**Rating**: Buy\n**Conviction**: 82\n**Uncertainty**: 15\nExecutive summary."
 check("parse conviction from PM markdown", _analyze.parse_pm_field_float(_pmd, "Conviction"), 82.0)
+check("parse uncertainty from PM markdown", _analyze.parse_pm_field_float(_pmd, "Uncertainty"), 15.0)
 _ef = _analyze.extract_fields({"trader_investment_plan": "**Action**: Buy", "final_trade_decision": _pmd}, "Buy", "SMH")
 check("extract_fields surfaces conviction", _ef["conviction"], 82.0)
 check("extract_fields surfaces uncertainty", _ef["uncertainty"], 15.0)
-_pd_none = PortfolioDecision(rating=PortfolioRating.HOLD, executive_summary="x", investment_thesis="y")
-check_true("conviction omitted when model gives none", "**Conviction**" not in render_pm_decision(_pd_none))
+# conviction omitted when the label is absent (model gave none)
+check("conviction None when label absent", _analyze.parse_pm_field_float("no labels here", "Conviction"), None)
 # persistence + migration round-trip
 _cvled = _tmp_ledger()
 _cvid = _cvled.record_decision(trade_date="2026-06-20", ticker="SMH",
@@ -1054,7 +1083,7 @@ check_true("signals.py never imports risk/reflect_memory (use-case-1/2 wall)",
 # import nodes (the modules describe the wall in their docstrings, so a text scan would
 # false-positive on "never import lib.risk").
 import ast as _ast  # noqa: E402
-_WALL_FORBIDDEN = {"lib.risk", "lib.signals", "lib.config"}
+_WALL_FORBIDDEN = {"lib.risk", "lib.signals", "lib.config", "lib.levers"}
 def _imported_modules(src: str) -> set:
     mods = set()
     for _node in _ast.walk(_ast.parse(src)):
@@ -1063,60 +1092,42 @@ def _imported_modules(src: str) -> set:
         elif isinstance(_node, _ast.ImportFrom) and _node.module:
             mods.add(_node.module)
     return mods
-for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py", "lib/screener.py"):
-    _src = (Path(__file__).resolve().parent.parent / _mod).read_text(encoding="utf-8")
+for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
+             "lib/screener.py", "lib/screener_data.py"):
+    _mp = Path(__file__).resolve().parent.parent / _mod
+    if not _mp.exists():
+        continue  # lib/screener_data.py lands at F8 (the gated retire step); until then skip
+    _src = _mp.read_text(encoding="utf-8")
     _bad = _imported_modules(_src) & _WALL_FORBIDDEN
-    check_true(f"{_mod}: imports none of lib.risk/signals/config (decision wall)", not _bad)
+    check_true(f"{_mod}: imports none of lib.risk/signals/config/levers (decision wall)", not _bad)
+
+# REVERSE wall: the self-learning levers module must NOT import the sizing/gate
+# modules (a lever can't call sizing or the consistency gate; it only records
+# evaluation inputs). lib.levers owns its own SQLite writes; EVE never touches
+# SQLite.
+_lev_src = (Path(__file__).resolve().parent.parent / "lib" / "levers.py").read_text(encoding="utf-8")
+_lev_bad = _imported_modules(_lev_src) & {"lib.signals", "lib.risk", "lib.config"}
+check_true("lib/levers.py: imports none of lib.signals/risk/config (reverse wall)", not _lev_bad)
+check_true("lib/levers.py: never imports sqlite3's broker/limits (pure registry)",
+           "tradingagents" not in _lev_src and "broker" not in _lev_src.lower())
 
 
-# --- D7: offline stub-LLM prompt injection (block present iff context) ---
-from tradingagents.agents.researchers.bull_researcher import create_bull_researcher  # noqa: E402
-from tradingagents.agents.researchers.bear_researcher import create_bear_researcher  # noqa: E402
-from tradingagents.agents.risk_mgmt.aggressive_debator import create_aggressive_debator  # noqa: E402
-from tradingagents.agents.risk_mgmt.conservative_debator import create_conservative_debator  # noqa: E402
-from tradingagents.agents.risk_mgmt.neutral_debator import create_neutral_debator  # noqa: E402
-
-
-class _RecLLM:
-    """Records the prompt it was handed; returns a canned response (no network)."""
-    def __init__(self):
-        self.prompt = None
-
-    def invoke(self, prompt):
-        self.prompt = prompt
-        return type("_R", (), {"content": "ok"})()
-
-
-def _node_state(ctx):
-    debate = {"history": "", "bull_history": "", "bear_history": "", "current_response": "", "count": 0}
-    risk_state = {"history": "", "aggressive_history": "", "conservative_history": "",
-                  "neutral_history": "", "current_aggressive_response": "",
-                  "current_conservative_response": "", "current_neutral_response": "",
-                  "count": 0, "latest_speaker": ""}
-    return {
-        "investment_debate_state": debate, "risk_debate_state": risk_state,
-        "market_report": "m", "sentiment_report": "s", "news_report": "n", "fundamentals_report": "f",
-        "asset_type": "stock", "trader_investment_plan": "BUY plan", "company_of_interest": "AAPL",
-        "past_context_compact": ctx, "past_context": ctx,
-    }
-
-
-_MARKER = "Deterministic track-record context"
-for _name, _factory in {"bull": create_bull_researcher, "bear": create_bear_researcher,
-                        "aggressive": create_aggressive_debator,
-                        "conservative": create_conservative_debator,
-                        "neutral": create_neutral_debator}.items():
-    _llm = _RecLLM()
-    _factory(_llm)(_node_state("PROOF-CONTEXT-XYZ"))
-    check_true(f"D7 {_name}: block injected when context present",
-               _MARKER in _llm.prompt and "PROOF-CONTEXT-XYZ" in _llm.prompt)
-    _llm2 = _RecLLM()
-    _factory(_llm2)(_node_state(""))
-    check_true(f"D7 {_name}: no block when context empty", _MARKER not in _llm2.prompt)
-
-import tradingagents.agents.managers.research_manager as _rmmod  # noqa: E402
-check_true("D7 research_manager wires track_record_block",
-           "track_record_block(state)" in Path(_rmmod.__file__).read_text(encoding="utf-8"))
+# --- D7: EVE brain past_context injection (block present iff context) -------
+# (F8: the legacy bull/bear/debator factories lived in tradingagents/, deleted.
+# The EVE brain (quiver_eve/run/decide.mjs) receives past_context via stdin from
+# analyze.py:_run_eve. Verify the injection path is wired: decide.mjs reads stdin
+# into its prompt, and analyze.py passes past_context as the subprocess stdin.)
+import analyze as _az_d7  # noqa: E402
+_azsrc = Path(_az_d7.__file__).read_text(encoding="utf-8")
+check_true("D7: analyze.py passes past_context to the EVE brain via stdin",
+           "ctx_stdin" in _azsrc and "past_context" in _azsrc)
+_decide_src = (Path(_az_d7.__file__).resolve().parent / "quiver_eve" / "run" / "decide.mjs")
+if _decide_src.exists():
+    _dsrc = _decide_src.read_text(encoding="utf-8")
+    check_true("D7: decide.mjs reads past_context from stdin into the prompt",
+               "readStdin" in _dsrc and "PAST_CONTEXT" in _dsrc)
+else:
+    check_true("D7: decide.mjs present", False)  # fail loudly if the brain is missing
 
 
 # --- T1: digest renders account-equity risk line; content_hash excludes it ---
@@ -2183,119 +2194,20 @@ _dw_bad = _strat.regime_with_confirmation(
 check_true("regr: an unparseable regime_since dwell-LOCKS (never skips the lock)", not _dw_bad["changed"])
 
 
-# ---------------------------------------------------------------------------
-# GLM 5.2 (z.ai) provider wiring — the DeepSeek->GLM swap.
-# Pure/offline: constructing the langchain client does NOT call the API; we only
-# inspect the request payload it WOULD send (extra_body shaping, roundtrip, routing).
-# ---------------------------------------------------------------------------
-import os as _os  # noqa: E402
-_os.environ.setdefault("GLM_API_KEY", "dummy-key-for-tests")
-from langchain_core.messages import AIMessage as _AIMessage, HumanMessage as _HumanMessage  # noqa: E402
-from lib.ds_config import build_glm_config, build_agents_config  # noqa: E402
-from tradingagents.llm_clients.capabilities import get_capabilities as _get_caps  # noqa: E402
-from tradingagents.llm_clients.api_key_env import get_api_key_env as _get_key_env  # noqa: E402
-from tradingagents.llm_clients.validators import validate_model as _validate_model  # noqa: E402
-from tradingagents.llm_clients.factory import create_llm_client as _create_llm_client  # noqa: E402
-from tradingagents.llm_clients.openai_client import (  # noqa: E402
-    GLMChatOpenAI as _GLMChat, MinimaxChatOpenAI as _MiniMaxChat, _merge_extra_body,
-)
 
-# build_glm_config points the framework at GLM (provider literal + provider-default URL).
-_glm_cfg = build_glm_config("glm-5.2", "glm-5.2", state_dir="/tmp/quiver_test_state")
-check("build_glm_config provider=glm", _glm_cfg["llm_provider"], "glm")
-check("build_glm_config backend_url=None (provider default applies)", _glm_cfg["backend_url"], None)
-check("build_glm_config quick_think=chat_model", _glm_cfg["quick_think_llm"], "glm-5.2")
-check("build_glm_config deep_think=reasoner_model", _glm_cfg["deep_think_llm"], "glm-5.2")
-# Shim still sets BOTH roles to glm (single-provider back-compat).
-check("build_glm_config quick provider=glm", _glm_cfg["quick_think_provider"], "glm")
-check("build_glm_config deep provider=glm", _glm_cfg["deep_think_provider"], "glm")
-
-# build_agents_config: per-role providers (the live mixed setup: deepseek quick + glm deep).
-_mix_cfg = build_agents_config("deepseek-v4-flash", "deepseek", "glm-5.2", "glm",
-                               state_dir="/tmp/quiver_test_state")
-check("mixed: quick_think_provider=deepseek", _mix_cfg["quick_think_provider"], "deepseek")
-check("mixed: deep_think_provider=glm", _mix_cfg["deep_think_provider"], "glm")
-check("mixed: llm_provider defaults to deep provider (glm)", _mix_cfg["llm_provider"], "glm")
-check("mixed: quick_think_llm=deepseek-v4-flash", _mix_cfg["quick_think_llm"], "deepseek-v4-flash")
-check("mixed: deep_think_llm=glm-5.2", _mix_cfg["deep_think_llm"], "glm-5.2")
-check("mixed: backend_url=None (each provider resolves its own)", _mix_cfg["backend_url"], None)
-
-# Offline per-role routing: trading_graph._build_llm_clients routes each role to its
-# provider (deep first, then quick), falling back to llm_provider when keys are absent.
-# Monkeypatch create_llm_client so no API keys / network are touched.
-import tradingagents.graph.trading_graph as _tg  # noqa: E402
-_routed = []
-class _FakeLLMClient:
-    def __init__(self, provider, model): self._p, self._m = provider, model
-    def get_llm(self): return f"{self._p}:{self._m}"
-def _fake_create(provider, model, base_url=None, **kw):
-    _routed.append((provider, model)); return _FakeLLMClient(provider, model)
-_orig_create = _tg.create_llm_client
-_tg.create_llm_client = _fake_create
-try:
-    _g = _tg.TradingAgentsGraph.__new__(_tg.TradingAgentsGraph)
-    _g.config = _mix_cfg
-    _g._build_llm_clients({})
-    check("graph routes deep->glm, quick->deepseek (deep first)", _routed,
-          [("glm", "glm-5.2"), ("deepseek", "deepseek-v4-flash")])
-    _routed.clear()
-    _g.config = {"llm_provider": "glm", "deep_think_llm": "glm-5.2",
-                 "quick_think_llm": "glm-5.2", "backend_url": None}
-    _g._build_llm_clients({})
-    check("graph fallback: absent per-role keys -> both llm_provider", _routed,
-          [("glm", "glm-5.2"), ("glm", "glm-5.2")])
-finally:
-    _tg.create_llm_client = _orig_create
-
-# Provider->key env map + model catalog.
-check("glm provider -> GLM_API_KEY env", _get_key_env("glm"), "GLM_API_KEY")
-check_true("glm-5.2 is a known model (no unknown-model warning)", _validate_model("glm", "glm-5.2"))
-
-# Capability row: thinking ON at high effort; conservative tool_choice + roundtrip.
-_gc = _get_caps("glm-5.2")
-check_true("glm-5.2 caps: thinking enabled", _gc.requires_thinking_enabled)
-check("glm-5.2 caps: reasoning_effort=high", _gc.reasoning_effort, "high")
-check_true("glm-5.2 caps: reasoning_content roundtrip", _gc.requires_reasoning_content_roundtrip)
-check("glm-5.2 caps: tool_choice suppressed (False)", _gc.supports_tool_choice, False)
-check_true("^glm-5 pattern: glm-5.1 inherits thinking", _get_caps("glm-5.1").requires_thinking_enabled)
-check_true("^glm-5 pattern: glm-5-turbo inherits thinking", _get_caps("glm-5-turbo").requires_thinking_enabled)
-check("non-GLM unaffected: deepseek has no thinking-enabled flag",
-      _get_caps("deepseek-v4-pro").requires_thinking_enabled, False)
-
-# _merge_extra_body: additive into extra_body, preserves existing keys.
-_p = {"extra_body": {"keep": 1}}
-_merge_extra_body(_p, {"thinking": {"type": "enabled"}, "reasoning_effort": "max"})
-check("merge_extra_body preserves existing key", _p["extra_body"]["keep"], 1)
-check("merge_extra_body adds thinking", _p["extra_body"]["thinking"], {"type": "enabled"})
-check("merge_extra_body adds reasoning_effort", _p["extra_body"]["reasoning_effort"], "max")
-
-# factory routes glm -> GLMChatOpenAI.
-check("factory glm -> GLMChatOpenAI",
-      type(_create_llm_client("glm", "glm-5.2").get_llm()).__name__, "GLMChatOpenAI")
-
-# GLMChatOpenAI request shaping (offline): thinking + reasoning_effort go via
-# extra_body (NOT top-level — openai>=2 create() is strict keyword-only).
-_glm = _GLMChat(model="glm-5.2", api_key="dummy", base_url="https://api.z.ai/api/paas/v4/")
-_pl = _glm._get_request_payload([_HumanMessage("hi")])
-check("GLM payload: thinking in extra_body", (_pl.get("extra_body") or {}).get("thinking"), {"type": "enabled"})
-check("GLM payload: reasoning_effort in extra_body", (_pl.get("extra_body") or {}).get("reasoning_effort"), "high")
-check_true("GLM payload: thinking NOT top-level (would TypeError on openai>=2)", "thinking" not in _pl)
-check_true("GLM payload: reasoning_effort NOT top-level", not _pl.get("reasoning_effort"))
-
-# reasoning_content roundtrip: a prior assistant turn's reasoning is echoed back on send.
-_pl2 = _glm._get_request_payload(
-    [_AIMessage(content="prev", additional_kwargs={"reasoning_content": "because X"}), _HumanMessage("next")])
-check_true("GLM roundtrip: prior reasoning_content re-attached on send",
-           any(m.get("reasoning_content") == "because X" for m in _pl2.get("messages", [])))
-
-# MiniMax fix (D4): reasoning_split now rides extra_body, not a top-level key.
-_mm = _MiniMaxChat(model="MiniMax-M2", api_key="dummy", base_url="https://api.minimax.io/v1")
-_mp = _mm._get_request_payload([_HumanMessage("hi")])
-check("MiniMax reasoning_split in extra_body", (_mp.get("extra_body") or {}).get("reasoning_split"), True)
-check_true("MiniMax reasoning_split NOT top-level", "reasoning_split" not in _mp)
+# --- (F8) GLM/provider client wiring tests removed: tradingagents/ is deleted,
+# the EVE brain uses @ai-sdk/openai + OpenRouter directly (quiver_eve/agent/agent.ts).
+# The config-parsing tests below (glm: block, legacy deepseek:, per-role providers)
+# are KEPT — they test lib.config.load_config, which survives. ---
 
 # lib/config.py reads the glm: block; legacy deepseek: still loads (fail-safe back-compat).
 check("config reads glm: block", make_config().chat_model, "glm-5.2")
+
+# (F8) build_glm_config/build_agents_config + the GLMChatOpenAI/MiniMax/factory/
+# capabilities/extra_body checks removed — they tested tradingagents.llm_clients,
+# which is deleted. The EVE brain wires GLM+DeepSeek via @ai-sdk/openai in
+# quiver_eve/agent/agent.ts; its provider options are exercised by the live e2e.
+
 _legacy_d = {
     "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
     "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
@@ -2493,6 +2405,125 @@ check("screener: provider error -> [] (fail-safe, universe never grows on bad da
       _scr.screen_book(_sleeves, ["NVDA"], [], (lambda s: (_ for _ in ()).throw(RuntimeError("down")))), [])
 check("screener: a sleeve with no `screen` is skipped",
       _scr.screen_book({"Cash": {}}, ["NVDA"], [], _prov), [])
+
+
+# --- EVE migration: lib/rating + lib/levers + the EVE-markdown->fields contract --
+# These pin the brain-swap's pure-Python seams WITHOUT burning tokens. The wall is
+# untouched; the EVE brain (Node) is exercised by tests/test_e2e_live.py.
+
+# lib/rating: the 5-tier signal derivation ported from tradingagents (survives F8).
+from lib import rating as _rating  # noqa: E402
+check("rating: explicit Rating label -> 5-tier", _rating.parse_rating("**Rating**: Buy"), "Buy")
+check("rating: label tolerant of markdown bold", _rating.parse_rating("blah\n**Rating**: **Overweight**\n"), "Overweight")
+check("rating: falls back to first 5-tier word", _rating.parse_rating("we rate this a Hold for now"), "Hold")
+check("rating: no rating word -> default Hold", _rating.parse_rating("nothing here"), "Hold")
+check("rating: default arg respected", _rating.parse_rating("nothing", default="Sell"), "Sell")
+
+# lib/levers: the self-learning registry. Pure, wall-side, Python owns the SQLite.
+from lib import levers as _lev  # noqa: E402
+_levled = _tmp_ledger()
+with _levled._conn() as _c:
+    _lev.ensure_schema(_c)
+    # propose is idempotent on name
+    _lid = _lev.propose(_c, "options_flow", "data_source", {"feed": "odd_lot"}, "test")
+    _lid2 = _lev.propose(_c, "options_flow", "data_source", {}, "dup")
+    check("levers: propose idempotent on name", _lid, _lid2)
+    check("levers: proposal starts as proposed", _c.execute("SELECT status FROM eval_levers WHERE id=?", (_lid,)).fetchone()[0], "proposed")
+    # active list empty until activated
+    check("levers: no active levers before activate", _lev.active_levers(_c), [])
+    _lev.activate(_c, _lid)
+    check("levers: active after activate", [l.name for l in _lev.active_levers(_c)], ["options_flow"])
+    # record_use is idempotent per (lever, decision); bumps decisions_used
+    _lev.record_use(_c, _lid, 100)
+    _lev.record_use(_c, _lid, 100)  # dup -> no double count
+    _lev.record_use(_c, _lid, 101)
+    check("levers: record_use idempotent + counts", [l.decisions_used for l in _lev.active_levers(_c)], [2])
+    # scoring: underperforming lever auto-retires after min_decisions
+    for _did in (102, 103, 104, 105, 106, 107):
+        _lev.record_use(_c, _lid, _did)
+        _lev.score_lever(_c, _lid, _did, lever_alpha=-0.05, baseline_alpha=0.0,
+                         min_decisions=5, retire_alpha=-0.02)
+    _st = _c.execute("SELECT status, score FROM eval_levers WHERE id=?", (_lid,)).fetchone()
+    check("levers: underperforming lever auto-retires", _st[0], "retired")
+    check_true("levers: retired score is negative", float(_st[1]) <= -0.02)
+    # a kept (positive) lever
+    _lid3 = _lev.propose(_c, "good_lever", "analysis_angle", {}, "good")
+    _lev.activate(_c, _lid3)
+    for _did in (200, 201, 202, 203, 204):
+        _lev.record_use(_c, _lid3, _did)
+        _lev.score_lever(_c, _lid3, _did, lever_alpha=0.03, baseline_alpha=0.0,
+                         min_decisions=5, retire_alpha=-0.02)
+    check("levers: positive lever -> kept", _c.execute("SELECT status FROM eval_levers WHERE id=?", (_lid3,)).fetchone()[0], "kept")
+    # render_active_block: compact text for past_context; empty when none active
+    _blk = _lev.render_active_block(_c)
+    check_true("levers: render_active_block names active levers", "good_lever" in _blk)
+    _c.execute("UPDATE eval_levers SET status='retired' WHERE id=?", (_lid3,))
+    check("levers: render_active_block empty when none active", _lev.render_active_block(_c), "")
+
+# The EVE-markdown -> fields contract: analyze.py:parse_trader_plan + _split_eve_markdown
+# + extract_fields on a fixture carrying all 12 labels + 7 sections. Pins the load-bearing
+# seam without an LLM. (The live e2e exercises the real EVE brain.)
+import analyze as _az  # noqa: E402
+_EVE_FIXTURE = """## market_report
+Price closed 195.1, volume up 12%, RSI 62.
+
+## sentiment_report
+StockTwits (24 msgs): mildly bullish.
+
+## news_report
+Earnings beat; guidance raised.
+
+## fundamentals_report
+PE 28, P/B 6.1, market cap 3.0e11.
+
+## trader_investment_plan
+**Action**: Buy
+**Entry Price**: 195.1
+**Stop Loss**: 182.5
+**Position Sizing**: ~4.5% of capital
+**Position Pct**: 4.5
+**Strategy Basis**: momentum_breakout
+**Catalyst**: none
+**Target Price**: 210
+
+## final_trade_decision
+**Rating**: Buy
+**Next Review Hours**: 24
+**Conviction**: 72
+**Uncertainty**: 30
+Executive summary: momentum intact, beat + raised.
+
+## lever_proposals
+- [data_source] options_flow: add odd-lot flow as a confirmation input
+"""
+_split = _az._split_eve_markdown(_EVE_FIXTURE)
+check("eve-split: market_report section", "195.1" in _split.get("market_report", ""), True)
+check("eve-split: final_trade_decision section", "Executive summary" in _split.get("final_trade_decision", ""), True)
+_plan = _az.parse_trader_plan(_split["trader_investment_plan"])
+check("eve-contract: Action parsed", _plan["action"], "Buy")
+check("eve-contract: Entry Price parsed", _plan["entry_price"], 195.1)
+check("eve-contract: Stop Loss parsed", _plan["stop_loss"], 182.5)
+check("eve-contract: Position Pct parsed", _plan["position_pct"], 4.5)
+check("eve-contract: Strategy Basis parsed + non-empty", _plan["basis"], "momentum_breakout")
+check("eve-contract: Target Price parsed", _plan["target_price"], 210.0)
+_fields = _az.extract_fields(_split, _rating.parse_rating(_split["final_trade_decision"]), "AAPL")
+check("eve-contract: signal derived from Rating label", _fields["signal"], "Buy")
+check("eve-contract: conviction parsed", _fields["conviction"], 72.0)
+check("eve-contract: next_review_hours parsed", _fields["next_review_hours"], 24.0)
+check("eve-contract: schema=1", _fields["schema"], 1)
+
+# Fail-SAFE: a fixture with missing market_report -> core_available false -> ERROR override.
+_BAD = _EVE_FIXTURE.replace("## market_report\nPrice closed 195.1, volume up 12%, RSI 62.\n",
+                            "## market_report\nUNAVAILABLE: no price data\n")
+_bad_split = _az._split_eve_markdown(_BAD)
+_bad_fields = _az.extract_fields(_bad_split, _rating.parse_rating(_bad_split["final_trade_decision"]), "AAPL")
+check("eve-contract: missing core data -> ERROR (fail-safe)", _bad_fields["signal"], "ERROR")
+check_true("eve-contract: ERROR carries reason", "core data unavailable" in (_bad_fields["error"] or ""))
+
+# Missing-label fixture -> the TS validator exits 1 (asserted by quiver_eve/test); here we
+# only assert parse_trader_plan returns None for a missing label (the Python side of the gate).
+_NO_BASIS = _EVE_FIXTURE.replace("**Strategy Basis**: momentum_breakout\n", "")
+check("eve-contract: missing basis -> None (gate suppresses the reversal)", _az.parse_trader_plan(_NO_BASIS.split("## trader_investment_plan")[1])["basis"], None)
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

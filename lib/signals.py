@@ -120,6 +120,51 @@ def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:
     return round(qty, 6)
 
 
+# Robinhood rejects any fractional order whose notional (qty * price) is under
+# $1. A model trim (e.g. the Underweight 0.5-half) on a thin position can land
+# below that floor and bounce. This is the sell-side mirror of the buy path's
+# `rebalance_buy_below_min` / `whole_shares_for_dollars < 1` guards.
+MIN_SELL_NOTIONAL_USD = 1.0
+
+
+def resolve_sell_quantity_min_notional(
+    held_qty: float, raw_qty: float, quote: Optional[float],
+    *, min_notional: float = MIN_SELL_NOTIONAL_USD,
+) -> Tuple[float, str]:
+    """Bump a trim's share count UP just enough to clear ``min_notional``
+    (default $1, RH's fractional floor), clamped to the held quantity.
+
+    Returns (qty, reason). ``reason`` is one of:
+      * "trim"           -> the raw trim already clears the floor; unchanged.
+      * "bumped_to_min"  -> bumped up to the cheapest qty that clears $1.
+      * "skip_dust"      -> the WHOLE position is under the floor (physically
+                            unsellable as a fractional); nothing to sell.
+      * "skip_no_quote"  -> no usable quote to value the trim (fail to skip,
+                            never synthesize a price to force a sell).
+      * "skip_nothing"   -> nothing held or nothing to trim.
+
+    Never exceeds ``held_qty`` (long-only: cannot oversell into a short). A 0
+    return means SKIP — the caller records a clean ``sell_below_min`` skip, NOT a
+    broker-rejected error. Pure + total (unit-tested).
+    """
+    if held_qty <= 0 or raw_qty <= 0:
+        return (0.0, "skip_nothing")
+    if not quote or quote <= 0:
+        return (0.0, "skip_no_quote")
+    raw_qty = min(held_qty, raw_qty)
+    if raw_qty * quote >= min_notional:
+        return (round(raw_qty, 6), "trim")
+    if held_qty * quote < min_notional:
+        # The entire position is under the floor — there is no fractional qty
+        # that clears $1 without overselling. Honest outcome: leave the dust.
+        return (0.0, "skip_dust")
+    bumped = min(held_qty, min_notional / quote)
+    bumped = round(bumped, 6)
+    if bumped <= 0:
+        return (0.0, "skip_dust")
+    return (bumped, "bumped_to_min")
+
+
 def room_under_target(target_dollars: float, current_mv: float,
                       upper_band_dollars: float = 0.0) -> float:
     """Dollars of headroom before a holding reaches its target weight (+ band).

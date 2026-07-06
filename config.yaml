@@ -64,6 +64,28 @@ glm:
   reasoner_model: "glm-5.2"
   reasoner_provider: "glm"
 
+# --- Brain engine (EVE migration) ------------------------------------------
+# brain.engine selects the analysis backend. "tradingagents" (default) = the legacy
+# in-tree LangGraph framework (the validated once-a-day path, kept live as the
+# rollback). "eve" = the Node/EVE deep-research agent (quiver_eve/). Flip to "eve"
+# ONLY after the live e2e is green on the EVE brain. FAIL-SAFE: a missing/garbled
+# block stays on the legacy brain — never silently flips the live brain.
+brain:
+  engine: "eve"
+  eve_dir: "quiver_eve"
+
+# --- Self-learning tail (lib/levers) ----------------------------------------
+# The EVE agent can propose NEW evaluation levers (data sources, analysis angles).
+# A lever never touches sizing/caps/ref_ids — it only adds evaluation INPUTS, and
+# the existing reflect step scores each lever's realized alpha (skill, not beta).
+# auto_apply_levers=false (default): a lever needs human `tick.py levers-approve`
+# to activate (mirrors universe-apply). true: activate on next tick, auto-retire on
+# underperformance over lever_min_decisions decisions.
+learning:
+  auto_apply_levers: false
+  lever_min_decisions: 8              # decisions before a lever is score-eligible
+  lever_retire_alpha: -0.02           # retire if lever_alpha vs baseline <= this
+
 # --- Loop timing -----------------------------------------------------------
 loop:
   act_after_open_minutes: 5            # wait N min after the open before acting

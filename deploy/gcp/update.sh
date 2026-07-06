@@ -74,6 +74,26 @@ else
   echo "  no dependency changes — skipping pip"
 fi
 
+# EVE brain (Node/TypeScript). Idempotent Node-24 upgrade for an ALREADY-provisioned
+# box (setup.sh only runs at provision; the live box shipped with Node 20). NOT gated
+# on `command -v node` — that would keep an old Node 20. npm ci when the EVE package
+# or any agent source changed (mirrors the conditional pip block above).
+_ensure_node24() {
+  if command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 24 ] 2>/dev/null; then return 0; fi
+  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+  apt-get install -y nodejs
+}
+if grep -qE '^quiver_eve/(package\.json|package-lock\.json|agent/)' <<<"$CHANGED"; then
+  echo "  EVE brain changed -> ensuring Node 24 + npm ci"
+  _ensure_node24
+  asq sh -c "cd '$QUIVER_HOME/quiver_eve' && { npm ci 2>/dev/null || npm install --omit=dev; }"
+elif ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 24 ] 2>/dev/null; then
+  echo "  EVE brain unchanged but Node <24 -> upgrading Node only"
+  _ensure_node24
+else
+  echo "  no EVE brain changes — skipping npm"
+fi
+
 echo "[5/6] systemd units"
 if grep -qE '^deploy/quiver\.(service|timer)$' <<<"$CHANGED"; then
   echo "  unit files changed -> reinstalling + daemon-reload"

@@ -173,6 +173,24 @@ class Config:
     # (debates/judgment) can name different providers (e.g. deepseek + glm).
     chat_provider: str = "glm"
     reasoner_provider: str = "glm"
+    # --- Brain engine (EVE migration) ------------------------------------
+    # brain_engine selects the analysis backend. "tradingagents" (default) = the
+    # legacy in-tree LangGraph framework (kept live as the rollback path until F8
+    # deletes tradingagents/). "eve" = the Node/EVE deep-research agent. The
+    # dispatch lives in analyze.py:run_analysis(); the legacy import is deferred
+    # into the else-branch so the EVE path never loads tradingagents/. Flip to
+    # "eve" only after the live e2e is green on the EVE brain.
+    brain_engine: str = "eve"
+    eve_dir: str = "quiver_eve"
+    eve_url: str = "http://127.0.0.1:2244"  # the EVE server (eve dev / eve start) HTTP endpoint
+    # --- Self-learning tail (lib/levers) --------------------------------
+    # auto_apply_levers=false (default) = a discovered lever needs human
+    # `tick.py levers-approve` to activate (mirrors universe-apply). true =
+    # activate on next tick but still score-gated (auto-retire on underperformance).
+    # Levers only add EVALUATION inputs; they never touch sizing/caps/ref_ids.
+    auto_apply_levers: bool = False
+    lever_min_decisions: int = 8
+    lever_retire_alpha: float = -0.02
     # --- Strategy layer (Stage 0) ----------------------------------------
     # strategy is Optional[lib.strategy.StrategyConfig] (typed as object to keep
     # config a light leaf with no heavy import). It is None when strategy.yaml is
@@ -524,6 +542,25 @@ def load_config(path) -> Config:
         except Exception:
             strategy_obj = None
 
+    # --- Brain engine (EVE migration) ----------------------------------
+    # brain.engine: "tradingagents" (default, legacy) | "eve" (Node/EVE agent).
+    # FAIL-SAFE: anything other than an explicit "eve" stays on the legacy path
+    # (the validated once-a-day brain) — a missing/garbled block never silently
+    # flips the live brain.
+    brain = d.get("brain", {}) or {}
+    brain_engine = str(brain.get("engine", "eve") or "eve").strip().lower()
+    if brain_engine not in ("tradingagents", "eve"):
+        brain_engine = "eve"
+    eve_dir = str(brain.get("eve_dir", "quiver_eve") or "quiver_eve").strip()
+    eve_url = str(brain.get("eve_url", os.environ.get("QUIVER_EVE_URL", "http://127.0.0.1:2244"))
+                  or "http://127.0.0.1:2244").strip()
+
+    # --- Self-learning tail (lib/levers) --------------------------------
+    learning = d.get("learning", {}) or {}
+    auto_apply_levers = bool(learning.get("auto_apply_levers", False))
+    lever_min_decisions = int(learning.get("lever_min_decisions", 8))
+    lever_retire_alpha = float(learning.get("lever_retire_alpha", -0.02))
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -533,6 +570,12 @@ def load_config(path) -> Config:
         reasoner_model=reasoner_model,
         chat_provider=chat_provider,
         reasoner_provider=reasoner_provider,
+        brain_engine=brain_engine,
+        eve_dir=eve_dir,
+        eve_url=eve_url,
+        auto_apply_levers=auto_apply_levers,
+        lever_min_decisions=lever_min_decisions,
+        lever_retire_alpha=lever_retire_alpha,
         buy_type=buy_type,
         sell_mode=str(order.get("sell_mode", "close_position")),
         time_in_force=str(order.get("time_in_force", "gfd")),

@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -120,7 +121,10 @@ def parse_trader_plan(plan_text: str) -> dict:
     '**Stop Loss**: 182.5', '**Position Sizing**: ...', '**Action**: Buy'.
     """
     def grab(label: str):
-        m = re.search(rf"\*\*{re.escape(label)}\*\*:\s*(.+)", plan_text)
+        # Tolerate both `**Label**: value` (legacy render) and `**Label:** value`
+        # (a common LLM variant where the colon sits inside the bold). The wall
+        # reads the value either way; the label presence is what matters.
+        m = re.search(rf"\*\*{re.escape(label)}(?::\*\*|\*\*:)\s*(.+)", plan_text)
         return m.group(1).strip() if m else None
 
     def grab_float(label: str):
@@ -148,8 +152,9 @@ def parse_trader_plan(plan_text: str) -> dict:
 
 
 def parse_pm_field_float(decision_text: str, label: str):
-    """Pull a numeric '**Label**: value' field out of the PM decision markdown."""
-    m = re.search(rf"\*\*{re.escape(label)}\*\*:\s*(-?\d+(?:\.\d+)?)", decision_text)
+    """Pull a numeric '**Label**: value' field out of the PM decision markdown.
+    Tolerates both `**Label**: N` and `**Label:** N` (colon inside the bold)."""
+    m = re.search(rf"\*\*{re.escape(label)}(?::\*\*|\*\*:)\s*(-?\d+(?:\.\d+)?)", decision_text)
     return float(m.group(1)) if m else None
 
 
@@ -252,46 +257,167 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
     path.write_text(json.dumps(safe, indent=2, default=str), encoding="utf-8")
 
 
+# --- EVE brain (the migration path) -----------------------------------------
+# EVE (eve.dev) is a TypeScript/Node agent framework with no Python SDK. The
+# brain is invoked as a subprocess (`eve run` in quiver_eve/), passed the
+# read-only past_context via a temp file, and returns its final answer as
+# markdown on stdout. The markdown carries the SAME `**Label**: value` lines the
+# legacy framework rendered, so extract_fields/parse_trader_plan are reused
+# unchanged. The wall is untouched: this process still DECIDES and never touches
+# the broker / limits; EVE is the brain only.
+
+# The separable `## section` headers EVE emits (F1 contract) -> final_state keys.
+_EVE_SECTIONS = (
+    "market_report", "sentiment_report", "news_report", "fundamentals_report",
+    "trader_investment_plan", "final_trade_decision", "lever_proposals",
+)
+
+
+def _split_eve_markdown(md: str) -> dict:
+    """Split EVE's stdout markdown into a pseudo-final_state dict the existing
+    extract_fields() can consume. Each `## <section>` becomes a final_state key
+    with the section body (the labels are parsed downstream by regex). Unknown
+    sections are ignored; everything before the first `##` is the preamble.
+    """
+    out = {}
+    cur_key = None
+    cur_lines = []
+    for line in md.splitlines():
+        m = re.match(r"^##\s+([A-Za-z_][A-Za-z0-9_]*)\s*$", line)
+        if m:
+            if cur_key in _EVE_SECTIONS:
+                out[cur_key] = "\n".join(cur_lines).strip()
+            cur_key = m.group(1)
+            cur_lines = []
+        elif cur_key in _EVE_SECTIONS:
+            cur_lines.append(line)
+    if cur_key in _EVE_SECTIONS:
+        out[cur_key] = "\n".join(cur_lines).strip()
+    return out
+
+
+def _run_eve(ticker: str, date: str, cfg, past_context: str,
+             past_context_compact: str, sink) -> dict:
+    """Drive the EVE brain (a standalone Node script) and return a pseudo-final_state.
+
+    The brain is `quiver_eve/run/decide.mjs` — a plain Node script that uses the ai
+    SDK + OpenRouter to run GLM-5.2 with the data tools in-process, prints the final
+    contract markdown to stdout. We pass the read-only past_context (memory scorecard
+    — never limits/broker) via stdin, ticker/date via argv, and collect stdout.
+
+    Why a subprocess script (not the `eve dev` HTTP server): EVE's stream proxy stalls
+    on long generations; the ai SDK + OpenRouter stream fine in-process, and a plain
+    `node decide.mjs` per ticker is simpler for the orchestrator's subprocess seam.
+    stderr is tee'd into `sink` so logs/reasoning/<date>_<TICKER>.log stays live.
+
+    Raises on any failure (non-zero exit / no stdout / missing decision sections) so
+    the caller maps to an ERROR signal (fail-safe).
+    """
+    import subprocess
+    import threading
+
+    eve_dir = REPO / (getattr(cfg, "eve_dir", "quiver_eve") or "quiver_eve")
+    script = eve_dir / "run" / "decide.mjs"
+    if not script.is_file():
+        raise RuntimeError(f"EVE brain script not found: {script}")
+
+    env = dict(os.environ)
+    env.setdefault("QUIVER_REPO", str(REPO))
+    env.setdefault("QUIVER_PYTHON", str(REPO / ".venv" / "bin" / "python"))
+    env.setdefault("QUIVER_DATA_HELPER", str(eve_dir / "run" / "quill_data.py"))
+    # Pipe the past_context in via stdin (argv-length-safe).
+    ctx_stdin = (past_context or "").encode("utf-8")
+    try:
+        proc = subprocess.Popen(
+            ["node", str(script), ticker, date],
+            cwd=str(eve_dir), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=env,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"node not found (is Node 24+ installed?): {e}")
+
+    # Stream stderr into the tee so the reasoning log is live (tail -f), and
+    # capture the REASONING_TOKENS: marker decide.mjs emits (the provider-reported
+    # thinking-ON count — survivor #4 gate).
+    reasoning_tokens = [0]
+    def _drain_stderr():
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace")
+                sink.write(line)
+                m = re.search(r"REASONING_TOKENS:\s*(\d+)", line)
+                if m:
+                    reasoning_tokens[0] = int(m.group(1))
+        except Exception:  # noqa: BLE001 — the log is best-effort
+            pass
+    t = threading.Thread(target=_drain_stderr, daemon=True)
+    t.start()
+    md, _ = proc.communicate(input=ctx_stdin, timeout=getattr(cfg, "analyze_timeout_sec", 3600))
+    t.join(timeout=5)
+    if proc.returncode != 0:
+        raise RuntimeError(f"EVE brain (decide.mjs) exited {proc.returncode}")
+    md = md.decode("utf-8", errors="replace")
+    if not md.strip():
+        raise RuntimeError("EVE brain returned no markdown on stdout")
+    pseudo = _split_eve_markdown(md)
+    if not pseudo.get("final_trade_decision") or not pseudo.get("trader_investment_plan"):
+        raise RuntimeError("EVE output missing final_trade_decision/trader_investment_plan sections")
+    pseudo["_reasoning_tokens"] = reasoning_tokens[0]
+    return pseudo
+
+
 def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
                  past_context_compact: str = "") -> dict:
-    from lib.ds_config import build_agents_config
-    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    # The brain engine. F8 deleted the legacy tradingagents/ framework; EVE
+    # (quiver_eve/run/decide.mjs, GLM-5.2 via OpenRouter) is the only brain.
+    # A stale config saying brain.engine: tradingagents fails LOUD here (not
+    # silent) so a half-deployed box never trades blind.
+    engine = (getattr(cfg, "brain_engine", "eve") or "eve").strip().lower()
+    if engine != "eve":
+        raise RuntimeError(
+            f"brain.engine={engine!r} but tradingagents/ was removed (F8). "
+            "Set brain.engine: eve (the EVE brain) in config.yaml."
+        )
+    return _run_eve_analysis(ticker, date, cfg, past_context, past_context_compact)
 
-    ta_cfg = build_agents_config(
-        cfg.chat_model, cfg.chat_provider,
-        cfg.reasoner_model, cfg.reasoner_provider,
-        state_dir=str(STATE),
-    )
-    # Send all framework stdout noise to stderr (so our stdout stays JSON-only)
-    # AND tee it to logs/reasoning/<date>_<TICKER>.log so the live thinking is
-    # watchable (`tail -f`) and durable. The tee is best-effort; stdout is never
-    # touched, preserving the single-JSON-line contract.
+
+def _run_eve_analysis(ticker: str, date: str, cfg, past_context: str,
+                      past_context_compact: str) -> dict:
+    """The EVE path: spawn the brain subprocess, build a pseudo-final_state from
+    its markdown, derive the 5-tier signal via lib.rating.parse_rating (the
+    **Rating**: label), and feed the SAME extract_fields the legacy path uses.
+    The wall is untouched; EVE is the brain only.
+    """
+    from lib.rating import parse_rating
+
     reasoning_log = _open_reasoning_log(ticker, date)
     sink = _Tee(sys.stderr, reasoning_log)
-    # The framework emits most of its progress (analyst tool calls, debate turns,
-    # node transitions) via the `logging` module, which bypasses redirect_stdout.
-    # Attach a handler that mirrors EVERY log record into the same tee, so the
-    # per-ticker reasoning log is a complete record of the run — not just the
-    # stdout chatter. Noisy HTTP libs are pinned to WARNING so the signal isn't
-    # buried. Handler + level changes are reverted in `finally` (this process is
-    # short-lived, but keep it clean for the test/import paths).
-    log_handler = _install_run_logging(sink)
+    sink.write(f"[eve] brain=eve ticker={ticker} date={date}\n")
     try:
-        with contextlib.redirect_stdout(sink):
-            graph = TradingAgentsGraph(config=ta_cfg)
-            final_state, signal = graph.propagate(
-                ticker, date, past_context_override=past_context,
-                past_context_compact_override=past_context_compact,
-            )
+        final_state = _run_eve(ticker, date, cfg, past_context, past_context_compact, sink)
+        # Derive the 5-tier signal from the PM decision's **Rating**: label, the
+        # same deterministic heuristic the legacy framework used internally
+        # (parse_rating, ported to lib/rating.py so it survives tradingagents/
+        # deletion). WITHOUT this, extract_fields gets signal=None -> plan_action
+        # skips every ticker -> the bot silently stops trading.
+        signal = parse_rating(str(final_state.get("final_trade_decision") or ""))
     finally:
-        _remove_run_logging(log_handler)
         if reasoning_log is not None:
             try:
                 reasoning_log.close()
             except Exception:  # noqa: BLE001
                 pass
     _dump_full_state(final_state, ticker, date)
-    return extract_fields(final_state, signal, ticker)
+    out = extract_fields(final_state, signal, ticker)
+    # Thinking-mode regression guard (survivor #4): surface the provider-reported
+    # reasoning TOKEN count so a silent thinking-OFF regression (an ai-SDK upgrade
+    # dropping reasoning) is observable on the decision row + caught by the live
+    # e2e. The @ai-sdk/openai .chat() provider doesn't map OpenRouter's `reasoning`
+    # content into the V4 reasoning-text channel, but it DOES report the count in
+    # usage.outputTokenDetails.reasoningTokens — decide.mjs emits that as
+    # `REASONING_TOKENS: N` on stderr, captured by _run_eve. >0 = GLM reasoned.
+    out["reasoning_content_len"] = int(final_state.get("_reasoning_tokens") or 0)
+    return out
 
 
 def main(argv) -> int:

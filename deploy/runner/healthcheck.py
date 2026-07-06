@@ -48,11 +48,38 @@ def run_healthcheck() -> dict:
         for m in ("lib.strategy", "lib.portfolio", "lib.goal", "lib.signals",
                   "lib.learn", "lib.universe", "lib.runlock", "lib.strategy_context"):
             importlib.import_module(m)
+        # The brain must load too: a brained-out box (bad EVE install / missing
+        # node_modules / a deleted-tradingagents ImportError post-F8) must FAIL
+        # the healthcheck so update.sh never restarts the timer into a live tick
+        # with zero analysis. analyze.py dispatches on cfg.brain_engine; importing
+        # it + lib.ds_config surfaces a broken legacy path; the EVE install is
+        # checked separately (a missing eve binary / node_modules isn't caught by
+        # a Python import).
+        importlib.import_module("analyze")
+        importlib.import_module("lib.ds_config")
+        importlib.import_module("lib.rating")  # the ported parse_rating (F8 survivor)
+        importlib.import_module("lib.levers")  # the self-learning registry
+
+    def _eve_install():
+        # Only assert the EVE install when the brain is actually configured to EVE;
+        # on the legacy brain (default) the EVE install is irrelevant. On the EVE
+        # brain, a missing eve binary or node_modules is a hard fail.
+        from lib.config import load_config
+        cfg = load_config(_REPO / "config.yaml")
+        if (getattr(cfg, "brain_engine", "tradingagents") or "tradingagents") != "eve":
+            return
+        import shutil, os
+        eve_dir = _REPO / (getattr(cfg, "eve_dir", "quiver_eve") or "quiver_eve")
+        if not eve_dir.is_dir():
+            raise RuntimeError(f"EVE brain dir missing: {eve_dir}")
+        if not (eve_dir / "node_modules").is_dir() and not shutil.which("eve"):
+            raise RuntimeError("EVE brain selected but node_modules/ absent and `eve` not on PATH")
 
     _try("config", _config)
     _try("market", _market)
     _try("ledger", _ledger)
     _try("imports", _imports)
+    _try("eve_install", _eve_install)
     return {"ok": all(v == "ok" for v in checks.values()), "checks": checks}
 
 

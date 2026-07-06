@@ -147,6 +147,15 @@ def _alert_target():
     return recips, from_addr, on_error, dry_run
 
 
+def _brain_engine(cfg) -> str:
+    """The configured brain engine for an alert payload. 'unknown' if cfg is None
+    (load_config failed — the alert itself is the signal)."""
+    try:
+        return str(getattr(cfg, "brain_engine", "tradingagents") or "tradingagents")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 def _is_silent_noop(pending, recorded_before, recorded_after) -> bool:
     """True iff a PROCEEDED tick recorded NOTHING NEW this run despite pending tickers.
 
@@ -278,6 +287,15 @@ def main() -> int:
                     analyses = []
                 n_err = sum(1 for a in analyses if (a or {}).get("signal") == "ERROR")
                 _emit({"stage": "analyze", "count": len(analyses), "errors": n_err})
+                # Brain-outage paging: if EVERY analysis this tick ERRORED (and there
+                # was at least one), the brain is down (EVE subprocess crash / missing
+                # node_modules / provider failure). The all-ERROR case records skip rows
+                # with delta>0, so _is_silent_noop does NOT catch it — without this
+                # page, a total brain outage on a live box is silent partial-blind
+                # trading. Page it (best-effort, deduped by content_hash per stage/day).
+                if analyses and n_err == len(analyses):
+                    _maybe_alert(led, kind="error", stage="analyze", day=day, now_iso=now_iso,
+                                 event_detail=f"brain outage: all {n_err} analyses ERROR (brain_engine={_brain_engine(cfg)})")
             try:
                 _tmp = _REPO / "state" / "tmp"
                 _tmp.mkdir(parents=True, exist_ok=True)
