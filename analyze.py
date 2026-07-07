@@ -36,6 +36,15 @@ LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (STATE / "ledger.db"))
 from lib.rating import parse_rating  # module-level: _validate_contract (F6) uses it too
 
 
+def process_stderr(msg: str) -> None:
+    """Write to stderr without raising (used by the F2 fallback path)."""
+    try:
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class _Tee:
     """Fan stdout writes to a primary stream (always) + a best-effort file.
 
@@ -424,7 +433,7 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
 
 
 def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
-                 past_context_compact: str = "") -> dict:
+                 past_context_compact: str = "", *, deadline_s: float | None = None) -> dict:
     # The brain engine. F8 deleted the legacy tradingagents/ framework; EVE
     # (quiver_eve/run/decide.mjs, GLM-5.2 via OpenRouter) is the only brain.
     # A stale config saying brain.engine: tradingagents fails LOUD here (not
@@ -435,7 +444,82 @@ def run_analysis(ticker: str, date: str, cfg, past_context: str = "",
             f"brain.engine={engine!r} but tradingagents/ was removed (F8). "
             "Set brain.engine: eve (the EVE brain) in config.yaml."
         )
-    return _run_eve_analysis(ticker, date, cfg, past_context, past_context_compact)
+    return _run_eve_with_fallback(ticker, date, cfg, past_context,
+                                  past_context_compact, deadline_s=deadline_s)
+
+
+def _classify_failure(err: Exception) -> str:
+    """F3: tag the failure mode for observability (error_mode on the ERROR datum)."""
+    msg = str(err).lower()
+    if "missing" in msg and "section" in msg:
+        return "missing_sections"
+    if "contract violation" in msg or "basis" in msg or "label" in msg:
+        return "contract_violation"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if "no markdown" in msg or "empty" in msg:
+        return "empty_output"
+    if "exited" in msg:
+        return "turn_threw"
+    return "unknown"
+
+
+def _run_eve_with_fallback(ticker: str, date: str, cfg, past_context: str,
+                           past_context_compact: str, *, deadline_s: float | None) -> dict:
+    """F2: run the brain; on a transient failure, re-run ONCE (the brain is
+    non-deterministic — every failed ticker in the 2026-07-07 live tick
+    succeeded on manual re-run). Bounded to exactly 1 fallback. The fallback is
+    skipped if the per-ticker deadline leaves < 600s (don't start a doomed run
+    the outer SIGKILL catches mid-brain as a misleading -15). F6 + the section
+    check gate the 2nd run identically. The wall is untouched: analyze.py only
+    READS the ledger (line 505 -> safe_build_context); the re-run writes no rows,
+    mints no ref_ids (those are downstream in tick.py plan).
+
+    F3: on a persistent failure (both runs fail), the ERROR datum carries
+    error_mode + fallback_triggered so the digest/tick.log show WHICH mode hit.
+    F2 (signal-flip audit): when the fallback succeeds, the run-1 dump is
+    preserved as <date>_<ticker>.run1.json and the result carries
+    fallback_triggered=True + original_signal for the decision row.
+    """
+    import time
+    FLOOR = 600.0  # don't start a fallback re-run with < 10min left
+    first_err = None
+    original_signal = None
+    try:
+        return _run_eve_analysis(ticker, date, cfg, past_context, past_context_compact)
+    except Exception as e:  # noqa: BLE001 — the fallback is the whole point
+        first_err = e
+        process_stderr(f"[analyze] first run failed ({_classify_failure(e)}): {e}\n")
+
+    # Decide whether to attempt the fallback.
+    remaining = None
+    if deadline_s is not None:
+        remaining = deadline_s - time.monotonic()
+    if remaining is not None and remaining < FLOOR:
+        process_stderr(f"[analyze] skipping fallback (only {remaining:.0f}s left < {FLOOR:.0f}s floor)\n")
+        raise RuntimeError(f"brain failed ({_classify_failure(first_err)}); no fallback (deadline): {first_err}")
+
+    # Preserve run-1's dump for the signal-flip audit (F2 Gate-B): rename it
+    # before the re-run overwrites it. Best-effort.
+    try:
+        run1 = LOGDIR / f"{date}_{ticker}.json"
+        if run1.exists():
+            run1.rename(LOGDIR / f"{date}_{ticker}.run1.json")
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        out = _run_eve_analysis(ticker, date, cfg, past_context, past_context_compact)
+        # F2 audit: flag that this decision came via a fallback re-run (the brain
+        # is non-deterministic; run-1 may have said something different).
+        out["fallback_triggered"] = True
+        out["original_signal"] = original_signal  # None (run-1 failed before a signal)
+        return out
+    except Exception as e2:  # noqa: BLE001 — persistent failure -> ERROR (fail-safe)
+        process_stderr(f"[analyze] fallback also failed ({_classify_failure(e2)}): {e2}\n")
+        raise RuntimeError(
+            f"brain failed persistently (run1={_classify_failure(first_err)}, "
+            f"run2={_classify_failure(e2)}); first={first_err}; second={e2}")
 
 
 def _run_eve_analysis(ticker: str, date: str, cfg, past_context: str,
@@ -487,9 +571,16 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("ticker")
     ap.add_argument("--date", default=None)
+    ap.add_argument("--deadline", type=float, default=None,
+                    help="epoch-seconds deadline (F2 fallback budget); passed by run_analyses")
     args = ap.parse_args(argv)
     ticker = args.ticker.strip().upper()
     date = args.date or trading_day_et()
+    # F2: convert the caller's epoch deadline to a monotonic-relative budget so the
+    # fallback re-run can skip itself if < 600s remain (don't start a doomed run
+    # the outer SIGKILL catches mid-brain). None = no deadline (manual runs).
+    import time
+    deadline_s = (args.deadline - time.monotonic()) if args.deadline else None
 
     try:
         cfg = load_config(REPO / "config.yaml")
@@ -505,7 +596,7 @@ def main(argv) -> int:
             ctx = reflect_memory.safe_build_context(Ledger(LEDGER_DB), ticker, cfg)
         except Exception:  # noqa: BLE001 — even ledger-open failure must not block analysis
             ctx = reflect_memory.ContextResult("", "", None, "empty")
-        result = run_analysis(ticker, date, cfg, ctx.full, ctx.compact)
+        result = run_analysis(ticker, date, cfg, ctx.full, ctx.compact, deadline_s=deadline_s)
         # Decision-time WRITE: append this run's snapshot + refresh the metric blocks
         # from the SAME bundle the agents saw. Best-effort; never touches stdout.
         if ctx.bundle is not None:
@@ -519,7 +610,13 @@ def main(argv) -> int:
                 pass
     except Exception as e:  # noqa: BLE001 — wrapper must never crash silently
         traceback.print_exc(file=sys.stderr)
-        print(json.dumps({"ticker": ticker, "signal": "ERROR", "error": str(e), "schema": 1}))
+        err = {"ticker": ticker, "signal": "ERROR", "error": str(e), "schema": 1}
+        # F3: surface the failure mode + whether a fallback was attempted.
+        try:
+            err["error_mode"] = _classify_failure(e)
+        except Exception:  # noqa: BLE001
+            pass
+        print(json.dumps(err))
         return 1
 
     print(json.dumps(result))

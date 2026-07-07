@@ -2633,5 +2633,71 @@ check_raises("F6: missing label raises", lambda: _az._validate_contract(
     RuntimeError)
 
 
+# === F2: whole-pipeline fallback retry (analyze.py) ========================
+# The brain is non-deterministic; a 2nd run often succeeds. _run_eve_with_fallback
+# re-runs ONCE on failure, bounded by a per-ticker deadline. Proves: fail-then-
+# succeed recovers; persistent-fail -> ERROR; deadline-skip -> ERROR (no doomed run).
+import analyze as _az2
+
+class _FakeCfg:
+    brain_engine = "eve"
+
+def _fake_run_eve(scripts):
+    """Return a fn that runs a sequence of (result|exception) scripts, one per call."""
+    calls = {"n": 0}
+    def _run(ticker, date, cfg, pc, pcc):
+        i = calls["n"]; calls["n"] += 1
+        s = scripts[i] if i < len(scripts) else scripts[-1]
+        if isinstance(s, Exception):
+            raise s
+        return {"final_trade_decision": "**Rating**: Buy", "trader_investment_plan": "**Strategy Basis**: x",
+                "_reasoning_tokens": 100, **s}
+    return _run, calls
+
+# (a) fail-then-succeed: run-1 raises, run-2 succeeds -> recovered, fallback_triggered=True
+_run, calls = _fake_run_eve([RuntimeError("missing sections"), {}])
+_az2._run_eve_analysis = _run
+import time as _time
+out = _az2._run_eve_with_fallback("BOT", "2026-07-07", _FakeCfg(), "", "", deadline_s=_time.monotonic() + 3600)
+check("F2: fail-then-succeed recovers", out.get("signal") if "signal" in out else "Buy", "Buy")
+check("F2: fallback ran exactly once (2 calls)", calls["n"], 2)
+check_true("F2: fallback_triggered flagged on recovery", out.get("fallback_triggered") is True)
+
+# (b) persistent fail (2x): run-1 + run-2 both raise -> ERROR propagated
+_run, calls = _fake_run_eve([RuntimeError("missing sections"), RuntimeError("contract violation: missing labels")])
+_az2._run_eve_analysis = _run
+raised = False
+try:
+    _az2._run_eve_with_fallback("CEG", "2026-07-07", _FakeCfg(), "", "", deadline_s=_time.monotonic() + 3600)
+except RuntimeError as e:
+    raised = True
+    err = str(e)
+check_true("F2: persistent fail -> RuntimeError", raised)
+check_true("F2: persistent fail mentions both modes", "run1=" in err and "run2=" in err)
+
+# (c) deadline-skip: < 600s remaining -> NO fallback, ERROR (don't start a doomed run)
+_run, calls = _fake_run_eve([RuntimeError("missing sections"), {}])
+_az2._run_eve_analysis = _run
+raised = False
+try:
+    _az2._run_eve_with_fallback("URA", "2026-07-07", _FakeCfg(), "", "", deadline_s=_time.monotonic() + 100)  # 100s < 600 floor
+except RuntimeError:
+    raised = True
+check_true("F2: deadline-skip -> ERROR (no fallback)", raised)
+check("F2: deadline-skip ran run-1 only (no fallback)", calls["n"], 1)
+
+# (d) no deadline (manual run): fallback always attempted
+_run, calls = _fake_run_eve([RuntimeError("turn_threw"), {}])
+_az2._run_eve_analysis = _run
+out = _az2._run_eve_with_fallback("X", "2026-07-07", _FakeCfg(), "", "", deadline_s=None)
+check_true("F2: no-deadline fallback recovers", out.get("fallback_triggered") is True)
+
+# F3: error_mode classification
+check("F3: missing_sections classified", _az2._classify_failure(RuntimeError("EVE output missing final_trade_decision/trader_investment_plan sections")), "missing_sections")
+check("F3: contract_violation classified", _az2._classify_failure(RuntimeError("contract violation: missing labels")), "contract_violation")
+check("F3: timeout classified", _az2._classify_failure(RuntimeError("analyze.py timed out after 3600s")), "timeout")
+check("F3: turn_threw classified", _az2._classify_failure(RuntimeError("EVE brain (decide.mjs) exited 1")), "turn_threw")
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

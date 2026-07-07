@@ -69,10 +69,16 @@ def analyze_one(ticker: str, *, timeout: int) -> dict:
 
     analyze.py prints framework chatter to stderr and exactly one JSON line to
     stdout (its LAST stdout line). We parse that; anything else is an ERROR datum.
+
+    F2: pass a per-ticker --deadline (epoch s) = now + timeout, so analyze.py's
+    fallback re-run can skip itself if < 600s remain (anchored to the SAME clock
+    as this subprocess's SIGKILL, not the tick-wide deadline).
     """
+    import time
+    deadline = time.monotonic() + timeout
     try:
         p = subprocess.run(
-            [PYTHON, ANALYZE_SCRIPT, ticker],
+            [PYTHON, ANALYZE_SCRIPT, ticker, "--deadline", f"{deadline}"],
             cwd=str(_REPO), capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:

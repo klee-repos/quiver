@@ -15,7 +15,7 @@ const REQUIRED_LABELS = [
 ];
 const REQUIRED_SECTIONS = [
   "market_report", "sentiment_report", "news_report", "fundamentals_report",
-  "trader_investment_plan", "final_trade_decision", "lever_proposals",
+  "trend_report", "trader_investment_plan", "final_trade_decision", "lever_proposals",
 ];
 
 function validateMarkdown(md) {
@@ -52,6 +52,9 @@ beat.
 
 ## fundamentals_report
 PE 28.
+
+## trend_report
+ADX 28, regime UPTREND, Sharpe 1.1.
 
 ## trader_investment_plan
 **Action**: Buy

@@ -31,6 +31,17 @@ const DATE = process.argv[3] || "";
 const PAST_CONTEXT = await readStdin();
 const ROUNDS = Math.max(1, parseInt(process.env.QUIVER_RESEARCH_ROUNDS || "1", 10) || 1);
 
+// F1: top-level safety net. The pipeline is top-level awaits; if any turn
+// exhausts its retries and throws (withRetry rethrows), this maps it to a clean
+// exit 1 so analyze.py sees a non-zero rc -> signal:ERROR (fail-safe skip),
+// rather than a raw unhandled-rejection dump. Never catches the success path.
+let _pipelineFailed = false;
+process.on("unhandledRejection", (e) => {
+  _pipelineFailed = true;
+  process.stderr.write(`[decide] PIPELINE FAILED: ${e?.message || e}\n`);
+  process.exit(1);
+});
+
 const or = createOpenAI({
   baseURL: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
   apiKey: process.env.OPENROUTER_API_KEY,
@@ -40,44 +51,114 @@ const or = createOpenAI({
 const DEEP = or.chat(process.env.QUIVER_REASONER_MODEL || "z-ai/glm-5.2");
 const QUICK = or.chat(process.env.QUIVER_CHAT_MODEL || "z-ai/glm-4.7-flash");
 
-// Reasoning-token accumulator (Gate-B): emitted per deep turn in a finally so a
-// later-turn crash still surfaces the count; analyze.py SUMS the lines.
-let reasoningTokens = 0;
+// Reasoning-token accounting (Gate-B): emitted per deep turn WITH the attempt
+// index whose output is actually used. analyze.py tracks the SUCCESSFUL (final)
+// attempt's count — not a sum — so reasoning_content_len honestly reflects the
+// accepted contract (a thinking-OFF regression on the winning attempt is caught).
+let reasoningTokens = 0;       // the FINAL attempt's count (the one whose output is used)
+let reasoningAttempt = 0;      // which attempt produced reasoningTokens
+
+// F1: a boolean "did the labels parse?" predicate. MUST mirror F6's Python `grab`
+// regex `(?::\*\*|\*\*:)` (analyze.py:315) — NOT the TS test's `:?\*\*:` which
+// rejects `**Label:** value` (would force a false-positive retry on every such
+// ticker). Returns true iff EVERY required label is present (case-insensitive,
+// spaces as \s+ — matching extractLabels at decide.mjs:268).
+function hasRequiredLabels(text, labels) {
+  const lines = (text || "").split("\n");
+  for (const lab of labels) {
+    const re = new RegExp("\\*\\*" + lab.replace(/ /g, "\\s+") + "(?::\\*\\*|\\*\\*:)\\s*(.+)", "i");
+    if (!lines.some(l => re.test(l))) return false;
+  }
+  return true;
+}
+
+// F1: a boolean "did the gather turn produce all 5 sub-reports?" predicate.
+function hasSubheads(text, names) {
+  for (const n of names) {
+    const re = new RegExp("###\\s+" + n + "\\s*\\n", "i");
+    if (!re.test(text || "")) return false;
+  }
+  return true;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// F1: bounded retry wrapper. Retries on (a) a thrown error AND (b) an
+// empty/unusable output (checked via the optional `validate` predicate — e.g.
+// hasRequiredLabels for the contract turns, hasSubheads for gather). Backoff:
+// exponential+jitter for thrown errors (rate-limit windows are 5-30s); NO delay
+// for empty-output failures (a content issue, not a rate issue). On exhaustion
+// it throws (the caller's top-level maps to exit 1 -> analyze.py ERROR).
+async function withRetry(label, fn, { tries = 3, validate = null } = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const out = await fn(attempt);
+      if (validate && !validate(out)) {
+        process.stderr.write(`[decide] ${label} attempt ${attempt}/${tries}: output failed validation (empty/missing labels); ${attempt < tries ? "retrying" : "giving up"}\n`);
+        lastErr = new Error(`${label}: output failed validation`);
+        if (attempt < tries) continue;   // no backoff for content failures
+        throw lastErr;
+      }
+      return out;
+    } catch (e) {
+      lastErr = e;
+      process.stderr.write(`[decide] ${label} attempt ${attempt}/${tries} error: ${e?.message || e}\n`);
+      if (attempt < tries) {
+        const base = 2000 * Math.pow(2, attempt - 1);   // 2s, 4s
+        const jitter = Math.floor(Math.random() * 1000);
+        await sleep(base + jitter);
+      }
+    }
+  }
+  throw lastErr;
+}
 
 async function deepTurn(system, prompt) {
-  try {
-    const r = await generateText({
-      model: DEEP,
-      maxOutputTokens: 16000,
-      providerOptions: { openrouter: { max_tokens: 16000, reasoning: { effort: "high" } } },
-      system, prompt,
-      stopWhen: isStepCount(1),
-    });
-    const t = r.usage?.outputTokenDetails?.reasoningTokens ?? r.usage?.reasoningTokens ?? 0;
-    reasoningTokens += t;
-    process.stderr.write(`REASONING_TOKENS: ${t}\n`);
-    return r.text;
-  } catch (e) {
-    process.stderr.write(`[decide] deep turn error: ${e?.message || e}\n`);
-    throw e;  // the caller's top-level catch maps to a non-zero exit -> analyze.py ERROR
-  }
+  // reasoningTokens/reasoningAttempt are set by the withRetry caller per
+  // successful attempt (below). This fn just does ONE generateText call.
+  const r = await generateText({
+    model: DEEP,
+    maxOutputTokens: 16000,
+    providerOptions: { openrouter: { max_tokens: 16000, reasoning: { effort: "high" } } },
+    system, prompt,
+    stopWhen: isStepCount(1),
+  });
+  const t = r.usage?.outputTokenDetails?.reasoningTokens ?? r.usage?.reasoningTokens ?? 0;
+  // Stash this attempt's count; withRetry's caller promotes it to the global
+  // only when the WHOLE turn (incl. validation) succeeds.
+  return { text: r.text, reasoningTokens: t };
 }
 
 async function quickTurn(system, prompt) {
-  try {
-    const r = await generateText({
-      model: QUICK,
-      maxOutputTokens: 6000,
-      providerOptions: { openrouter: { max_tokens: 6000 } },
-      system, prompt,
-      stopWhen: isStepCount(1),
-    });
-    return r.text;
-  } catch (e) {
-    process.stderr.write(`[decide] quick turn error: ${e?.message || e}\n`);
-    throw e;
-  }
+  const r = await generateText({
+    model: QUICK,
+    maxOutputTokens: 6000,
+    providerOptions: { openrouter: { max_tokens: 6000 } },
+    system, prompt,
+    stopWhen: isStepCount(1),
+  });
+  return r.text;
 }
+
+// Deep-turn wrapper with retry: on the SUCCESSFUL attempt, set the global
+// reasoningTokens/reasoningAttempt to THAT attempt's count (Gate-B: the count
+// is from the attempt whose output is used, not a sum across failed attempts).
+// The single final REASONING_TOKENS line is emitted once at the end of the run.
+async function deepTurnRetry(label, system, prompt, { tries = 3, validate = null } = {}) {
+  return withRetry(label, async (attempt) => {
+    const { text, reasoningTokens: t } = await deepTurn(system, prompt);
+    if (validate && !validate(text)) throw new Error(`${label}: output failed validation`);
+    reasoningTokens = t;        // promote ONLY on success (overwrites any prior failed attempt's stash)
+    reasoningAttempt = attempt;
+    return text;
+  }, { tries, validate: null });  // validation handled inside (so the count isn't stashed on a validation fail)
+}
+
+async function quickTurnRetry(label, system, prompt, { tries = 3, validate = null } = {}) {
+  return withRetry(label, (attempt) => quickTurn(system, prompt), { tries, validate });
+}
+
 
 const HORIZON = `You are the Quiver decision brain: a LONG-HORIZON TREND FOLLOWER. You ride
 multi-quarter to multi-year trends, NOT daily pops. Treat short-term noise (RSI overbought,
@@ -92,20 +173,22 @@ decisions + outcomes, NOT limits):
 ${PAST_CONTEXT || "(no prior decisions on this ticker)"}`;
 
 // --- Step 1: gather (analysts via tools, quick model drives the tool calls) ---
+// F1: gather retries re-run all 5 yfinance tool calls, so cap at 2 tries (cost/
+// rate-limit). Validate the 5 ### subheads are present (not just non-empty text).
+const GATHER_NAMES = ["market_report", "trend_report", "fundamentals_report", "news_report", "sentiment_report"];
 const dataTool = (kind, description) => tool({
   description,
   inputSchema: z.object({ ticker: z.string().min(1) }),
   execute: async ({ ticker }) => runPythonDataTool(kind, { ticker, date: DATE }),
 });
 
-process.stderr.write(`[decide] ticker=${TICKER} date=${DATE} rounds=${ROUNDS} deep=${process.env.QUIVER_REASONER_MODEL || "z-ai/glm-5.2"}\n`);
-
-const gather = await generateText({
-  model: QUICK,
-  maxOutputTokens: 8000,
-  providerOptions: { openrouter: { max_tokens: 8000 } },
-  system: HORIZON,
-  prompt: `Analyze ${TICKER} for trade date ${DATE}. Call the market_data, fundamentals,
+async function runGather() {
+  const r = await generateText({
+    model: QUICK,
+    maxOutputTokens: 8000,
+    providerOptions: { openrouter: { max_tokens: 8000 } },
+    system: HORIZON,
+    prompt: `Analyze ${TICKER} for trade date ${DATE}. Call the market_data, fundamentals,
 news, sentiment, AND trend tools to gather real data. ${PAST}
 
 Then output FIVE report blocks, each under a single `+ "`"+`### `+ "`"+` subheading (use ###, NEVER ##):
@@ -116,21 +199,25 @@ Then output FIVE report blocks, each under a single `+ "`"+`### `+ "`"+` subhead
 ### sentiment_report
 Summarize the fetched data in each. If a tool returned UNAVAILABLE, write "UNAVAILABLE: <reason>".
 Do not emit any ## section headers — only ### subheadings inside your reports.`,
-  tools: {
-    market_data: dataTool("market", "Fetch OHLCV + short-term technical indicators for a ticker. Read-only."),
-    trend: dataTool("trend", "Fetch LONG-HORIZON trend/risk guideposts (3y: Sharpe/Sortino/Calmar, drawdown depth+duration, ADX/DI, MA structure, regime). Read-only."),
-    fundamentals: dataTool("fundamentals", "Fetch fundamentals (PE, P/B, market cap, balance sheet). Read-only."),
-    news: dataTool("news", "Fetch recent news flow. Read-only."),
-    sentiment: dataTool("sentiment", "Fetch sentiment (StockTwits). Read-only."),
-  },
-  stopWhen: isStepCount(10),
-}).catch(e => { process.stderr.write(`[decide] gather failed: ${e?.message||e}\n`); process.exit(1); });
-const reports = gather.text;
+    tools: {
+      market_data: dataTool("market", "Fetch OHLCV + short-term technical indicators for a ticker. Read-only."),
+      trend: dataTool("trend", "Fetch LONG-HORIZON trend/risk guideposts (3y: Sharpe/Sortino/Calmar, drawdown depth+duration, ADX/DI, MA structure, regime). Read-only."),
+      fundamentals: dataTool("fundamentals", "Fetch fundamentals (PE, P/B, market cap, balance sheet). Read-only."),
+      news: dataTool("news", "Fetch recent news flow. Read-only."),
+      sentiment: dataTool("sentiment", "Fetch sentiment (StockTwits). Read-only."),
+    },
+    stopWhen: isStepCount(10),
+  });
+  return r.text;
+}
+const reports = await withRetry("gather", runGather, { tries: 2, validate: (t) => hasSubheads(t, GATHER_NAMES) });
+
+process.stderr.write(`[decide] ticker=${TICKER} date=${DATE} rounds=${ROUNDS} deep=${process.env.QUIVER_REASONER_MODEL || "z-ai/glm-5.2"}\n`);
 
 // --- Step 2: bull vs bear debate (quick model, `rounds` each) ---
 let bull = "", bear = "";
 for (let i = 0; i < ROUNDS; i++) {
-  bull = await quickTurn(HORIZON, `Round ${i+1} BULL case for ${TICKER} as a long-horizon trend
+  bull = await quickTurnRetry(`bull_r${i+1}`, HORIZON, `Round ${i+1} BULL case for ${TICKER} as a long-horizon trend
 follow. Use the reports + your memory scorecard as evidence; ground the bull thesis in the
 trend guideposts (regime, ADX, drawdown quality, multi-horizon momentum, risk-adjusted return).
 Be specific and data-backed.
@@ -138,20 +225,20 @@ Be specific and data-backed.
 REPORTS:
 ${reports}
 
-${PAST}`).catch(() => process.exit(1));
+${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
 
-  bear = await quickTurn(HORIZON, `Round ${i+1} BEAR case for ${TICKER}. Steelman the bearish
+  bear = await quickTurnRetry(`bear_r${i+1}`, HORIZON, `Round ${i+1} BEAR case for ${TICKER}. Steelman the bearish
 view against the same reports + memory. Where could the trend break? What drawdown risk,
 regime-flip risk, or fundamental deterioration is the bull case ignoring? Be data-backed.
 
 REPORTS:
 ${reports}
 
-${PAST}`).catch(() => process.exit(1));
+${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
 }
 
 // --- Step 3: research plan (deep model) ---
-const plan = await deepTurn(HORIZON, `As Research Manager, synthesize the bull + bear cases into
+const plan = await deepTurnRetry("plan", HORIZON, `As Research Manager, synthesize the bull + bear cases into
 ONE investment plan for ${TICKER}. State a recommendation, the time horizon you're betting on,
 the rationale grounded in the trend guideposts, and the strategic actions. Weigh the bull vs
 bear strength honestly.
@@ -165,10 +252,11 @@ ${bear}
 REPORTS:
 ${reports}
 
-${PAST}`).catch(() => process.exit(1));
+${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
 
 // --- Step 4: trade proposal (quick model) ---
-const proposal = await quickTurn(HORIZON, `As Trader, turn this research plan into a concrete
+const TRADER_LABELS = ["Action","Entry Price","Stop Loss","Position Sizing","Position Pct","Strategy Basis","Catalyst","Target Price"];
+const proposal = await quickTurnRetry("proposal", HORIZON, `As Trader, turn this research plan into a concrete
 proposal for ${TICKER}. Emit EXACTLY these 8 lines (use the `+ "`"+`**Label**: value`+ "`"+` form), nothing
 else for this block:
 **Action**: <Buy|Overweight|Hold|Underweight|Sell|skip>
@@ -183,10 +271,10 @@ else for this block:
 Frame entry/stop as trend-ride levels, not scalp levels. Python prices the stop; you only seed it.
 
 PLAN:
-${plan}`).catch(() => process.exit(1));
+${plan}`, { tries: 3, validate: (t) => hasRequiredLabels(t, TRADER_LABELS) });
 
 // --- Step 5: risk debate (quick model, aggressive + conservative) ---
-const riskAgg = await quickTurn(HORIZON, `As an AGGRESSIVE risk reviewer for ${TICKER}, argue the
+const riskAgg = await quickTurnRetry("risk_agg", HORIZON, `As an AGGRESSIVE risk reviewer for ${TICKER}, argue the
 risks of the proposal below. What's the worst realistic outcome, the stop that's too tight, the
 drawdown that'd force an exit? Be concrete.
 
@@ -194,9 +282,9 @@ PROPOSAL:
 ${proposal}
 
 PLAN:
-${plan}`).catch(() => process.exit(1));
+${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
 
-const riskCon = await quickTurn(HORIZON, `As a CONSERVATIVE risk reviewer for ${TICKER}, argue
+const riskCon = await quickTurnRetry("risk_con", HORIZON, `As a CONSERVATIVE risk reviewer for ${TICKER}, argue
 the risks of the proposal below. What's the downside the bull case is underweighting, the
 position size that's too large, the regime that could flip? Be concrete.
 
@@ -204,10 +292,11 @@ PROPOSAL:
 ${proposal}
 
 PLAN:
-${plan}`).catch(() => process.exit(1));
+${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
 
 // --- Step 6: portfolio decision (deep model, reasoning ON) ---
-const decision = await deepTurn(HORIZON, `As Portfolio Manager (thinking ON), make the FINAL call
+const PM_LABELS = ["Rating","Next Review Hours","Conviction","Uncertainty"];
+const decision = await deepTurnRetry("decision", HORIZON, `As Portfolio Manager (thinking ON), make the FINAL call
 for ${TICKER}. Read the whole chain. Emit EXACTLY these 4 lines (use `+ "`"+`**Label**: value`+ "`"+`),
 then a one-paragraph executive summary:
 **Rating**: <Buy|Overweight|Hold|Underweight|Sell>
@@ -227,7 +316,7 @@ ${proposal}
 RISKS (aggressive): ${riskAgg}
 RISKS (conservative): ${riskCon}
 
-${PAST}`).catch(() => process.exit(1));
+${PAST}`, { tries: 3, validate: (t) => hasRequiredLabels(t, PM_LABELS) });
 
 // --- Step 7: lever proposals (folded into the PM turn output; extract here) ---
 // The PM turn may include a lever line; default to "none" if absent.
@@ -259,8 +348,7 @@ const sentBody = grabSub(reports, "sentiment_report");
 // Pull the 8 trader labels + the 4 PM labels out of the proposal/decision turns
 // so the final sections carry ONLY the contract (no stray prose that could
 // introduce a second `**Label**:`). Fallback: keep the whole turn if extraction fails.
-const TRADER_LABELS = ["Action","Entry Price","Stop Loss","Position Sizing","Position Pct","Strategy Basis","Catalyst","Target Price"];
-const PM_LABELS = ["Rating","Next Review Hours","Conviction","Uncertainty"];
+// (TRADER_LABELS/PM_LABELS declared above at the proposal/decision call sites.)
 function extractLabels(text, labels) {
   const lines = (text || "").split("\n");
   const out = [];
@@ -303,8 +391,8 @@ const final = [
 
 process.stdout.write(final);
 
-process.stderr.write(`REASONING_TOKENS: ${reasoningTokens}\n`);
-process.stderr.write(`[decide] done: deep reasoning=${reasoningTokens}tok, ${final.length} chars\n`);
+process.stderr.write(`REASONING_TOKENS: ${reasoningTokens} attempt=${reasoningAttempt}\n`);
+process.stderr.write(`[decide] done: deep reasoning=${reasoningTokens}tok (attempt=${reasoningAttempt}), ${final.length} chars\n`);
 
 async function readStdin() {
   let data = "";
