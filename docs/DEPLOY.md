@@ -22,7 +22,7 @@ guard** denies any order whose `ref_id` the Python `plan` did not reserve.
 
 ## 0. Prerequisites
 - `gcloud` authed (`gcloud auth login`) and a project with **billing enabled**
-  (default `your-gcp-project-id`). Terraform ≥ 1.5.
+  (set in `terraform.tfvars`, see `terraform.tfvars.example`). Terraform ≥ 1.5.
 - Required APIs enabled (compute, secretmanager, iap, logging, monitoring,
   cloudresourcemanager) — `gcloud services enable ...`.
 - The repo is **public**, so the box clones over HTTPS — no deploy key / SSH / `gh` needed.
@@ -56,7 +56,7 @@ Monitoring policies are a secondary net.)
 ## 3. Verify the box (admin via IAP — no public inbound)
 IAP-tunneled SSH is the ONLY shell (no public SSH). The principal running it needs
 **`roles/iap.tunnelResourceAccessor`** + an OS Login role — a project **Owner** has both
-implicitly (so `ops@yourdomain.com` works out of the box); a non-owner operator must be granted
+implicitly (so your owner account works out of the box); a non-owner operator must be granted
 them, or they're locked out.
 ```bash
 gcloud compute ssh quiver --zone us-central1-a --tunnel-through-iap

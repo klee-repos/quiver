@@ -1,7 +1,7 @@
 variable "project" {
   description = "GCP project ID (billing enabled)"
   type        = string
-  default     = "your-gcp-project-id"
+  default     = "your-gcp-project-id" # override in terraform.tfvars (gitignored)
 }
 
 variable "region" {
@@ -37,7 +37,7 @@ variable "repo_url" {
 variable "alert_email" {
   description = "Email for the Cloud Monitoring notification channel (AUTH_ERROR / halt / plan error)"
   type        = string
-  default     = "ops@yourdomain.com"
+  default     = "ops@yourdomain.com" # override in terraform.tfvars (gitignored)
 }
 
 variable "secret_prefix" {

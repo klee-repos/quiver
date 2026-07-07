@@ -1,7 +1,8 @@
-# All variables have working defaults in variables.tf — `terraform apply` works with NO
-# tfvars. Copy this to terraform.tfvars only to override (e.g. a different project/region).
-# None of these are secrets (the public repo URL, project id, region, email), so committing
-# a filled-in terraform.tfvars is harmless if you prefer.
+# Copy this to terraform.tfvars (gitignored) and fill in YOUR values before `terraform apply`.
+# The variables.tf defaults are placeholders — they will NOT work as-is against a real GCP
+# account, so a terraform.tfvars with your real project + alert_email is required.
+# None of these are secrets (project id, region, email), so committing a filled-in
+# terraform.tfvars is harmless if you prefer — but it IS gitignored to keep your infra private.
 project      = "your-gcp-project-id"
 region       = "us-central1"
 zone         = "us-central1-a"
