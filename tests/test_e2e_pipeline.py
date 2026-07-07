@@ -191,6 +191,102 @@ def main() -> int:
         ok("Q3 non-allow-listed ADD blocked by validate_add",
            res.get("applied") is False and "refusing add" in (res.get("reason") or ""), res)
 
+    # === F4 multi-agent assembly seam (deterministic; no tokens) ============
+    # Proves decide.mjs's assembly glue (sanitize ## -> ###, prepend canonical
+    # headers once, extract the 12 labels) yields a contract that analyze.py's
+    # _split_eve_markdown + _validate_contract + extract_fields accept — incl.
+    # the adversarial case where a turn body contains a stray `## Rationale`.
+    import analyze as _az
+    import lib.rating as _rating
+
+    # Simulated turn outputs (what decide.mjs's deep/quick turns would emit).
+    # The gather turn emits ### sub-reports (NOT ##).
+    gather_out = """### market_report
+Price 195, RSI 58, volume up.
+### trend_report
+ADX 31, regime UPTREND, Sharpe 1.2, max DD -14%.
+### fundamentals_report
+PE 24, market cap 3T.
+### news_report
+earnings beat.
+### sentiment_report
+bullish 0.7."""
+    # The trader turn — with a STRAY `## Rationale` mid-block (the Gate-B
+    # adversarial case): decide.mjs must sanitize it so the splitter keeps all
+    # 8 labels under trader_investment_plan.
+    trader_turn = """**Action**: Buy
+**Entry Price**: 195
+**Stop Loss**: 180
+**Position Sizing**: ~5% of capital
+**Position Pct**: 5
+**Strategy Basis**: multi-quarter AI-capex uptrend
+## Rationale
+because ADX 31 and 200d slope positive
+**Catalyst**: none
+**Target Price**: 240"""
+    pm_turn = """**Rating**: Buy
+**Next Review Hours**: 48
+**Conviction**: 72
+**Uncertainty**: 28
+The trend is persistent; ride it."""
+
+    # Replicate decide.mjs's sanitize + extract + prepend-headers-once:
+    def _sanitize(body):
+        return "\n".join(("### " + l[3:]) if l.startswith("## ") else l
+                         for l in (body or "").split("\n")).strip()
+
+    def _extract(text, labels):
+        lines = (text or "").split("\n")
+        out = []
+        for lab in labels:
+            import re
+            re_lbl = re.compile(r"\*\*" + lab.replace(" ", r"\s+") + r"(?::\*\*|\*\*:)\s*(.+)", re.I)
+            hit = next((l for l in lines if re_lbl.search(l)), None)
+            if hit:
+                out.append(hit.strip())
+        return "\n".join(out) if out else text.strip()
+
+    TRADER = ["Action","Entry Price","Stop Loss","Position Sizing","Position Pct","Strategy Basis","Catalyst","Target Price"]
+    PM = ["Rating","Next Review Hours","Conviction","Uncertainty"]
+    def grab_sub(body, name):
+        import re
+        m = re.search(r"###\s+" + name + r"\s*\n([\s\S]*?)(?=###\s+|$)", body, re.I)
+        return m.group(1).strip() if m else "UNAVAILABLE"
+
+    final = "\n\n".join([
+        "## market_report", _sanitize(grab_sub(gather_out, "market_report")),
+        "## trend_report", _sanitize(grab_sub(gather_out, "trend_report")),
+        "## sentiment_report", _sanitize(grab_sub(gather_out, "sentiment_report")),
+        "## news_report", _sanitize(grab_sub(gather_out, "news_report")),
+        "## fundamentals_report", _sanitize(grab_sub(gather_out, "fundamentals_report")),
+        "## trader_investment_plan", _sanitize(_extract(trader_turn, TRADER)),
+        "## final_trade_decision", _sanitize(_extract(pm_turn, PM)),
+        "## lever_proposals", "none",
+    ])
+
+    # 1. the splitter yields exactly the 8 canonical sections, each non-empty.
+    pseudo = _az._split_eve_markdown(final)
+    ok("F4 seam: 8 canonical sections present",
+       all(k in pseudo for k in ("market_report","trend_report","sentiment_report","news_report",
+          "fundamentals_report","trader_investment_plan","final_trade_decision","lever_proposals")), list(pseudo.keys()))
+    # 2. the stray `## Rationale` did NOT truncate the trader labels (the
+    #    sanitizer downgraded it to `### Rationale` so the splitter kept the
+    #    Target Price line after it).
+    ok("F4 seam: stray ## Rationale sanitized (all 8 trader labels kept)",
+       "**Target Price**" in (pseudo.get("trader_investment_plan") or ""),
+       pseudo.get("trader_investment_plan"))
+    # 3. the F6 contract gate PASSES on the assembled output (12 labels + basis).
+    try:
+        _az._validate_contract(pseudo)
+        ok("F4 seam: F6 validator passes assembled contract", True)
+    except RuntimeError as e:
+        ok("F4 seam: F6 validator passes assembled contract", False, str(e))
+    # 4. extract_fields + parse_rating yield a valid 5-tier signal (the live seam).
+    fields = _az.extract_fields(pseudo, _rating.parse_rating(pseudo.get("final_trade_decision", "")), "AAPL")
+    ok("F4 seam: signal derived as Buy", fields["signal"], "Buy")
+    ok("F4 seam: basis carried through", fields["basis"], "multi-quarter AI-capex uptrend")
+    ok("F4 seam: trend_report captured in audit dump keys", "trend_report" in _az._EVE_SECTIONS)
+
     print(f"\nE2E pipeline: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

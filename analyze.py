@@ -33,6 +33,8 @@ REASONDIR = REPO / "logs" / "reasoning"
 # WITHOUT touching live state. analyze.py only READS the ledger here (it writes no rows).
 LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (STATE / "ledger.db"))
 
+from lib.rating import parse_rating  # module-level: _validate_contract (F6) uses it too
+
 
 class _Tee:
     """Fan stdout writes to a primary stream (always) + a best-effort file.
@@ -249,7 +251,7 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
     LOGDIR.mkdir(parents=True, exist_ok=True)
     keys = [
         "company_of_interest", "trade_date", "market_report", "sentiment_report",
-        "news_report", "fundamentals_report", "investment_plan",
+        "news_report", "fundamentals_report", "trend_report", "investment_plan",
         "trader_investment_plan", "final_trade_decision",
     ]
     safe = {k: final_state.get(k) for k in keys if k in final_state}
@@ -267,10 +269,58 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
 # the broker / limits; EVE is the brain only.
 
 # The separable `## section` headers EVE emits (F1 contract) -> final_state keys.
+# F3: trend_report added (optional long-horizon guidepost block; missing -> the
+# splitter just won't have it, never an ERROR — only core market data gates).
 _EVE_SECTIONS = (
     "market_report", "sentiment_report", "news_report", "fundamentals_report",
-    "trader_investment_plan", "final_trade_decision", "lever_proposals",
+    "trend_report", "trader_investment_plan", "final_trade_decision", "lever_proposals",
 )
+
+# F6: the 12 contract labels. The Python-side gate is BINDING (the TS validator
+# is dead code in the live path — decide.mjs never imports it). Ported from
+# quiver_eve/test/contract.test.mjs (agent.ts does NOT export REQUIRED_LABELS;
+# validate.ts:8's import is broken, so this Python list is the source of truth).
+_CONTRACT_LABELS = (
+    # trader_investment_plan (8)
+    "Action", "Entry Price", "Stop Loss", "Position Sizing", "Position Pct",
+    "Strategy Basis", "Catalyst", "Target Price",
+    # final_trade_decision (4)
+    "Rating", "Next Review Hours", "Conviction", "Uncertainty",
+)
+
+
+def _validate_contract(pseudo: dict) -> None:
+    """F6 binding fail-safe gate. Asserts the 12 contract labels are PRESENT in
+    the assembled markdown AND ``**Strategy Basis**`` is non-empty — then a
+    multi-turn brain (F4) cannot emit a half-formed PM decision that passes the
+    section-only check at line 363 and yields a tradable signal. Uses
+    parse_trader_plan's ``grab`` regex (the ``(?::\\*\\*|\\*\\*:)`` alternation)
+    which accepts BOTH ``**Label**: v`` and ``**Label:** v`` — the common LLM
+    variant. MUST NOT use validate.ts's regex (``:?\\*\\*:``) which REJECTS the
+    colon-inside-bold form and would make every ticker ERROR (a unit test pins
+    this). Raises RuntimeError -> _run_eve maps to signal:ERROR (skip)."""
+    plan_md = str(pseudo.get("trader_investment_plan") or "")
+    pm_md = str(pseudo.get("final_trade_decision") or "")
+    # Strategy Basis non-empty AND not a sentinel (none/null/n/a) — mirroring
+    # validate.ts's empty_basis check. parse_trader_plan.grab returns the raw
+    # text; "none" is a non-empty string but is the model saying "no basis",
+    # which the consistency gate must treat as ungrounded (fail-safe).
+    basis = (parse_trader_plan(plan_md).get("basis") or "").strip()
+    if not basis or re.match(r"^(none|null|n/a)$", basis, re.IGNORECASE):
+        raise RuntimeError(
+            "contract violation: **Strategy Basis** missing or empty")
+    missing = []
+    for label in _CONTRACT_LABELS:
+        # grab's regex (analyze.py:127): \*\*LABEL(?::\*\*|\*\*:)\s*(.+)
+        m = re.search(rf"\*\*{re.escape(label)}(?::\*\*|\*\*:)\s*(.+)", plan_md + "\n" + pm_md)
+        if not m:
+            missing.append(label)
+    if missing:
+        raise RuntimeError(
+            f"contract violation: missing labels {missing}")
+    rating = parse_rating(pm_md)
+    if rating is None or rating == "ERROR":
+        raise RuntimeError(f"contract violation: no valid **Rating** (got {rating!r})")
 
 
 def _split_eve_markdown(md: str) -> dict:
@@ -325,6 +375,8 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
     env.setdefault("QUIVER_REPO", str(REPO))
     env.setdefault("QUIVER_PYTHON", str(REPO / ".venv" / "bin" / "python"))
     env.setdefault("QUIVER_DATA_HELPER", str(eve_dir / "run" / "quill_data.py"))
+    # F4: the multi-agent debate round count (bull/bear + risk-debate per round).
+    env.setdefault("QUIVER_RESEARCH_ROUNDS", str(getattr(cfg, "research_rounds", 1)))
     # Pipe the past_context in via stdin (argv-length-safe).
     ctx_stdin = (past_context or "").encode("utf-8")
     try:
@@ -347,7 +399,11 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
                 sink.write(line)
                 m = re.search(r"REASONING_TOKENS:\s*(\d+)", line)
                 if m:
-                    reasoning_tokens[0] = int(m.group(1))
+                    # F4 (Gate-B): SUM across deep turns (not last-write-wins) so a
+                    # Step-6 throw after a Step-3 count still leaves a nonzero total
+                    # (honest thinking-ON proof). decide.mjs emits per deep turn in a
+                    # finally so a crash still surfaces its count.
+                    reasoning_tokens[0] += int(m.group(1))
         except Exception:  # noqa: BLE001 — the log is best-effort
             pass
     t = threading.Thread(target=_drain_stderr, daemon=True)
@@ -362,6 +418,7 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
     pseudo = _split_eve_markdown(md)
     if not pseudo.get("final_trade_decision") or not pseudo.get("trader_investment_plan"):
         raise RuntimeError("EVE output missing final_trade_decision/trader_investment_plan sections")
+    _validate_contract(pseudo)  # F6: binding fail-safe gate (12 labels + non-empty basis)
     pseudo["_reasoning_tokens"] = reasoning_tokens[0]
     return pseudo
 

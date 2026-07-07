@@ -2526,5 +2526,112 @@ _NO_BASIS = _EVE_FIXTURE.replace("**Strategy Basis**: momentum_breakout\n", "")
 check("eve-contract: missing basis -> None (gate suppresses the reversal)", _az.parse_trader_plan(_NO_BASIS.split("## trader_investment_plan")[1])["basis"], None)
 
 
+# === F1 lib.trend long-horizon guideposts (pure math) =======================
+import numpy as _np
+
+def _line(n, slope=0.0, noise=0.0, base=100.0, seed=1):
+    return [float(base + i * slope + (_np.random.RandomState(seed).normal(0, noise) if noise else 0.0))
+            for i in range(n)]
+
+from lib import trend as _tr
+
+_up = _tr.trend_metrics(_line(300, slope=0.10, base=100.0), high=_line(300, 0.10, base=101.0), low=_line(300, 0.10, base=99.0))
+check_true("trend: uptrend +1y", _up.ret_1y is not None and _up.ret_1y > 0)
+check("trend: uptrend regime", _up.trend_regime, "UPTREND")
+check_true("trend: uptrend +Sharpe", _up.sharpe is not None and _up.sharpe > 0)
+check_true("trend: ADX computable on 300 rows", _up.adx is not None)
+
+_down = _tr.trend_metrics(_line(300, slope=-0.10, base=100.0), high=_line(300, -0.10, base=101.0), low=_line(300, -0.10, base=99.0))
+check_true("trend: downtrend -1y", _down.ret_1y is not None and _down.ret_1y < 0)
+check("trend: downtrend regime", _down.trend_regime, "DOWNTREND")
+
+_short = _tr.trend_metrics([100.0, 101.0])
+check("trend: short series ADX None", _short.adx, None)
+check("trend: short series regime RANGE", _short.trend_regime, "RANGE")
+check("trend: short series Sharpe None", _short.sharpe, None)
+
+_px = [100.0] + [100 + i for i in range(1, 21)] + [120 - i * 1.5 for i in range(1, 21)] + [90 + i for i in range(1, 40)]
+_dd = _tr.drawdown_stats(_px)
+check_true("trend: max DD ~25%", _dd.max_depth is not None and 0.24 < _dd.max_depth < 0.26)
+check_true("trend: DD duration >=20 days", _dd.max_duration_days is not None and _dd.max_duration_days >= 20)
+check("trend: ends at new high (current DD 0)", _dd.current_depth, 0.0)
+
+check("trend: calmar None on no-DD", _tr.calmar(_line(300, slope=0.05, base=100.0)), None)
+check("trend: 12-1 None on short", _tr.momentum_12_1(_line(100, slope=0.1)), None)
+check_true("trend: 12-1 computable on 280", _tr.momentum_12_1(_line(280, slope=0.05)) is not None)
+
+_md_tr = _tr.render_trend_report(_up)
+check_true("trend: render has no ## subheadings", not any(l.startswith("## ") for l in _md_tr.splitlines()))
+check("trend: None ADX -> RANGE", _tr.trend_regime(None, _tr.MAStats(None, None, None, None, None, None, None)), "RANGE")
+
+
+# === F3: _split_eve_markdown section tolerance ==============================
+def _contract_md(*, with_trend=True, basis="multi-qtr uptrend thesis",
+                 rating="Buy", extra_trend_subheading=False):
+    p = ["## market_report", "price data here", ""]
+    if with_trend:
+        p += ["## trend_report", "1y return: +12%"]
+        if extra_trend_subheading:
+            # SINGLE-word `##` subheading is the real splitter risk (multi-word
+            # `## Drawdown Metrics` does NOT match the single-word regex). This
+            # is why lib.trend renders with `###` not `##`.
+            p += ["## Drawdown", "max DD -18%"]
+        p += [""]
+    p += ["## sentiment_report", "bullish", "", "## news_report", "news", "",
+          "## fundamentals_report", "fundy", "", "## trader_investment_plan",
+          "**Action**: " + rating, "**Entry Price**: 100", "**Stop Loss**: 90",
+          "**Position Sizing**: ~5%", "**Position Pct**: 5",
+          f"**Strategy Basis**: {basis}", "**Catalyst**: none", "**Target Price**: 120", "",
+          "## final_trade_decision", f"**Rating**: {rating}",
+          "**Next Review Hours**: 24", "**Conviction**: 70", "**Uncertainty**: 30", "",
+          "## lever_proposals", "none"]
+    return "\n".join(p)
+
+_split_with = _az._split_eve_markdown(_contract_md(with_trend=True))
+check_true("F3: trend_report kept when present", "trend_report" in _split_with and "1y return" in (_split_with.get("trend_report") or ""))
+_split_without = _az._split_eve_markdown(_contract_md(with_trend=False))
+check_true("F3: missing trend_report tolerated", "trend_report" not in _split_without and "final_trade_decision" in _split_without)
+_split_bad = _az._split_eve_markdown(_contract_md(with_trend=True, extra_trend_subheading=True))
+check_true("F3: stray ## subheading truncates trend body (pins the render rule)", "Drawdown" not in (_split_bad.get("trend_report") or ""))
+
+
+# === F6: Python contract validator (binding fail-safe gate) =================
+def _trader_block(form="outer"):
+    """form='outer' -> `**Label**: value` ; 'inner' -> `**Label:** value`.
+    Labels are written as `**Label` + SEP + value where SEP closes the bold."""
+    sep = "**: " if form == "outer" else ":** "
+    return (f"**Action{sep}Buy\n**Entry Price{sep}100\n**Stop Loss{sep}90\n"
+            f"**Position Sizing{sep}~5%\n**Position Pct{sep}5\n"
+            f"**Strategy Basis{sep}uptrend thesis\n**Catalyst{sep}none\n**Target Price{sep}120")
+
+def _pm_block(form="outer"):
+    sep = "**: " if form == "outer" else ":** "
+    return f"**Rating{sep}Buy\n**Next Review Hours{sep}24\n**Conviction{sep}70\n**Uncertainty{sep}30"
+
+# canonical `**Label**: value`
+_az._validate_contract({"trader_investment_plan": _trader_block("outer"), "final_trade_decision": _pm_block("outer")})
+PASS += 1
+# colon-inside-bold `**Label:** value` (Gate-B: validate.ts rejects this; grab accepts -> gate MUST too)
+_az._validate_contract({"trader_investment_plan": _trader_block("inner"), "final_trade_decision": _pm_block("inner")})
+PASS += 1
+# colon-inside-bold `**Label:** value` (Gate-B: validate.ts rejects this; grab accepts -> gate MUST too)
+_inner_plan = "\n".join(f"**{lbl}:** {v}" for lbl, v in [
+    ("Action", "Buy"), ("Entry Price", "100"), ("Stop Loss", "90"),
+    ("Position Sizing", "~5%"), ("Position Pct", "5"),
+    ("Strategy Basis", "uptrend thesis"), ("Catalyst", "none"), ("Target Price", "120")])
+_inner_pm = "\n".join(f"**{lbl}:** {v}" for lbl, v in [
+    ("Rating", "Buy"), ("Next Review Hours", "24"), ("Conviction", "70"), ("Uncertainty", "30")])
+_az._validate_contract({"trader_investment_plan": _inner_plan, "final_trade_decision": _inner_pm})
+PASS += 1
+
+check_raises("F6: empty basis raises", lambda: _az._validate_contract(
+    {"trader_investment_plan": _trader_block("outer").replace("uptrend thesis", "none"),
+     "final_trade_decision": _pm_block("outer")}), RuntimeError)
+check_raises("F6: missing label raises", lambda: _az._validate_contract(
+    {"trader_investment_plan": _trader_block("outer"),
+     "final_trade_decision": "**Rating**: Buy\n**Next Review Hours**: 24\n**Uncertainty**: 30"}),
+    RuntimeError)
+
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

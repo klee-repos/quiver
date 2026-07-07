@@ -84,9 +84,38 @@ def fetch_fundamentals(ticker: str) -> tuple[str, bool]:
             f"Balance Sheet: {json.dumps(bs, default=str)[:1500]}"), bool(f)
 
 
+def fetch_trend(ticker: str, date: str | None) -> tuple[str, bool]:
+    """F1: long-horizon trend/risk guideposts (yfinance, no key). ~3y daily.
+    Pure metrics computed by lib.trend (unit-tested). Rendered as markdown with
+    ``###`` subheadings ONLY (NEVER ``##`` — analyze.py:_split_eve_markdown
+    keys on ``^##\\s+<word>`` and would drop the whole trend_report body). Fails
+    safe: any error -> UNAVAILABLE (never raises). ``core_available`` reflects
+    the price series (a usable close), NOT the trend metrics — a missing trend
+    report never trips the core-data ERROR gate (only market_report does)."""
+    import yfinance as yf
+    from datetime import datetime, timedelta
+    from lib import trend
+
+    end = datetime.strptime(date, "%Y-%m-%d") if date else datetime.now()
+    start = end - timedelta(days=365 * 3 + 30)
+    tk = yf.Ticker(ticker)
+    hist = tk.history(start=start.strftime("%Y-%m-%d"),
+                     end=(end + timedelta(days=1)).strftime("%Y-%m-%d"), auto_adjust=True)
+    if hist is None or hist.empty:
+        return "UNAVAILABLE: no price history for trend window", False
+    close = [float(x) for x in hist["Close"].tolist()]
+    high = [float(x) for x in hist["High"].tolist()]
+    low = [float(x) for x in hist["Low"].tolist()]
+    if not close or close[-1] is None:
+        return "UNAVAILABLE: no usable close", False
+    bundle = trend.trend_metrics(close, high=high, low=low)
+    report = trend.render_trend_report(bundle)
+    return report, True
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["market", "sentiment", "news", "fundamentals"])
+    ap.add_argument("kind", choices=["market", "sentiment", "news", "fundamentals", "trend"])
     ap.add_argument("ticker")
     ap.add_argument("--date", default=None)
     args = ap.parse_args(argv)
@@ -97,6 +126,8 @@ def main(argv) -> int:
         out = _safe(lambda: fetch_sentiment(t))
     elif args.kind == "news":
         out = _safe(lambda: fetch_news(t))
+    elif args.kind == "trend":
+        out = _safe(lambda: fetch_trend(t, args.date))
     else:
         out = _safe(lambda: fetch_fundamentals(t))
     print(json.dumps(out))

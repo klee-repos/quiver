@@ -183,6 +183,7 @@ class Config:
     brain_engine: str = "eve"
     eve_dir: str = "quiver_eve"
     eve_url: str = "http://127.0.0.1:2244"  # the EVE server (eve dev / eve start) HTTP endpoint
+    research_rounds: int = 1  # F4: bull/bear + risk-debate rounds (default 1; spec max 2)
     # --- Self-learning tail (lib/levers) --------------------------------
     # auto_apply_levers=false (default) = a discovered lever needs human
     # `tick.py levers-approve` to activate (mirrors universe-apply). true =
@@ -554,6 +555,13 @@ def load_config(path) -> Config:
     eve_dir = str(brain.get("eve_dir", "quiver_eve") or "quiver_eve").strip()
     eve_url = str(brain.get("eve_url", os.environ.get("QUIVER_EVE_URL", "http://127.0.0.1:2244"))
                   or "http://127.0.0.1:2244").strip()
+    # F4: research_rounds bounds the bull/bear + risk-debate turns (each round =
+    # +2 quick-model turns). Default 1 (~8 turns/ticker worst case) preserves the
+    # v1 cost ceiling; the spec's max is 2. Raise only with data to justify it.
+    try:
+        research_rounds = max(1, int(brain.get("research_rounds", 1) or 1))
+    except (TypeError, ValueError):
+        research_rounds = 1
 
     # --- Self-learning tail (lib/levers) --------------------------------
     learning = d.get("learning", {}) or {}
@@ -573,6 +581,7 @@ def load_config(path) -> Config:
         brain_engine=brain_engine,
         eve_dir=eve_dir,
         eve_url=eve_url,
+        research_rounds=research_rounds,
         auto_apply_levers=auto_apply_levers,
         lever_min_decisions=lever_min_decisions,
         lever_retire_alpha=lever_retire_alpha,
