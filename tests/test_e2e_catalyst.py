@@ -265,5 +265,13 @@ ok("J: pass_min=3 gives perfect agreement on this set (b1 pass, b2 fail)",
    _pm3 is not None and _pm3["accuracy"] == 1.0)
 ok("J: best-precision operating point returned", rJ.get("best_precision") is not None)
 
+# --- K) labeling corpus round-trips (catalyst-seed writes / catalyst-label reads the JSONL) ---
+_cp = str(Path(tempfile.mkdtemp()) / "corpus.jsonl")
+T._save_corpus(_cp, [{"bill_id": "b1", "human_verdict": None, "impacted_tickers": [_imp("COIN")]},
+                     {"bill_id": "b2", "human_verdict": "pass"}])
+_back = T._load_corpus(_cp)
+ok("K: corpus round-trips", len(_back) == 2 and _back[0]["bill_id"] == "b1")
+ok("K: un-labeled rows are distinguishable from labeled", sum(1 for r in _back if not r.get("human_verdict")) == 1)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

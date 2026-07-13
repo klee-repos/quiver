@@ -1697,61 +1697,155 @@ def _run_judge_eval(cfg, led, args, *, judge=None) -> dict:
             "best_precision": je.best_operating_point(sweep, "precision")}
 
 
+def _load_corpus(path: str) -> list:
+    rows = []
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    return rows
+
+
+def _save_corpus(path: str, rows: list) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+
+
 def cmd_catalyst_label(args) -> dict:
-    """Interactive: label the QUALITY of the impact-analysis on each analyzed bill (grading the
-    ANALYSIS, not predicting the market). Appends one JSONL row per verdict to the labels file;
-    the accumulated labels tune the judge via `catalyst-eval judge`."""
+    """Interactive: grade the QUALITY of each impact-analysis in the corpus (is it coherent,
+    grounded, directionally right — NOT a market prediction). Fills in the un-labeled rows a
+    `catalyst-seed` produced (and pulls any live-analyzed bills from the ledger into the corpus
+    too). The accumulated labels tune the judge via `catalyst-eval judge`. Runs locally."""
     import sys
     cfg, led = _cfg_and_ledger()
     import lib.legislative as legis
-    labels_path = _labels_path(args)
-    already = set()
-    if os.path.exists(labels_path):
-        with open(labels_path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    already.add(json.loads(line).get("bill_id"))
-                except ValueError:
-                    continue
+    corpus_path = _labels_path(args)
+    rows = _load_corpus(corpus_path)
+    known = {r.get("bill_id") for r in rows}
+    # fold in any live-analyzed bills not already in the corpus, as un-labeled rows
     with led.legislative_conn() as c:
-        cards = []
         for b in legis.analyzed_bills(c):
-            if b["bill_id"] in already:
+            if b["bill_id"] in known:
                 continue
-            b["impacts"] = legis.get_bill_impacts(c, b["bill_id"])
-            cards.append(b)
-    cards = cards[:int(getattr(args, "limit", 10) or 10)]
-    if not cards:
-        return {"labeled": 0, "reason": "no un-labeled analyzed bills with impacts — let bills-review "
-                "accumulate a corpus over a few days (or temporarily lower legislative.passage_prob_min)",
-                "already_labeled": len(already)}
+            rows.append({"bill_id": b["bill_id"], "title": b["title"], "status": b["status"],
+                         "impacted_tickers": legis.get_bill_impacts(c, b["bill_id"]),
+                         "thesis": b["thesis"], "human_verdict": None, "why": ""})
+            known.add(b["bill_id"])
+    unlabeled = [r for r in rows if str(r.get("human_verdict") or "").lower() not in ("pass", "fail")]
+    labeled_total = len(rows) - len(unlabeled)
+    if not unlabeled:
+        _save_corpus(corpus_path, rows)
+        return {"labeled": 0, "corpus": corpus_path, "total_in_corpus": len(rows),
+                "already_labeled": labeled_total,
+                "reason": "no un-labeled entries — run `catalyst-seed` to add bills to grade"}
     if not sys.stdin.isatty():
-        return {"error": "catalyst-label is interactive — run it in a terminal",
-                "to_label": [b["bill_id"] for b in cards]}
-    os.makedirs(os.path.dirname(labels_path), exist_ok=True)
+        return {"labeled": 0, "corpus": corpus_path, "unlabeled": len(unlabeled),
+                "already_labeled": labeled_total,
+                "note": "interactive — run `.venv/bin/python tick.py catalyst-label` in a terminal to grade"}
+    limit = int(getattr(args, "limit", 20) or 20)
     labeled = 0
-    with open(labels_path, "a", encoding="utf-8") as f:
-        for b in cards:
-            print("\n" + "=" * 72, file=sys.stderr)
-            print(f"{b['bill_id']}  [{b['status']}]  passage_prob={b['passage_prob']}", file=sys.stderr)
-            print(f"  {b['title']}", file=sys.stderr)
-            print(f"  thesis: {b['thesis']}", file=sys.stderr)
-            for i in b["impacts"]:
-                print(f"    - {i['ticker']}: {i['direction']} mag={i['magnitude']} ({i['horizon']}) "
-                      f"— {i['rationale']}", file=sys.stderr)
-            ans = input("  is this impact analysis GOOD? [g]ood / [b]ad / [s]kip / [q]uit: ").strip().lower()
-            if ans in ("q", "quit"):
-                break
-            if ans not in ("g", "good", "b", "bad"):
-                continue
-            why = input("  why (optional one-liner): ").strip()
-            row = {"bill_id": b["bill_id"], "title": b["title"], "status": b["status"],
-                   "impacted_tickers": b["impacts"], "thesis": b["thesis"],
-                   "human_verdict": "pass" if ans in ("g", "good") else "fail", "why": why}
-            f.write(json.dumps(row) + "\n")
-            f.flush()
-            labeled += 1
-    return {"labeled": labeled, "path": labels_path, "total_labels": len(already) + labeled}
+    for r in unlabeled[:limit]:
+        print("\n" + "=" * 72, file=sys.stderr)
+        print(f"{r['bill_id']}  [{r.get('status')}]  ({labeled_total + labeled + 1} of "
+              f"{labeled_total + len(unlabeled)})", file=sys.stderr)
+        print(f"  {r.get('title')}", file=sys.stderr)
+        print(f"  thesis: {r.get('thesis')}", file=sys.stderr)
+        for i in (r.get("impacted_tickers") or []):
+            print(f"    - {i.get('ticker')}: {i.get('direction')} mag={i.get('magnitude')} "
+                  f"({i.get('horizon')}) — {i.get('rationale')}", file=sys.stderr)
+        ans = input("  is this impact analysis GOOD? [g]ood / [b]ad / [s]kip / [q]uit: ").strip().lower()
+        if ans in ("q", "quit"):
+            break
+        if ans not in ("g", "good", "b", "bad"):
+            continue
+        r["human_verdict"] = "pass" if ans in ("g", "good") else "fail"
+        r["why"] = input("  why (optional one-liner): ").strip()
+        labeled += 1
+    _save_corpus(corpus_path, rows)
+    return {"labeled": labeled, "corpus": corpus_path, "total_in_corpus": len(rows),
+            "labeled_total": labeled_total + labeled,
+            "remaining_unlabeled": len(unlabeled) - labeled}
+
+
+def cmd_catalyst_seed(args) -> dict:
+    """Build a labeling corpus: fetch recent SUBSTANTIVE bills (reached committee+; cached), run
+    the real impact analysis on each (parallel), and append the ones that name tickers to the
+    corpus as un-labeled rows for `catalyst-label`. Decoupled from the live trading ledger — a
+    seed bill is NEVER judged or proposed. Cost = one LLM analysis per candidate; bounded by
+    --max-analyze + a deadline."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    import lib.legislative as legis
+    from lib.dataflows import congress
+    from lib.dataflows.errors import DataUnavailableError
+    cfg, led = _cfg_and_ledger()
+    leg = cfg.legislative
+    if not leg.api_key:
+        return {"error": "CONGRESS_API_KEY not set"}
+    corpus_path = _labels_path(args)
+    have = {r.get("bill_id") for r in _load_corpus(corpus_path)}
+    target = int(getattr(args, "n", 15) or 15)
+    max_analyze = int(getattr(args, "max_analyze", 40) or 40)
+    lookback = int(getattr(args, "lookback_days", 240) or 240)
+    deadline = time.monotonic() + int(getattr(args, "deadline_sec", 540) or 540)
+    now = market.now_et()
+    stats: dict = {}
+    opener = legis.caching_opener(led, now=now.isoformat(), stats=stats)
+
+    # candidate pool: recent bills that reached a SUBSTANTIVE stage (impact-likely), newest first.
+    since = (now - timedelta(days=lookback)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        pool = congress.poll_changed_bills(since, until, leg.api_key, page_limit=250, max_pages=6, opener=opener)
+    except DataUnavailableError as e:
+        return {"error": f"poll failed: {e}", "cache": stats}
+    substantive = {"reported", "passed_one", "passed_both", "to_president", "became_law"}
+    cands = [b for b in pool
+             if congress.derive_status(b.get("latest_action")) in substantive and b["bill_id"] not in have]
+    cands = cands[:max_analyze]
+
+    def _analyze_one(b):
+        if time.monotonic() > deadline:
+            return None
+        try:
+            detail = congress.fetch_bill_detail(b["congress"], b["bill_type"], b["number"], leg.api_key, opener=opener)
+            tvs = congress.fetch_text_versions(detail.get("text_versions_url"), leg.api_key, opener=opener) \
+                if detail.get("text_versions_url") else []
+            text = congress.fetch_bill_text(tvs, opener=opener) if tvs else ""
+            meta = {"bill_id": b["bill_id"], "title": detail.get("title") or b.get("title"),
+                    "status": detail.get("status"), "policy_codes": detail.get("policy_codes"),
+                    "latest_action": detail.get("latest_action")}
+            analysis = _default_bill_analyze(meta, text)
+            if not analysis.get("impacted_tickers"):
+                return None
+            return {"bill_id": b["bill_id"], "title": meta["title"], "status": meta["status"],
+                    "impacted_tickers": analysis["impacted_tickers"], "thesis": analysis.get("thesis", ""),
+                    "human_verdict": None, "why": ""}
+        except Exception:  # noqa: BLE001 — one bad bill never sinks the seed
+            return None
+
+    seeded = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for row in ex.map(_analyze_one, cands):
+            if row and row["bill_id"] not in have:
+                seeded.append(row)
+                have.add(row["bill_id"])
+                if len(seeded) >= target:
+                    break
+    corpus = _load_corpus(corpus_path)
+    corpus.extend(seeded)
+    _save_corpus(corpus_path, corpus)
+    return {"seeded": len(seeded), "analyzed_candidates": len(cands), "corpus": corpus_path,
+            "total_in_corpus": len(corpus), "cache": stats,
+            "next": "label them: .venv/bin/python tick.py catalyst-label"}
 
 
 def cmd_universe_apply(args) -> dict:
@@ -2440,7 +2534,13 @@ def main(argv) -> int:
     p_ce.add_argument("--judge-votes", dest="judge_votes", default="5")
     p_cl = sub.add_parser("catalyst-label")
     p_cl.add_argument("--labels", default="")
-    p_cl.add_argument("--limit", default="10")
+    p_cl.add_argument("--limit", default="20")
+    p_cs = sub.add_parser("catalyst-seed")
+    p_cs.add_argument("--labels", default="")
+    p_cs.add_argument("--n", default="15")
+    p_cs.add_argument("--max-analyze", dest="max_analyze", default="40")
+    p_cs.add_argument("--lookback-days", dest="lookback_days", default="240")
+    p_cs.add_argument("--deadline-sec", dest="deadline_sec", default="540")
     p_ua = sub.add_parser("universe-apply")
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
@@ -2487,6 +2587,8 @@ def main(argv) -> int:
             out = cmd_catalyst_eval(args)
         elif args.cmd == "catalyst-label":
             out = cmd_catalyst_label(args)
+        elif args.cmd == "catalyst-seed":
+            out = cmd_catalyst_seed(args)
         elif args.cmd == "universe-apply":
             out = cmd_universe_apply(args)
         elif args.cmd == "prune":
