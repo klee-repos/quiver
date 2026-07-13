@@ -146,7 +146,7 @@ memory:
 # `enabled: true` (and seed the "Legislative Catalyst" allow-list via `strategy-set`) only
 # after live validation. Analysis path reads no limits/broker (a wall test enforces this).
 legislative:
-  enabled: false                       # master switch; fail-safe OFF
+  enabled: true                        # ON (live-validated 2026-07-13); propose-only, human-approve gated
   passage_prob_min: 0.55               # HIGH-passage gate (Python heuristic number), (0,1]
   impact_min: 0.5                      # HIGH-impact advisory pre-filter on magnitude, (0,1]
   judge_enabled: true                  # LLM-judge veto (keep true)
