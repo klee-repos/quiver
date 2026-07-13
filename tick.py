@@ -1534,6 +1534,114 @@ def _default_bill_judge(meta, analysis, *, votes, pass_min):
     return legislative_llm.judge_bill(meta, analysis, votes=votes, pass_min=pass_min)
 
 
+def cmd_catalyst_eval(args) -> dict:
+    """Observability (never trades): measure the legislative-catalyst signal quality.
+      passage  — calibrate congress.heuristic_passage_prob vs KNOWN outcomes (self-labeling
+                 backtest over a completed Congress; Brier/AUC/reliability + per-status rates).
+      sleeve   — the live report card: the Legislative Catalyst sleeve's realized alpha from
+                 resolved decisions (reads the decision-memory scorecard only)."""
+    cfg, led = _cfg_and_ledger()
+    kind = getattr(args, "kind", "")
+    if kind == "passage":
+        return _run_passage_eval(cfg, led, args)
+    if kind == "sleeve":
+        return _run_sleeve_eval(cfg, led)
+    return {"error": f"unknown catalyst-eval kind: {kind!r} (use passage|sleeve)"}
+
+
+def _run_passage_eval(cfg, led, args) -> dict:
+    import lib.legislative_backtest as bt
+    fixture = (getattr(args, "fixture", "") or "").strip() or "state/fixtures/congress_118.json"
+    fixture = fixture if os.path.isabs(fixture) else str(REPO / fixture)
+    built = None
+    if getattr(args, "build", False):
+        built = _build_passage_fixture(cfg, int(getattr(args, "congress", 118) or 118), fixture,
+                                       n_pos=int(getattr(args, "n_pos", 160) or 160),
+                                       n_neg=int(getattr(args, "n_neg", 280) or 280))
+    if not os.path.exists(fixture):
+        return {"error": f"no fixture at {fixture}; run with --build to fetch it (needs CONGRESS_API_KEY)"}
+    bills = json.load(open(fixture, encoding="utf-8"))
+    report = bt.calibrate(bt.records_from_fixture(bills))
+    return {"eval": "passage", "fixture": fixture, "built": built, **report}
+
+
+def _build_passage_fixture(cfg, congress_num: int, out_path: str, *, n_pos: int, n_neg: int) -> int:
+    """One-time real fetch of a completed Congress -> a re-runnable backtest fixture. Positives =
+    enacted laws (/law/{c}); negatives = a sample of un-enacted bills. Caches each bill's RAW
+    action timeline so the calibration re-scores offline after a derive_status change."""
+    import urllib.request
+    import urllib.parse
+    from concurrent.futures import ThreadPoolExecutor
+    key = cfg.legislative.api_key
+    if not key:
+        raise RuntimeError("CONGRESS_API_KEY not set (needed to build the fixture)")
+
+    def _get(path, **p):
+        q = {"api_key": key, "format": "json", **p}
+        url = f"https://api.congress.gov/v3/{path}?{urllib.parse.urlencode(q)}"
+        with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310 (fixed api host)
+            return json.loads(r.read())
+
+    def _actions(c, bt_type, num):
+        return [{"text": a.get("text"), "actionDate": a.get("actionDate")}
+                for a in _get(f"bill/{c}/{str(bt_type).lower()}/{num}/actions", limit=250).get("actions", [])]
+
+    laws = []
+    for off in (0, 250, 500):
+        laws += _get(f"law/{congress_num}", limit=250, offset=off).get("bills", [])
+        if len(laws) >= n_pos:
+            break
+    laws = laws[:n_pos]
+
+    def _pos(b):
+        return {"bill_id": f"{congress_num}-{str(b['type']).lower()}-{b['number']}", "enacted": 1,
+                "title": b.get("title", ""), "cosponsors_n": 0, "actions": _actions(congress_num, b["type"], b["number"])}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        pos = list(ex.map(_pos, laws))
+    law_ids = {p["bill_id"] for p in pos}
+
+    cands = []
+    for off in (0, 250, 500, 750, 1000, 1250):
+        for b in _get(f"bill/{congress_num}", sort="updateDate+desc", limit=250, offset=off).get("bills", []):
+            bid = f"{congress_num}-{str(b['type']).lower()}-{b['number']}"
+            if bid not in law_ids:
+                cands.append(b)
+        if len(cands) >= n_neg:
+            break
+    cands = cands[:n_neg]
+
+    def _neg(b):
+        return {"bill_id": f"{congress_num}-{str(b['type']).lower()}-{b['number']}", "enacted": 0,
+                "title": b.get("title", ""), "cosponsors_n": 0, "actions": _actions(congress_num, b["type"], b["number"])}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        neg = list(ex.map(_neg, cands))
+
+    bills = pos + neg
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(bills, f)
+    return len(bills)
+
+
+def _run_sleeve_eval(cfg, led) -> dict:
+    """Live report card: realized alpha/hit-rate of the Legislative Catalyst sleeve from resolved
+    decisions. Reads the decision-memory scorecard only (never limits/broker)."""
+    import lib.memory as memory
+    rows = led.all_return_series()
+    goal = led.get_active_goal()
+    if goal:
+        sleeve_of = {r["ticker"]: r.get("sleeve") for r in led.active_target_portfolio(
+            goal["id"], statuses=("active", "exiting", "removed"))}
+        for r in rows:
+            r["sleeve"] = sleeve_of.get(r.get("ticker"))
+    n_cat = sum(1 for r in rows if r.get("sleeve") == "Legislative Catalyst")
+    block = memory.build_sliced_scorecard(rows, "sleeve", "sleeve/sector")
+    return {"eval": "sleeve", "catalyst_decisions_scored": n_cat,
+            "note": ("no resolved catalyst decisions yet — this is the live report card that fills in "
+                     "as catalyst-added names trade and resolve" if n_cat == 0 else "catalyst sleeve is scoring"),
+            "scorecard": block or "(no cross-sectional slice yet)"}
+
+
 def cmd_universe_apply(args) -> dict:
     cfg, led = _cfg_and_ledger()
     return _run_universe_apply(cfg, led, change_id=int(args.id),
@@ -2209,6 +2317,13 @@ def main(argv) -> int:
     p_lr.add_argument("--input", required=False)
     p_br = sub.add_parser("bills-review")
     p_br.add_argument("--input", required=False)
+    p_ce = sub.add_parser("catalyst-eval")
+    p_ce.add_argument("kind", choices=["passage", "sleeve"])
+    p_ce.add_argument("--fixture", default="")
+    p_ce.add_argument("--build", action="store_true")
+    p_ce.add_argument("--congress", default="118")
+    p_ce.add_argument("--n-pos", dest="n_pos", default="160")
+    p_ce.add_argument("--n-neg", dest="n_neg", default="280")
     p_ua = sub.add_parser("universe-apply")
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
@@ -2251,6 +2366,8 @@ def main(argv) -> int:
             out = cmd_learn_review(args)
         elif args.cmd == "bills-review":
             out = cmd_bills_review(args)
+        elif args.cmd == "catalyst-eval":
+            out = cmd_catalyst_eval(args)
         elif args.cmd == "universe-apply":
             out = cmd_universe_apply(args)
         elif args.cmd == "prune":

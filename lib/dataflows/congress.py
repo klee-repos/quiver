@@ -238,13 +238,23 @@ def derive_status(latest_action_text: str) -> str:
     t = (latest_action_text or "").lower()
     if "became public law" in t or "became private law" in t or "signed by president" in t:
         return "became_law"
-    if "presented to president" in t or "cleared for white house" in t:
+    if "presented to president" in t or "cleared for white house" in t \
+            or "sent to president" in t:
         return "to_president"
     if ("passed senate" in t and "passed house" in t) or "resolving differences" in t \
             or "passed congress" in t:
         return "passed_both"
+    # Chamber passage detection. Beyond the literal "Passed House/Senate", the House passes
+    # most non-controversial bills by SUSPENSION OF THE RULES ("On motion to suspend the rules
+    # and pass the bill ... Agreed to") — the dominant path for commemorative/naming/minor
+    # bills, and a real blind spot the calibration backtest surfaced. A bare "Received in the
+    # Senate/House" also implies the originating chamber already passed it. (A MOTION to suspend
+    # without "agreed to" is not passage, so it stays below.)
     if "passed/agreed to in house" in t or "passed house" in t \
-            or "passed/agreed to in senate" in t or "passed senate" in t:
+            or "passed/agreed to in senate" in t or "passed senate" in t \
+            or ("suspend the rules and pass" in t and "agreed to" in t) \
+            or ("suspend the rules and agree" in t and "agreed to" in t) \
+            or "received in the senate" in t or "received in the house" in t:
         return "passed_one"
     if "reported" in t or "ordered to be reported" in t or "placed on" in t and "calendar" in t:
         return "reported"

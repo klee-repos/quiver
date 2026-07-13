@@ -1132,7 +1132,8 @@ for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
              "lib/screener.py", "lib/screener_data.py",
              # Legislative-catalyst analysis modules: bill ingest / store / LLM analysis+judge
              # must NEVER import the sizing/limit/broker-carrying modules (the wall).
-             "lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py"):
+             "lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
+                 "lib/legislative_backtest.py"):
     _mp = Path(__file__).resolve().parent.parent / _mod
     if not _mp.exists():
         continue  # lib/screener_data.py lands at F8 (the gated retire step); until then skip
@@ -1143,7 +1144,8 @@ for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
 # Source-scan: the legislative analysis modules must never READ a broker call or a trading
 # limit (the analysis side is blind to money), mirroring the strategy_context / learn scans.
 import re as _re  # noqa: E402  (used by the source-scans below + later blocks)
-for _legmod in ("lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py"):
+for _legmod in ("lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
+                 "lib/legislative_backtest.py"):
     _lp = Path(__file__).resolve().parent.parent / _legmod
     _lsrc = _lp.read_text(encoding="utf-8")
     for _forbidden in ("buying_power", "max_dollars_per_trade", "get_portfolio",
@@ -2919,6 +2921,33 @@ check_true("legislative: must-pass + cosponsors bump (clamped)",
            > _CG.heuristic_passage_prob({"status": "passed_one", "title": "x", "cosponsors_n": 0}))
 check("legislative: derive_status became_law", _CG.derive_status("Became Public Law No: 119-1."), "became_law")
 check("legislative: derive_status committee", _CG.derive_status("Referred to the Committee on Finance."), "committee")
+# House suspension-of-rules passage + received-in-chamber (the calibration-backtest fix — these
+# were being mis-detected as introduced/committee, so enacted bills scored ~0.03 and got gated out)
+check("legislative: suspension-rules pass -> passed_one",
+      _CG.derive_status("On motion to suspend the rules and pass the bill Agreed to by voice vote."), "passed_one")
+check("legislative: a MOTION to suspend (no 'agreed to') is NOT passage",
+      _CG.derive_status("Mr. Smith moved to suspend the rules and pass the bill."), "introduced")
+check("legislative: received in the senate -> passed_one",
+      _CG.derive_status("Received in the Senate and Read twice and referred to the Committee on Finance."), "passed_one")
+
+# --- passage-calibration backtest (lib/legislative_backtest, pure scorers + leak-free timeline) ---
+import lib.legislative_backtest as _BT  # noqa: E402
+check("backtest: brier perfect", _BT.brier_score([(1, 1), (0, 0)]), 0.0)
+check("backtest: brier coinflip", _BT.brier_score([(0.5, 1), (0.5, 0)]), 0.25)
+check("backtest: auc perfect separation", _BT.auc([(0.9, 1), (0.2, 0)]), 1.0)
+check("backtest: auc reversed", _BT.auc([(0.1, 1), (0.9, 0)]), 0.0)
+check_true("backtest: auc one-class -> None", _BT.auc([(0.9, 1), (0.9, 1)]) is None)
+# LEAK GUARD: the terminal became_law action must be excluded from the scored peak status
+_bt_acts = [{"text": "Introduced in House"}, {"text": "Passed House"}, {"text": "Became Public Law No: 118-1."}]
+check("backtest: peak excludes terminal became_law", _BT.peak_nonterminal_status(_bt_acts), "passed_one")
+check("backtest: peak defaults to introduced", _BT.peak_nonterminal_status([]), "introduced")
+# records_from_fixture re-derives peak from RAW actions (so a derive_status change re-scores offline)
+_bt_recs = _BT.records_from_fixture([
+    {"bill_id": "x", "enacted": 1, "title": "t", "actions": _bt_acts},
+    {"bill_id": "y", "enacted": 0, "title": "t", "actions": [{"text": "Referred to the Committee."}]}])
+check("backtest: fixture re-derives peak status", _bt_recs[0]["peak_status"], "passed_one")
+check_true("backtest: calibrate emits brier+auc+reliability+status",
+           all(k in _BT.calibrate(_bt_recs) for k in ("brier", "auc", "reliability", "status_calibration")))
 
 # poll_changed_bills: dedup + fail-safe (fake opener, no network)
 def _fake_opener(url, timeout):
