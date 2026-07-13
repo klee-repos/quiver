@@ -26,6 +26,12 @@ risk:
   reconcile_unmanaged: true            # sell any HELD position not in the book down to cash
   rebalance_drift_band_pct: 5.0        # default no-trade dead-band (per-holding `band` overrides)
   cash_sleeve_ticker: "SGOV"           # the residual ballast; never churned like an engine name
+  # Anti-churn (F2/F3): min ECONOMIC trade size + conviction target hysteresis. A trim/buy
+  # below min_trade_notional is skipped (full exits/reconciles are exempt, wound at the $1 RH
+  # floor); the conviction allocator only moves a name's target weight on a shift >= the
+  # hysteresis (day-to-day noise keeps the prior target). Set either to 0 to disable it.
+  min_trade_notional: 5                 # $; skip rebalance trims/buys under this (floored at RH's $1)
+  conviction_rebalance_min_delta_pct: 2.0  # weight-pts; material-change gate on the conviction target
 
   # Memory-grounded strategy-consistency gate: suppress RANDOM cross-day buy/sell flips;
   # allow reversals grounded in the recorded plan (stop/target/loss) or a named new
@@ -129,3 +135,32 @@ memory:
     hit_rate_reduced: 0.40
     sharpe_elevated: 0.50
     sharpe_reduced: 0.0
+
+# --- Legislative catalyst (bill-driven universe proposals; opt-in, fail-safe OFF) ---
+# Ingests changed US Congress bills (Congress.gov API, key in .env: CONGRESS_API_KEY),
+# runs an LLM impact analysis + an adversarial N-of-M judge, and for a bill clearing BOTH
+# a Python-owned passage-probability gate AND the judge PROPOSES a universe change that
+# rides the EXISTING confirm/validate_add/human `universe-apply --approve` machinery. It
+# NEVER trades directly and NEVER auto-applies (legislative proposals are always human-
+# gated). Runs in the best-effort learning loop, ~once/trading day. Ships OFF; flip
+# `enabled: true` (and seed the "Legislative Catalyst" allow-list via `strategy-set`) only
+# after live validation. Analysis path reads no limits/broker (a wall test enforces this).
+legislative:
+  enabled: false                       # master switch; fail-safe OFF
+  passage_prob_min: 0.55               # HIGH-passage gate (Python heuristic number), (0,1]
+  impact_min: 0.5                      # HIGH-impact advisory pre-filter on magnitude, (0,1]
+  judge_enabled: true                  # LLM-judge veto (keep true)
+  judge_votes: 3                       # N independent judge calls (1 framed to refute)
+  judge_pass_min: 2                    # require >= this many PASS votes (1 <= this <= judge_votes)
+  max_proposals_per_review: 3          # cap ADD/REMOVE mints per review
+  max_bills_analyzed_per_review: 15    # cap the analyze+judge LLM loop per review
+  lookback_days: 3                     # cold-start cursor backstop
+  add_weight: 4.0                      # default sleeve target weight for a catalyst ADD (%)
+  passage_source: heuristic            # heuristic | kalshi_blend (blend is a fast-follow, not built)
+  model: claude                        # analysis/judge backend label (default = headless claude CLI)
+  review_deadline_sec: 300             # internal wall-clock budget (< the 600s systemd margin)
+  remove_enabled: false                # suffer->REMOVE OFF by default; needs ticker_policy_areas
+  # ticker_policy_areas: map a held ticker to the Congress policyArea/legislativeSubjects codes
+  # that make a bill RELEVANT to it — the ONLY structured (non-attacker-controlled) signal used
+  # to bind a REMOVE to a bill. Required (non-empty) when remove_enabled: true.
+  ticker_policy_areas: {}

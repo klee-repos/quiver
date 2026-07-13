@@ -179,6 +179,32 @@ def main() -> int:
         ok("Q3 AUTO ADD refused until confirmed over N days",
            res.get("applied") is False and "confirmed" in (res.get("reason") or ""), res)
 
+    # --- F4 (churn-fix guard): auto_apply_universe_changes=false -> an AUTO REMOVE is NOT applied
+    # without a human --approve. The learning layer currently proposes whole-book removals on
+    # "sustained underperformance" (a SYMPTOM of the bearish brain, not bad names); this pins the
+    # flag gate at tick.py:_run_universe_apply so a refactor can't silently start evicting the book.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d))  # auto_apply=False (the default, matches production)
+        gid = led.get_active_goal()["id"]
+        before = {r["ticker"]: r["status"]
+                  for r in led.active_target_portfolio(gid, statuses=("active", "exiting", "removed"))}
+        rid = led.record_universe_proposal(
+            goal_id=gid, proposed_at="2026-06-20T10:00:00", kind="PROPOSE_REMOVE", ticker="AAA",
+            sleeve="Tech", from_book=None, to_book=None, target_weight=0, tier="universe",
+            content_hash="h_f4_remove", reason="sustained underperformance", goal_gap_pct=None)
+        res = tick._run_universe_apply(cfg, led, change_id=rid, approve=False)
+        ok("F4: AUTO REMOVE refused (auto_apply_universe_changes off -> needs --approve)",
+           res.get("applied") is False and "auto_apply_universe_changes" in (res.get("reason") or ""), res)
+        after = {r["ticker"]: r["status"]
+                 for r in led.active_target_portfolio(gid, statuses=("active", "exiting", "removed"))}
+        ok("F4: the book is UNCHANGED after the refused AUTO remove (AAA still active)",
+           after.get("AAA") == "active" and after == before, (before, after))
+        # A human --approve IS the deliberate gate -> it applies (AAA -> exiting).
+        res2 = tick._run_universe_apply(cfg, led, change_id=rid, approve=True)
+        ok("F4: human --approve applies the REMOVE (the guard is a gate, not a hard block)",
+           res2.get("applied") is True
+           and bool(led.active_target_portfolio(gid, statuses=("exiting",))), res2)
+
     # --- Q3: a non-allow-listed candidate is blocked at apply by validate_add ---
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d), rh="[AAA, SGOV]", sleeves=_sleeves, holdings=_holds)

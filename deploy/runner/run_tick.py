@@ -78,10 +78,15 @@ TICK_LOG = os.environ.get("QUIVER_TICK_LOG", str(_REPO / "logs" / "tick.log"))
 SYSTEM_PROMPT = load_prompt("orchestrator").strip()
 
 
-def _tick_json(args):
-    """Run a tick.py subcommand and return its one-line JSON (or an error dict)."""
-    p = subprocess.run([VENV_PY, str(_REPO / "tick.py"), *args],
-                       capture_output=True, text=True, cwd=str(_REPO))
+def _tick_json(args, timeout=None):
+    """Run a tick.py subcommand and return its one-line JSON (or an error dict). An optional
+    ``timeout`` (seconds) hard-bounds a heavy best-effort phase (e.g. bills-review's network +
+    LLM work) so a wedged child can never hang the runner past the systemd margin."""
+    try:
+        p = subprocess.run([VENV_PY, str(_REPO / "tick.py"), *args],
+                           capture_output=True, text=True, cwd=str(_REPO), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"error": f"{' '.join(args)} exceeded its {timeout}s outer timeout"}
     out = (p.stdout or "").strip()
     try:
         return json.loads(out.splitlines()[-1]) if out else {"error": (p.stderr or "")[:300]}
@@ -439,6 +444,24 @@ def main() -> int:
                                     "ahead_behind_pct", "cumulative_return_pct") if k in _r}})
                         except Exception as e:  # noqa: BLE001 — learning is best-effort
                             _emit({"stage": _step, "error": f"{type(e).__name__}: {e}"})
+                    # bills-review: heavier (Congress API + LLM analysis/judge), so it runs LAST
+                    # with an EXPLICIT outer timeout floored by the remaining wall-clock budget,
+                    # so a wedged fetch/LLM can never push the unit past the systemd margin. It
+                    # only ingests + PROPOSES universe changes (human `universe-apply --approve`
+                    # gated); OFF unless config.yaml legislative.enabled. Best-effort like the rest.
+                    try:
+                        _budget = int(_deadline - time.monotonic())
+                        if _budget >= 60:
+                            _r = _tick_json(["bills-review"], timeout=min(360, _budget))
+                            if _r.get("error"):
+                                _emit({"stage": "bills-review", "error": str(_r["error"])[:200]})
+                            else:
+                                _emit({"stage": "bills-review", **{k: _r[k] for k in (
+                                    "reviewed", "changed", "analyzed", "judged", "minted") if k in _r}})
+                        else:
+                            _emit({"stage": "bills-review", "skipped": "insufficient wall-clock budget"})
+                    except Exception as e:  # noqa: BLE001 — best-effort
+                        _emit({"stage": "bills-review", "error": f"{type(e).__name__}: {e}"})
 
                 # AUTH_ERROR is a hard-stop posture: exit non-zero so systemd + the
                 # documented drill see a failed run even if the orchestrator exited 0.

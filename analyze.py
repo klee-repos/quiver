@@ -196,7 +196,12 @@ def assess_data_quality(final_state: dict) -> dict:
     sentiment = _report_available(final_state.get("sentiment_report"))
     news = _report_available(final_state.get("news_report"))
     fundamentals = _report_available(final_state.get("fundamentals_report"))
-    avail = {"market": market, "sentiment": sentiment, "news": news, "fundamentals": fundamentals}
+    # macro is MARKET-WIDE news (Fed/oil/index) — tracked for observability + the
+    # calibration layer, but like sentiment/news it is NOT core (only a missing
+    # market_report fails the analysis safe to ERROR).
+    macro = _report_available(final_state.get("macro_report"))
+    avail = {"market": market, "sentiment": sentiment, "news": news,
+             "fundamentals": fundamentals, "macro": macro}
     return {
         **avail,
         "core_available": market,
@@ -260,8 +265,8 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
     LOGDIR.mkdir(parents=True, exist_ok=True)
     keys = [
         "company_of_interest", "trade_date", "market_report", "sentiment_report",
-        "news_report", "fundamentals_report", "trend_report", "investment_plan",
-        "trader_investment_plan", "final_trade_decision",
+        "news_report", "fundamentals_report", "trend_report", "macro_report",
+        "investment_plan", "trader_investment_plan", "final_trade_decision",
     ]
     safe = {k: final_state.get(k) for k in keys if k in final_state}
     path = LOGDIR / f"{date}_{ticker}.json"
@@ -282,7 +287,8 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
 # splitter just won't have it, never an ERROR — only core market data gates).
 _EVE_SECTIONS = (
     "market_report", "sentiment_report", "news_report", "fundamentals_report",
-    "trend_report", "trader_investment_plan", "final_trade_decision", "lever_proposals",
+    "trend_report", "macro_report", "trader_investment_plan", "final_trade_decision",
+    "lever_proposals",
 )
 
 # F6: the 12 contract labels. The Python-side gate is BINDING (the TS validator

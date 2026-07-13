@@ -13,14 +13,19 @@ _DEFAULT_CONFIG = {
     "data_cache_dir": "state/cache",
     # News / data fetching parameters
     "news_article_limit": 20,
-    "global_news_article_limit": 10,
+    "global_news_article_limit": 15,   # ~3 per query across the 5 macro topics
     "global_news_lookback_days": 7,
+    # yfinance Search fuzzy-matches CONCRETE NOUNS well and abstract phrases poorly
+    # (the old "geopolitical risk trade war sanctions" returned Amex/Disney junk). These
+    # are tuned to surface market-MOVING macro: rates, broad indices, oil/energy (the
+    # geopolitics->market channel — this caught the Iran/Strait-of-Hormuz oil spike),
+    # bonds/dollar, and the AI/semis sector the book is concentrated in.
     "global_news_queries": [
         "Federal Reserve interest rates inflation",
-        "S&P 500 earnings GDP economic outlook",
-        "geopolitical risk trade war sanctions",
-        "ECB Bank of England BOJ central bank policy",
-        "oil commodities supply chain energy",
+        "stock market S&P 500 Nasdaq today",
+        "oil prices energy crude commodities",
+        "Treasury yields bond market dollar",
+        "semiconductor AI data center stocks",
     ],
     # Data vendor configuration (yfinance default; alpha_vantage optional fallback)
     "data_vendors": {

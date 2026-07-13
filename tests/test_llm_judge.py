@@ -85,6 +85,20 @@ def judge(name: str, rubric: str, data, *, timeout: int = 150) -> bool:
     return verdict
 
 
+def det(name: str, cond: bool) -> bool:
+    """A DETERMINISTIC assertion (no LLM) — for gates whose correctness is exact, not
+    semantic. Kept alongside the judge() stages so this suite also proves the hard
+    legislative human-gate, not just an LLM opinion."""
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ✓ [{name}]")
+    else:
+        FAIL += 1
+        print(f"  ✗ [{name}]")
+    return cond
+
+
 def main() -> int:
     print("=" * 70)
     print("LLM-JUDGE PIPELINE VALIDATION (every critical stage but trade execution)")
@@ -220,6 +234,26 @@ def main() -> int:
         "1. reviewed is true.\n"
         "2. auto_apply_eligible MUST be 0 — risky universe changes (add/remove a whole asset) are "
         "human-gated by default and must never auto-apply."), lr)
+
+    # 8) Legislative-catalyst human-gating (DETERMINISTIC — no LLM) ------------
+    #    A tier="legislative" proposal must ALWAYS require human --approve (never auto),
+    #    and must apply cleanly on --approve. Proven here as an exact gate, not an opinion.
+    import lib.learn as _learn
+    led_cat = _tmp_led()
+    T._run_strategy_set(cfg, led_cat, {"equity": 100.0, "now_iso": now})
+    goal_cat = led_cat.get_active_goal()
+    _p = _learn.Proposal(_learn.ADD, "COIN", "Legislative Catalyst", _learn.TIER_LEGISLATIVE,
+                         "test legislative catalyst", target_weight=4.0)
+    _rid = led_cat.record_universe_proposal(
+        goal_id=goal_cat["id"], proposed_at=now, kind=_p.kind, ticker=_p.ticker, sleeve=_p.sleeve,
+        from_book=None, to_book=None, target_weight=_p.target_weight, tier=_p.tier,
+        content_hash=_p.content_hash(), reason=_p.reason, goal_gap_pct=None)
+    _deny = T._run_universe_apply(cfg, led_cat, change_id=_rid, approve=False)
+    det("catalyst-gating: legislative proposal refuses auto (requires --approve)",
+        _deny.get("applied") is False and "requires --approve" in str(_deny.get("reason")))
+    _appr = T._run_universe_apply(cfg, led_cat, change_id=_rid, approve=True)
+    det("catalyst-gating: legislative proposal applies on human --approve",
+        _appr.get("applied") is True)
 
     print("\n" + "=" * 70)
     print(f"LLM-JUDGE: {PASS} passed, {FAIL} failed")

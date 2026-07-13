@@ -47,41 +47,141 @@ def _recent_window(date: str | None, days: int = 60) -> tuple[str, str]:
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
+# Sentinels that mean "this fetch returned an error/empty placeholder, not real data".
+# Used to derive an HONEST core_available per channel (mirrors analyze.py's gate), so a
+# thin/garbage channel is reported unavailable instead of dressed up as present data.
+_SENTINELS = (
+    "error retrieving", "error fetching", "no data found", "no price data",
+    "no fundamentals data", "no balance sheet data", "no news found",
+    "no global news found", "no cash flow", "no income", "data unavailable", "could not retrieve",
+    "unavailable:", "<stocktwits unavailable", "<no stocktwits messages",
+)
+
+
+def _content_ok(text) -> bool:
+    """True only when `text` is real, usable data — non-trivial and free of any error
+    sentinel. The single source of truth for a channel's core_available flag."""
+    t = str(text or "").strip().lower()
+    if len(t) < 30:               # empty / near-empty -> unusable
+        return False
+    return not any(s in t for s in _SENTINELS)
+
+
+def _tail_csv(csv_text: str, max_rows: int = 45) -> str:
+    """Keep the ``#`` header comment lines + the column header + the MOST RECENT
+    ``max_rows`` data rows. get_YFin_data_online returns a chronological-ASCENDING
+    CSV; the old ``json.dumps(sd)[:1200]`` char-slice dropped the NEWEST bars (the
+    ones a decision actually needs) and cut mid-row. Tail-keeping preserves recency
+    and whole rows."""
+    lines = [l for l in str(csv_text).splitlines() if l != ""]
+    head = [l for l in lines if l.startswith("#")]
+    body = [l for l in lines if not l.startswith("#")]
+    if not body:
+        return str(csv_text)
+    col_header, rows = body[0], body[1:]
+    return "\n".join(head + [col_header] + rows[-max_rows:])
+
+
+def _latest_indicators(ticker: str, curr_date: str | None) -> dict:
+    """Latest available value of the key short-term indicators the trend tool does
+    NOT cover (RSI/MACD/Bollinger/ATR/EMA). Computed on the LAST SETTLED bar
+    (<= curr_date) so it works pre-market too — get_stockstats_indicator requires an
+    exact same-day row, which doesn't exist before today's close (the old
+    fetch_market ALSO passed the start-date into the indicator slot, so indicators
+    were always empty). Returns {"as_of": date, <ind>: value|None, ...}, or {} on any
+    failure (best-effort context; never fatal)."""
+    try:
+        from datetime import datetime
+        import pandas as pd
+        from stockstats import wrap
+        from lib.dataflows.stockstats_utils import load_ohlcv
+        d = curr_date or datetime.now().strftime("%Y-%m-%d")
+        data = load_ohlcv(ticker, d)
+        if data is None or data.empty:
+            return {}
+        df = wrap(data)
+        names = ["rsi", "macd", "macds", "macdh", "boll", "boll_ub", "boll_lb",
+                 "atr", "close_10_ema", "close_50_sma", "close_200_sma"]
+        for n in names:
+            df[n]  # trigger stockstats to compute the column
+        last = df.iloc[-1]
+        out = {"as_of": pd.to_datetime(last["Date"]).strftime("%Y-%m-%d")}
+        for n in names:
+            v = last[n]
+            out[n] = round(float(v), 4) if pd.notna(v) else None
+        return out
+    except Exception:  # noqa: BLE001 — indicators are best-effort context, never fatal
+        return {}
+
+
 def fetch_market(ticker: str, date: str | None) -> tuple[str, bool]:
-    from lib.dataflows.y_finance import get_YFin_data_online, get_stockstats_indicator
+    from lib.dataflows.y_finance import get_YFin_data_online
     start, end = _recent_window(date)
+    # get_YFin_data_online returns a CSV STRING (header + rows); it RAISES
+    # DataUnavailableError when empty (caught by _safe -> UNAVAILABLE), so reaching
+    # here means we have a real price series. Do NOT json.dumps it (the old code
+    # double-encoded — main() re-encodes the whole envelope — which inflated the
+    # escaped length so the char-slice cut even more real rows, mid-row).
     sd = get_YFin_data_online(ticker, start, end)
-    ind = get_stockstats_indicator(ticker, start, end)
-    report = f"Price/Volume:\n{json.dumps(sd, default=str)[:1200]}\nIndicators:\n{json.dumps(ind, default=str)[:1200]}"
-    # core_available = we got a usable close price
-    core = bool(sd and isinstance(sd, dict) and sd.get("close") is not None)
+    price_block = _tail_csv(sd, max_rows=45)          # RECENT bars, whole rows
+    inds = _latest_indicators(ticker, end)            # real RSI/MACD/BOLL/ATR/EMA snapshot
+    report = (f"Price/Volume (most-recent bars, CSV):\n{price_block}\n"
+              f"Latest indicators (as of {inds.get('as_of', 'n/a')}):\n{json.dumps(inds, default=str)}")
+    core = bool(price_block) and ("\n" in price_block) and ("Total records: 0" not in str(sd))
     return report, core
 
 
 def fetch_sentiment(ticker: str) -> tuple[str, bool]:
     try:
         from lib.dataflows.stocktwits import fetch_stocktwits_messages
-        msgs = fetch_stocktwits_messages(ticker)
-    except Exception as e:  # noqa: BLE001 — Reddit 403 / StockTwits errors degrade gracefully
+        # NB: this returns a pre-formatted STRING (bull/bear summary + recent message
+        # lines), NOT a list of dicts. The old code sliced it as a list -> the model
+        # got the first 15 CHARACTERS, one per line. Pass the string through verbatim.
+        text = fetch_stocktwits_messages(ticker)
+    except Exception as e:  # noqa: BLE001 — StockTwits errors degrade gracefully
         return f"UNAVAILABLE: sentiment fetch failed: {e}", False
-    sample = (msgs or [])[:15]
-    return f"StockTwits ({len(msgs or [])} msgs):\n" + "\n".join(
-        json.dumps(m, default=str)[:200] for m in sample), bool(sample)
+    text = (text or "").strip()
+    if not _content_ok(text):   # placeholder / outage string -> unavailable, not sentiment
+        return f"UNAVAILABLE: {text or 'no sentiment'}", False
+    return f"StockTwits sentiment:\n{text}", True
 
 
-def fetch_news(ticker: str) -> tuple[str, bool]:
+def fetch_news(ticker: str, date: str | None) -> tuple[str, bool]:
     from lib.dataflows.yfinance_news import get_news_yfinance
-    start, end = _recent_window(None, days=7)
-    news = get_news_yfinance(ticker, start, end)
-    return f"News:\n{json.dumps(news, default=str)[:2000]}", bool(news)
+    # Window ends at the TRADE DATE (was hard-coded None -> today, i.e. the only
+    # fetcher that ignored --date: a look-ahead landmine on any dated/backtest run).
+    start, end = _recent_window(date, days=7)
+    news = get_news_yfinance(ticker, start, end)     # returns a STRING; single-encode
+    core = _content_ok(news)
+    return f"News ({start}..{end}):\n{news[:3000]}", core
 
 
-def fetch_fundamentals(ticker: str) -> tuple[str, bool]:
+def fetch_fundamentals(ticker: str, date: str | None) -> tuple[str, bool]:
     from lib.dataflows.y_finance import get_fundamentals, get_balance_sheet
-    f = get_fundamentals(ticker)
-    bs = get_balance_sheet(ticker)
-    return (f"Fundamentals: {json.dumps(f, default=str)[:1500]}\n"
-            f"Balance Sheet: {json.dumps(bs, default=str)[:1500]}"), bool(f)
+    # Thread curr_date so filter_financials_by_date engages (the balance-sheet
+    # look-ahead guard was silently bypassed when curr_date was None).
+    f = get_fundamentals(ticker, date)
+    bs = get_balance_sheet(ticker, curr_date=date)
+    core = _content_ok(f)
+    # Single-encode; balance-sheet budget raised 1500 -> 3000 (the old cap dropped
+    # Total Assets/Liabilities/Cash rows on the bigger balance sheets).
+    return (f"Fundamentals:\n{str(f)[:2000]}\n"
+            f"Balance Sheet:\n{str(bs)[:3000]}"), core
+
+
+def fetch_macro(date: str | None) -> tuple[str, bool]:
+    """MARKET-WIDE macro/geopolitical news — the ONE non-ticker-scoped feed, so a
+    macro shock (Fed move, oil spike, war/tariffs) reaches the brain even when no held
+    name mentions it in its own feed. yfinance Search over the curated
+    `global_news_queries` (keyless; headline-only — Search returns titles+publishers,
+    no summaries). Window ends at the TRADE DATE (look-ahead safe live). Fails safe:
+    an error -> UNAVAILABLE via _content_ok. Not ticker-specific, so it ignores ticker."""
+    from datetime import datetime
+    from lib.dataflows.yfinance_news import get_global_news_yfinance
+    d = date or datetime.now().strftime("%Y-%m-%d")
+    news = get_global_news_yfinance(d)     # returns a STRING; single-encode
+    core = _content_ok(news)
+    return f"Macro / market-wide news (as of {d}):\n{news[:3000]}", core
 
 
 def fetch_trend(ticker: str, date: str | None) -> tuple[str, bool]:
@@ -115,7 +215,7 @@ def fetch_trend(ticker: str, date: str | None) -> tuple[str, bool]:
 
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("kind", choices=["market", "sentiment", "news", "fundamentals", "trend"])
+    ap.add_argument("kind", choices=["market", "sentiment", "news", "fundamentals", "trend", "macro"])
     ap.add_argument("ticker")
     ap.add_argument("--date", default=None)
     args = ap.parse_args(argv)
@@ -125,11 +225,13 @@ def main(argv) -> int:
     elif args.kind == "sentiment":
         out = _safe(lambda: fetch_sentiment(t))
     elif args.kind == "news":
-        out = _safe(lambda: fetch_news(t))
+        out = _safe(lambda: fetch_news(t, args.date))
     elif args.kind == "trend":
         out = _safe(lambda: fetch_trend(t, args.date))
+    elif args.kind == "macro":
+        out = _safe(lambda: fetch_macro(args.date))   # market-wide; ticker ignored
     else:
-        out = _safe(lambda: fetch_fundamentals(t))
+        out = _safe(lambda: fetch_fundamentals(t, args.date))
     print(json.dumps(out))
     return 0
 

@@ -129,19 +129,35 @@ MIN_SELL_NOTIONAL_USD = 1.0
 
 def resolve_sell_quantity_min_notional(
     held_qty: float, raw_qty: float, quote: Optional[float],
-    *, min_notional: float = MIN_SELL_NOTIONAL_USD,
+    *, min_notional: float = MIN_SELL_NOTIONAL_USD, bump_to_min: bool = True,
 ) -> Tuple[float, str]:
-    """Bump a trim's share count UP just enough to clear ``min_notional``
-    (default $1, RH's fractional floor), clamped to the held quantity.
+    """Reconcile a sell's share count against a ``min_notional`` floor, clamped to
+    the held quantity.
+
+    ``bump_to_min`` selects the behavior for a below-floor sub-order:
+      * ``True`` (default, EXIT/wind-down semantics): bump the qty UP to the
+        cheapest that clears ``min_notional`` — the position must be reduced, so
+        we complete it at the smallest legal size. This is what a full exit /
+        reconcile wants (finish the wind-down), and it is the pre-F2 behavior.
+      * ``False`` (TRIM semantics, F2): a below-floor rebalance/Underweight trim
+        is CHURN — skip it (``skip_below_min``) rather than force a tiny trade.
 
     Returns (qty, reason). ``reason`` is one of:
-      * "trim"           -> the raw trim already clears the floor; unchanged.
-      * "bumped_to_min"  -> bumped up to the cheapest qty that clears $1.
+      * "trim"           -> the raw qty already clears the floor; unchanged.
+      * "bumped_to_min"  -> (bump_to_min=True) bumped up to clear ``min_notional``.
+      * "skip_below_min" -> (bump_to_min=False) a sub-floor TRIM, deliberately not
+                            sent (F2 churn guard); the position stays slightly off
+                            target rather than churning a sub-``min_notional`` order.
       * "skip_dust"      -> the WHOLE position is under the floor (physically
                             unsellable as a fractional); nothing to sell.
       * "skip_no_quote"  -> no usable quote to value the trim (fail to skip,
                             never synthesize a price to force a sell).
       * "skip_nothing"   -> nothing held or nothing to trim.
+
+    IMPORTANT: the ``skip_dust`` branch (whole position under the floor) fires
+    BEFORE the bump/skip choice, so a full exit passed a raised ``min_notional``
+    would strand a $1-$5 position. Callers therefore keep exits on the $1 RH floor
+    (``MIN_SELL_NOTIONAL_USD``) and apply the raised economic floor to TRIMS only.
 
     Never exceeds ``held_qty`` (long-only: cannot oversell into a short). A 0
     return means SKIP — the caller records a clean ``sell_below_min`` skip, NOT a
@@ -156,8 +172,11 @@ def resolve_sell_quantity_min_notional(
         return (round(raw_qty, 6), "trim")
     if held_qty * quote < min_notional:
         # The entire position is under the floor — there is no fractional qty
-        # that clears $1 without overselling. Honest outcome: leave the dust.
+        # that clears the floor without overselling. Honest outcome: leave the dust.
         return (0.0, "skip_dust")
+    if not bump_to_min:
+        # TRIM semantics (F2): a sub-floor trim is churn — skip it, don't bump it up.
+        return (0.0, "skip_below_min")
     bumped = min(held_qty, min_notional / quote)
     bumped = round(bumped, 6)
     if bumped <= 0:

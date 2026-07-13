@@ -50,8 +50,21 @@ macro_thesis:
 # --- The Robinhood-tradable universe (allow-list; add/remove gate) -----------
 # A proposed ADD must be on this list AND quotable via the equities MCP. These are
 # illustrative broad ETFs — swap in your own universe.
+# NOTE: the optional legislative-catalyst feature (config.yaml `legislative:`) can only
+# ever PROPOSE_ADD a name that is ALREADY on this human-vetted list — a bill can never
+# introduce an off-list ticker. So to let a catalyst reach a name (e.g. defense/energy/
+# semis), add it here (illustrative catalyst names shown: LMT, RTX, FSLR, ENPH, SMH).
 rh_tradable_confirmed:
-  [QQQ, RSP, XLV, EEM, XLE, AVUV, IBIT, ETHA, SGOV]
+  [QQQ, RSP, XLV, EEM, XLE, AVUV, IBIT, ETHA, SGOV, LMT, RTX, FSLR, ENPH, SMH]
+
+# The legislative-catalyst sleeve is a plain HOLDING LABEL ("Legislative Catalyst") — it is
+# intentionally NOT listed under `sleeves:` below, because a `screen:` there would switch on
+# the generic momentum screener and auto-add names with no bill/judge. A catalyst ADD's target
+# weight comes from config.yaml `legislative.add_weight`, not a sleeve screen.
+# To enable suffer->REMOVE (config.yaml `legislative.remove_enabled: true`), map each held name
+# to the Congress policy codes that make a bill RELEVANT to it, in config.yaml, e.g.:
+#   legislative: { ticker_policy_areas: { LMT: ["Armed Forces and National Security"],
+#                                         FSLR: ["Energy"] } }
 
 # --- The books --------------------------------------------------------------
 # core is the DEFAULT, validated active book. dial_up is OFF; ACTIVATING dial-up

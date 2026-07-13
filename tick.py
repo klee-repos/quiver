@@ -27,7 +27,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -615,6 +615,16 @@ def _run_plan(cfg, led, data) -> dict:
                 decision.update(status="order", intent="buy", quantity=shares, limit_price=limit_price)
                 result["decisions"].append(decision)
             else:
+                # F2: floor classic market buys at the economic minimum too (RH rejects sub-$1
+                # fractional buys; skip a sub-min entry rather than dribble). Reached only for a
+                # non-book name / rebalance-off; in-book buys defer to the rebalance pass below.
+                buy_min = max(signals.MIN_SELL_NOTIONAL_USD, cfg.risk.min_trade_notional)
+                if dollars < buy_min:
+                    led.record_action(day, ticker, signal=signal, intent="buy", status="skipped",
+                                      detail="sized_below_min", now_iso=now_iso)
+                    decision.update(status="skipped", intent="buy", detail="sized_below_min")
+                    result["decisions"].append(decision)
+                    continue
                 remaining_daily_cap -= dollars
                 ref_id = None
                 if not cfg.dry_run:
@@ -650,7 +660,14 @@ def _run_plan(cfg, led, data) -> dict:
                 result["decisions"].append(decision)
                 continue
             raw_qty = signals.resolve_sell_quantity(held_qty, frac)
-            qty, sreason = signals.resolve_sell_quantity_min_notional(held_qty, raw_qty, quote)
+            # F2: a full Sell (frac>=1.0) is a wind-down EXIT -> keep RH's $1 floor and BUMP so it
+            # always completes (a $1-$5 position must still be sellable to zero); an Underweight
+            # TRIM (frac<1.0) uses the economic floor and SKIPS a sub-floor churn trim.
+            is_full_close = frac >= 1.0 or signal == "Sell"
+            sell_min = (signals.MIN_SELL_NOTIONAL_USD if is_full_close
+                        else max(signals.MIN_SELL_NOTIONAL_USD, cfg.risk.min_trade_notional))
+            qty, sreason = signals.resolve_sell_quantity_min_notional(
+                held_qty, raw_qty, quote, min_notional=sell_min, bump_to_min=is_full_close)
             if qty <= 0:
                 # Sub-$1 trim (RH rejects fractional orders under $1) or nothing to
                 # sell. Skip cleanly rather than send an order the broker bounces
@@ -740,7 +757,12 @@ def _run_plan(cfg, led, data) -> dict:
             raw_qty = signals.resolve_target_sell_quantity(
                 held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
                 full_exit=full_exit)
-            qty, sreason = signals.resolve_sell_quantity_min_notional(held_qty, raw_qty, quote)
+            # F2: a full EXIT / reconcile winds to zero at RH's $1 floor (BUMP so it completes);
+            # a partial rebalance TRIM uses the economic floor and SKIPS a sub-floor churn trim.
+            sell_min = (signals.MIN_SELL_NOTIONAL_USD if full_exit
+                        else max(signals.MIN_SELL_NOTIONAL_USD, cfg.risk.min_trade_notional))
+            qty, sreason = signals.resolve_sell_quantity_min_notional(
+                held_qty, raw_qty, quote, min_notional=sell_min, bump_to_min=full_exit)
             if qty <= 0:
                 # Sub-$1 trim/exit (RH rejects fractional orders under $1) — most
                 # often a whole position under the floor (unstoppable dust). Skip
@@ -785,6 +807,9 @@ def _run_plan(cfg, led, data) -> dict:
     # SUM of every buy planned this tick can never exceed buying_power - buffer.
     if target_weights and not result["halt"] and cfg.risk.rebalance_enabled:
         cash_tk = (cfg.risk.cash_sleeve_ticker or "SGOV").upper()
+        # F2: no rebalance buy tranche below the economic minimum (floored at RH's $1) — kills
+        # sub-$5 residual/dribble buys. Threaded through the outer guard AND the tranche loop.
+        buy_min = max(signals.MIN_SELL_NOTIONAL_USD, cfg.risk.min_trade_notional)
         ordered = {o.get("ticker") for o in result["orders"]}
         # Names the consistency gate SUPPRESSED this tick (an ungrounded reversal) are
         # hands-off: the deterministic buy-to-target deploy must NOT re-buy a name whose
@@ -818,10 +843,10 @@ def _run_plan(cfg, led, data) -> dict:
             # intact across the loop — the SUM still can't exceed buying_power - buffer.
             name_budget = round(min(signals.room_under_target(td, held_mv),
                                     remaining_daily_cap, avail_cash), 2)
-            if name_budget < 1.0:
-                # <$1 is Robinhood's fractional minimum (also covers <=0). Skip pre-submit
-                # rather than send an order the broker bounces. At full deployment no book
-                # weight lands here; this only guards a genuinely tiny/at-target name.
+            if name_budget < buy_min:
+                # Below the economic minimum (F2; >= RH's $1 fractional floor). Skip pre-submit
+                # rather than dribble a tiny order. At full deployment no book weight lands here;
+                # this only guards a genuinely tiny / at-target name (room under target < buy_min).
                 led.record_action(day, ticker, signal="REBALANCE", intent="buy",
                                   status="skipped", detail="rebalance_buy_below_min", now_iso=now_iso)
                 result["decisions"].append({
@@ -831,10 +856,10 @@ def _run_plan(cfg, led, data) -> dict:
             ceiling = cfg.risk.max_dollars_per_trade
             tranches = 0
             spent_name = 0.0
-            while (name_budget - spent_name) >= 1.0 and remaining_daily_cap >= 1.0 and avail_cash >= 1.0:
+            while (name_budget - spent_name) >= buy_min and remaining_daily_cap >= 1.0 and avail_cash >= 1.0:
                 chunk = round(min(ceiling, name_budget - spent_name,
                                   remaining_daily_cap, avail_cash), 2)
-                if chunk < 1.0:
+                if chunk < buy_min:
                     break
                 remaining_daily_cap -= chunk
                 avail_cash -= chunk
@@ -1119,14 +1144,31 @@ def _run_construct(cfg, led, data) -> dict:
             alloc = allocate.allocate_targets(
                 candidates, analyses_map, calibration=calib, regime_scalar=rscalar,
                 policy=policy, hold_floors=hold_floors)
+            # F3: material-change HYSTERESIS on the conviction target. Keep each name at its PRIOR
+            # target weight unless the fresh reading moved it >= conviction_rebalance_min_delta_pct
+            # weight-points — a noisy ~0-alpha signal no longer wanders the target (and churns the
+            # book with $5-40 trims) day to day. Applies to names the allocator KEPT (>0); a grounded
+            # reduction to 0 (a real Sell/exit) is NOT reverted. Then CONSERVE: engines never exceed
+            # (100 - cash_floor); cash takes the residual so the book still sums to ~100%. min_delta
+            # 0 -> no-op (byte-identical to re-clipping every tick — the pre-F3 behavior).
+            prior_map = {c["ticker"]: c["prior_weight"] for c in candidates}
+            eng_weights = allocate.apply_target_hysteresis(
+                alloc.weights, prior_map, cfg.risk.conviction_rebalance_min_delta_pct)
+            cash_floor = float(policy["cash_floor_pct"]) if (policy and policy.get("cash_floor_pct") is not None) else 5.0
+            eng_ceiling = max(0.0, 100.0 - cash_floor)
+            eng_sum = sum(eng_weights.values())
+            if eng_sum > eng_ceiling + 1e-9 and eng_sum > 0:
+                scale = eng_ceiling / eng_sum
+                eng_weights = {t: round(w * scale, 4) for t, w in eng_weights.items()}
+            cash_pct = round(max(cash_floor, 100.0 - sum(eng_weights.values())), 4)
             new_targets = []
             for t in targets:
                 tk = str(t["ticker"]).upper()
                 nt = dict(t)
                 if tk == cash_tk or (t.get("sleeve") or "") == strategy.CASH_SLEEVE:
-                    nt["target_weight"] = alloc.cash_pct          # cash takes the residual
+                    nt["target_weight"] = cash_pct                # cash takes the residual
                 elif str(t.get("status", "active")) == "active":
-                    w = alloc.weights.get(tk, 0.0)                # exiting rows keep their 0
+                    w = eng_weights.get(tk, 0.0)                  # exiting rows keep their 0
                     nt["target_weight"] = w
                     # Keep the rebalance dead-band strictly INSIDE the (possibly shrunk)
                     # conviction weight. Without this the band stays at the static
@@ -1139,8 +1181,9 @@ def _run_construct(cfg, led, data) -> dict:
                         nt["band"] = round(min(ob, w * 0.5), 4)
                 new_targets.append(nt)
             targets = new_targets
-            conviction_detail = {"regime_scalar": rscalar, "cash_pct": alloc.cash_pct,
-                                 "weights": alloc.weights, "calibration": calib}
+            conviction_detail = {"regime_scalar": rscalar, "cash_pct": cash_pct,
+                                 "weights": eng_weights, "calibration": calib,
+                                 "hysteresis_min_delta_pct": cfg.risk.conviction_rebalance_min_delta_pct}
 
     rows = portfolio.construct_target_book(
         targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
@@ -1287,6 +1330,206 @@ def _run_learn_review(cfg, led, data) -> dict:
             "recorded_ids": recorded, "expired": expired, "suppressed_cooldown": len(cooled)}
 
 
+def cmd_bills_review(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    return _run_bills_review(cfg, led, _load_input(args))
+
+
+def _run_bills_review(cfg, led, data, *, poll=None, detail_fetch=None, text_fetch=None,
+                      analyze=None, judge=None) -> dict:
+    """Best-effort (never stops a tick): ingest changed US Congress bills, run an LLM impact
+    analysis + adversarial judge, and MINT legislative universe proposals for the rare bill
+    clearing BOTH a Python-owned passage gate AND the judge. All sizing/apply stays in the
+    existing Python wall — this only records + proposes (always human `--approve` gated).
+
+    Fully injectable (poll/detail_fetch/text_fetch/analyze/judge default to the real callables)
+    so the offline e2e drives the whole chain with fakes and zero network/subprocess. Fails
+    SAFE to zero proposals on any error; a per-bill failure is isolated so one bad bill can
+    neither abort the review nor strand the poll cursor."""
+    import time
+    import lib.legislative as legis
+    import lib.learn as learn
+    import lib.strategy as strategy
+    from lib.dataflows import congress
+    from lib.dataflows.errors import DataUnavailableError
+
+    leg = cfg.legislative
+    if not getattr(leg, "enabled", False):
+        return {"reviewed": False, "reason": "disabled"}
+    goal = led.get_active_goal()
+    if not goal or cfg.strategy is None:
+        return {"reviewed": False, "reason": "no active goal / strategy layer inactive"}
+    if not leg.api_key:
+        return {"reviewed": False, "reason": "no CONGRESS_API_KEY"}
+
+    poll = poll or congress.poll_changed_bills
+    detail_fetch = detail_fetch or congress.fetch_bill_detail
+    analyze = analyze or _default_bill_analyze
+    judge = judge or _default_bill_judge
+    if text_fetch is None:
+        text_fetch = lambda detail: _default_bill_text(congress, detail, leg.api_key)  # noqa: E731
+
+    now = market.now_et()
+    now_iso = now.isoformat()
+    today = market.trading_day_et()
+    deadline = time.monotonic() + max(30, int(leg.review_deadline_sec))
+
+    with led.legislative_conn() as c:
+        cur = legis.get_cursor(c)
+
+    # RECONCILE (GB2): mark applied any bill whose linked proposal is now applied, so a
+    # multi-bill-per-ticker orphan can't stay actionable and re-mint/re-fund cash. Runs
+    # BEFORE the daily-dedup return, so an applied bill is marked promptly even on a
+    # skip day (cheap + idempotent).
+    reconciled = 0
+    try:
+        with led.legislative_conn() as c:
+            hashes = legis.linked_proposal_hashes(c)
+        for h in hashes:
+            last = led.last_decided_universe_change(goal["id"], h)
+            if last and last.get("status") == "applied":
+                with led.legislative_conn() as c:
+                    for bid in legis.bills_for_proposal_hash(c, h):
+                        legis.mark_bill_applied(c, bid)
+                        reconciled += 1
+    except Exception:  # noqa: BLE001 — reconcile is best-effort
+        pass
+
+    # daily dedup: one full ingest per trading day (so intraday mode can't re-poll hourly)
+    if cur and str(cur.get("polled_at") or "")[:10] == today:
+        return {"reviewed": False, "reason": "already ran today", "reconciled": reconciled}
+
+    # POLL. Arm the cursor immediately after a successful poll (GB5) so any downstream raise
+    # can't leave the daily latch un-set and cause a re-poll storm.
+    since = (cur.get("last_update_date") if cur and cur.get("last_update_date")
+             else (now - timedelta(days=int(leg.lookback_days))).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    until = now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        changed = poll(since, until, leg.api_key)
+    except DataUnavailableError as e:
+        return {"reviewed": False, "reason": f"poll failed: {e}", "reconciled": reconciled}
+    max_update = max([b.get("update_date") for b in changed if b.get("update_date")],
+                     default=(cur.get("last_update_date") if cur else None))
+    with led.legislative_conn() as c:
+        legis.set_cursor(c, max_update or until, until, now_iso)
+
+    # ANALYZE (heuristic-first: skip below-passage bills BEFORE any text-fetch/LLM; cap the
+    # loop; per-bill try/except; honor the wall-clock deadline).
+    analyzed = below_gate = 0
+    for b in changed:
+        if time.monotonic() > deadline or analyzed >= int(leg.max_bills_analyzed_per_review):
+            break
+        try:
+            chash = legis.bill_content_hash(congress.derive_status(b.get("latest_action")),
+                                            b.get("latest_action_date"),
+                                            b.get("update_date_including_text"))
+            with led.legislative_conn() as c:
+                needs = legis.upsert_bill(
+                    c, bill_id=b["bill_id"], congress=b["congress"], chamber=None,
+                    bill_type=b["bill_type"], number=b["number"], title=b.get("title"),
+                    status=congress.derive_status(b.get("latest_action")),
+                    latest_action=b.get("latest_action"), latest_action_date=b.get("latest_action_date"),
+                    policy_codes=[], content_hash=chash, first_seen=now_iso, now=now_iso)
+            if not needs:
+                continue
+            detail = detail_fetch(b["congress"], b["bill_type"], b["number"], leg.api_key)
+            prob = round(float(congress.heuristic_passage_prob(detail)), 4)
+            with led.legislative_conn() as c:
+                legis.set_bill_detail(c, b["bill_id"], detail.get("status"), detail.get("policy_codes"), now_iso)
+                legis.record_analysis(c, b["bill_id"], passage_prob=prob,
+                                      passage_source=leg.passage_source, thesis="", model="", now=now_iso)
+            if prob < float(leg.passage_prob_min):
+                below_gate += 1
+                continue  # below the passage gate -> never spend an LLM call
+            text = text_fetch(detail)
+            meta = {"bill_id": b["bill_id"], "title": detail.get("title") or b.get("title"),
+                    "status": detail.get("status"), "policy_codes": detail.get("policy_codes"),
+                    "latest_action": detail.get("latest_action")}
+            analysis = analyze(meta, text)
+            with led.legislative_conn() as c:
+                legis.record_analysis(c, b["bill_id"], passage_prob=prob, passage_source=leg.passage_source,
+                                      thesis=analysis.get("thesis", ""), model=leg.model, now=now_iso)
+                legis.replace_bill_impacts(c, b["bill_id"], analysis.get("impacted_tickers", []), now_iso)
+            analyzed += 1
+        except Exception:  # noqa: BLE001 — one bad bill never aborts the review
+            continue
+
+    # JUDGE analyzed-but-unjudged bills (adversarial N-of-M; a judge outage = non-PASS = safe).
+    judged = 0
+    with led.legislative_conn() as c:
+        pending = legis.bills_needing_judgment(c)
+    for pj in pending:
+        if time.monotonic() > deadline:
+            break
+        try:
+            with led.legislative_conn() as c:
+                impacts = legis.get_bill_impacts(c, pj["bill_id"])
+            if leg.judge_enabled:
+                verdict = judge({"bill_id": pj["bill_id"], "title": pj.get("title"), "status": pj.get("status")},
+                                {"impacted_tickers": impacts, "thesis": pj.get("thesis") or ""},
+                                votes=int(leg.judge_votes), pass_min=int(leg.judge_pass_min))
+            else:
+                verdict = {"verdict": legis.VERDICT_PASS, "reason": "judge disabled", "votes_json": "[]"}
+            with led.legislative_conn() as c:
+                legis.mark_bill_judged(c, pj["bill_id"], verdict.get("verdict", legis.VERDICT_FAIL),
+                                       verdict.get("reason", ""), verdict.get("votes_json", "[]"), now_iso)
+            judged += 1
+        except Exception:  # noqa: BLE001
+            continue
+
+    # MINT proposals from actionable (judged-PASS) impacts, via the pure builder + the
+    # existing E1 cooldown + record_universe_proposal path. Link EVERY contributing bill.
+    with led.legislative_conn() as c:
+        actionable = legis.actionable_impacts(c, min_passage_prob=float(leg.passage_prob_min),
+                                              min_magnitude=float(leg.impact_min))
+    held = [h["ticker"] for h in led.active_target_portfolio(goal["id"], statuses=("active", "exiting"))]
+    allow = cfg.strategy.rh_tradable_confirmed
+    props = learn.build_catalyst_proposals(
+        actionable, held, add_weight=float(leg.add_weight), tier=learn.TIER_LEGISLATIVE,
+        allow=allow, policy_area_map=leg.ticker_policy_areas, remove_enabled=bool(leg.remove_enabled))
+    cons = cfg.strategy.consistency or strategy.ConsistencyConfig()
+    cooldown_cut = (now - timedelta(days=cons.proposal_cooldown_days)).isoformat()
+    recorded = []
+    for p in props[:int(leg.max_proposals_per_review)]:
+        if p.ticker is None:
+            continue
+        chash = p.content_hash()
+        last = led.last_decided_universe_change(goal["id"], chash)
+        if last and (last.get("decided_at") or "") >= cooldown_cut:
+            continue  # E1 anti-oscillation: recently decided -> don't re-propose yet
+        rid = led.record_universe_proposal(
+            goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker, sleeve=p.sleeve,
+            from_book=None, to_book=None, target_weight=p.target_weight, tier=p.tier,
+            content_hash=chash, reason=p.reason, goal_gap_pct=None)
+        direction = "benefit" if p.kind == learn.ADD else "suffer"
+        with led.legislative_conn() as c:
+            for row in actionable:
+                if (str(row.get("ticker", "")).upper() == p.ticker
+                        and str(row.get("direction", "")).lower() == direction):
+                    legis.link_impact_proposal(c, row["bill_id"], p.ticker, chash)
+        if rid:
+            recorded.append(rid)
+    return {"reviewed": True, "changed": len(changed), "analyzed": analyzed, "below_gate": below_gate,
+            "judged": judged, "reconciled": reconciled, "minted": len(recorded), "recorded_ids": recorded}
+
+
+def _default_bill_text(congress_mod, detail: dict, api_key: str) -> str:
+    """Resolve a bill's text via the real Congress fetcher (text versions -> newest text)."""
+    tvs = congress_mod.fetch_text_versions(detail.get("text_versions_url"), api_key) \
+        if detail.get("text_versions_url") else []
+    return congress_mod.fetch_bill_text(tvs) if tvs else ""
+
+
+def _default_bill_analyze(meta, text):
+    from lib import legislative_llm
+    return legislative_llm.analyze_bill(meta, text)
+
+
+def _default_bill_judge(meta, analysis, *, votes, pass_min):
+    from lib import legislative_llm
+    return legislative_llm.judge_bill(meta, analysis, votes=votes, pass_min=pass_min)
+
+
 def cmd_universe_apply(args) -> dict:
     cfg, led = _cfg_and_ledger()
     return _run_universe_apply(cfg, led, change_id=int(args.id),
@@ -1334,6 +1577,15 @@ def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
     if change["kind"] == "PROPOSE_REMOVE" and change.get("ticker") and goal:
         import lib.risk as risk
         import lib.universe as universe
+        # A legislative-catalyst REMOVE gets an allow-list gate AT APPLY TIME (the shared
+        # REMOVE branch otherwise has none, and --approve skips the underperf re-check). Scoped
+        # to tier=='legislative' so the shipped derisk/underperf REMOVE path is untouched.
+        if change.get("tier") == "legislative":
+            allow = cfg.strategy.rh_tradable_confirmed if cfg.strategy is not None else set()
+            ok_al, why_al = universe.validate_add(change["ticker"], allow, allow)
+            if not ok_al:
+                return {"applied": False, "change": change,
+                        "reason": f"refusing legislative remove: {why_al}"}
         learning = cfg.strategy.learning
         # E3a — re-validate the underperformance NOW for the AUTO path (the propose-time
         # proof may be stale; the name may have recovered). A human --approve trusts the
@@ -1951,6 +2203,8 @@ def main(argv) -> int:
     sub.add_parser("goal-track")
     p_lr = sub.add_parser("learn-review")
     p_lr.add_argument("--input", required=False)
+    p_br = sub.add_parser("bills-review")
+    p_br.add_argument("--input", required=False)
     p_ua = sub.add_parser("universe-apply")
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
@@ -1991,6 +2245,8 @@ def main(argv) -> int:
             out = cmd_goal_track(args)
         elif args.cmd == "learn-review":
             out = cmd_learn_review(args)
+        elif args.cmd == "bills-review":
+            out = cmd_bills_review(args)
         elif args.cmd == "universe-apply":
             out = cmd_universe_apply(args)
         elif args.cmd == "prune":

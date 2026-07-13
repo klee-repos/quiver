@@ -175,6 +175,10 @@ ${PAST_CONTEXT || "(no prior decisions on this ticker)"}`;
 // --- Step 1: gather (analysts via tools, quick model drives the tool calls) ---
 // F1: gather retries re-run all 5 yfinance tool calls, so cap at 2 tries (cost/
 // rate-limit). Validate the 5 ### subheads are present (not just non-empty text).
+// The gather-validation set (hasSubheads retries until these are present). macro_report
+// is deliberately NOT here: it's supplementary market-wide context, so a missing macro
+// subhead must NOT fail gather -> ERROR (only market_report gates a trade). It's still
+// prompted for + assembled below via grabSub (falls back to "UNAVAILABLE: not produced").
 const GATHER_NAMES = ["market_report", "trend_report", "fundamentals_report", "news_report", "sentiment_report"];
 const dataTool = (kind, description) => tool({
   description,
@@ -189,24 +193,28 @@ async function runGather() {
     providerOptions: { openrouter: { max_tokens: 8000 } },
     system: HORIZON,
     prompt: `Analyze ${TICKER} for trade date ${DATE}. Call the market_data, fundamentals,
-news, sentiment, AND trend tools to gather real data. ${PAST}
+news, sentiment, trend, AND macro tools to gather real data. ${PAST}
 
-Then output FIVE report blocks, each under a single `+ "`"+`### `+ "`"+` subheading (use ###, NEVER ##):
+Then output SIX report blocks, each under a single `+ "`"+`### `+ "`"+` subheading (use ###, NEVER ##):
 ### market_report
 ### trend_report
 ### fundamentals_report
 ### news_report
 ### sentiment_report
-Summarize the fetched data in each. If a tool returned UNAVAILABLE, write "UNAVAILABLE: <reason>".
-Do not emit any ## section headers — only ### subheadings inside your reports.`,
+### macro_report
+Summarize the fetched data in each. The macro_report is MARKET-WIDE (Fed/rates, oil/energy,
+index moves, geopolitics) — in it, note any macro read-through to ${TICKER} specifically (e.g. an
+oil spike or rate move that helps/hurts this name). If a tool returned UNAVAILABLE, write
+"UNAVAILABLE: <reason>". Do not emit any ## section headers — only ### subheadings inside your reports.`,
     tools: {
       market_data: dataTool("market", "Fetch OHLCV + short-term technical indicators for a ticker. Read-only."),
       trend: dataTool("trend", "Fetch LONG-HORIZON trend/risk guideposts (3y: Sharpe/Sortino/Calmar, drawdown depth+duration, ADX/DI, MA structure, regime). Read-only."),
       fundamentals: dataTool("fundamentals", "Fetch fundamentals (PE, P/B, market cap, balance sheet). Read-only."),
-      news: dataTool("news", "Fetch recent news flow. Read-only."),
+      news: dataTool("news", "Fetch recent ticker-specific news flow. Read-only."),
       sentiment: dataTool("sentiment", "Fetch sentiment (StockTwits). Read-only."),
+      macro: dataTool("macro", "Fetch MARKET-WIDE macro/geopolitical news (Fed/rates, oil/energy, index moves) — NOT ticker-specific; the one feed that catches a macro shock no single holding mentions. Read-only."),
     },
-    stopWhen: isStepCount(10),
+    stopWhen: isStepCount(12),
   });
   return r.text;
 }
@@ -344,6 +352,7 @@ const trendBody = grabSub(reports, "trend_report");
 const fundBody = grabSub(reports, "fundamentals_report");
 const newsBody = grabSub(reports, "news_report");
 const sentBody = grabSub(reports, "sentiment_report");
+const macroBody = grabSub(reports, "macro_report");
 
 // Pull the 8 trader labels + the 4 PM labels out of the proposal/decision turns
 // so the final sections carry ONLY the contract (no stray prose that could
@@ -374,6 +383,9 @@ const final = [
   "",
   "## news_report",
   sanitize(newsBody),
+  "",
+  "## macro_report",
+  sanitize(macroBody),
   "",
   "## fundamentals_report",
   sanitize(fundBody),

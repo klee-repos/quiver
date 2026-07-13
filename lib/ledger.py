@@ -287,6 +287,14 @@ class Ledger:
         finally:
             conn.close()
 
+    def legislative_conn(self):
+        """Public context manager yielding the raw connection for lib.legislative store
+        operations (which own their SQL + take a cursor, exactly like lib.levers). Commits
+        on clean exit; a raise inside the block leaves the txn uncommitted. Keeps the
+        legislative module's many small ops out of a dozen thin Ledger wrappers while
+        preserving the "SQL lives with the Ledger connection" convention."""
+        return self._conn()
+
     def ensure_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
@@ -298,6 +306,10 @@ class Ledger:
             # its own schema so it can evolve independently of the core tables.
             from lib import levers
             levers.ensure_schema(c)
+            # Legislative-catalyst store (lib/legislative): bills + impacts + poll cursor.
+            # Owns its own schema, same pattern as levers.
+            from lib import legislative
+            legislative.ensure_schema(c)
 
     @staticmethod
     def _migrate_decisions(c) -> None:

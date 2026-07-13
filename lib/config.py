@@ -62,6 +62,18 @@ class RiskConfig:
     max_discretionary_reversals: int = 1   # ungrounded "changed my mind" flips tolerated per window
     consistency_flip_window: int = 6       # how many recent COMPLETED trades the budget looks back over
     loss_catalyst_pct: float = 8.0         # a sell within the window is grounded if the position is down >= this
+    # --- F2/F3 anti-churn knobs -------------------------------------------
+    # F2: economic minimum trade size. A rebalance TRIM or BUY-to-target below this dollar
+    # notional is SKIPPED (not sent) — kills the sub-$1..$5 churn orders. Full EXITS /
+    # reconciles are EXEMPT (they wind a position to zero at RH's $1 fractional floor). The
+    # sell path floors the effective minimum at $1 so a configured 0 can never strip that
+    # hard RH floor. Default $5 (well above the $1 broker minimum).
+    min_trade_notional: float = 5.0
+    # F3: conviction target-weight HYSTERESIS (material-change gate). The conviction
+    # allocator only MOVES a name's target weight when the fresh reading shifts it by >= this
+    # many weight-points; smaller day-to-day noise keeps the PRIOR target (no trim), so a
+    # noisy signal can't churn the book. 0 disables (re-clip every tick — the pre-F3 behavior).
+    conviction_rebalance_min_delta_pct: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,35 @@ class MemoryConfig:
 
 
 @dataclass(frozen=True)
+class LegislativeConfig:
+    """Legislative-catalyst settings. Analysis/proposal side only — NEVER trading.
+
+    Fails SAFE: stays disabled unless ``legislative.enabled`` is exactly ``true``; a
+    disabled or garbled block never blocks a tick. Thresholds are validated ONLY when
+    enabled. The Congress.gov key lives in ``.env`` (``CONGRESS_API_KEY``), never here.
+    ``remove_enabled`` defaults OFF — a suffer->REMOVE needs the operator's
+    ``ticker_policy_areas`` map (ticker -> Congress policyArea/subject codes) to bind a
+    held name to a bill via a structured, non-attacker-controlled field.
+    """
+    enabled: bool
+    api_key: str
+    passage_prob_min: float
+    impact_min: float
+    judge_enabled: bool
+    judge_votes: int
+    judge_pass_min: int
+    max_proposals_per_review: int
+    max_bills_analyzed_per_review: int
+    lookback_days: int
+    add_weight: float
+    passage_source: str
+    model: str
+    remove_enabled: bool
+    review_deadline_sec: int
+    ticker_policy_areas: dict
+
+
+@dataclass(frozen=True)
 class Config:
     account_number: str
     dry_run: bool
@@ -166,6 +207,7 @@ class Config:
     notify: NotifyConfig
     storage: StorageConfig
     memory: MemoryConfig
+    legislative: LegislativeConfig
     raw: dict
     # Per-role LLM providers (mixed-provider support). Default to "glm" so an
     # absent block/key keeps today's single-provider GLM behavior byte-identical.
@@ -298,6 +340,20 @@ def load_config(path) -> Config:
         raise ConfigError("config.yaml: risk.consistency.flip_window must be > 0")
     if loss_catalyst_pct < 0:
         raise ConfigError("config.yaml: risk.consistency.loss_catalyst_pct must be >= 0")
+    # F2/F3 anti-churn knobs (default to sensible non-zero values; 0 disables each).
+    try:
+        min_trade_notional = float(risk_d.get("min_trade_notional", 5.0) or 0.0)
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: risk.min_trade_notional must be a number")
+    if min_trade_notional < 0:
+        raise ConfigError("config.yaml: risk.min_trade_notional must be >= 0")
+    try:
+        conviction_rebalance_min_delta_pct = float(
+            risk_d.get("conviction_rebalance_min_delta_pct", 2.0) or 0.0)
+    except (TypeError, ValueError):
+        raise ConfigError("config.yaml: risk.conviction_rebalance_min_delta_pct must be a number")
+    if conviction_rebalance_min_delta_pct < 0:
+        raise ConfigError("config.yaml: risk.conviction_rebalance_min_delta_pct must be >= 0")
     risk = RiskConfig(
         max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
@@ -313,6 +369,8 @@ def load_config(path) -> Config:
         max_discretionary_reversals=max_discretionary_reversals,
         consistency_flip_window=consistency_flip_window,
         loss_catalyst_pct=loss_catalyst_pct,
+        min_trade_notional=min_trade_notional,
+        conviction_rebalance_min_delta_pct=conviction_rebalance_min_delta_pct,
     )
 
     # Model IDs live under a `glm:` block (the name is historical — providers are
@@ -569,6 +627,64 @@ def load_config(path) -> Config:
     lever_min_decisions = int(learning.get("lever_min_decisions", 8))
     lever_retire_alpha = float(learning.get("lever_retire_alpha", -0.02))
 
+    # --- Legislative catalyst (opt-in; fail-safe OFF) -------------------
+    # Parse fields with safe defaults always; validate ranges ONLY when enabled so a
+    # disabled/garbled block never blocks a tick (mirrors the notify idiom). The
+    # Congress.gov key comes from .env, never config.yaml.
+    leg_d = d.get("legislative", {}) or {}
+
+    def _leg_num(key, default, cast):
+        # None/garbage -> default (fail-safe), but preserve an explicit 0 so a
+        # nonsensical-when-enabled value like impact_min:0 is caught by validation
+        # rather than silently swallowed by an `x or default` truthiness check.
+        v = leg_d.get(key, default)
+        try:
+            return cast(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    leg_enabled = leg_d.get("enabled", False) is True
+    leg_passage_min = _leg_num("passage_prob_min", 0.55, float)
+    leg_impact_min = _leg_num("impact_min", 0.5, float)
+    leg_judge_enabled = leg_d.get("judge_enabled", True) is not False
+    leg_judge_votes = _leg_num("judge_votes", 3, int)
+    leg_judge_pass_min = _leg_num("judge_pass_min", 2, int)
+    leg_max_props = _leg_num("max_proposals_per_review", 3, int)
+    leg_max_bills = _leg_num("max_bills_analyzed_per_review", 15, int)
+    leg_lookback = _leg_num("lookback_days", 3, int)
+    leg_add_weight = _leg_num("add_weight", 4.0, float)
+    leg_passage_source = str(leg_d.get("passage_source", "heuristic") or "heuristic").strip().lower()
+    leg_model = str(leg_d.get("model", "claude") or "claude").strip()
+    leg_remove_enabled = leg_d.get("remove_enabled", False) is True
+    leg_deadline = int(leg_d.get("review_deadline_sec", 300) or 300)
+    _tpa = leg_d.get("ticker_policy_areas", {}) or {}
+    leg_tpa = {str(k).upper(): [str(x) for x in (v or [])]
+               for k, v in _tpa.items()} if isinstance(_tpa, dict) else {}
+    if leg_enabled:
+        if not (0.0 < leg_passage_min <= 1.0):
+            raise ConfigError("config.yaml: legislative.passage_prob_min must be in (0, 1]")
+        if not (0.0 < leg_impact_min <= 1.0):
+            raise ConfigError("config.yaml: legislative.impact_min must be in (0, 1]")
+        if leg_judge_enabled and (leg_judge_votes < 1 or not (1 <= leg_judge_pass_min <= leg_judge_votes)):
+            raise ConfigError("config.yaml: legislative.judge_votes must be >= 1 and "
+                              "1 <= judge_pass_min <= judge_votes")
+        if leg_add_weight <= 0:
+            raise ConfigError("config.yaml: legislative.add_weight must be > 0")
+        if leg_passage_source not in ("heuristic", "kalshi_blend"):
+            raise ConfigError("config.yaml: legislative.passage_source must be 'heuristic' or 'kalshi_blend'")
+        if leg_remove_enabled and not leg_tpa:
+            raise ConfigError("config.yaml: legislative.remove_enabled needs a non-empty "
+                              "ticker_policy_areas map (a suffer->REMOVE must bind a held name to a "
+                              "bill via structured policy codes, never free bill text)")
+    legislative_cfg = LegislativeConfig(
+        enabled=leg_enabled, api_key=os.environ.get("CONGRESS_API_KEY", "").strip(),
+        passage_prob_min=leg_passage_min, impact_min=leg_impact_min,
+        judge_enabled=leg_judge_enabled, judge_votes=leg_judge_votes, judge_pass_min=leg_judge_pass_min,
+        max_proposals_per_review=leg_max_props, max_bills_analyzed_per_review=leg_max_bills,
+        lookback_days=leg_lookback, add_weight=leg_add_weight, passage_source=leg_passage_source,
+        model=leg_model, remove_enabled=leg_remove_enabled, review_deadline_sec=leg_deadline,
+        ticker_policy_areas=leg_tpa)
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -603,6 +719,7 @@ def load_config(path) -> Config:
         notify=notify,
         storage=storage,
         memory=memory,
+        legislative=legislative_cfg,
         raw=d,
         strategy_path=strategy_path,
         strategy=strategy_obj,

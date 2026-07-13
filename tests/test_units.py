@@ -140,6 +140,27 @@ check("custom $2 floor", _mn(0.02, 0.005, 140.0, min_notional=2.0),
 check("bump leaves sliver", _mn(0.0072, 0.003, 140.0),
       (round(1.0 / 140.0, 6), "bumped_to_min"))  # 0.007143*140=$1.00; 0.0072-0.007143 dust stays
 
+# --- F2: bump_to_min flag (TRIM=skip vs EXIT=bump) + raised economic floor ---
+# TRIM semantics (bump_to_min=False): a sub-floor trim (raw < $5) whose WHOLE position clears
+# the floor SKIPS (churn guard) instead of bumping up. held 0.05*140=$7 (>=$5, not dust); raw
+# 0.01*140=$1.40 (< $5) -> skip_below_min.
+check("F2 trim below $5 floor -> skip_below_min",
+      _mn(0.05, 0.01, 140.0, min_notional=5.0, bump_to_min=False), (0.0, "skip_below_min"))
+# a trim that CLEARS the raised floor is unchanged ('trim'): 0.05*140=$7 >= $5.
+check("F2 trim clears raised floor -> trim",
+      _mn(0.05, 0.05, 140.0, min_notional=5.0, bump_to_min=False), (0.05, "trim"))
+# skip_dust (whole pos under floor) still PRECEDES the bump/skip choice (the review-flagged
+# ordering): 0.004*140=$0.56 < $5 -> skip_dust regardless of bump_to_min.
+check("F2 dust precedes skip_below_min",
+      _mn(0.004, 0.002, 140.0, min_notional=5.0, bump_to_min=False), (0.0, "skip_dust"))
+# EXIT semantics (bump_to_min=True, $1 floor): a sub-$1 sliver still BUMPS so wind-downs finish.
+check("F2 exit still bumps at the $1 floor",
+      _mn(0.02, 0.005, 140.0, min_notional=1.0, bump_to_min=True),
+      (round(1.0 / 140.0, 6), "bumped_to_min"))
+# default (bump_to_min omitted) is the pre-F2 bump behavior (back-compat).
+check("F2 default bump_to_min=True (back-compat)",
+      _mn(0.02, 0.005, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+
 
 
 # ============================ EMAIL DIGEST ==================================
@@ -723,6 +744,21 @@ def make_loop_config(loop_block=None, risk_extra=None):
 check("intraday defaults OFF (classic once-a-day)", make_loop_config().intraday_enabled, False)
 check("intraday enabled only on exact True", make_loop_config({"intraday_enabled": True}).intraday_enabled, True)
 check("intraday string 'yes' -> OFF (fail-safe)", make_loop_config({"intraday_enabled": "yes"}).intraday_enabled, False)
+
+# --- config: F2/F3 anti-churn knobs parse + validate (defaults when absent; reject negative) ---
+check("config: min_trade_notional defaults 5 when absent", make_loop_config().risk.min_trade_notional, 5.0)
+check("config: hysteresis defaults 2 when absent",
+      make_loop_config().risk.conviction_rebalance_min_delta_pct, 2.0)
+check("config: min_trade_notional parses explicit value",
+      make_loop_config(risk_extra={"min_trade_notional": 10}).risk.min_trade_notional, 10.0)
+check("config: hysteresis parses explicit value",
+      make_loop_config(risk_extra={"conviction_rebalance_min_delta_pct": 3.5}).risk.conviction_rebalance_min_delta_pct, 3.5)
+check("config: min_trade_notional 0 disables (falls back to RH $1 at call sites)",
+      make_loop_config(risk_extra={"min_trade_notional": 0}).risk.min_trade_notional, 0.0)
+check_raises("config: negative min_trade_notional raises",
+             lambda: make_loop_config(risk_extra={"min_trade_notional": -1}), ConfigError)
+check_raises("config: negative hysteresis raises",
+             lambda: make_loop_config(risk_extra={"conviction_rebalance_min_delta_pct": -1}), ConfigError)
 _lc = make_loop_config()
 check("cadence defaults", (_lc.review_floor_min, _lc.review_ceiling_open_min, _lc.review_ceiling_min), (30, 120, 1440))
 check_raises("inverted cadence bounds raise",
@@ -1093,13 +1129,27 @@ def _imported_modules(src: str) -> set:
             mods.add(_node.module)
     return mods
 for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
-             "lib/screener.py", "lib/screener_data.py"):
+             "lib/screener.py", "lib/screener_data.py",
+             # Legislative-catalyst analysis modules: bill ingest / store / LLM analysis+judge
+             # must NEVER import the sizing/limit/broker-carrying modules (the wall).
+             "lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py"):
     _mp = Path(__file__).resolve().parent.parent / _mod
     if not _mp.exists():
         continue  # lib/screener_data.py lands at F8 (the gated retire step); until then skip
     _src = _mp.read_text(encoding="utf-8")
     _bad = _imported_modules(_src) & _WALL_FORBIDDEN
     check_true(f"{_mod}: imports none of lib.risk/signals/config/levers (decision wall)", not _bad)
+
+# Source-scan: the legislative analysis modules must never READ a broker call or a trading
+# limit (the analysis side is blind to money), mirroring the strategy_context / learn scans.
+import re as _re  # noqa: E402  (used by the source-scans below + later blocks)
+for _legmod in ("lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py"):
+    _lp = Path(__file__).resolve().parent.parent / _legmod
+    _lsrc = _lp.read_text(encoding="utf-8")
+    for _forbidden in ("buying_power", "max_dollars_per_trade", "get_portfolio",
+                       "place_equity_order", "get_equity_positions"):
+        check_true(f"{_legmod}: source never reads '{_forbidden}' (analysis path reads no limits/broker)",
+                   _re.search(rf"\b{_re.escape(_forbidden)}\b", _lsrc) is None)
 
 # REVERSE wall: the self-learning levers module must NOT import the sizing/gate
 # modules (a lever can't call sizing or the consistency gate; it only records
@@ -1233,6 +1283,9 @@ _rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capit
 check("config: RiskConfig rebalance knobs default to today's behavior",
       (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.reconcile_unmanaged),
       (False, "SGOV", 5.0, True))
+# F2/F3 anti-churn knobs default on the dataclass (min trade size $5, hysteresis 2 weight-pts).
+check("config: F2/F3 anti-churn knobs default (min_trade_notional=5, hysteresis=2)",
+      (_rc.min_trade_notional, _rc.conviction_rebalance_min_delta_pct), (5.0, 2.0))
 
 # --- ledger: the 6 new tables round-trip (temp db; fresh + existing) ---
 _db = tempfile.mktemp(suffix=".db")
@@ -2267,6 +2320,19 @@ check_true("alloc: higher conviction gets more weight", _al.weights["AAA"] > _al
 check_true("alloc: engine sums to deployable budget (90)", abs(sum(_al.weights.values()) - 90.0) < 0.01)
 check_true("alloc: cash is the residual (~10)", abs(_al.cash_pct - 10.0) < 0.01)
 
+# --- F3: apply_target_hysteresis (material-change gate on the conviction target) ------------
+# Keep a name at its PRIOR (static book) weight unless the fresh reading moved it >= min_delta;
+# REVERT (not blend) on a sub-threshold move so a persistent tiny lean can't slow-accumulate.
+_hy = _alloc.apply_target_hysteresis
+check("F3 hyst: sub-delta keeps prior (|14-15|=1 < 2)", _hy({"AAA": 14.0}, {"AAA": 15.0}, 2.0), {"AAA": 15.0})
+check("F3 hyst: at-threshold applies new (|13-15|=2, NOT < 2)", _hy({"AAA": 13.0}, {"AAA": 15.0}, 2.0), {"AAA": 13.0})
+check("F3 hyst: supra-delta applies new", _hy({"AAA": 9.0}, {"AAA": 15.0}, 2.0), {"AAA": 9.0})
+check("F3 hyst: fresh add (no prior) takes new weight", _hy({"NEW": 5.0}, {}, 2.0), {"NEW": 5.0})
+check("F3 hyst: min_delta 0 disables (identity)", _hy({"AAA": 14.0}, {"AAA": 15.0}, 0.0), {"AAA": 14.0})
+check("F3 hyst: case-insensitive prior lookup", _hy({"AAA": 14.0}, {"aaa": 15.0}, 2.0), {"AAA": 15.0})
+# revert-not-blend: a 1pt daily nudge never walks the target off its static anchor.
+check("F3 hyst: revert prevents 1pt/day accumulation", _hy({"AAA": 14.0}, {"AAA": 15.0}, 2.0), {"AAA": 15.0})
+
 # --- D2: ERROR / missing HOLDS prior weight, never sells to cash -------------
 _alD2 = _alloc.allocate_targets(
     [{"ticker": "SMH", "sleeve": "c", "prior_weight": 15}, {"ticker": "CEG", "sleeve": "p", "prior_weight": 9}],
@@ -2697,6 +2763,256 @@ check("F3: missing_sections classified", _az2._classify_failure(RuntimeError("EV
 check("F3: contract_violation classified", _az2._classify_failure(RuntimeError("contract violation: missing labels")), "contract_violation")
 check("F3: timeout classified", _az2._classify_failure(RuntimeError("analyze.py timed out after 3600s")), "timeout")
 check("F3: turn_threw classified", _az2._classify_failure(RuntimeError("EVE brain (decide.mjs) exited 1")), "turn_threw")
+
+
+# === Data-health audit fixes (2026-07-13): pin the fetcher-channel repairs ========
+# BUG 5 — total_return is None when the series is too short for the horizon (the old
+# min(lookback+1,2) guard clamped to since-inception and mislabeled it as e.g. "3y").
+check("dh: total_return None below horizon", _tr.total_return([100.0 + i for i in range(50)], 252), None)
+check_true("dh: total_return computes when covered", _tr.total_return([100.0 + i for i in range(300)], 252) is not None)
+# BUGs 5+7 — a thin/young name: long horizons + annualized ratios render None (n/a),
+# NOT fabricated identical 6m=1y=2y=3y values / noise ratios on a tiny sample.
+_thin_b = _tr.trend_metrics(_line(42, slope=0.2, base=100.0))
+check("dh: thin ret_3y None", _thin_b.ret_3y, None)
+check("dh: thin ret_1y None", _thin_b.ret_1y, None)
+check("dh: thin Sharpe None (min-N gate)", _thin_b.sharpe, None)
+check("dh: thin Calmar None (min-N gate)", _thin_b.calmar, None)
+check_true("dh: mature Sharpe present (300 rows)", _up.sharpe is not None)
+check_true("dh: mature ret_1y present (300 rows)", _up.ret_1y is not None)
+# BUG 6 — coverage label derived from N, never a hard-coded ~3y on short history.
+_thin_hdr = _tr.render_trend_report(_thin_b).splitlines()[0]
+check_true("dh: thin coverage not ~3y", "~3y" not in _thin_hdr)
+check_true("dh: thin coverage shows mo/rows", ("mo)" in _thin_hdr) or ("rows)" in _thin_hdr))
+check_true("dh: mature coverage shows ~Ny", "y)" in _tr.render_trend_report(_up).splitlines()[0])
+
+# BUG 2 — fundamentals unit normalization (fractions->%, div-yield %, D/E ratio x).
+import lib.dataflows.y_finance as _yfm  # noqa: E402
+class _FakeInfoTicker:
+    def __init__(self, *a, **k): pass
+    @property
+    def info(self):
+        return {"longName": "Test Co", "trailingPE": 20.0, "dividendYield": 2.7,
+                "profitMargins": 0.218, "returnOnEquity": 0.057,
+                "operatingMargins": 0.172, "returnOnAssets": 0.0125,
+                "debtToEquity": 76.592, "marketCap": 1000}
+_orig_ticker_fn = _yfm.yf.Ticker
+_yfm.yf.Ticker = _FakeInfoTicker
+try:
+    _fund_md = _yfm.get_fundamentals("TEST")
+finally:
+    _yfm.yf.Ticker = _orig_ticker_fn
+check_true("dh: fund div-yield labeled %", "Dividend Yield: 2.70%" in _fund_md)
+check_true("dh: fund D/E as ratio x", "Debt to Equity: 0.77x" in _fund_md)
+check_true("dh: fund margin fraction->%", "Profit Margin: 21.80%" in _fund_md)
+check_true("dh: fund ROE fraction->%", "Return on Equity: 5.70%" in _fund_md)
+
+# BUGs 4/10/1/8 — the EVE data adapter (loaded by file path; it's not a package).
+import importlib.util as _ilu  # noqa: E402
+_qd_path = Path(__file__).resolve().parent.parent / "quiver_eve" / "run" / "quill_data.py"
+_qd_spec = _ilu.spec_from_file_location("quill_data_uut", _qd_path)
+_qd = _ilu.module_from_spec(_qd_spec)
+_qd_spec.loader.exec_module(_qd)
+import lib.dataflows.stocktwits as _stm  # noqa: E402
+# BUG 4 — sentiment passes the pre-formatted StockTwits STRING through (the old code
+# sliced it as a list -> 15 one-char lines) + honest core_available.
+_orig_st_fn = _stm.fetch_stocktwits_messages
+_stm.fetch_stocktwits_messages = lambda t, **k: ("Bullish: 5 (25%) · Bearish: 2 (10%) · "
+    "Unlabeled: 13 · Total: 20 most-recent messages\n\n[ts · @u · Bullish] hi there")
+try:
+    _srep, _score = _qd.fetch_sentiment("TEST")
+finally:
+    _stm.fetch_stocktwits_messages = _orig_st_fn
+check_true("dh: sentiment passes real summary", "Bullish: 5 (25%)" in _srep)
+check_true("dh: sentiment not char-exploded", ('"B"' not in _srep) and ('\n"u"' not in _srep))
+check_true("dh: sentiment core True on real data", _score is True)
+_stm.fetch_stocktwits_messages = lambda t, **k: "<no StockTwits messages found for $TEST>"
+try:
+    _srep2, _score2 = _qd.fetch_sentiment("TEST")
+finally:
+    _stm.fetch_stocktwits_messages = _orig_st_fn
+check_true("dh: sentiment placeholder -> core False", _score2 is False)
+# BUG 10 — content-aware core_available (sentinel/near-empty -> False, real -> True).
+check_true("dh: _content_ok rejects sentinel", _qd._content_ok("Long padding text but this report has no news found in it") is False)
+check_true("dh: _content_ok accepts real", _qd._content_ok("Bullish: 5 (25%) real message body with enough length here") is True)
+# BUGs 1/8 — _tail_csv keeps the NEWEST rows + whole rows (recency), header preserved.
+_csv_uut = "# hdr line\nDate,Close\n" + "\n".join(f"2026-01-{i:02d},{100 + i}" for i in range(1, 26))
+_tail_uut = _qd._tail_csv(_csv_uut, max_rows=5)
+check_true("dh: tail keeps header+cols", _tail_uut.startswith("# hdr line\nDate,Close"))
+check_true("dh: tail keeps NEWEST row", "2026-01-25,125" in _tail_uut)
+check_true("dh: tail drops OLDEST row", "2026-01-01,101" not in _tail_uut)
+
+# === Macro news tool (6th channel) — wired 2026-07-13 =============================
+# The macro_report section is recognized by the splitter + tracked (non-core).
+_macro_md = ("## market_report\n" + "x" * 60 + "\n\n## macro_report\nOil prices surge on "
+             "US-Iran attacks; Strait of Hormuz closed once again\n\n## final_trade_decision\n"
+             "**Rating**: Hold\n**Next Review Hours**: 24\n**Conviction**: 50\n**Uncertainty**: 40\n")
+_macro_split = _az._split_eve_markdown(_macro_md)
+check_true("macro: section captured by split", "macro_report" in _macro_split and "Hormuz" in _macro_split["macro_report"])
+check_true("macro: in _EVE_SECTIONS", "macro_report" in _az._EVE_SECTIONS)
+_macro_dq = _az.assess_data_quality(_macro_split)
+check_true("macro: tracked in data_quality", _macro_dq.get("macro") is True)
+check("macro: does NOT gate core (market-only)", _macro_dq["core_available"], _macro_dq["market"])
+# fetch_macro passes the global-news STRING through + honest core; ignores ticker.
+import lib.dataflows.yfinance_news as _ynm  # noqa: E402
+_orig_gn = _ynm.get_global_news_yfinance
+_ynm.get_global_news_yfinance = lambda d, **k: "## Global Market News:\n\n### Oil prices surge on US-Iran attacks, Strait of Hormuz (source: AP)\n"
+try:
+    _mrep, _mcore = _qd.fetch_macro("2026-07-13")
+finally:
+    _ynm.get_global_news_yfinance = _orig_gn
+check_true("macro: fetch passes real news", "Oil prices surge" in _mrep)
+check_true("macro: fetch core True on real data", _mcore is True)
+_ynm.get_global_news_yfinance = lambda d, **k: "No global news found for 2026-07-13"
+try:
+    _mrep2, _mcore2 = _qd.fetch_macro("2026-07-13")
+finally:
+    _ynm.get_global_news_yfinance = _orig_gn
+check_true("macro: empty -> core False (honest)", _mcore2 is False)
+
+
+# ===================== LEGISLATIVE CATALYST (lib/legislative, congress, learn) =====================
+import lib.legislative as _L  # noqa: E402
+import lib.dataflows.congress as _CG  # noqa: E402
+import lib.learn as _LEARN  # noqa: E402
+import lib.universe as _UNI  # noqa: E402
+from lib.dataflows.errors import DataUnavailableError as _DUE  # noqa: E402
+
+# parse_analysis: strict sanitize + fail-safe + NEVER carries a passage field (GA1 wall)
+_pa = _L.parse_analysis('```json\n{"passage_probability":0.99,"impacted_tickers":['
+                        '{"ticker":"lmt","direction":"benefit","magnitude":1.7,"horizon":"x","rationale":"y"},'
+                        '{"ticker":"!!!","direction":"benefit","magnitude":0.5},'
+                        '{"ticker":"MSFT","direction":"bogus","magnitude":0.5}],"thesis":"t"}\n```')
+check("legislative: parse keeps only valid tickers", [i["ticker"] for i in _pa["impacted_tickers"]], ["LMT"])
+check("legislative: parse clamps magnitude to 1.0", _pa["impacted_tickers"][0]["magnitude"], 1.0)
+check("legislative: parse defaults bad horizon", _pa["impacted_tickers"][0]["horizon"], "medium")
+check_true("legislative: parse output has NO passage key (GA1 wall)",
+           "passage_probability" not in str(_pa) and "passage_prob" not in str(_pa))
+check("legislative: parse garbage -> empty (fail-safe)", _L.parse_analysis("not json"),
+      {"impacted_tickers": [], "thesis": ""})
+
+# passes_thresholds (dual gate, inclusive >=, fail-safe on None)
+check_true("legislative: passes both gates", _L.passes_thresholds(0.6, 0.6, prob_min=0.55, impact_min=0.5))
+check_true("legislative: fails low passage", not _L.passes_thresholds(0.5, 0.9, prob_min=0.55, impact_min=0.5))
+check_true("legislative: fails low impact", not _L.passes_thresholds(0.9, 0.4, prob_min=0.55, impact_min=0.5))
+check_true("legislative: None -> False", not _L.passes_thresholds(None, 0.9, prob_min=0.55, impact_min=0.5))
+
+# tally_judge: only >= pass_min PASS advances; a tie never passes
+check("legislative: judge 2/3 pass -> pass", _L.tally_judge(["pass", "pass", "fail"], 2), ("pass", 2))
+check("legislative: judge 1/3 pass -> fail", _L.tally_judge(["pass", "fail", "fail"], 2), ("fail", 1))
+check_true("legislative: judge 1pass/1hold/1fail never passes",
+           _L.tally_judge(["pass", "hold", "fail"], 2)[0] != "pass")
+check("legislative: judge empty -> fail", _L.tally_judge([], 2), ("fail", 0))
+
+# bill_content_hash: stable + changes when status/action advances
+check("legislative: content_hash stable", _L.bill_content_hash("committee", "2026-07-01", "u1"),
+      _L.bill_content_hash("committee", "2026-07-01", "u1"))
+check_true("legislative: content_hash changes on advance",
+           _L.bill_content_hash("committee", "2026-07-01", "u1") != _L.bill_content_hash("passed_one", "2026-07-01", "u1"))
+
+# heuristic_passage_prob: monotonic in progress; failed=0; must-pass bump; clamp
+_seq = [_CG.heuristic_passage_prob({"status": s, "title": "x", "cosponsors_n": 0, "latest_action": ""})
+        for s in ("introduced", "committee", "reported", "passed_one", "passed_both", "to_president", "became_law")]
+check_true("legislative: passage prob monotonic in progress", _seq == sorted(_seq) and _seq[-1] == 1.0)
+check("legislative: failed bill prob 0", _CG.heuristic_passage_prob({"status": "failed", "title": "x"}), 0.0)
+check_true("legislative: must-pass + cosponsors bump (clamped)",
+           _CG.heuristic_passage_prob({"status": "passed_one", "title": "defense appropriations", "cosponsors_n": 100})
+           > _CG.heuristic_passage_prob({"status": "passed_one", "title": "x", "cosponsors_n": 0}))
+check("legislative: derive_status became_law", _CG.derive_status("Became Public Law No: 119-1."), "became_law")
+check("legislative: derive_status committee", _CG.derive_status("Referred to the Committee on Finance."), "committee")
+
+# poll_changed_bills: dedup + fail-safe (fake opener, no network)
+def _fake_opener(url, timeout):
+    import json as _j
+    return _j.dumps({"bills": [
+        {"congress": 119, "type": "HR", "number": 10, "title": "Bill A",
+         "latestAction": {"text": "Passed House", "actionDate": "2026-07-10"}, "updateDate": "2026-07-10T00:00:00Z"},
+        {"congress": 119, "type": "HR", "number": 10, "title": "Bill A dup",
+         "latestAction": {"text": "Passed House", "actionDate": "2026-07-10"}, "updateDate": "2026-07-10T00:00:00Z"}]}).encode()
+_polled = _CG.poll_changed_bills("a", "b", "KEY", max_pages=1, opener=_fake_opener)
+check("legislative: poll dedups (bill_id,update)", len(_polled), 1)
+check_raises("legislative: poll no key raises (fail-safe)",
+             lambda: _CG.poll_changed_bills("a", "b", "", opener=_fake_opener), _DUE)
+
+# apply_add: funds only the DELTA; a re-add of an already-active name is a no-op (GB2 cash-drift fix)
+_rows0 = [{"sleeve": "Cash", "ticker": "SGOV", "target_weight": 40.0, "status": "active"},
+          {"sleeve": "US", "ticker": "QQQ", "target_weight": 60.0, "band": 5, "status": "active"}]
+_r1, _f1, _ = _UNI.apply_add(_rows0, "LMT", "Legislative Catalyst", 4.0, 1.0, cash_ticker="SGOV")
+check("legislative: apply_add funds full weight for a NEW name", _f1, 4.0)
+check("legislative: apply_add debits cash by the funded weight",
+      round(next(r["target_weight"] for r in _r1 if r["ticker"] == "SGOV"), 2), 36.0)
+_r2, _f2, _ = _UNI.apply_add(_r1, "LMT", "Legislative Catalyst", 4.0, 1.0, cash_ticker="SGOV")
+check("legislative: re-add already-active name is a NO-OP (no re-debit)", _f2, 0.0)
+check("legislative: re-add leaves cash unchanged", _r2, _r1)
+_r3, _f3, _ = _UNI.apply_add(_r1, "LMT", "Legislative Catalyst", 6.0, 1.0, cash_ticker="SGOV")
+check("legislative: apply_add funds only the incremental delta on an increase", _f3, 2.0)
+
+# build_catalyst_proposals gating (benefit ADD allow-list; suffer REMOVE held+allow+policy-map)
+_act = [{"bill_id": "119-hr-2", "ticker": "FSLR", "direction": "benefit", "magnitude": 0.8, "rationale": "r", "policy_codes": ["Energy"]},
+        {"bill_id": "119-hr-3", "ticker": "XOM", "direction": "suffer", "magnitude": 0.7, "rationale": "r2", "policy_codes": ["Energy"]},
+        {"bill_id": "119-hr-4", "ticker": "ZZZZ", "direction": "benefit", "magnitude": 0.9, "rationale": "r3", "policy_codes": ["x"]}]
+_allow = frozenset({"FSLR", "XOM", "QQQ"})
+_held = {"XOM", "QQQ"}
+_p_add = _LEARN.build_catalyst_proposals(_act, _held, add_weight=4.0, allow=_allow, policy_area_map={}, remove_enabled=False)
+_addkeys = {(p.kind, p.ticker) for p in _p_add}
+check_true("legislative: benefit on allow-list -> ADD", ("PROPOSE_ADD", "FSLR") in _addkeys)
+check_true("legislative: benefit OFF allow-list -> no ADD", ("PROPOSE_ADD", "ZZZZ") not in _addkeys)
+check_true("legislative: ADD tier is 'legislative'", all(p.tier == "legislative" for p in _p_add))
+check_true("legislative: no REMOVE when remove_enabled=False", not any(p.kind == "PROPOSE_REMOVE" for p in _p_add))
+check_true("legislative: no REMOVE without a policy-area map",
+           not any(p.kind == "PROPOSE_REMOVE" for p in _LEARN.build_catalyst_proposals(
+               _act, _held, add_weight=4.0, allow=_allow, policy_area_map={}, remove_enabled=True)))
+_p_rm = _LEARN.build_catalyst_proposals(_act, _held, add_weight=4.0, allow=_allow,
+                                        policy_area_map={"XOM": ["Energy"]}, remove_enabled=True)
+check_true("legislative: REMOVE when held+allow+policy-code overlap",
+           any(p.kind == "PROPOSE_REMOVE" and p.ticker == "XOM" for p in _p_rm))
+check_true("legislative: no REMOVE when policy codes don't overlap",
+           not any(p.kind == "PROPOSE_REMOVE" for p in _LEARN.build_catalyst_proposals(
+               _act, _held, add_weight=4.0, allow=_allow, policy_area_map={"XOM": ["Taxation"]}, remove_enabled=True)))
+check_true("legislative: no REMOVE for an UNHELD suffer name",
+           not any(p.kind == "PROPOSE_REMOVE" for p in _LEARN.build_catalyst_proposals(
+               [{"bill_id": "b", "ticker": "FSLR", "direction": "suffer", "magnitude": 0.7, "rationale": "r", "policy_codes": ["Energy"]}],
+               _held, add_weight=4.0, allow=_allow, policy_area_map={"FSLR": ["Energy"]}, remove_enabled=True)))
+
+# actionable_impacts filter (judged=pass AND applied=0 AND passage>=min AND magnitude>=min) via temp ledger
+import tempfile as _tf2  # noqa: E402
+from lib.ledger import Ledger as _Led2  # noqa: E402
+_ldb = str(Path(_tf2.mkdtemp()) / "leg.db")
+_lg = _Led2(_ldb)
+_lg.ensure_schema()
+with _lg.legislative_conn() as _lc:
+    check_true("legislative: upsert_bill returns True for a NEW bill",
+               _L.upsert_bill(_lc, bill_id="119-hr-2", congress=119, chamber="house", bill_type="hr", number=2,
+                              title="T", status="passed_one", latest_action="Passed House",
+                              latest_action_date="2026-07-10", policy_codes=["Energy"], content_hash="c1",
+                              first_seen="2026-07-13", now="2026-07-13"))
+    check_true("legislative: upsert_bill True again (analyzed_at still NULL -> retry)",
+               _L.upsert_bill(_lc, bill_id="119-hr-2", congress=119, chamber="house", bill_type="hr", number=2,
+                              title="T", status="passed_one", latest_action="Passed House",
+                              latest_action_date="2026-07-10", policy_codes=["Energy"], content_hash="c1",
+                              first_seen="2026-07-13", now="2026-07-13"))
+    _L.record_analysis(_lc, "119-hr-2", passage_prob=0.7, passage_source="heuristic", thesis="t", model="claude", now="2026-07-13")
+    check_true("legislative: upsert_bill False once unchanged AND analyzed",
+               not _L.upsert_bill(_lc, bill_id="119-hr-2", congress=119, chamber="house", bill_type="hr", number=2,
+                                  title="T", status="passed_one", latest_action="Passed House",
+                                  latest_action_date="2026-07-10", policy_codes=["Energy"], content_hash="c1",
+                                  first_seen="2026-07-13", now="2026-07-13"))
+    _L.replace_bill_impacts(_lc, "119-hr-2", [{"ticker": "FSLR", "direction": "benefit", "magnitude": 0.8,
+                                               "horizon": "medium", "rationale": "r", "sector": "energy"}], "2026-07-13")
+    check("legislative: unjudged bill is NOT actionable",
+          _L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.5), [])
+    _L.mark_bill_judged(_lc, "119-hr-2", "fail", "no", "[]", "2026-07-13")
+    check("legislative: judge-FAIL bill is NOT actionable",
+          _L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.5), [])
+    _L.mark_bill_judged(_lc, "119-hr-2", "pass", "ok", "[]", "2026-07-13")
+    check("legislative: judged-PASS bill is actionable",
+          len(_L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.5)), 1)
+    check("legislative: actionable excludes below-magnitude",
+          _L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.9), [])
+    check("legislative: actionable excludes below-passage",
+          _L.actionable_impacts(_lc, min_passage_prob=0.75, min_magnitude=0.5), [])
+    _L.mark_bill_applied(_lc, "119-hr-2")
+    check("legislative: applied bill is NOT actionable",
+          _L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.5), [])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

@@ -46,7 +46,8 @@ def run_healthcheck() -> dict:
     def _imports():
         import importlib
         for m in ("lib.strategy", "lib.portfolio", "lib.goal", "lib.signals",
-                  "lib.learn", "lib.universe", "lib.runlock", "lib.strategy_context"):
+                  "lib.learn", "lib.universe", "lib.runlock", "lib.strategy_context",
+                  "lib.legislative", "lib.legislative_llm", "lib.dataflows.congress"):
             importlib.import_module(m)
         # The brain must load too: a brained-out box (bad EVE install / missing
         # node_modules / a deleted-tradingagents ImportError post-F8) must FAIL

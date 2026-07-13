@@ -2,9 +2,10 @@
 """Deterministic e2e for the sub-$1 fractional-sell guard + the LLM-sell/rebalance
 unification (no network, no broker, no LLM).
 
-  * Fix 1 (min-notional): a trim whose notional < $1 is bumped to clear $1, or
-        cleanly skipped when the WHOLE position is under $1 (dust). Both sell paths
-        (the classic LLM exit and the rebalance trim/exit) honor it; never an error.
+  * Fix 1 + F2 (min-notional): a TRIM below min_trade_notional ($5) is SKIPPED
+        (churn guard), not bumped; a full EXIT/reconcile stays on RH's $1 floor and
+        still winds to zero (exempt); dust (whole pos < $1) is a clean skip. Both
+        sell paths (classic LLM exit + rebalance trim/exit) honor it; never an error.
   * Fix 2 (unify): with rebalance ON, an in-book LLM Underweight/Sell is DEFERRED
         to the rebalance trim/exit pass (deferred_to_rebalance_trim) — the book owns
         trim sizing (target weight), not the model's blunt 0.5-half. Symmetric with
@@ -38,7 +39,8 @@ def ok(name, cond, detail: object = ""):
         print(f"  ✗ FAIL: {name}{(' — ' + str(detail)) if detail else ''}")
 
 
-def _mk(tmp: Path, *, rebalance=True, holdings=None, per_name=80, rh="[AAA, BBB, SGOV]"):
+def _mk(tmp: Path, *, rebalance=True, holdings=None, per_name=80, rh="[AAA, BBB, SGOV]",
+        min_delta=None):
     """Write a strategy + config and return (Config, freshly-seeded Ledger)."""
     from lib.config import load_config
     from lib.strategy import load_strategy
@@ -66,7 +68,9 @@ def _mk(tmp: Path, *, rebalance=True, holdings=None, per_name=80, rh="[AAA, BBB,
         f"risk: {{max_dollars_per_trade: 100, daily_loss_halt_pct: 20, "
         "daily_capital_deploy_cap: 1000, min_buying_power_buffer: 5, "
         "max_actions_per_ticker_per_day: 1, max_analyses_per_ticker_per_day: 1, "
-        f"rebalance_enabled: {str(rebalance).lower()}, cash_sleeve_ticker: SGOV}}\n"
+        f"rebalance_enabled: {str(rebalance).lower()}, cash_sleeve_ticker: SGOV"
+        + (f", conviction_rebalance_min_delta_pct: {min_delta}" if min_delta is not None else "")
+        + "}\n"
         "notify: {enabled: false}\n",
         encoding="utf-8")
     cfg = load_config(str(cfg_path))
@@ -131,41 +135,55 @@ def main() -> int:
            aaa_rtrim is not None and aaa_rtrim["quantity"] == expected_trim
            and expected_trim != 0.5 * 2.0, (aaa_rtrim, expected_trim))
 
-    # --- Fix 1: rebalance trim >= $1 passes through unchanged (no bump, no skip) --
-    # Overweight with a trim whose notional is already >= $1: held 0.05 sh @ $140 = $7.00,
-    # target $2.00 -> raw trim = ($7.00-$2.00)/$140 = 0.0357 sh = $5.00 (>= $1, "trim").
+    # --- F2: a rebalance trim >= min_trade_notional ($5) passes; a sub-$5 trim SKIPS (churn) --
+    # held 0.05 sh @ $140 = $7.00; target $1.00 -> raw trim = ($7-$1)/$140 = 0.042857 sh = $6.00
+    # (>= $5 -> places at the raw excess shares, NOT bumped).
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d))
         snap = {"equity": 1000.0, "buying_power": 500.0, "now_iso": "2026-06-20T10:00:00-04:00",
                 "positions": {"AAA": {"quantity": 0.05, "market_value": 7.00}},
                 "quotes": {"AAA": 140.0, "BBB": 30.0, "SGOV": 1.0}}
-        tw = {"AAA": {"intent": "trim", "target_dollars": 2.00, "quotable": True}}
+        tw = {"AAA": {"intent": "trim", "target_dollars": 1.00, "quotable": True}}
         plan = tick._run_plan(cfg, led, {**snap, "now_iso": snap["now_iso"], "run_id": "E2E",
                                          "analyses": [], "target_weights": tw})
         aaa = next((o for o in plan["orders"] if o["ticker"] == "AAA"), None)
-        ok("rebalance trim >= $1 passes through (order placed, not skipped)",
-           aaa is not None and aaa.get("order_kind") == "rebalance_trim", aaa)
-        ok("rebalance trim >= $1 is NOT bumped (raw excess shares)",
-           aaa is not None and abs(aaa["quantity"] - round((7.00 - 2.00) / 140.0, 6)) < 1e-9, aaa)
+        ok("F2: rebalance trim >= $5 places (raw excess shares, not bumped)",
+           aaa is not None and aaa.get("order_kind") == "rebalance_trim"
+           and abs(aaa["quantity"] - round((7.00 - 1.00) / 140.0, 6)) < 1e-9, aaa)
 
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d))
-        # Held 0.02 sh @ $140 = $2.80; target $2.60 -> raw trim = $0.20/$140 = 0.00143 sh = $0.20 (< $1).
-        # Whole pos ($2.80) >= $1 so NOT dust -> bumped to 1/140=0.007143 sh ($1.00) to clear the floor.
+        # held 0.05 sh @ $140 = $7.00; target $3.50 -> raw trim = ($7-$3.50)/$140 = 0.025 sh = $3.50
+        # (< $5, whole pos NOT dust) -> SKIPPED (F2 churn guard): don't bump a sub-floor trim up.
         snap = {"equity": 1000.0, "buying_power": 500.0, "now_iso": "2026-06-20T10:00:00-04:00",
-                "positions": {"AAA": {"quantity": 0.02, "market_value": 2.80}},
+                "positions": {"AAA": {"quantity": 0.05, "market_value": 7.00}},
                 "quotes": {"AAA": 140.0, "BBB": 30.0, "SGOV": 1.0}}
-        # Force a trim toward a near-current target so the raw trim is sub-$1.
-        tw = {"AAA": {"intent": "trim", "target_dollars": 2.60, "quotable": True}}
+        tw = {"AAA": {"intent": "trim", "target_dollars": 3.50, "quotable": True}}
         plan = tick._run_plan(cfg, led, {**snap, "now_iso": snap["now_iso"], "run_id": "E2E",
                                          "analyses": [], "target_weights": tw})
         aaa = next((o for o in plan["orders"] if o["ticker"] == "AAA"), None)
         skip_dec = next((dd for dd in plan["decisions"] if dd.get("ticker") == "AAA"
                         and dd.get("detail", "").startswith("sell_below_min")), None)
-        ok("sub-$1 rebalance trim is BUMPED to >= $1 (order placed, not skipped)",
-           aaa is not None and aaa.get("quantity", 0) * 140.0 >= 1.0, aaa)
-        ok("bumped trim never exceeds held (long-only)",
-           aaa is not None and aaa.get("quantity", 99) <= 0.02, aaa)
+        ok("F2: sub-$5 rebalance trim SKIPS (not bumped, no order)", aaa is None, aaa)
+        ok("F2: sub-$5 trim records sell_below_min:skip_below_min",
+           skip_dec is not None and "skip_below_min" in skip_dec.get("detail", ""), skip_dec)
+
+    # --- F2 P1 (CRITICAL, review survivor): a full EXIT of a $1-$5 position STILL winds to zero.
+    # The $5 economic floor must NOT reach the exit path, or resolve_sell_quantity_min_notional's
+    # skip_dust branch (held*quote < min_notional, evaluated BEFORE the bump) would strand it.
+    # Exits stay on RH's $1 floor. held 0.02 sh @ $140 = $2.80 -> full rebalance_exit sells all 0.02.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d))
+        snap = {"equity": 1000.0, "buying_power": 500.0, "now_iso": "2026-06-20T10:00:00-04:00",
+                "positions": {"AAA": {"quantity": 0.02, "market_value": 2.80}},
+                "quotes": {"AAA": 140.0, "BBB": 30.0, "SGOV": 1.0}}
+        tw = {"AAA": {"intent": "exit", "target_dollars": 0.0, "quotable": True}}
+        plan = tick._run_plan(cfg, led, {**snap, "now_iso": snap["now_iso"], "run_id": "E2E",
+                                         "analyses": [], "target_weights": tw})
+        aaa = next((o for o in plan["orders"] if o["ticker"] == "AAA"), None)
+        ok("F2 P1: $1-$5 full EXIT still winds to zero (exit exempt from the $5 floor)",
+           aaa is not None and aaa.get("order_kind") == "rebalance_exit"
+           and abs(aaa["quantity"] - 0.02) < 1e-9, aaa)
 
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d))
@@ -184,12 +202,12 @@ def main() -> int:
         ok("dust -> clean sell_below_min:skip_dust skip (NOT an error)",
            skip_dec is not None and "skip_dust" in skip_dec.get("detail", ""), skip_dec)
 
-    # --- Fix 1 on the CLASSIC LLM sell path (rebalance OFF) ---------------------
-    # rebalance OFF -> target_weights is None -> the LLM Underweight 0.5-trim runs.
-    # A sub-$1 trim gets bumped; dust gets a clean skip. NEVER an unhandled sub-$1 order.
+    # --- F2 on the CLASSIC LLM sell path (rebalance OFF): sub-$5 Underweight trim SKIPS ---------
+    # rebalance OFF -> target_weights is None -> the LLM Underweight 0.5-trim runs. A sub-$5 trim
+    # is churn -> skipped; a trim >= $5 places; a full Sell (wind-down) always completes.
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d), rebalance=False)
-        # Held 0.02 sh @ $140 = $2.80; LLM Underweight -> 0.5-trim = 0.01 sh = $1.40 (>= $1, passes).
+        # Held 0.02 sh @ $140 = $2.80; LLM Underweight -> 0.5-trim = 0.01 sh = $1.40 (< $5 -> SKIP).
         snap = {"equity": 1000.0, "buying_power": 500.0, "now_iso": "2026-06-20T10:00:00-04:00",
                 "positions": {"AAA": {"quantity": 0.02, "market_value": 2.80}},
                 "quotes": {"AAA": 140.0, "BBB": 30.0, "SGOV": 1.0}}
@@ -197,8 +215,23 @@ def main() -> int:
         plan = tick._run_plan(cfg, led, {**snap, "now_iso": snap["now_iso"], "run_id": "E2E",
                                          "analyses": an})  # no target_weights -> classic
         aaa = next((o for o in plan["orders"] if o["ticker"] == "AAA"), None)
-        ok("classic: 0.5-trim >= $1 places an exit order", aaa is not None
-           and aaa.get("order_kind") == "exit", aaa)
+        skip_dec = next((dd for dd in plan["decisions"] if dd.get("ticker") == "AAA"
+                        and dd.get("detail", "").startswith("sell_below_min")), None)
+        ok("F2 classic: sub-$5 Underweight trim SKIPS (churn guard)", aaa is None, aaa)
+        ok("F2 classic: sub-$5 trim records sell_below_min", skip_dec is not None, skip_dec)
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), rebalance=False)
+        # Held 0.20 sh @ $140 = $28.00; Underweight 0.5-trim = 0.10 sh = $14.00 (>= $5 -> places).
+        snap = {"equity": 1000.0, "buying_power": 500.0, "now_iso": "2026-06-20T10:00:00-04:00",
+                "positions": {"AAA": {"quantity": 0.20, "market_value": 28.00}},
+                "quotes": {"AAA": 140.0, "BBB": 30.0, "SGOV": 1.0}}
+        an = [{"ticker": "AAA", "signal": "Underweight", "conviction": 60, "uncertainty": 30}]
+        plan = tick._run_plan(cfg, led, {**snap, "now_iso": snap["now_iso"], "run_id": "E2E",
+                                         "analyses": an})
+        aaa = next((o for o in plan["orders"] if o["ticker"] == "AAA"), None)
+        ok("F2 classic: Underweight trim >= $5 still places an exit order",
+           aaa is not None and aaa.get("order_kind") == "exit", aaa)
 
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d), rebalance=False)
@@ -270,6 +303,46 @@ def main() -> int:
            not any(o["ticker"] == "AAA" and o.get("order_kind", "").startswith("rebalance")
                    for o in p2["orders"]),
            [o for o in p2["orders"] if o["ticker"] == "AAA"])
+
+    # --- F3: conviction HYSTERESIS pins a noisy tick to the static book (no churn) + conserves ---
+    # A big min_delta gate holds every name at its STATIC weight regardless of the day's conviction,
+    # so a name held AT target does not get re-clipped and trimmed. Proves _run_construct actually
+    # calls apply_target_hysteresis AND conserves the book to ~100%.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), min_delta=50.0)   # huge gate -> pin all to static
+        # AAA + BBB held EXACTLY at their static 30% targets ($30 each on a $100 deployable).
+        snap = {"equity": 100.0, "buying_power": 40.0, "now_iso": "2026-06-20T10:00:00-04:00",
+                "positions": {"AAA": {"quantity": 0.5, "market_value": 30.0},
+                              "BBB": {"quantity": 1.0, "market_value": 30.0}},
+                "quotes": {"AAA": 60.0, "BBB": 30.0, "SGOV": 1.0}}
+        an = [{"ticker": "AAA", "signal": "Underweight", "conviction": 68, "uncertainty": 30}]
+        con = tick._run_construct(cfg, led, {**{k: snap[k] for k in
+                                  ("equity", "buying_power", "positions", "quotes")}, "analyses": an})
+        tw = con["target_weights"]
+        ok("F3: hysteresis pins AAA target to its static 30% (noise gated, not re-clipped)",
+           abs(tw["AAA"]["target_weight"] - 30.0) < 1e-6, tw.get("AAA"))
+        ok("F3: book still conserves to ~100% after hysteresis + cash residual",
+           abs(sum(v["target_weight"] for v in tw.values()) - 100.0) < 0.5,
+           {k: v["target_weight"] for k, v in tw.items()})
+        # held == target -> construct intent is hold -> the plan places NO trim (the churn we kill).
+        plan = tick._run_plan(cfg, led, {**snap, "run_id": "E2E", "analyses": an, "target_weights": tw})
+        aaa_reb = next((o for o in plan["orders"] if o["ticker"] == "AAA"
+                        and str(o.get("order_kind", "")).startswith("rebalance")), None)
+        ok("F3: no rebalance trim/buy when hysteresis holds the target (no churn)", aaa_reb is None, aaa_reb)
+
+    # --- F3 knob OFF (min_delta 0): the target re-clips to conviction (byte-identical to pre-F3) ---
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), min_delta=0.0)
+        snap = {"equity": 100.0, "buying_power": 40.0, "now_iso": "2026-06-20T10:00:00-04:00",
+                "positions": {"AAA": {"quantity": 0.5, "market_value": 30.0},
+                              "BBB": {"quantity": 1.0, "market_value": 30.0}},
+                "quotes": {"AAA": 60.0, "BBB": 30.0, "SGOV": 1.0}}
+        an = [{"ticker": "AAA", "signal": "Underweight", "conviction": 68, "uncertainty": 30}]
+        con = tick._run_construct(cfg, led, {**{k: snap[k] for k in
+                                  ("equity", "buying_power", "positions", "quotes")}, "analyses": an})
+        ok("F3 OFF: min_delta 0 lets the target move off static (re-clip, pre-F3 behavior)",
+           abs(con["target_weights"]["AAA"]["target_weight"] - 30.0) > 1e-6,
+           con["target_weights"].get("AAA"))
 
     print("\n" + "=" * 64)
     print(f"E2E: {PASS} checks passed, {FAIL} failed")

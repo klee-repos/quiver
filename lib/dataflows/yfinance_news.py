@@ -135,6 +135,11 @@ def get_global_news_yfinance(
 
     all_news = []
     seen_titles = set()
+    # Take a few from EACH query (a per-query cap) rather than filling `limit` from the
+    # first query and breaking — otherwise the first query (Fed) saturates the cap and
+    # the later oil/energy + sector queries (which carry e.g. an Iran/Strait-of-Hormuz
+    # oil shock) never get sampled. ceil(limit / n_queries) per topic.
+    per_query = max(2, -(-limit // max(1, len(search_queries))))
 
     try:
         for query in search_queries:
@@ -144,6 +149,7 @@ def get_global_news_yfinance(
                 enable_fuzzy_query=True,
             ))
 
+            taken = 0
             if search.news:
                 for article in search.news:
                     # Handle both flat and nested structures
@@ -157,9 +163,9 @@ def get_global_news_yfinance(
                     if title and title not in seen_titles:
                         seen_titles.add(title)
                         all_news.append(article)
-
-            if len(all_news) >= limit:
-                break
+                        taken += 1
+                        if taken >= per_query:
+                            break   # move to the next TOPIC so every query is represented
 
         if not all_news:
             return f"No global news found for {curr_date}"

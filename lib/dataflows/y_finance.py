@@ -290,9 +290,27 @@ def get_fundamentals(
             ("Free Cash Flow", info.get("freeCashflow")),
         ]
 
+        # yfinance mixes units within one .info dict with NO labels: margins/ROE/ROA
+        # come as FRACTIONS (0.218 = 21.8%), dividendYield as a PERCENT number (2.7 =
+        # 2.7%), and debtToEquity as debt-as-%-of-equity (76.6 = 0.77x). Emitting them
+        # bare made a model read "Debt to Equity: 76.6" as 76x leverage -> a false Sell.
+        # Normalize + label so the number the model reads carries its real unit.
+        _pct_from_fraction = {"Profit Margin", "Operating Margin",
+                              "Return on Equity", "Return on Assets"}
+        _pct_already = {"Dividend Yield"}         # already a percent-scaled number
+        _ratio_from_pct = {"Debt to Equity"}      # /100 = the x ratio
+
         lines = []
         for label, value in fields:
-            if value is not None:
+            if value is None:
+                continue
+            if label in _pct_from_fraction and isinstance(value, (int, float)):
+                lines.append(f"{label}: {value * 100:.2f}%")
+            elif label in _pct_already and isinstance(value, (int, float)):
+                lines.append(f"{label}: {value:.2f}%")
+            elif label in _ratio_from_pct and isinstance(value, (int, float)):
+                lines.append(f"{label}: {value / 100:.2f}x")
+            else:
                 lines.append(f"{label}: {value}")
 
         header = f"# Company Fundamentals for {ticker.upper()}\n"

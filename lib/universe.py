@@ -121,15 +121,19 @@ def redistribute_to_cash(rows: List[dict], freed_weight: float, cash_ticker: str
 
 def apply_add(rows: List[dict], ticker: str, sleeve: str, weight: float, band: float,
               cash_ticker: str = "SGOV") -> Tuple[List[dict], float, str]:
-    """Add (or re-activate) ``ticker`` at ``weight``, FUNDED from the cash sleeve.
+    """Add (or re-activate) ``ticker`` at ``weight``, FUNDING ONLY THE DELTA from cash.
 
     The safety-critical inverse of ``apply_remove`` (returns ``(new_rows,
-    applied_weight, reason)``):
-      * REFUSES (applied 0, no change) if ``weight <= 0`` or the cash sleeve has
-        less than ``weight`` to give — never creates a negative cash weight / a book
-        that doesn't conserve to ~100.
-      * if the ticker already exists (e.g. a prior ``exiting``/``removed`` row), it is
-        re-activated at the new weight rather than duplicated.
+    funded_delta, reason)``):
+      * REFUSES (funded 0, NO change) if ``weight <= 0``; if the ticker is ALREADY at
+        ``>= weight`` (an idempotent re-add — e.g. a re-approved catalyst proposal);
+        or if the cash sleeve has less than the incremental ``delta`` to give — never
+        creates a negative cash weight or a book that doesn't conserve to ~100.
+      * funds only ``delta = weight - existing_weight`` from cash, so re-applying a
+        name already active at ``weight`` is a NO-OP (does not re-debit cash) — closing
+        the multi-bill / re-approve cash-erosion path.
+      * if the ticker already exists (a prior ``exiting``/``removed``/``active`` row) it is
+        re-activated/adjusted to the new weight rather than duplicated.
     The caller still runs ``validate_book`` (allow-list/quotability is ``validate_add``).
     """
     t = str(ticker).upper()
@@ -137,11 +141,16 @@ def apply_add(rows: List[dict], ticker: str, sleeve: str, weight: float, band: f
     w = float(weight)
     if w <= 0:
         return (rows, 0.0, f"add weight must be > 0 (got {w})")
+    existing_w = sum(float(r.get("target_weight", 0) or 0)
+                     for r in rows if str(r.get("ticker")).upper() == t and r.get("status") != "removed")
+    delta = w - existing_w
+    if delta <= 1e-9:
+        return (rows, 0.0, f"{t} already at {existing_w:.2f}% >= requested {w:.2f}% (no funding needed)")
     cash_w = sum(float(r.get("target_weight", 0) or 0)
                  for r in rows if str(r.get("ticker")).upper() == ct)
-    if w > cash_w + 1e-9:
+    if delta > cash_w + 1e-9:
         return (rows, 0.0, f"insufficient cash weight to fund {t}: "
-                           f"{cash_w:.2f}% available < {w:.2f}% requested")
+                           f"{cash_w:.2f}% available < {delta:.2f}% needed")
     out: List[dict] = []
     found = False
     for r in rows:
@@ -155,8 +164,8 @@ def apply_add(rows: List[dict], ticker: str, sleeve: str, weight: float, band: f
     if not found:
         out.append({"sleeve": sleeve, "ticker": t, "target_weight": w, "band": float(band or 0),
                     "status": "active", "book": None, "quotable": 1, "proxy_ticker": None})
-    out = conserve_to_cash(out, -w, ct)   # pull the new name's weight FROM cash
-    return (out, w, "ok")
+    out = conserve_to_cash(out, -delta, ct)   # fund only the INCREMENTAL weight FROM cash
+    return (out, delta, "ok")
 
 
 def validate_book(rows: List[dict]) -> Tuple[bool, str]:

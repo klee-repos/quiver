@@ -270,3 +270,36 @@ def allocate_targets(
         detail[t]["smoothed"] = round(smoothed.get(t, 0.0), 4)
         detail[t]["target_weight"] = weights.get(t, 0.0)
     return Allocation(weights=weights, cash_pct=cash_pct, detail=detail)
+
+
+def apply_target_hysteresis(
+    new_weights: Dict[str, float], prior_weights: Dict[str, float],
+    min_delta_pct: float,
+) -> Dict[str, float]:
+    """Material-change gate on the TARGET weight (F3, anti-churn).
+
+    The allocator re-runs every tick that carries any fresh conviction, so a noisy,
+    ~0-alpha signal nudges each name's smoothed target a little every day and the
+    rebalancer chases that MOVING target with tiny value-destroying trims. This gate
+    keeps a name at its PRIOR target weight unless the fresh conviction moved it by at
+    least ``min_delta_pct`` weight-points — a real conviction shift relocates the
+    target; day-to-day noise does not.
+
+    REVERT (not blend) to the prior on a sub-threshold move, so a persistent tiny lean
+    can NOT slow-accumulate the target away point-by-point: the target only ever moves
+    in a single ``>= min_delta_pct`` step. A name with no prior (a fresh add) always
+    takes its new weight. ``min_delta_pct <= 0`` disables the gate (byte-identical to
+    re-clipping every tick). Pure + total; the CALLER re-derives the cash residual /
+    book conservation after (this only decides engine weights).
+    """
+    if min_delta_pct is None or min_delta_pct <= 0:
+        return dict(new_weights)
+    prior_u = {str(k).upper(): v for k, v in (prior_weights or {}).items()}
+    out: Dict[str, float] = {}
+    for t, w_new in new_weights.items():
+        w_prior = prior_u.get(str(t).upper())
+        if w_prior is not None and abs(float(w_new) - float(w_prior)) < min_delta_pct:
+            out[t] = round(float(w_prior), 4)
+        else:
+            out[t] = w_new
+    return out

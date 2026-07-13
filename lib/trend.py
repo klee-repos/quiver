@@ -45,12 +45,16 @@ def _returns(prices: Sequence[float]) -> List[float]:
 
 
 def total_return(prices: Sequence[float], lookback_days: int) -> Optional[float]:
-    """Return over the last `lookback_days` calendar rows, or None if too short."""
+    """Return over the last `lookback_days` rows, or None when the series is too SHORT
+    to cover the horizon. The old guard `min(lookback_days+1, 2)` was always 2, so a
+    thin series never returned None — it clamped `i` to 0 and reported the
+    SINCE-INCEPTION return mislabeled as (e.g.) a 3-year return, making 6m=1y=2y=3y
+    identical on young names. Mirror momentum_12_1: need a real bar `lookback_days`
+    rows back."""
     p = [float(x) for x in prices if x and x == x]
-    if len(p) < min(lookback_days + 1, 2):
+    if len(p) < lookback_days + 1:
         return None
-    i = max(0, len(p) - 1 - lookback_days)
-    start = p[i]
+    start = p[len(p) - 1 - lookback_days]
     if not start:
         return None
     return (p[-1] / start) - 1.0
@@ -328,6 +332,7 @@ def ma_stats(prices: Sequence[float]) -> MAStats:
 ADX_TRENDING = 25.0      # ADX >= this = a real trend, not chop
 ADX_VERY_STRONG = 35.0
 REGIME_RANGE_ADX = 20.0  # below this = range/no trend
+MIN_ANNUALIZED_ROWS = 60  # min daily returns before annualized ratios are meaningful (~3mo)
 
 
 def trend_regime(adx: Optional[float], ma: MAStats) -> str:
@@ -408,6 +413,11 @@ def trend_metrics(prices: Sequence[float], *, high: Optional[Sequence[float]] = 
     adx = adx_di(hi, lo, p)
     ma = ma_stats(p)
     dd = drawdown_stats(p)
+    # Annualized ratios (Sharpe/Sortino/Calmar/CAGR) on a tiny sample are noise: on
+    # ~20-40 daily returns the sqrt(252) scaling produces confident-looking but
+    # meaningless figures (a name down 15% can print a +Sharpe from vol-drag sign
+    # artifacts). Gate them behind a minimum sample -> render "n/a" below it.
+    have_ratio_n = len(rets) >= MIN_ANNUALIZED_ROWS
     return TrendBundle(
         n_rows=n,
         ret_6m=total_return(p, 126),
@@ -415,10 +425,10 @@ def trend_metrics(prices: Sequence[float], *, high: Optional[Sequence[float]] = 
         ret_2y=total_return(p, 504),
         ret_3y=total_return(p, 756),
         mom_12_1=momentum_12_1(p),
-        sharpe=annualized_sharpe(rets, periods_per_year=periods_per_year),
-        sortino=annualized_sortino(rets, periods_per_year=periods_per_year),
-        calmar=calmar(p, periods_per_year=periods_per_year),
-        cagr_=cagr(p, periods_per_year=periods_per_year),
+        sharpe=annualized_sharpe(rets, periods_per_year=periods_per_year) if have_ratio_n else None,
+        sortino=annualized_sortino(rets, periods_per_year=periods_per_year) if have_ratio_n else None,
+        calmar=calmar(p, periods_per_year=periods_per_year) if have_ratio_n else None,
+        cagr_=cagr(p, periods_per_year=periods_per_year) if have_ratio_n else None,
         dd_current=dd.current_depth,
         dd_max=dd.max_depth,
         dd_max_duration_days=dd.max_duration_days,
@@ -448,8 +458,18 @@ def render_trend_report(b: TrendBundle) -> str:
     a ``## Drawdown`` subheading would flip the section key and silently drop
     the whole trend_report body; enforced by a unit test)."""
     ma = b.ma
+    # Coverage label from the ACTUAL row count, not a hard-coded "~3y" — the fetch
+    # window is 3y but a newly-listed/spun-off name has far less history, and
+    # claiming "~3y" on 5 weeks of data (SPCX N=19) is dishonest.
+    _yrs = b.n_rows / 252.0
+    if _yrs >= 1.0:
+        _cov = f"~{_yrs:.1f}y"
+    elif b.n_rows >= 21:
+        _cov = f"~{b.n_rows / 21.0:.0f}mo"
+    else:
+        _cov = f"{b.n_rows} rows"
     lines = [
-        f"Long-horizon trend guideposts (N={b.n_rows} rows; yfinance close, ~3y).",
+        f"Long-horizon trend guideposts (N={b.n_rows} rows; yfinance close, {_cov}).",
         f"**Trend regime**: {b.trend_regime}",
         "",
         "### Returns (multi-horizon)",

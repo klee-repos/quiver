@@ -100,6 +100,66 @@ def build_add_proposals(led, goal_id: int, strategy_cfg, candidate_provider,
     return out
 
 
+TIER_LEGISLATIVE = "legislative"
+
+
+def build_catalyst_proposals(actionable, held_tickers, *, add_weight: float,
+                             tier: str = TIER_LEGISLATIVE, allow=frozenset(),
+                             policy_area_map=None, remove_enabled: bool = False) -> List[Proposal]:
+    """PURE — turn judged-PASS bill impacts into universe proposals (legislative catalyst).
+
+    ``actionable`` is a list of {bill_id, ticker, direction, magnitude, rationale,
+    policy_codes, ...} rows (already prob/impact/judge-gated by lib.legislative). Gating,
+    per the adversarial review:
+      * benefit -> PROPOSE_ADD, but ONLY when the ticker is on the ``allow`` list
+        (rh_tradable_confirmed) — an off-list name is undiscoverable/unaddable.
+      * suffer  -> PROPOSE_REMOVE, ONLY when ``remove_enabled`` AND the ticker is
+        (held AND allow-listed) AND bound to the bill by the operator's structured
+        ``policy_area_map`` (ticker -> Congress policyArea/subject codes ∩ the bill's
+        policy_codes is non-empty). No map / no code overlap -> NO remove. This never
+        matches against attacker-controlled bill title/text.
+    Returns unique Proposals (deduped by (kind, ticker)); the caller links every
+    contributing bill to the minted proposal's content_hash. Degrades to [] on bad input."""
+    allow_u = {str(t).upper() for t in (allow or [])}
+    held_u = {str(t).upper() for t in (held_tickers or [])}
+    pa_map = {str(k).upper(): {str(x) for x in (v or [])}
+              for k, v in (policy_area_map or {}).items()}
+    out: List[Proposal] = []
+    seen = set()
+    aw = float(add_weight)
+    for row in (actionable or []):
+        if not isinstance(row, dict):
+            continue
+        ticker = str(row.get("ticker", "") or "").strip().upper()
+        direction = str(row.get("direction", "") or "").strip().lower()
+        if not ticker:
+            continue
+        rationale = str(row.get("rationale", "") or "")[:200]
+        bill_id = row.get("bill_id")
+        if direction == "benefit":
+            if ticker not in allow_u:
+                continue  # cannot ADD a name outside the human-vetted allow-list
+            key = ("PROPOSE_ADD", ticker)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(Proposal(ADD, ticker, "Legislative Catalyst", tier,
+                                f"legislative catalyst {bill_id}: {rationale}", target_weight=aw))
+        elif direction == "suffer":
+            if not remove_enabled or ticker not in held_u or ticker not in allow_u:
+                continue  # REMOVE is off / not held / not allow-listed
+            bill_codes = {str(c) for c in (row.get("policy_codes") or [])}
+            if not (pa_map.get(ticker) and (pa_map[ticker] & bill_codes)):
+                continue  # no structured policy-area binding -> never remove on free text
+            key = ("PROPOSE_REMOVE", ticker)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(Proposal(REMOVE, ticker, None, tier,
+                                f"legislative catalyst {bill_id}: {rationale}"))
+    return out
+
+
 def build_proposals(led, goal_id: int, learning_cfg, macro_regime: str, goal_progress,
                     *, strategy_cfg=None, candidate_provider=None) -> dict:
     """All proposals for the active goal, split into auto_apply vs needs_approval."""
