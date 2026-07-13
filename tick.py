@@ -1415,7 +1415,7 @@ def _run_bills_review(cfg, led, data, *, poll=None, detail_fetch=None, text_fetc
 
     # ANALYZE (heuristic-first: skip below-passage bills BEFORE any text-fetch/LLM; cap the
     # loop; per-bill try/except; honor the wall-clock deadline).
-    analyzed = below_gate = 0
+    analyzed = below_gate = skipped_enacted = 0
     for b in changed:
         if time.monotonic() > deadline or analyzed >= int(leg.max_bills_analyzed_per_review):
             break
@@ -1438,6 +1438,9 @@ def _run_bills_review(cfg, led, data, *, poll=None, detail_fetch=None, text_fetc
                 legis.set_bill_detail(c, b["bill_id"], detail.get("status"), detail.get("policy_codes"), now_iso)
                 legis.record_analysis(c, b["bill_id"], passage_prob=prob,
                                       passage_source=leg.passage_source, thesis="", model="", now=now_iso)
+            if detail.get("status") == "became_law":
+                skipped_enacted += 1
+                continue  # already enacted -> priced in; no front-run edge (prob is honestly 1.0)
             if prob < float(leg.passage_prob_min):
                 below_gate += 1
                 continue  # below the passage gate -> never spend an LLM call
@@ -1510,6 +1513,7 @@ def _run_bills_review(cfg, led, data, *, poll=None, detail_fetch=None, text_fetc
         if rid:
             recorded.append(rid)
     return {"reviewed": True, "changed": len(changed), "analyzed": analyzed, "below_gate": below_gate,
+            "skipped_enacted": skipped_enacted,
             "judged": judged, "reconciled": reconciled, "minted": len(recorded), "recorded_ids": recorded}
 
 

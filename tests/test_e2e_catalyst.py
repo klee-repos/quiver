@@ -174,6 +174,13 @@ rC = run(cfg, led, [_bill()], detail=detail_of("committee"))  # prob ~0.05 < 0.5
 ok("C: below-gate bill counted, not analyzed", rC.get("below_gate", 0) >= 1 and rC.get("analyzed") == 0)
 ok("C: no proposal below passage gate", len(led.pending_universe_changes(goal["id"])) == 0)
 
+# --- C2) already-enacted bill -> skipped (no front-run edge), no LLM, no proposal ---------
+cfg, led, goal = mk()
+rC2 = run(cfg, led, [_bill()], detail=detail_of("became_law"))
+ok("C2: became_law skipped (not front-runnable, prob honestly 1.0)",
+   rC2.get("skipped_enacted", 0) >= 1 and rC2.get("analyzed") == 0)
+ok("C2: no proposal for an already-enacted bill", len(led.pending_universe_changes(goal["id"])) == 0)
+
 # --- D) judge FAIL -> not actionable -> no proposal -------------------------------------
 cfg, led, goal = mk()
 rD = run(cfg, led, [_bill()], judge=judge_of("fail"))
