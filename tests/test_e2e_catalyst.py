@@ -239,5 +239,31 @@ rI2 = run(cfg2, led2, [_bill()], detail=detail_of("passed_both", ["Semiconductor
 ok("I: no REMOVE when policy codes don't overlap",
    not any(p["kind"] == "PROPOSE_REMOVE" for p in led2.pending_universe_changes(goal2["id"])))
 
+# --- J) judge eval: re-run the judge over human labels -> agreement + pass_min sweep (offline) ---
+import json  # noqa: E402
+import types as _types  # noqa: E402
+cfg, led, goal = mk()
+_lf = str(Path(tempfile.mkdtemp()) / "labels.jsonl")
+with open(_lf, "w", encoding="utf-8") as _f:
+    _f.write(json.dumps({"bill_id": "b1", "title": "t", "status": "passed_both",
+                         "impacted_tickers": [_imp("COIN")], "thesis": "x", "human_verdict": "pass"}) + "\n")
+    _f.write(json.dumps({"bill_id": "b2", "title": "t", "status": "passed_both",
+                         "impacted_tickers": [_imp("XYZ")], "thesis": "x", "human_verdict": "fail"}) + "\n")
+
+
+def _fake_judge(meta, analysis, *, votes, pass_min):
+    cast = ["pass", "pass", "pass"] if meta["bill_id"] == "b1" else ["pass", "fail", "fail"]
+    return {"verdict": "pass", "reason": "", "votes_json": json.dumps({"votes": cast})}
+
+
+_jargs = _types.SimpleNamespace(labels=_lf, judge_votes="3")
+rJ = T._run_judge_eval(cfg, led, _jargs, judge=_fake_judge)
+ok("J: judge eval scored both labeled rows", rJ.get("n") == 2)
+ok("J: pass_min sweep spans 1..3", [s["pass_min"] for s in rJ.get("sweep", [])] == [1, 2, 3])
+_pm3 = next((s for s in rJ.get("sweep", []) if s["pass_min"] == 3), None)
+ok("J: pass_min=3 gives perfect agreement on this set (b1 pass, b2 fail)",
+   _pm3 is not None and _pm3["accuracy"] == 1.0)
+ok("J: best-precision operating point returned", rJ.get("best_precision") is not None)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

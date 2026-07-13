@@ -1546,7 +1546,9 @@ def cmd_catalyst_eval(args) -> dict:
         return _run_passage_eval(cfg, led, args)
     if kind == "sleeve":
         return _run_sleeve_eval(cfg, led)
-    return {"error": f"unknown catalyst-eval kind: {kind!r} (use passage|sleeve)"}
+    if kind == "judge":
+        return _run_judge_eval(cfg, led, args)
+    return {"error": f"unknown catalyst-eval kind: {kind!r} (use passage|sleeve|judge)"}
 
 
 def _run_passage_eval(cfg, led, args) -> dict:
@@ -1640,6 +1642,112 @@ def _run_sleeve_eval(cfg, led) -> dict:
             "note": ("no resolved catalyst decisions yet — this is the live report card that fills in "
                      "as catalyst-added names trade and resolve" if n_cat == 0 else "catalyst sleeve is scoring"),
             "scorecard": block or "(no cross-sectional slice yet)"}
+
+
+def _labels_path(args) -> str:
+    p = (getattr(args, "labels", "") or "").strip() or "state/fixtures/judge_labels.jsonl"
+    return p if os.path.isabs(p) else str(REPO / p)
+
+
+def _run_judge_eval(cfg, led, args, *, judge=None) -> dict:
+    """Measure the impact-JUDGE against the operator's human labels: re-run judge_bill with N
+    votes over each labeled (bill, analysis), then PURELY sweep pass_min to find the operating
+    point that best matches the labels. ``judge`` is injectable (offline test uses a replay)."""
+    import lib.legislative_judge_eval as je
+    labels_path = _labels_path(args)
+    if not os.path.exists(labels_path):
+        return {"error": f"no labels at {labels_path}; run `tick.py catalyst-label` first"}
+    rows = []
+    with open(labels_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if str(r.get("human_verdict", "")).strip().lower() in ("pass", "fail"):
+                rows.append(r)
+    if not rows:
+        return {"error": f"no pass/fail-labeled rows in {labels_path}"}
+    judge = judge or _default_bill_judge
+    votes_n = int(getattr(args, "judge_votes", 5) or 5)
+    vote_rows = []
+    for r in rows:
+        meta = {"bill_id": r.get("bill_id"), "title": r.get("title"), "status": r.get("status")}
+        analysis = {"impacted_tickers": r.get("impacted_tickers", []), "thesis": r.get("thesis", "")}
+        try:
+            v = judge(meta, analysis, votes=votes_n, pass_min=1)
+            cast = json.loads(v.get("votes_json", "{}")).get("votes", []) or []
+        except Exception:  # noqa: BLE001 — a judge hiccup on one row shouldn't sink the eval
+            cast = []
+        vote_rows.append((cast, str(r["human_verdict"]).strip().lower()))
+    sweep = je.sweep_pass_min(vote_rows, max_votes=votes_n)
+    current = next((s for s in sweep if s["pass_min"] == int(cfg.legislative.judge_pass_min)), None)
+    return {"eval": "judge", "labels": labels_path, "n": len(rows), "votes_cast": votes_n,
+            "current_config": {"judge_votes": cfg.legislative.judge_votes,
+                               "judge_pass_min": cfg.legislative.judge_pass_min},
+            "current_agreement": current, "sweep": sweep,
+            "best_f1": je.best_operating_point(sweep, "f1"),
+            "best_precision": je.best_operating_point(sweep, "precision")}
+
+
+def cmd_catalyst_label(args) -> dict:
+    """Interactive: label the QUALITY of the impact-analysis on each analyzed bill (grading the
+    ANALYSIS, not predicting the market). Appends one JSONL row per verdict to the labels file;
+    the accumulated labels tune the judge via `catalyst-eval judge`."""
+    import sys
+    cfg, led = _cfg_and_ledger()
+    import lib.legislative as legis
+    labels_path = _labels_path(args)
+    already = set()
+    if os.path.exists(labels_path):
+        with open(labels_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    already.add(json.loads(line).get("bill_id"))
+                except ValueError:
+                    continue
+    with led.legislative_conn() as c:
+        cards = []
+        for b in legis.analyzed_bills(c):
+            if b["bill_id"] in already:
+                continue
+            b["impacts"] = legis.get_bill_impacts(c, b["bill_id"])
+            cards.append(b)
+    cards = cards[:int(getattr(args, "limit", 10) or 10)]
+    if not cards:
+        return {"labeled": 0, "reason": "no un-labeled analyzed bills with impacts — let bills-review "
+                "accumulate a corpus over a few days (or temporarily lower legislative.passage_prob_min)",
+                "already_labeled": len(already)}
+    if not sys.stdin.isatty():
+        return {"error": "catalyst-label is interactive — run it in a terminal",
+                "to_label": [b["bill_id"] for b in cards]}
+    os.makedirs(os.path.dirname(labels_path), exist_ok=True)
+    labeled = 0
+    with open(labels_path, "a", encoding="utf-8") as f:
+        for b in cards:
+            print("\n" + "=" * 72, file=sys.stderr)
+            print(f"{b['bill_id']}  [{b['status']}]  passage_prob={b['passage_prob']}", file=sys.stderr)
+            print(f"  {b['title']}", file=sys.stderr)
+            print(f"  thesis: {b['thesis']}", file=sys.stderr)
+            for i in b["impacts"]:
+                print(f"    - {i['ticker']}: {i['direction']} mag={i['magnitude']} ({i['horizon']}) "
+                      f"— {i['rationale']}", file=sys.stderr)
+            ans = input("  is this impact analysis GOOD? [g]ood / [b]ad / [s]kip / [q]uit: ").strip().lower()
+            if ans in ("q", "quit"):
+                break
+            if ans not in ("g", "good", "b", "bad"):
+                continue
+            why = input("  why (optional one-liner): ").strip()
+            row = {"bill_id": b["bill_id"], "title": b["title"], "status": b["status"],
+                   "impacted_tickers": b["impacts"], "thesis": b["thesis"],
+                   "human_verdict": "pass" if ans in ("g", "good") else "fail", "why": why}
+            f.write(json.dumps(row) + "\n")
+            f.flush()
+            labeled += 1
+    return {"labeled": labeled, "path": labels_path, "total_labels": len(already) + labeled}
 
 
 def cmd_universe_apply(args) -> dict:
@@ -2318,12 +2426,17 @@ def main(argv) -> int:
     p_br = sub.add_parser("bills-review")
     p_br.add_argument("--input", required=False)
     p_ce = sub.add_parser("catalyst-eval")
-    p_ce.add_argument("kind", choices=["passage", "sleeve"])
+    p_ce.add_argument("kind", choices=["passage", "sleeve", "judge"])
     p_ce.add_argument("--fixture", default="")
     p_ce.add_argument("--build", action="store_true")
     p_ce.add_argument("--congress", default="118")
     p_ce.add_argument("--n-pos", dest="n_pos", default="160")
     p_ce.add_argument("--n-neg", dest="n_neg", default="280")
+    p_ce.add_argument("--labels", default="")
+    p_ce.add_argument("--judge-votes", dest="judge_votes", default="5")
+    p_cl = sub.add_parser("catalyst-label")
+    p_cl.add_argument("--labels", default="")
+    p_cl.add_argument("--limit", default="10")
     p_ua = sub.add_parser("universe-apply")
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
@@ -2368,6 +2481,8 @@ def main(argv) -> int:
             out = cmd_bills_review(args)
         elif args.cmd == "catalyst-eval":
             out = cmd_catalyst_eval(args)
+        elif args.cmd == "catalyst-label":
+            out = cmd_catalyst_label(args)
         elif args.cmd == "universe-apply":
             out = cmd_universe_apply(args)
         elif args.cmd == "prune":

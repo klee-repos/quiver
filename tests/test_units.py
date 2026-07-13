@@ -1133,7 +1133,7 @@ for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
              # Legislative-catalyst analysis modules: bill ingest / store / LLM analysis+judge
              # must NEVER import the sizing/limit/broker-carrying modules (the wall).
              "lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
-                 "lib/legislative_backtest.py"):
+                 "lib/legislative_backtest.py", "lib/legislative_judge_eval.py"):
     _mp = Path(__file__).resolve().parent.parent / _mod
     if not _mp.exists():
         continue  # lib/screener_data.py lands at F8 (the gated retire step); until then skip
@@ -1145,7 +1145,7 @@ for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
 # limit (the analysis side is blind to money), mirroring the strategy_context / learn scans.
 import re as _re  # noqa: E402  (used by the source-scans below + later blocks)
 for _legmod in ("lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
-                 "lib/legislative_backtest.py"):
+                 "lib/legislative_backtest.py", "lib/legislative_judge_eval.py"):
     _lp = Path(__file__).resolve().parent.parent / _legmod
     _lsrc = _lp.read_text(encoding="utf-8")
     for _forbidden in ("buying_power", "max_dollars_per_trade", "get_portfolio",
@@ -2948,6 +2948,19 @@ _bt_recs = _BT.records_from_fixture([
 check("backtest: fixture re-derives peak status", _bt_recs[0]["peak_status"], "passed_one")
 check_true("backtest: calibrate emits brier+auc+reliability+status",
            all(k in _BT.calibrate(_bt_recs) for k in ("brier", "auc", "reliability", "status_calibration")))
+
+# --- judge-vs-human-label agreement scorer (lib/legislative_judge_eval, pure) ---
+import lib.legislative_judge_eval as _JE  # noqa: E402
+_jm = _JE.agreement_metrics([("pass", "pass"), ("fail", "fail"), ("pass", "fail")])
+check("judge-eval: precision (1 TP, 1 FP)", _jm["precision"], 0.5)
+check("judge-eval: recall (1 TP, 0 FN)", _jm["recall"], 1.0)
+check("judge-eval: 'hold' is a negative prediction", _JE.agreement_metrics([("hold", "pass")])["confusion"]["fn"], 1)
+_jsw = _JE.sweep_pass_min([(["pass", "pass", "fail"], "pass"), (["pass", "fail", "fail"], "fail"),
+                          (["fail", "fail", "fail"], "fail")])
+check("judge-eval: sweep spans pass_min 1..3", [s["pass_min"] for s in _jsw], [1, 2, 3])
+check_true("judge-eval: stricter pass_min raises precision (fewer false PASSes)",
+           _JE.best_operating_point(_jsw, "precision")["pass_min"] >= _JE.best_operating_point(_jsw, "recall")["pass_min"]
+           if _JE.best_operating_point(_jsw, "recall") else True)
 
 # poll_changed_bills: dedup + fail-safe (fake opener, no network)
 def _fake_opener(url, timeout):

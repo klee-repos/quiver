@@ -356,6 +356,18 @@ def bills_needing_judgment(c: sqlite3.Connection) -> List[dict]:
              "thesis": r[4]} for r in rows]
 
 
+def analyzed_bills(c: sqlite3.Connection) -> List[dict]:
+    """Every LLM-analyzed bill that has >=1 impact — the labelable set for the judge eval
+    (independent of judged status; we're grading the ANALYSIS, not the judge here)."""
+    rows = c.execute(
+        "SELECT b.bill_id, b.title, b.status, b.passage_prob, b.impact_json FROM bills b "
+        "WHERE b.analyzed_at IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM bill_impacts i WHERE i.bill_id=b.bill_id) "
+        "ORDER BY b.passage_prob DESC").fetchall()
+    return [{"bill_id": r[0], "title": r[1], "status": r[2], "passage_prob": r[3],
+             "thesis": r[4]} for r in rows]
+
+
 def get_bill_impacts(c: sqlite3.Connection, bill_id: str) -> List[dict]:
     rows = c.execute(
         "SELECT ticker, sector, direction, magnitude, horizon, rationale FROM bill_impacts "
