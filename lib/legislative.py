@@ -88,6 +88,16 @@ CREATE TABLE IF NOT EXISTS bill_cursor (
     last_update_including_text TEXT,
     polled_at TEXT
 );
+
+-- CONGRESS_CACHE: a memo of raw Congress.gov GET responses so heavy/immutable pulls (backtest
+-- action timelines, historical bills, bill text) never re-hit the 5,000/hr quota. Keyed by the
+-- request URL with the api_key stripped, so it survives a key rotation. Historical data is
+-- immutable -> cache permanently; a caller wanting freshness passes a TTL.
+CREATE TABLE IF NOT EXISTS congress_cache (
+    cache_key   TEXT PRIMARY KEY,
+    body        BLOB NOT NULL,
+    fetched_at  TEXT NOT NULL
+);
 """
 
 
@@ -95,6 +105,57 @@ def ensure_schema(c: sqlite3.Connection) -> None:
     """Create the legislative tables if absent. Idempotent. Called from
     Ledger.ensure_schema beside levers.ensure_schema."""
     c.executescript(LEGISLATIVE_SCHEMA)
+
+
+def _cache_key(url: str) -> str:
+    """Stable cache key = the request URL minus the volatile ``api_key`` param (so a rotated
+    key still hits the cache), with the remaining params sorted for canonical form."""
+    import urllib.parse
+    parts = urllib.parse.urlsplit(url)
+    q = sorted((k, v) for k, v in urllib.parse.parse_qsl(parts.query) if k != "api_key")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(q), ""))
+
+
+def _within_ttl(fetched_at: str, ttl_seconds: float, now_iso: str) -> bool:
+    from datetime import datetime
+    try:
+        age = (datetime.fromisoformat(now_iso) - datetime.fromisoformat(fetched_at)).total_seconds()
+        return age <= float(ttl_seconds)
+    except (ValueError, TypeError):
+        return False
+
+
+def caching_opener(led, *, ttl_seconds=None, now: str = "", stats: Optional[dict] = None, fetch=None):
+    """A drop-in ``opener(url, timeout) -> bytes`` for the Congress fetchers that memoizes
+    responses in the ``congress_cache`` ledger table. ``ttl_seconds=None`` caches permanently
+    (right for immutable historical data — the backtest/seed pulls); pass a TTL for freshness.
+    ``fetch`` overrides the network call (injected in tests). ``stats`` (a dict) accrues
+    hits/misses for observability."""
+    if fetch is None:
+        from lib.dataflows.congress import _default_opener as fetch
+
+    def _opener(url, timeout):
+        key = _cache_key(url)
+        with led.legislative_conn() as c:
+            row = c.execute("SELECT body, fetched_at FROM congress_cache WHERE cache_key=?", (key,)).fetchone()
+        if row is not None and (ttl_seconds is None or _within_ttl(row[1], ttl_seconds, now)):
+            if stats is not None:
+                stats["hits"] = stats.get("hits", 0) + 1
+            return bytes(row[0])
+        body = fetch(url, timeout)
+        with led.legislative_conn() as c:
+            c.execute("INSERT OR REPLACE INTO congress_cache(cache_key, body, fetched_at) VALUES(?,?,?)",
+                      (key, sqlite3.Binary(body), now))
+        if stats is not None:
+            stats["misses"] = stats.get("misses", 0) + 1
+        return body
+    return _opener
+
+
+def cache_stats(c: sqlite3.Connection) -> dict:
+    """How many Congress responses are memoized (rows + total bytes)."""
+    row = c.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(body)), 0) FROM congress_cache").fetchone()
+    return {"rows": int(row[0] or 0), "bytes": int(row[1] or 0)}
 
 
 def bill_content_hash(status, latest_action_date, update_including_text) -> str:

@@ -1557,7 +1557,7 @@ def _run_passage_eval(cfg, led, args) -> dict:
     fixture = fixture if os.path.isabs(fixture) else str(REPO / fixture)
     built = None
     if getattr(args, "build", False):
-        built = _build_passage_fixture(cfg, int(getattr(args, "congress", 118) or 118), fixture,
+        built = _build_passage_fixture(cfg, led, int(getattr(args, "congress", 118) or 118), fixture,
                                        n_pos=int(getattr(args, "n_pos", 160) or 160),
                                        n_neg=int(getattr(args, "n_neg", 280) or 280))
     if not os.path.exists(fixture):
@@ -1567,22 +1567,26 @@ def _run_passage_eval(cfg, led, args) -> dict:
     return {"eval": "passage", "fixture": fixture, "built": built, **report}
 
 
-def _build_passage_fixture(cfg, congress_num: int, out_path: str, *, n_pos: int, n_neg: int) -> int:
+def _build_passage_fixture(cfg, led, congress_num: int, out_path: str, *, n_pos: int, n_neg: int) -> dict:
     """One-time real fetch of a completed Congress -> a re-runnable backtest fixture. Positives =
-    enacted laws (/law/{c}); negatives = a sample of un-enacted bills. Caches each bill's RAW
-    action timeline so the calibration re-scores offline after a derive_status change."""
-    import urllib.request
+    enacted laws (/law/{c}); negatives = a sample of un-enacted bills. Every GET is memoized in the
+    ledger's congress_cache (permanent — historical data is immutable), so a rebuild is served from
+    the DB and never re-hits the quota. Also caches each bill's RAW action timeline so the
+    calibration re-scores offline after a derive_status change."""
     import urllib.parse
     from concurrent.futures import ThreadPoolExecutor
+    import lib.legislative as legis
     key = cfg.legislative.api_key
     if not key:
         raise RuntimeError("CONGRESS_API_KEY not set (needed to build the fixture)")
+    now_iso = market.now_et().isoformat()
+    stats: dict = {}
+    opener = legis.caching_opener(led, now=now_iso, stats=stats)  # ttl=None: historical data is immutable
 
     def _get(path, **p):
         q = {"api_key": key, "format": "json", **p}
         url = f"https://api.congress.gov/v3/{path}?{urllib.parse.urlencode(q)}"
-        with urllib.request.urlopen(url, timeout=30) as r:  # noqa: S310 (fixed api host)
-            return json.loads(r.read())
+        return json.loads(opener(url, 30))
 
     def _actions(c, bt_type, num):
         return [{"text": a.get("text"), "actionDate": a.get("actionDate")}
@@ -1622,7 +1626,7 @@ def _build_passage_fixture(cfg, congress_num: int, out_path: str, *, n_pos: int,
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(bills, f)
-    return len(bills)
+    return {"bills": len(bills), "cache": stats}
 
 
 def _run_sleeve_eval(cfg, led) -> dict:

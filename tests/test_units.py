@@ -3056,6 +3056,24 @@ with _lg.legislative_conn() as _lc:
     check("legislative: applied bill is NOT actionable",
           _L.actionable_impacts(_lc, min_passage_prob=0.55, min_magnitude=0.5), [])
 
+# --- congress_cache: memoize GETs so repeated historical pulls never re-hit the API quota ---
+_cache_calls = {"n": 0}
+
+
+def _cache_fake(_u, _t):
+    _cache_calls["n"] += 1
+    return b'{"x":1}'
+
+
+_cstats = {}
+_copener = _L.caching_opener(_lg, now="2026-07-13T12:00:00", stats=_cstats, fetch=_cache_fake)
+_cu = "https://api.congress.gov/v3/bill/118/hr/1/actions?api_key=SECRET&format=json"
+check("legislative: cache 1st fetch hits network", _copener(_cu, 30), b'{"x":1}')
+check("legislative: cache 2nd fetch is a hit", _copener(_cu, 30), b'{"x":1}')
+check("legislative: cache hit survives api_key rotation", _copener(_cu.replace("SECRET", "ROT"), 30), b'{"x":1}')
+check("legislative: ONE network call for 3 cached fetches", _cache_calls["n"], 1)
+check("legislative: cache stats (1 miss, 2 hits)", _cstats, {"misses": 1, "hits": 2})
+
 
 print(f"\n{PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)
