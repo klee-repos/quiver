@@ -1675,10 +1675,14 @@ def _run_judge_eval(cfg, led, args, *, judge=None) -> dict:
                 rows.append(r)
     if not rows:
         return {"error": f"no pass/fail-labeled rows in {labels_path}"}
+    limit = int(getattr(args, "limit", 0) or 0)
+    if limit > 0:
+        rows = rows[:limit]
     judge = judge or _default_bill_judge
     votes_n = int(getattr(args, "judge_votes", 5) or 5)
-    vote_rows = []
-    for r in rows:
+    workers = max(1, int(getattr(args, "workers", 6) or 6))
+
+    def _judge_row(r):
         meta = {"bill_id": r.get("bill_id"), "title": r.get("title"), "status": r.get("status")}
         analysis = {"impacted_tickers": r.get("impacted_tickers", []), "thesis": r.get("thesis", "")}
         try:
@@ -1686,7 +1690,11 @@ def _run_judge_eval(cfg, led, args, *, judge=None) -> dict:
             cast = json.loads(v.get("votes_json", "{}")).get("votes", []) or []
         except Exception:  # noqa: BLE001 — a judge hiccup on one row shouldn't sink the eval
             cast = []
-        vote_rows.append((cast, str(r["human_verdict"]).strip().lower()))
+        return (cast, str(r["human_verdict"]).strip().lower())
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        vote_rows = list(ex.map(_judge_row, rows))
     sweep = je.sweep_pass_min(vote_rows, max_votes=votes_n)
     current = next((s for s in sweep if s["pass_min"] == int(cfg.legislative.judge_pass_min)), None)
     return {"eval": "judge", "labels": labels_path, "n": len(rows), "votes_cast": votes_n,
@@ -2532,6 +2540,8 @@ def main(argv) -> int:
     p_ce.add_argument("--n-neg", dest="n_neg", default="280")
     p_ce.add_argument("--labels", default="")
     p_ce.add_argument("--judge-votes", dest="judge_votes", default="5")
+    p_ce.add_argument("--workers", default="6")
+    p_ce.add_argument("--limit", default="0")
     p_cl = sub.add_parser("catalyst-label")
     p_cl.add_argument("--labels", default="")
     p_cl.add_argument("--limit", default="20")
