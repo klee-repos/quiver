@@ -218,10 +218,13 @@ def allocate_targets(
     detail: Dict[str, dict] = {}
     conv_score: Dict[str, float] = {}   # names with a fresh conviction opinion
     keep_prior: Dict[str, float] = {}   # Hold / ERROR / missing -> hold prior weight (D2)
+    reduce_only: set = set()            # Underweight -> a REDUCE intent; target may never exceed prior
     for c in cand:
         t = str(c["ticker"]).upper()
         a = analyses.get(t)
         ec = effective_conviction(a, policy)
+        if str((a or {}).get("signal") or "").strip().lower() == "underweight":
+            reduce_only.add(t)
         if ec is None:
             keep_prior[t] = prior.get(t, 0.0)
             # ERROR / missing data is a HARD hold-prior floor (D2): never sell on bad data.
@@ -249,6 +252,14 @@ def allocate_targets(
     for t, s in conv_score.items():
         fresh[t] = (s / score_sum * remaining) if score_sum > 1e-12 else 0.0
 
+    # item 4: Underweight is REDUCE-ONLY — proportional renormalization must never push a
+    # lean-smaller name's target ABOVE its prior weight. A lone Underweight water-filling UP
+    # is the inverse of the model's intent and was the upward-concentration that fed the SOXX
+    # churn (SOXX 7% prior -> an inflated ~11-18% target). Clamp BEFORE smoothing so the EWMA
+    # blends a reduction, never an inflation. Never blocks a trim-down, a Sell, or a real add.
+    for t in reduce_only:
+        fresh[t] = min(fresh[t], prior.get(t, 0.0))
+
     # Day-to-day stickiness: EWMA-blend the fresh target with the prior weight.
     smoothed = {t: _ewma(fresh[t], prior.get(t, 0.0), alpha) for t in fresh}
     # D2/D3 hold-floors: a bad-data or suppressed-reversal name can't fall below prior.
@@ -261,7 +272,7 @@ def allocate_targets(
     # inflated by a capped peer's excess (that would re-grow a name the analysis wants OUT);
     # the unabsorbed excess falls to cash instead.
     capped = _apply_caps(smoothed, per_cap, hold_floors,
-                         recipients={t for t, s in conv_score.items() if s > 0})
+                         recipients={t for t, s in conv_score.items() if s > 0 and t not in reduce_only})
 
     # Per-sleeve cap: clip each sleeve's total, push excess to cash (do not water-fill
     # across sleeves — that would defeat the concentration limit).

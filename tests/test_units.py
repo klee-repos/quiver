@@ -2666,6 +2666,33 @@ _alCal = _alloc.allocate_targets(
                                               "cash_floor_pct": 0, "smoothing_alpha": 1.0})
 check_true("calibration: the learned winner gets more weight", _alCal.weights["W"] > _alCal.weights["L"])
 
+# --- item 4: Underweight is REDUCE-ONLY (renormalization can't inflate a lean-smaller name) ---
+_POLro = {"per_name_max_pct": 80, "sleeve_max_pct": 90, "cash_floor_pct": 5, "smoothing_alpha": 1.0}
+# The churn case: a lone Underweight on a concentrated book. Pre-fix the freed budget
+# water-filled UP into it (SOXX 7% prior -> a ~80% target here); now it is capped at prior.
+_alRO = _alloc.allocate_targets(
+    [{"ticker": "SOXX", "sleeve": "c", "prior_weight": 7},
+     {"ticker": "SMH", "sleeve": "c", "prior_weight": 15}],
+    {"SOXX": {"signal": "Underweight", "conviction": 58}, "SMH": {"signal": "ERROR"}}, policy=_POLro)
+check_true("item4: lone Underweight never exceeds prior (no upward inflation)",
+           _alRO.weights["SOXX"] <= 7.0 + 1e-6)
+# Underweight still REDUCES below prior when it shares the budget with a stronger add.
+_alRO2 = _alloc.allocate_targets(
+    [{"ticker": "UW", "sleeve": "a", "prior_weight": 20}, {"ticker": "BUY", "sleeve": "b", "prior_weight": 0}],
+    {"UW": {"signal": "Underweight", "conviction": 10}, "BUY": {"signal": "Buy", "conviction": 95}}, policy=_POLro)
+check_true("item4: Underweight still reduces below prior when outbid", _alRO2.weights["UW"] < 20.0)
+# A capped Buy peer's spillover must NOT water-fill into the Underweight name.
+_alRO3 = _alloc.allocate_targets(
+    [{"ticker": "UW", "sleeve": "a", "prior_weight": 5}, {"ticker": "BIG", "sleeve": "b", "prior_weight": 0}],
+    {"UW": {"signal": "Underweight", "conviction": 50}, "BIG": {"signal": "Buy", "conviction": 100}},
+    policy={"per_name_max_pct": 30, "sleeve_max_pct": 100, "cash_floor_pct": 0, "smoothing_alpha": 1.0})
+check_true("item4: Underweight excluded from water-fill (stays <= prior)", _alRO3.weights.get("UW", 0.0) <= 5.0 + 1e-6)
+# A genuine Buy is untouched — reduce-only never blocks an add growing above its prior.
+_alRO4 = _alloc.allocate_targets(
+    [{"ticker": "ADD", "sleeve": "a", "prior_weight": 5}],
+    {"ADD": {"signal": "Buy", "conviction": 90}}, policy=_POLro)
+check_true("item4: a Buy still grows above prior (reduce-only doesn't touch adds)", _alRO4.weights["ADD"] > 5.0)
+
 # --- F3: conviction_deploy_factor (book-conviction deployment scalar; reallocation teeth) -----
 # A broadly-BEARISH book deploys less -> raises cash; a bullish book deploys full. Takes RAW
 # effective_conviction (0..1) so curve_k/calibration stay deployment-neutral. Defaults: full
