@@ -75,10 +75,12 @@ def main() -> int:
     ok("book holdings persisted (>=10)", ss["holdings"] >= 10)
 
     # --- STEP B: broker snapshot (SYNTHETIC — read-only in real life) ---
-    print("\n[B] broker snapshot (synthetic): equity=$100, holding $20 of XLV (overweight)")
+    print("\n[B] broker snapshot (synthetic): equity=$100, holding $30 of XLV (overweight)")
+    # XLV held well above its 9% target so the trim clears the target+band EDGE by more than
+    # the $5 min-notional (item 1: trims stop at the edge; a sub-$5 edge-trim would skip as churn).
     snapshot = {
         "equity": 100.0, "buying_power": 100.0,
-        "positions": {"XLV": {"quantity": 2.0, "market_value": 20.0}},
+        "positions": {"XLV": {"quantity": 3.0, "market_value": 30.0}},
         "quotes": {"SMH": 50.0, "IBIT": 36.0, "XLV": 10.0, "EEM": 68.0},
     }
 

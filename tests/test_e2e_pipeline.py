@@ -167,13 +167,15 @@ def main() -> int:
     ok("F3 e2e: F3-off reverts Underweight to ~static (the v1 no-op it guards)",
        abs(cash_off - 20.0) < 3.0, cash_off)
     ok("F3 e2e: book still conserves to ~100%", abs(cash_on + eng_on - 100.0) < 0.5, cash_on + eng_on)
-    # Drive construct->plan: positions AT the static book -> F3's lower targets emit trim orders
-    # that actually raise cash (proves it reaches the broker path, not just the target map).
+    # Drive construct->plan: positions held ABOVE F3's lowered targets by more than the band+min
+    # -> F3's de-risk emits trim orders that actually raise cash (reaches the broker path, not just
+    # the target map). NB item 1 (trim-to-edge + $5 min) damps a sub-band F3 de-risk to no trade;
+    # a materially overweight book is what makes F3's cash-raise reach the broker.
     with tempfile.TemporaryDirectory() as d3:
         cfg_p, led_p = _mk(Path(d3), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
                            holdings=_bear_holds)
         snap = {"equity": 1000.0, "buying_power": 200.0,
-                "positions": {t: {"quantity": 2.0, "market_value": 200.0} for t in _engines},
+                "positions": {t: {"quantity": 3.0, "market_value": 300.0} for t in _engines},
                 "quotes": {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0, "DDD": 100.0, "SGOV": 1.0},
                 "now_iso": "2026-06-20T11:00:00-04:00"}
         con = tick._run_construct(cfg_p, led_p, {**snap, "analyses": _an_uw})

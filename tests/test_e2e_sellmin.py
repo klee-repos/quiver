@@ -130,8 +130,9 @@ def main() -> int:
         # the model's blunt 0.5*held (1.0 sh). Compute the expected book trim from the
         # target construct actually emitted (total equity = positions_mv + buying_power).
         aaa_target = tw["AAA"]["target_dollars"]
-        expected_trim = round(max(0.0, (120.0 - aaa_target) / 60.0), 6)
-        ok("unify: trim sized toward target_dollars (NOT 0.5*held)",
+        aaa_band = tw["AAA"]["band_dollars"]        # item 1: trims stop at the target+band EDGE
+        expected_trim = round(max(0.0, (120.0 - aaa_target - aaa_band) / 60.0), 6)
+        ok("unify: trim sized toward the target+band edge (NOT 0.5*held)",
            aaa_rtrim is not None and aaa_rtrim["quantity"] == expected_trim
            and expected_trim != 0.5 * 2.0, (aaa_rtrim, expected_trim))
 
@@ -331,13 +332,15 @@ def main() -> int:
         ok("F3: no rebalance trim/buy when hysteresis holds the target (no churn)", aaa_reb is None, aaa_reb)
 
     # --- F3 knob OFF (min_delta 0): the target re-clips to conviction (byte-identical to pre-F3) ---
+    # Use an OVERWEIGHT (add) here: item 4 makes Underweight reduce-only, so a lone Underweight is
+    # pinned at prior regardless of the hysteresis knob — an add is what demonstrates the re-clip.
     with tempfile.TemporaryDirectory() as d:
         cfg, led = _mk(Path(d), min_delta=0.0)
         snap = {"equity": 100.0, "buying_power": 40.0, "now_iso": "2026-06-20T10:00:00-04:00",
                 "positions": {"AAA": {"quantity": 0.5, "market_value": 30.0},
                               "BBB": {"quantity": 1.0, "market_value": 30.0}},
                 "quotes": {"AAA": 60.0, "BBB": 30.0, "SGOV": 1.0}}
-        an = [{"ticker": "AAA", "signal": "Underweight", "conviction": 68, "uncertainty": 30}]
+        an = [{"ticker": "AAA", "signal": "Overweight", "conviction": 68, "uncertainty": 30}]
         con = tick._run_construct(cfg, led, {**{k: snap[k] for k in
                                   ("equity", "buying_power", "positions", "quotes")}, "analyses": an})
         ok("F3 OFF: min_delta 0 lets the target move off static (re-clip, pre-F3 behavior)",
