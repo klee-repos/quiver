@@ -31,7 +31,7 @@ risk:
   # floor); the conviction allocator only moves a name's target weight on a shift >= the
   # hysteresis (day-to-day noise keeps the prior target). Set either to 0 to disable it.
   min_trade_notional: 5                 # $; skip rebalance trims/buys under this (floored at RH's $1)
-  conviction_rebalance_min_delta_pct: 2.0  # weight-pts; material-change gate on the conviction target
+  conviction_rebalance_min_delta_pct: 6.0  # weight-pts; material-change gate on the conviction target
 
   # Memory-grounded strategy-consistency gate: suppress RANDOM cross-day buy/sell flips;
   # allow reversals grounded in the recorded plan (stop/target/loss) or a named new
