@@ -197,14 +197,18 @@ def room_under_target(target_dollars: float, current_mv: float,
 
 def resolve_target_sell_quantity(
     held_qty: float, quote: Optional[float], current_mv: float, target_dollars: float,
-    *, full_exit: bool = False,
+    *, full_exit: bool = False, upper_band_dollars: float = 0.0,
 ) -> float:
-    """Shares to TRIM down to a target weight, or to FULLY EXIT.
+    """Shares to TRIM down to a target weight (+ band edge), or to FULLY EXIT.
 
-    full_exit -> sell all held (a removed/exiting name). Otherwise trim only the
-    EXCESS over target: shares = (current_mv - target_dollars) / quote, clamped to
-    held_qty. Returns 0 when already at/under target, the quote is missing, or
-    nothing is held — never oversells into a short (long-only).
+    full_exit -> sell all held (a removed/exiting name); the band is ignored.
+    Otherwise trim only the EXCESS over the UPPER BAND EDGE (target + band):
+    shares = (current_mv - target_dollars - upper_band_dollars) / quote, clamped to
+    held_qty. With upper_band_dollars == 0 this is the classic trim-to-exact-target;
+    with a band it trims only down to the near edge of the no-trade band, so a name
+    settles AT the edge instead of overshooting to target and re-arming opposite-side
+    churn next tick (the SOXX buy-then-trim pattern). Returns 0 when already within
+    band, the quote is missing, or nothing is held — never oversells (long-only).
     """
     if held_qty <= 0:
         return 0.0
@@ -212,7 +216,7 @@ def resolve_target_sell_quantity(
         return round(held_qty, 6)
     if not quote or quote <= 0:
         return 0.0
-    excess = current_mv - target_dollars
+    excess = current_mv - target_dollars - max(0.0, upper_band_dollars)
     if excess <= 0:
         return 0.0
     shares = excess / quote

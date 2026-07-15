@@ -754,9 +754,13 @@ def _run_plan(cfg, led, data) -> dict:
             else:
                 order_kind = "rebalance_exit" if full_exit else "rebalance_trim"
                 signal = "REBALANCE"
+            # Trim only down to the near band EDGE (target + band), not to the exact
+            # target — a name settles AT the edge instead of overshooting and re-arming
+            # opposite-side churn next tick. Full exits ignore the band (wind to zero).
             raw_qty = signals.resolve_target_sell_quantity(
                 held_qty, quote, held_mv, _to_float(tw.get("target_dollars")) or 0.0,
-                full_exit=full_exit)
+                full_exit=full_exit,
+                upper_band_dollars=(0.0 if full_exit else _to_float(tw.get("band_dollars")) or 0.0))
             # F2: a full EXIT / reconcile winds to zero at RH's $1 floor (BUMP so it completes);
             # a partial rebalance TRIM uses the economic floor and SKIPS a sub-floor churn trim.
             sell_min = (signals.MIN_SELL_NOTIONAL_USD if full_exit
@@ -1213,10 +1217,12 @@ def _run_construct(cfg, led, data) -> dict:
                                  "hysteresis_min_delta_pct": cfg.risk.conviction_rebalance_min_delta_pct}
 
     rows = portfolio.construct_target_book(
-        targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker)
+        targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker,
+        default_band_pct=cfg.risk.rebalance_drift_band_pct)
     target_weights = {r["ticker"]: {"intent": r["intent"], "target_dollars": r["target_dollars"],
                                     "target_weight": r["target_weight"],
                                     "delta_dollars": r.get("delta_dollars"),
+                                    "band_dollars": r.get("band_dollars", 0.0),
                                     "quotable": r["quotable"]} for r in rows}
     # Self-reconciliation: any HELD position NOT in the book (and not the cash sleeve)
     # is UNMANAGED -> emit a full-exit so plan winds it to zero. This is how the bot

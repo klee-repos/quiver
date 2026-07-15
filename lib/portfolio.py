@@ -72,16 +72,38 @@ def rebalance_intent(
     return ("buy" if drift < 0 else "trim", target_dollars, delta)
 
 
+def resolve_band_pct(per_name_band: float, weight_pct: float, default_band_pct: float) -> float:
+    """The effective no-trade dead-band for one holding, in weight points.
+
+    Uses the per-name band when set (>0), else falls back to the config
+    ``default_band_pct`` (so a row with no band is NOT churned on any drift), and
+    caps the result at ``weight*0.5`` so the band stays strictly inside the target
+    weight (the b < w invariant conviction sizing relies on). A zero/absent weight
+    keeps the resolved band as-is (an exiting name full-exits regardless).
+    """
+    band = float(per_name_band or 0.0)
+    if band <= 0.0:
+        band = float(default_band_pct or 0.0)
+    if weight_pct > 0.0:
+        band = min(band, weight_pct * 0.5)
+    return max(0.0, band)
+
+
 def construct_target_book(
     targets: List[dict], positions: Dict[str, float], equity: float, *,
-    cash_sleeve_ticker: str = "SGOV",
+    cash_sleeve_ticker: str = "SGOV", default_band_pct: float = 0.0,
 ) -> List[dict]:
     """The deterministic 'what the book should look like today'.
 
     targets: rows from the ledger target_portfolio (ticker, sleeve, target_weight,
     band, status, quotable). positions: {ticker -> market_value}. Returns one row
-    per target with its intent + target/delta dollars + flags. The cash sleeve is
-    the residual; non-quotable tickers are flagged and skipped (held in cash).
+    per target with its intent + target/delta/band dollars + flags. The cash sleeve
+    is the residual; non-quotable tickers are flagged and skipped (held in cash).
+
+    ``default_band_pct`` (config ``rebalance_drift_band_pct``) is the fallback band
+    for a row whose per-name band is unset — so a bandless name never churns on any
+    drift. ``band_dollars`` is emitted so the rebalance TRIM pass can trim to the
+    near band EDGE (not the exact target) and stop opposite-side churn.
     """
     cash = (cash_sleeve_ticker or "SGOV").upper()
     rows: List[dict] = []
@@ -89,15 +111,17 @@ def construct_target_book(
         ticker = str(t["ticker"]).upper()
         mv = float(positions.get(ticker, 0.0) or 0.0)
         weight = float(t.get("target_weight", 0.0) or 0.0)
-        band = float(t.get("band", 0.0) or 0.0)
+        band = resolve_band_pct(float(t.get("band", 0.0) or 0.0), weight, default_band_pct)
         status = str(t.get("status", "active"))
         quotable = bool(t.get("quotable", True))
         target_dollars = target_dollars_for_weight(weight, equity)
+        band_dollars = target_dollars_for_weight(band, equity)
         row = {
             "ticker": ticker,
             "sleeve": t.get("sleeve"),
             "target_weight": weight,
             "band": band,
+            "band_dollars": round(band_dollars, 2),
             "status": status,
             "quotable": quotable,
             "current_mv": round(mv, 2),

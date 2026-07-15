@@ -1358,6 +1358,20 @@ check("pf: SOL skipped (unquotable)", _book["SOL"]["intent"], "skip_unquotable")
 check("pf: SMH underweight -> buy", _book["SMH"]["intent"], "buy")
 check_true("pf: SMH buy delta positive (toward target)", _book["SMH"]["delta_dollars"] > 0)
 
+# --- item 1: band = a real no-trade dead-band with a config fallback + edge dollars ---
+check("pf: resolve_band per-name binds", _pf.resolve_band_pct(3.0, 7.0, 5.0), 3.0)
+check("pf: resolve_band fallback to config when 0", _pf.resolve_band_pct(0.0, 20.0, 5.0), 5.0)
+check("pf: resolve_band capped at weight*0.5", _pf.resolve_band_pct(8.0, 6.0, 5.0), 3.0)
+check("pf: resolve_band config fallback also capped", _pf.resolve_band_pct(0.0, 4.0, 5.0), 2.0)
+check("pf: resolve_band weight 0 keeps band (exit case)", _pf.resolve_band_pct(3.0, 0.0, 5.0), 3.0)
+# A bandless (band=0) name must pick up the config fallback and emit band_dollars, so it
+# no longer churns on any drift and the trim pass can size to the edge.
+_bt = [{"ticker": "AAA", "sleeve": "S", "target_weight": 10, "band": 0, "status": "active", "quotable": True}]
+_bk = {r["ticker"]: r for r in _pf.construct_target_book(_bt, {"AAA": 50.0}, 100.0, default_band_pct=5.0)}
+check("pf: bandless name gets config fallback band (10w,band0,cfg5 -> 5)", _bk["AAA"]["band"], 5.0)
+check("pf: band_dollars = band% * equity", _bk["AAA"]["band_dollars"], 5.0)
+check("pf: SMH band_dollars present (band4 * 100)", _book["SMH"]["band_dollars"], 4.0)
+
 # --- goal: glidepath + progress + coarse regime ---
 check("goal: glidepath elapsed0 == start", _goal.glidepath_target_value(100.0, 15, 12, 0.0), 100.0)
 check("goal: glidepath horizon == start*1.15", round(_goal.glidepath_target_value(100.0, 15, 12, 365.25), 2), 115.0)
@@ -1530,6 +1544,18 @@ check("sig: target sell full_exit -> all held", signals.resolve_target_sell_quan
 check("sig: target sell at/under target -> 0", signals.resolve_target_sell_quantity(10.0, 5.0, 40.0, 45.0), 0.0)
 check("sig: target sell never oversells", signals.resolve_target_sell_quantity(10.0, 5.0, 1000.0, 0.0), 10.0)
 check("sig: target sell no quote -> 0", signals.resolve_target_sell_quantity(10.0, 0.0, 60.0, 45.0), 0.0)
+# item 1 (trim->edge): with a band, trim only the excess over target+band (60-45-5=10 -> 2sh),
+# NOT the full excess over target (which would be 3sh). A name settles at the upper edge.
+check("sig: trim to band EDGE not exact target",
+      signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0, upper_band_dollars=5.0), 2.0)
+check("sig: within band (target+band) -> no trim",
+      signals.resolve_target_sell_quantity(10.0, 5.0, 48.0, 45.0, upper_band_dollars=5.0), 0.0)
+check("sig: full_exit ignores band (all held)",
+      signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0, full_exit=True, upper_band_dollars=5.0), 10.0)
+check("sig: band=0 == classic trim-to-target (byte-identical)",
+      signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0, upper_band_dollars=0.0), 3.0)
+# buy->target is unchanged: room_under_target with no band fills to the EXACT target
+check("sig: buy fills to exact target (buy->target, no band)", signals.room_under_target(45.0, 30.0), 15.0)
 _buy_args = dict(position_sizing=None, baseline_equity=100.0, buy_fraction=1.0, ceiling=25.0,
                  remaining_daily_cap=75.0, buying_power=100.0, buffer=5.0,
                  position_pct=10.0)
