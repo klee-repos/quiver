@@ -1255,7 +1255,14 @@ def cmd_goal_track(args) -> dict:
 
 def _run_goal_track(cfg, led) -> dict:
     """Best-effort goal-progress snapshot (never stops a tick). Records a
-    goal_tracking row from the ledger equity curve + the active goal."""
+    goal_tracking row from the ledger equity curve + the active goal.
+
+    Also runs deposit auto-capture (observability side): DETECTS suspected external cash
+    flows from day-over-day baseline jumps and SURFACES them (`suspected_flows`), and —
+    only when `cfg.goal_auto_capture_flows` — AUTO-WRITES the settled/persisted ones to
+    `cash_flows`. This never touches sizing, order placement, or the daily-loss halt (none
+    of them read `cash_flows`); its only downstream effect is the deposit-adjusted goal
+    return + coarse regime. Fully wrapped: a hiccup here can never break goal-track."""
     import lib.goal as goal_mod
     goal = led.get_active_goal()
     if not goal:
@@ -1271,7 +1278,74 @@ def _run_goal_track(cfg, led) -> dict:
         ahead_behind_pct=prog["ahead_behind_pct"],
         alpha_vs_benchmark_pct=prog["alpha_vs_benchmark_pct"],
         active_book=goal["active_book"], regime=prog["regime"])
-    return {"recorded": True, "goal_id": goal["id"], **prog}
+    out = {"recorded": True, "goal_id": goal["id"], **prog}
+    try:
+        min_pct = float(getattr(cfg, "goal_flow_min_pct", 25.0))
+        min_abs = float(getattr(cfg, "goal_flow_min_abs", 30.0))
+        suspected = goal_mod.suggest_flows_from_ledger(led, goal, min_pct=min_pct, min_abs=min_abs)
+        out["suspected_flows"] = suspected
+        out["n_suspected_flows"] = len(suspected)
+        if suspected and getattr(cfg, "goal_auto_capture_flows", False):
+            confirm_days = int(getattr(cfg, "goal_flow_confirm_days", 2))
+            points, _fl = goal_mod._goal_window(
+                led.baseline_equity_series() or [], [], goal.get("start_date"))
+            now_iso = market.now_et().isoformat()
+            captured = []
+            for f in goal_mod.confirmable_flows(points, suspected, confirm_days=confirm_days):
+                if led.record_cash_flow_if_absent(
+                        trade_date=f["trade_date"], amount=f["amount"],
+                        note=f"auto:equity-jump settled>={confirm_days}d ({f['pct']}%)",
+                        created_at=now_iso):
+                    captured.append({"trade_date": f["trade_date"], "amount": f["amount"]})
+            out["auto_captured"] = captured
+    except Exception as e:  # noqa: BLE001 — deposit-capture is best-effort observability
+        out["flow_capture_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def cmd_flow_suggest(args) -> dict:
+    """Read-only: list SUSPECTED external cash flows the operator should confirm.
+
+    Detects day-over-day baseline-equity jumps too large to be market moves and prints
+    ready-to-run `flow-record` commands for each — the ops hook that replaces hand-digging
+    Robinhood transfer history. Records NOTHING; the operator confirms each (a jump could be
+    a genuine large market move on a concentrated book). Use the SUGGESTED trade_date: it is
+    the day the deposit entered the equity curve, which is the date the deposit-adjusted
+    return must strip it on."""
+    import lib.goal as goal_mod
+    cfg, led = _cfg_and_ledger()
+    goal = led.get_active_goal()
+    min_pct = float(getattr(cfg, "goal_flow_min_pct", 25.0))
+    min_abs = float(getattr(cfg, "goal_flow_min_abs", 30.0))
+    suspected = (goal_mod.suggest_flows_from_ledger(led, goal, min_pct=min_pct, min_abs=min_abs)
+                 if goal else [])
+    commands = []
+    for f in suspected:
+        payload = json.dumps({
+            "trade_date": f["trade_date"], "amount": f["amount"],
+            "note": f"{f['direction']} (equity {f['prev_equity']}->{f['cur_equity']}, {f['pct']}%)"})
+        commands.append(f"tick.py flow-record --input '{payload}'")
+    return {"suspected_flows": suspected, "commands": commands, "count": len(suspected)}
+
+
+def cmd_flow_record(args) -> dict:
+    """Record one external cash flow so goal-progress can deposit-adjust the return.
+
+    amount > 0 = deposit, < 0 = withdrawal; trade_date defaults to today (ET). This is an
+    ops/observability utility ONLY — it feeds the goal/digest deposit-adjusted return and the
+    coarse goal-regime; it touches sizing, order placement, and the daily-loss halt in NO way.
+    """
+    cfg, led = _cfg_and_ledger()
+    data = _load_input(args)
+    amount = data.get("amount")
+    if amount is None:
+        raise ValueError("flow-record requires 'amount' (deposit > 0 / withdrawal < 0)")
+    trade_date = str(data.get("trade_date") or market.trading_day_et())
+    note = data.get("note")
+    led.record_cash_flow(trade_date=trade_date, amount=float(amount),
+                         note=(str(note) if note is not None else None),
+                         created_at=market.now_et().isoformat())
+    return {"recorded": True, "trade_date": trade_date, "amount": float(amount)}
 
 
 def cmd_learn_review(args) -> dict:
@@ -2554,6 +2628,9 @@ def main(argv) -> int:
     p_con = sub.add_parser("construct")
     p_con.add_argument("--input", required=False)
     sub.add_parser("goal-track")
+    p_fr = sub.add_parser("flow-record")
+    p_fr.add_argument("--input", required=True)
+    sub.add_parser("flow-suggest")
     p_lr = sub.add_parser("learn-review")
     p_lr.add_argument("--input", required=False)
     p_br = sub.add_parser("bills-review")
@@ -2616,6 +2693,10 @@ def main(argv) -> int:
             out = cmd_construct(args)
         elif args.cmd == "goal-track":
             out = cmd_goal_track(args)
+        elif args.cmd == "flow-record":
+            out = cmd_flow_record(args)
+        elif args.cmd == "flow-suggest":
+            out = cmd_flow_suggest(args)
         elif args.cmd == "learn-review":
             out = cmd_learn_review(args)
         elif args.cmd == "bills-review":

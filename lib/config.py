@@ -241,6 +241,17 @@ class Config:
     # cmd_plan behave exactly as the validated once-a-day path.
     strategy_path: str = "strategy.yaml"
     strategy: object = None
+    # --- Goal deposit auto-capture (observability; OFF by default) --------
+    # auto_capture_flows=false (default) = the tick only DETECTS + SURFACES suspected
+    # external cash flows (flow-suggest CLI + goal-track ops-log); the operator records
+    # them via `tick.py flow-record`. true = the goal-track tail also auto-writes the
+    # SETTLED, persisted candidates (confirmable_flows) to cash_flows. Read ONLY by the
+    # goal/digest deposit-adjust path — never sizing, order placement, or the daily-loss
+    # halt (those never read cash_flows). thresholds tune the jump detector.
+    goal_auto_capture_flows: bool = False
+    goal_flow_min_pct: float = 25.0
+    goal_flow_min_abs: float = 30.0
+    goal_flow_confirm_days: int = 2
 
 
 class ConfigError(ValueError):
@@ -685,6 +696,26 @@ def load_config(path) -> Config:
         model=leg_model, remove_enabled=leg_remove_enabled, review_deadline_sec=leg_deadline,
         ticker_policy_areas=leg_tpa)
 
+    # --- Goal / deposit-auto-capture (observability; fail-safe, MUST NOT raise) --------
+    # load_config runs at the START of every subcommand (before the best-effort tail), so a
+    # garbled goal: field here must NEVER raise ConfigError and stop a tick. Coerce each
+    # threshold to its default on bad input (mirrors the _leg_num idiom); no range validation.
+    # The write path (auto_capture_flows) is strictly opt-in via `is True` — a quoted/stray
+    # value can't silently enable it. Read ONLY by the goal/digest deposit-adjust path.
+    goal_d = d.get("goal", {}) or {}
+
+    def _goal_num(key, default, cast):
+        v = goal_d.get(key, default)
+        try:
+            return cast(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    goal_auto_capture_flows = goal_d.get("auto_capture_flows", False) is True
+    goal_flow_min_pct = _goal_num("flow_min_pct", 25.0, float)
+    goal_flow_min_abs = _goal_num("flow_min_abs", 30.0, float)
+    goal_flow_confirm_days = _goal_num("flow_confirm_days", 2, int)
+
     return Config(
         account_number=account,
         dry_run=dry_run,
@@ -723,4 +754,8 @@ def load_config(path) -> Config:
         raw=d,
         strategy_path=strategy_path,
         strategy=strategy_obj,
+        goal_auto_capture_flows=goal_auto_capture_flows,
+        goal_flow_min_pct=goal_flow_min_pct,
+        goal_flow_min_abs=goal_flow_min_abs,
+        goal_flow_confirm_days=goal_flow_confirm_days,
     )

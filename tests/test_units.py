@@ -1374,6 +1374,154 @@ check("goal: start<=0 -> None", _goal.goal_progress(0.0, 95.0, 15, 12, "2026-01-
 check("goal: coarse_regime dead-band -> ON-TRACK", _goal.coarse_regime(0.5), "ON-TRACK")
 check("goal: coarse_regime None -> ON-TRACK", _goal.coarse_regime(None), "ON-TRACK")
 
+# --- goal: deposit-adjusted (time-weighted) return — external flows are NOT gains ---
+# No flows -> byte-identical to the legacy simple return (short-circuit, no float drift).
+check_true("goal: TWR no-flows == legacy simple (+30%)",
+           abs(_goal.time_weighted_return_pct(100.0, "2026-01-01",
+               [("2026-02-01", 110.0), ("2026-03-01", 130.0)], []) - 30.0) < 1e-9)
+# A pure deposit ($900 into a $100 acct, no market move) is 0% return, NOT +900%.
+check_true("goal: TWR strips a pure deposit (0%, not 900%)",
+           abs(_goal.time_weighted_return_pct(100.0, "2026-01-01",
+               [("2026-01-02", 1000.0)], [("2026-01-02", 900.0)])) < 1e-9)
+# Chained real gains around an early deposit: 100->150(+50%), +850 dep->1000, ->1100(+10%) = 65%
+# (the buggy simple return would read +1000%).
+check_true("goal: TWR chains real gains around a deposit (65%, not 1000%)",
+           abs(_goal.time_weighted_return_pct(100.0, "2026-01-01",
+               [("2026-01-02", 150.0), ("2026-01-03", 1000.0), ("2026-01-04", 1100.0)],
+               [("2026-01-03", 850.0)]) - 65.0) < 1e-9)
+# Withdrawal (negative flow): 100->200 (+100%) then withdraw 50 -> 150 end = still +100%.
+check_true("goal: TWR strips a withdrawal (still +100%)",
+           abs(_goal.time_weighted_return_pct(100.0, "2026-01-01",
+               [("2026-01-02", 200.0), ("2026-01-03", 150.0)], [("2026-01-03", -50.0)]) - 100.0) < 1e-9)
+# Guards: start<=0 / non-positive interval-start equity / empty points -> None.
+check("goal: TWR start<=0 -> None",
+      _goal.time_weighted_return_pct(0.0, "2026-01-01", [("2026-02-01", 110.0)], [("2026-01-15", 5.0)]), None)
+check("goal: TWR prev_eq<=0 -> None",
+      _goal.time_weighted_return_pct(100.0, "2026-01-01",
+          [("2026-02-01", 0.0), ("2026-03-01", 50.0)], [("2026-02-15", 10.0)]), None)
+check("goal: TWR empty points -> None",
+      _goal.time_weighted_return_pct(100.0, "2026-01-01", [], [("2026-02-01", 5.0)]), None)
+
+# goal_progress: an explicit deposit-adjusted return de-inflates ahead_behind + alpha; with no
+# override it stays byte-identical to the legacy simple return.
+_gp_adj = _goal.goal_progress(100.0, 1000.0, 15, 12, "2026-01-01", "2026-07-02",
+                              benchmark_annual_pct=3.6, cumulative_return_pct=0.0)
+check("goal: override cumulative used verbatim", _gp_adj["cumulative_return_pct"], 0.0)
+check_true("goal: override de-inflates ahead_behind (<0 vs glidepath)", _gp_adj["ahead_behind_pct"] < 0)
+check_true("goal: override de-inflates alpha (<0 vs +cash bench)", _gp_adj["alpha_vs_benchmark_pct"] < 0)
+check("goal: override -> BEHIND regime", _gp_adj["regime"], "BEHIND")
+check("goal: no override == legacy simple (+900%)",
+      _goal.goal_progress(100.0, 1000.0, 15, 12, "2026-01-01", "2026-07-02",
+                          benchmark_annual_pct=3.6)["cumulative_return_pct"], 900.0)
+
+# ledger round-trip: record_cash_flow + cash_flows (date-ASC, signed).
+_fdb = tempfile.mktemp(suffix=".db")
+_fled = Ledger(_fdb)
+_fled.record_cash_flow(trade_date="2026-01-03", amount=900.0, note="seed deposit", created_at="t")
+_fled.record_cash_flow(trade_date="2026-02-01", amount=-50.0, note=None, created_at="t2")
+check("ledger: cash_flows round-trip (date-ASC, signed)",
+      [(f["trade_date"], f["amount"]) for f in _fled.cash_flows()],
+      [("2026-01-03", 900.0), ("2026-02-01", -50.0)])
+Path(_fdb).unlink(missing_ok=True)
+
+# compute_from_ledger integration (the RCA bug): a $900 deposit that grows a $100 seed to ~$1000
+# must NOT read as ~+900% return. With no flow recorded -> legacy inflated value; once the deposit
+# is recorded -> de-inflated to ~0%. This is the red/green anchor (old math fails the second check).
+_cdb = tempfile.mktemp(suffix=".db")
+_cled = Ledger(_cdb)
+_cled.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d",
+    start_date="2026-01-01", start_equity=100.0)
+_cled.get_or_create_baseline("2026-01-01", 100.0, "2026-01-01T00:00:00Z")
+_cled.get_or_create_baseline("2026-01-03", 1000.0, "2026-01-03T00:00:00Z")  # jumped via a deposit
+_crow = _cled.get_active_goal()
+check("goal: compute_from_ledger inflated w/o flow (legacy, RCA bug)",
+      _goal.compute_from_ledger(_cled, _crow)["cumulative_return_pct"], 900.0)
+_cled.record_cash_flow(trade_date="2026-01-03", amount=900.0, note="deposit", created_at="t")
+check_true("goal: compute_from_ledger deposit-adjusted ~0% (the fix)",
+           abs(_goal.compute_from_ledger(_cled, _crow)["cumulative_return_pct"]) < 1e-9)
+Path(_cdb).unlink(missing_ok=True)
+
+# --- deposit auto-capture: infer suspected external flows from baseline jumps ---
+# (The Robinhood MCP exposes NO cumulative net-deposit figure — verified get_portfolio only
+#  returns a transient pending_deposits — so flows are inferred from the equity curve, then
+#  surfaced/opt-in-written. All pure/offline; nothing here reads limits/broker/halt.)
+# _goal_window (Gate-B F4): points >= start_date INCLUDE the anchor baseline; flows > start_date EXCLUDE a start-date flow.
+_gw_pts, _gw_fl = _goal._goal_window(
+    [{"trade_date": "2026-01-01", "baseline_equity": 100.0},
+     {"trade_date": "2026-01-03", "baseline_equity": 1000.0}],
+    [{"trade_date": "2026-01-01", "amount": 5.0}, {"trade_date": "2026-01-03", "amount": 900.0}],
+    "2026-01-01")
+check("flow: _goal_window points include the start-date baseline (>=)",
+      [d for d, _e in _gw_pts], ["2026-01-01", "2026-01-03"])
+check("flow: _goal_window flows exclude a start-date flow (>)",
+      [d for d, _a in _gw_fl], ["2026-01-03"])
+# detect_external_flows: the real RCA jump (98->246 in a day) is flagged as a deposit.
+_det = _goal.detect_external_flows([("2026-06-02", 98.03), ("2026-06-03", 245.98)], [], min_pct=25, min_abs=30)
+check("flow: deposit jump flagged (count/amount)", (len(_det), _det[0]["amount"]), (1, 147.95))
+check("flow: deposit direction+date", (_det[0]["direction"], _det[0]["trade_date"]), ("deposit", "2026-06-03"))
+check("flow: within-band (+10%) ignored",
+      _goal.detect_external_flows([("d0", 100.0), ("d1", 110.0)], [], min_pct=25, min_abs=30), [])
+check("flow: min_pct leg (+1% on $4k) ignored",  # both AND legs must be pinned
+      _goal.detect_external_flows([("d0", 4000.0), ("d1", 4040.0)], [], min_pct=25, min_abs=30), [])
+check("flow: min_abs leg (+100% but $1) ignored",
+      _goal.detect_external_flows([("d0", 1.0), ("d1", 2.0)], [], min_pct=25, min_abs=30), [])
+check("flow: a recorded flow in the interval suppresses its candidate",
+      _goal.detect_external_flows([("2026-06-02", 98.03), ("2026-06-03", 245.98)],
+                                  [("2026-06-03", 147.95)], min_pct=25, min_abs=30), [])
+_wd = _goal.detect_external_flows([("d0", 200.0), ("d1", 100.0)], [], min_pct=25, min_abs=30)
+check("flow: withdrawal flagged (sign+dir)", (_wd[0]["amount"] < 0, _wd[0]["direction"]), (True, "withdrawal"))
+check("flow: prev_eq<=0 skipped (no raise)",
+      _goal.detect_external_flows([("d0", 0.0), ("d1", 100.0)], [], min_pct=25, min_abs=30), [])
+check("flow: None equity skipped (no raise)",
+      _goal.detect_external_flows([("d0", None), ("d1", 100.0)], [], min_pct=25, min_abs=30), [])
+check("flow: single point -> []", _goal.detect_external_flows([("d0", 100.0)], [], min_pct=25, min_abs=30), [])
+check("flow: multi-jump date-ASC order",
+      [c["trade_date"] for c in _goal.detect_external_flows(
+          [("d0", 100.0), ("d1", 1000.0), ("d2", 100.0)], [], min_pct=25, min_abs=30)], ["d1", "d2"])
+# confirmable_flows (Gate-B F-WALL-1): only SETTLED + PERSISTED jumps are auto-writable.
+_cand = _goal.detect_external_flows([("d0", 100.0), ("d1", 1000.0)], [], min_pct=25, min_abs=30)
+check("flow: unsettled jump (no later baselines) NOT confirmable",
+      _goal.confirmable_flows([("d0", 100.0), ("d1", 1000.0)], _cand, confirm_days=2), [])
+check("flow: settled + level persisted -> confirmable",
+      len(_goal.confirmable_flows([("d0", 100.0), ("d1", 1000.0), ("d2", 1010.0), ("d3", 990.0)],
+                                  _cand, confirm_days=2)), 1)
+check("flow: settled but REVERTED (transient spike) NOT confirmable",
+      _goal.confirmable_flows([("d0", 100.0), ("d1", 1000.0), ("d2", 105.0), ("d3", 102.0)],
+                              _cand, confirm_days=2), [])
+_cand_wd = _goal.detect_external_flows([("d0", 1000.0), ("d1", 100.0)], [], min_pct=25, min_abs=30)
+check("flow: withdrawal persisted (max stays low) -> confirmable",
+      len(_goal.confirmable_flows([("d0", 1000.0), ("d1", 100.0), ("d2", 110.0), ("d3", 90.0)],
+                                  _cand_wd, confirm_days=2)), 1)
+# suggest_flows_from_ledger (real Ledger) + red/green idempotency + Gate-B F4 anchor boundary.
+_sdb = tempfile.mktemp(suffix=".db"); _sled = Ledger(_sdb)
+_sled.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d", start_date="2026-01-01", start_equity=100.0)
+_sled.get_or_create_baseline("2026-01-01", 100.0, "2026-01-01T00:00:00Z")   # first baseline == goal start_date
+_sled.get_or_create_baseline("2026-01-03", 1000.0, "2026-01-03T00:00:00Z")  # the deposit jump
+_sgoal = _sled.get_active_goal()
+_sug = _goal.suggest_flows_from_ledger(_sled, _sgoal, min_pct=25, min_abs=30)
+check("flow: suggest_from_ledger finds the jump anchored at start_date (>= boundary)",
+      (len(_sug), _sug[0]["trade_date"], _sug[0]["amount"]), (1, "2026-01-03", 900.0))
+_sled.record_cash_flow(trade_date="2026-01-03", amount=900.0, note="deposit", created_at="t")
+check("flow: suggest suppressed once the flow is recorded (idempotent)",
+      _goal.suggest_flows_from_ledger(_sled, _sgoal, min_pct=25, min_abs=30), [])
+check("flow: suggest no goal -> []", _goal.suggest_flows_from_ledger(_sled, None, min_pct=25, min_abs=30), [])
+Path(_sdb).unlink(missing_ok=True)
+# record_cash_flow_if_absent (Gate-B F-IDEMPOTENCY): atomic guard, at most one auto row per date.
+_adb = tempfile.mktemp(suffix=".db"); _aled = Ledger(_adb)
+check_true("flow: if_absent first insert wins",
+           _aled.record_cash_flow_if_absent(trade_date="2026-02-01", amount=100.0, note="auto:x", created_at="t"))
+check("flow: if_absent second same-date insert is a no-op",
+      _aled.record_cash_flow_if_absent(trade_date="2026-02-01", amount=100.0, note="auto:y", created_at="t2"), False)
+check("flow: if_absent kept exactly one auto row",
+      len([f for f in _aled.cash_flows() if str(f.get("note") or "").startswith("auto:")]), 1)
+_aled.record_cash_flow(trade_date="2026-03-01", amount=50.0, note="manual", created_at="t")
+check("flow: manual record unaffected by the auto guard", len(_aled.cash_flows()), 2)
+Path(_adb).unlink(missing_ok=True)
+
 # --- signals: target-aware helpers + the BYTE-IDENTICAL clamp guarantee ---
 check("sig: room_under_target", signals.room_under_target(9.0, 2.0), 7.0)
 check("sig: room_under_target at/over -> 0", signals.room_under_target(9.0, 12.0), 0.0)
@@ -1435,6 +1583,26 @@ check_true("sctx: compact carries the disclaimer", "does NOT change sizing" in _
 check_true("sctx: full block names the sleeve + regime", "Uranium/Power" in _full and "AHEAD" in _full)
 check_true("sctx: D2 wall — full block has NO digit and NO '$'", _no_digit_no_dollar(_full))
 check_true("sctx: D2 wall — compact block has NO digit and NO '$'", _no_digit_no_dollar(_compact))
+
+# D2 decision-path regression + intended behavior: the coarse goal-regime injected into the
+# analysis prompt (via compute_from_ledger) is byte-identical while NO external flows are
+# recorded, and only shifts once a deposit is deliberately recorded (deposits are not gains).
+# Isolated ledger so it never mutates _s2. start 100 @2026-01-01, one baseline 110 @2026-07-02.
+_d2db = tempfile.mktemp(suffix=".db")
+_d2 = Ledger(_d2db)
+_d2gid = _d2.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="2026-06-13",
+    start_date="2026-01-01", start_equity=100.0)
+_d2.upsert_target_holding(goal_id=_d2gid, sleeve="Uranium/Power", ticker="URA", target_weight=7,
+    band=2, status="active", book="core_55_45", quotable=True, proxy_ticker=None, updated_at="t")
+_d2.get_or_create_baseline("2026-07-02", 110.0, "2026-07-02T00:00:00Z")
+check("sctx: D2 regime byte-identical under zero flows (AHEAD)",
+      _sctx.build_target_context(_d2, "URA", _sc)["goal_regime"], "AHEAD")
+_d2.record_cash_flow(trade_date="2026-02-01", amount=40.0, note="deposit", created_at="t")
+check("sctx: D2 regime shifts only after a deposit is recorded (BEHIND)",
+      _sctx.build_target_context(_d2, "URA", _sc)["goal_regime"], "BEHIND")
+Path(_d2db).unlink(missing_ok=True)
 check("sctx: render None -> ''", _sctx.render_target_block(None), "")
 check("sctx: render '' for ticker not in book",
       _sctx.render_target_block(_sctx.build_target_context(_s2, "NOPE", _sc)), "")
@@ -1711,6 +1879,85 @@ _led_s3.get_or_create_baseline("2026-09-01", 110.0, "2026-09-01T00:00:00-04:00")
 _gt = _tick._run_goal_track(_cfg_s3, _led_s3)
 check("goal-track: records a snapshot", _gt["recorded"], True)
 check_true("goal-track: regime present", _gt.get("regime") in ("AHEAD", "ON-TRACK", "BEHIND"))
+
+# ---- deposit auto-capture wired through _run_goal_track + config + flow-suggest CLI ----
+def _cfg_goal_dict(goal_block=None):
+    d = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/k_goal",
+         "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                  "daily_capital_deploy_cap": 75, "min_buying_power_buffer": 5},
+         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"}}
+    if goal_block is not None:
+        d["goal"] = goal_block
+    return d
+
+def _cfg_goal(auto, **over):
+    return load_config(_write_config(_cfg_goal_dict({"auto_capture_flows": auto, **over})))
+
+def _seed_jump_ledger(start_equity, jump_to, *later):
+    """A ledger: active goal (start @ 2026-01-01) + a start->jump_to jump on 2026-01-03
+    + optional later baselines (to settle/persist or revert the jump)."""
+    led = _tmp_ledger()
+    led.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+        benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+        macro_thesis_json="{}", active_book="core_55_45", as_of="d",
+        start_date="2026-01-01", start_equity=start_equity)
+    led.get_or_create_baseline("2026-01-01", start_equity, "2026-01-01T00:00:00Z")
+    led.get_or_create_baseline("2026-01-03", jump_to, "2026-01-03T00:00:00Z")
+    for dte, eq in later:
+        led.get_or_create_baseline(dte, eq, dte + "T00:00:00Z")
+    return led
+
+# Gate-B F1: the OFF test seeds the IDENTICAL settled jump the ON test uses, so an empty
+# cash_flows is attributable to the flag being OFF — not to an absent/undetectable jump.
+_led_off = _seed_jump_ledger(100.0, 1000.0, ("2026-01-05", 1010.0), ("2026-01-07", 990.0))
+_gt_off = _tick._run_goal_track(_cfg_goal(False), _led_off)
+check("flow: goal-track surfaces suspected flows even when auto OFF", _gt_off["n_suspected_flows"], 1)
+check("flow: auto-capture OFF writes nothing (same detectable jump)", _led_off.cash_flows(), [])
+# flag ON on the SAME settled jump -> exactly one row; a SECOND run adds nothing (idempotent).
+_led_on = _seed_jump_ledger(100.0, 1000.0, ("2026-01-05", 1010.0), ("2026-01-07", 990.0))
+_gt_on = _tick._run_goal_track(_cfg_goal(True), _led_on)
+check("flow: auto-capture ON writes the settled deposit", len(_led_on.cash_flows()), 1)
+check("flow: auto_captured reported in goal-track output", len(_gt_on.get("auto_captured", [])), 1)
+_tick._run_goal_track(_cfg_goal(True), _led_on)
+check("flow: auto-capture idempotent across ticks", len(_led_on.cash_flows()), 1)
+# Gate-B F-WALL-1: an UNSETTLED jump (no later baselines) is NOT auto-written even with the flag ON.
+_led_uns = _seed_jump_ledger(100.0, 1000.0)
+_tick._run_goal_track(_cfg_goal(True), _led_uns)
+check("flow: unsettled jump not auto-written (confirmation gate)", _led_uns.cash_flows(), [])
+# Gate-B F5: prove cfg.goal_flow_min_pct is actually threaded into the detector on the WRITE
+# path — DIFFERENTIAL: a +26% ($260) settled jump writes under min_pct=25 but not min_pct=50.
+_led_lo = _seed_jump_ledger(1000.0, 1260.0, ("2026-01-05", 1270.0), ("2026-01-07", 1255.0))
+_tick._run_goal_track(_cfg_goal(True), _led_lo)
+check("flow: +26% jump auto-written at default min_pct=25", len(_led_lo.cash_flows()), 1)
+_led_hi = _seed_jump_ledger(1000.0, 1260.0, ("2026-01-05", 1270.0), ("2026-01-07", 1255.0))
+_tick._run_goal_track(_cfg_goal(True, flow_min_pct=50), _led_hi)
+check("flow: +26% jump NOT written at min_pct=50 (cfg threaded, not a literal)", _led_hi.cash_flows(), [])
+
+# flow-suggest CLI is READ-ONLY (records nothing) and emits ready-to-run flow-record commands.
+_led_cli = _seed_jump_ledger(100.0, 1000.0, ("2026-01-05", 1010.0))
+_orig_cfl = _tick._cfg_and_ledger
+_tick._cfg_and_ledger = lambda: (_cfg_goal(False), _led_cli)
+try:
+    _sug_out = _tick.cmd_flow_suggest(None)  # cmd_flow_suggest ignores args (uses _cfg_and_ledger)
+finally:
+    _tick._cfg_and_ledger = _orig_cfl
+check("flow-suggest: count matches suspected", _sug_out["count"], 1)
+check_true("flow-suggest: emits a ready flow-record command",
+           _sug_out["commands"][0].startswith("tick.py flow-record --input"))
+check("flow-suggest: records NOTHING (read-only)", _led_cli.cash_flows(), [])
+
+# config: goal block parse — defaults (Gate-A) + F1 fail-safe + F2 strict gate.
+_c_absent = load_config(_write_config(_cfg_goal_dict(None)))
+check("config: goal block absent -> auto OFF + defaults (25/30/2)",
+      (_c_absent.goal_auto_capture_flows, _c_absent.goal_flow_min_pct,
+       _c_absent.goal_flow_min_abs, _c_absent.goal_flow_confirm_days), (False, 25.0, 30.0, 2))
+_c_expl = _cfg_goal(True, flow_min_pct=20)
+check("config: explicit goal values parsed",
+      (_c_expl.goal_auto_capture_flows, _c_expl.goal_flow_min_pct), (True, 20.0))
+check("config: garbled goal threshold does NOT brick load (Gate-A F1 fail-safe -> default)",
+      _cfg_goal(True, flow_min_pct="aggressive").goal_flow_min_pct, 25.0)
+check("config: quoted 'false' does NOT enable the write path (Gate-A F2 strict is-True)",
+      load_config(_write_config(_cfg_goal_dict({"auto_capture_flows": "false"}))).goal_auto_capture_flows, False)
 
 # --- universe derivation: preflight's `pending` comes from the PORTFOLIO book,
 #     never a hand-maintained watchlist (cash + non-quotable filtered out) ---

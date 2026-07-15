@@ -441,7 +441,8 @@ def main() -> int:
                             else:
                                 _emit({"stage": _step, **{k: _r[k] for k in (
                                     "reviewed", "recorded", "new_proposals", "regime",
-                                    "ahead_behind_pct", "cumulative_return_pct") if k in _r}})
+                                    "ahead_behind_pct", "cumulative_return_pct",
+                                    "n_suspected_flows", "auto_captured") if k in _r}})
                         except Exception as e:  # noqa: BLE001 — learning is best-effort
                             _emit({"stage": _step, "error": f"{type(e).__name__}: {e}"})
                     # bills-review: heavier (Congress API + LLM analysis/judge), so it runs LAST

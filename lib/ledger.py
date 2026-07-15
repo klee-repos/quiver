@@ -194,6 +194,18 @@ CREATE TABLE IF NOT EXISTS goal_tracking (
     regime                 TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_goal_tracking_goal ON goal_tracking(goal_id, trade_date);
+-- External cash flows: deposits (amount > 0) / withdrawals (amount < 0). Append-only.
+-- Read ONLY by the goal/digest path (deposit-adjusted, time-weighted return) so external
+-- capital is not miscounted as investment RETURN — NEVER by the trading path, sizing, or the
+-- daily-loss halt. Populated out-of-band via `tick.py flow-record` (an ops/observability tool).
+CREATE TABLE IF NOT EXISTS cash_flows (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_date  TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    note        TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cash_flows_date ON cash_flows(trade_date);
 CREATE TABLE IF NOT EXISTS thesis_state (
     goal_id         INTEGER PRIMARY KEY,
     as_of           TEXT,
@@ -1058,6 +1070,48 @@ class Ledger:
             return [dict(r) for r in c.execute(
                 "SELECT * FROM goal_tracking WHERE goal_id=? ORDER BY trade_date ASC, id ASC",
                 (goal_id,),
+            ).fetchall()]
+
+    # --- external cash flows (deposits/withdrawals) — goal/digest path ONLY ------
+    # These let the goal-progress math deposit-adjust the return so external capital is
+    # not counted as investment gain. Append-only; read ONLY by lib.goal / the digest —
+    # NEVER by sizing, order placement, or the daily-loss halt.
+
+    def record_cash_flow(self, *, trade_date: str, amount: float, note: Optional[str],
+                         created_at: str) -> None:
+        """Append one external cash flow (amount > 0 deposit, < 0 withdrawal)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO cash_flows (trade_date, amount, note, created_at) VALUES (?,?,?,?)",
+                (trade_date, float(amount), note, created_at),
+            )
+
+    def record_cash_flow_if_absent(self, *, trade_date: str, amount: float,
+                                   note: Optional[str], created_at: str) -> bool:
+        """Atomically append an AUTO-captured cash flow iff no auto row exists for that date.
+
+        The auto-capture path (``tick.py`` goal-track) can run concurrently — a scheduled tick
+        holding ``run_lock`` and a manual ``tick.py goal-track`` do not serialize — so a plain
+        read-then-INSERT is a TOCTOU that could double-insert the same jump. This does the guard
+        in ONE statement (``INSERT ... SELECT ... WHERE NOT EXISTS``), so SQLite's writer lock
+        enforces at-most-one ``auto:%`` row per ``trade_date`` (the auto-vs-auto race always lands
+        on the same jump date). Manual ``record_cash_flow`` rows are untouched. Returns True iff a
+        row was inserted.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO cash_flows (trade_date, amount, note, created_at) "
+                "SELECT ?,?,?,? WHERE NOT EXISTS "
+                "(SELECT 1 FROM cash_flows WHERE trade_date=? AND note LIKE 'auto:%')",
+                (trade_date, float(amount), note, created_at, trade_date),
+            )
+            return cur.rowcount > 0
+
+    def cash_flows(self) -> list:
+        """All recorded external cash flows, date-ASC. Read-only; goal/digest path only."""
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT trade_date, amount, note FROM cash_flows ORDER BY trade_date ASC, id ASC"
             ).fetchall()]
 
     def get_thesis_state(self, goal_id: int) -> Optional[dict]:

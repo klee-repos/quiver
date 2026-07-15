@@ -136,6 +136,25 @@ memory:
     sharpe_elevated: 0.50
     sharpe_reduced: 0.0
 
+# --- Goal deposit auto-capture (observability; tag external deposits/withdrawals) ---
+# The Robinhood MCP exposes no cumulative net-deposit figure, so the goal-track tail DETECTS
+# suspected external cash flows from day-over-day jumps in the equity curve and SURFACES them
+# (`tick.py flow-suggest` prints ready `flow-record` commands; goal-track logs a count each tick).
+# These feed ONLY the deposit-adjusted goal return + coarse goal-regime — NEVER sizing, order
+# placement, or the daily-loss halt (none of them read cash_flows). Fails SAFE: a garbled value
+# here never blocks a tick.
+goal:
+  auto_capture_flows: false   # true = the tail also AUTO-WRITES settled/persisted jumps to
+                              # cash_flows (idempotent). OFF = detect+surface only; the operator
+                              # confirms via `tick.py flow-record`. Turn ON only for a book where a
+                              # >flow_min_pct single-day move is unambiguously a deposit, not a
+                              # volatile concentrated book (a false positive shifts the coarse
+                              # goal-regime word injected into the analysis prompt).
+  flow_min_pct: 25.0          # a day-over-day equity jump >= this % AND >= flow_min_abs $ is
+  flow_min_abs: 30.0          # flagged as a suspected external flow (both legs required)
+  flow_confirm_days: 2        # auto-write only after the jump SETTLES this many baseline days AND
+                              # the new level persists past the midpoint (blocks a transient spike)
+
 # --- Legislative catalyst (bill-driven universe proposals; opt-in, fail-safe OFF) ---
 # Ingests changed US Congress bills (Congress.gov API, key in .env: CONGRESS_API_KEY),
 # runs an LLM impact analysis + an adversarial N-of-M judge, and for a bill clearing BOTH
