@@ -470,6 +470,19 @@ def _classify_failure(err: Exception) -> str:
     return "unknown"
 
 
+def _resolve_deadline_s(cli_deadline: float | None) -> float | None:
+    """The deadline main() forwards to the brain fallback, or None.
+
+    run_analyses.py passes ``--deadline = time.monotonic() + timeout`` — an ABSOLUTE
+    monotonic timestamp — and _run_eve_with_fallback computes ``remaining = deadline_s -
+    time.monotonic()``. So main() MUST pass that absolute value STRAIGHT THROUGH. A prior
+    bug re-relativized it here (``args.deadline - time.monotonic()``), which then got
+    subtracted from the monotonic clock a SECOND time downstream -> ``remaining`` hugely
+    negative -> the fallback was ALWAYS skipped ("no fallback (deadline)"). Passthrough
+    keeps the whole family on one monotonic convention (the unit tests pass absolute too)."""
+    return cli_deadline if cli_deadline else None
+
+
 def _run_eve_with_fallback(ticker: str, date: str, cfg, past_context: str,
                            past_context_compact: str, *, deadline_s: float | None) -> dict:
     """F2: run the brain; on a transient failure, re-run ONCE (the brain is
@@ -487,7 +500,6 @@ def _run_eve_with_fallback(ticker: str, date: str, cfg, past_context: str,
     preserved as <date>_<ticker>.run1.json and the result carries
     fallback_triggered=True + original_signal for the decision row.
     """
-    import time
     FLOOR = 600.0  # don't start a fallback re-run with < 10min left
     first_err = None
     original_signal = None
@@ -578,15 +590,16 @@ def main(argv) -> int:
     ap.add_argument("ticker")
     ap.add_argument("--date", default=None)
     ap.add_argument("--deadline", type=float, default=None,
-                    help="epoch-seconds deadline (F2 fallback budget); passed by run_analyses")
+                    help="ABSOLUTE time.monotonic() deadline (F2 fallback budget); passed by run_analyses")
     args = ap.parse_args(argv)
     ticker = args.ticker.strip().upper()
     date = args.date or trading_day_et()
-    # F2: convert the caller's epoch deadline to a monotonic-relative budget so the
-    # fallback re-run can skip itself if < 600s remain (don't start a doomed run
-    # the outer SIGKILL catches mid-brain). None = no deadline (manual runs).
-    import time
-    deadline_s = (args.deadline - time.monotonic()) if args.deadline else None
+    # F2: pass the caller's ABSOLUTE monotonic deadline straight through so the fallback
+    # re-run can skip itself if < 600s remain (don't start a doomed run the outer SIGKILL
+    # catches mid-brain). NOT re-relativized here — _run_eve_with_fallback already does
+    # `deadline_s - time.monotonic()`; converting twice made `remaining` always negative
+    # so the fallback never fired. None = no deadline (manual runs).
+    deadline_s = _resolve_deadline_s(args.deadline)
 
     try:
         cfg = load_config(REPO / "config.yaml")

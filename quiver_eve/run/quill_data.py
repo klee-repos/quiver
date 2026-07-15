@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -37,6 +38,26 @@ def _safe(fn) -> dict:
         return {"report": report, "core_available": bool(core)}
     except Exception as e:  # noqa: BLE001 — a fetch error is UNAVAILABLE, never fatal
         return {"report": f"UNAVAILABLE: {type(e).__name__}: {e}", "core_available": False}
+
+
+def _retry(fn, *, tries: int = 3, base_sleep: float = 1.0):
+    """F2: call ``fn()`` and retry up to ``tries`` on a RAISED exception (linear backoff),
+    re-raising the last error after exhaustion. Kills the class-B "core data unavailable:
+    missing market" ERRORs from a TRANSIENT yfinance miss (rate-limit/network blip) that a
+    single-shot fetch turns into a wasted skip. Only wrap the RAISING core price fetch —
+    helpers that already catch internally (e.g. ``_latest_indicators`` -> {}) never raise,
+    so retrying them is a no-op. Fail-safe preserved: after ``tries`` it still raises, so
+    ``_safe`` degrades to UNAVAILABLE and the analyze.py gate still refuses to trade blind."""
+    last: Exception | None = None
+    for attempt in range(1, tries + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 — transient miss; retry, then fail-safe
+            last = e
+            if attempt < tries:
+                time.sleep(base_sleep * attempt)
+    assert last is not None
+    raise last
 
 
 def _recent_window(date: str | None, days: int = 60) -> tuple[str, str]:
@@ -122,7 +143,10 @@ def fetch_market(ticker: str, date: str | None) -> tuple[str, bool]:
     # here means we have a real price series. Do NOT json.dumps it (the old code
     # double-encoded — main() re-encodes the whole envelope — which inflated the
     # escaped length so the char-slice cut even more real rows, mid-row).
-    sd = get_YFin_data_online(ticker, start, end)
+    # F2: retry the CORE price fetch so a TRANSIENT yfinance miss doesn't skip the ticker
+    # (this is the one fetch that GATES a trade). _latest_indicators below is NOT retried —
+    # it catches internally and never raises (a retry there would be dead code).
+    sd = _retry(lambda: get_YFin_data_online(ticker, start, end))
     price_block = _tail_csv(sd, max_rows=45)          # RECENT bars, whole rows
     inds = _latest_indicators(ticker, end)            # real RSI/MACD/BOLL/ATR/EMA snapshot
     report = (f"Price/Volume (most-recent bars, CSV):\n{price_block}\n"

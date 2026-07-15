@@ -25,6 +25,7 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, tool, isStepCount } from "ai";
 import { z } from "zod";
 import { runPythonDataTool } from "./quill_data.mjs";
+import { withRetry } from "./retry.mjs";
 
 const TICKER = process.argv[2] || "AAPL";
 const DATE = process.argv[3] || "";
@@ -81,38 +82,8 @@ function hasSubheads(text, names) {
   return true;
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-// F1: bounded retry wrapper. Retries on (a) a thrown error AND (b) an
-// empty/unusable output (checked via the optional `validate` predicate — e.g.
-// hasRequiredLabels for the contract turns, hasSubheads for gather). Backoff:
-// exponential+jitter for thrown errors (rate-limit windows are 5-30s); NO delay
-// for empty-output failures (a content issue, not a rate issue). On exhaustion
-// it throws (the caller's top-level maps to exit 1 -> analyze.py ERROR).
-async function withRetry(label, fn, { tries = 3, validate = null } = {}) {
-  let lastErr;
-  for (let attempt = 1; attempt <= tries; attempt++) {
-    try {
-      const out = await fn(attempt);
-      if (validate && !validate(out)) {
-        process.stderr.write(`[decide] ${label} attempt ${attempt}/${tries}: output failed validation (empty/missing labels); ${attempt < tries ? "retrying" : "giving up"}\n`);
-        lastErr = new Error(`${label}: output failed validation`);
-        if (attempt < tries) continue;   // no backoff for content failures
-        throw lastErr;
-      }
-      return out;
-    } catch (e) {
-      lastErr = e;
-      process.stderr.write(`[decide] ${label} attempt ${attempt}/${tries} error: ${e?.message || e}\n`);
-      if (attempt < tries) {
-        const base = 2000 * Math.pow(2, attempt - 1);   // 2s, 4s
-        const jitter = Math.floor(Math.random() * 1000);
-        await sleep(base + jitter);
-      }
-    }
-  }
-  throw lastErr;
-}
+// withRetry (+ the fallbackValue option F1 relies on) is EXTRACTED to ./retry.mjs so it
+// is unit-testable without importing this side-effectful script. See retry.mjs.
 
 async function deepTurn(system, prompt) {
   // reasoningTokens/reasoningAttempt are set by the withRetry caller per
@@ -155,9 +126,16 @@ async function deepTurnRetry(label, system, prompt, { tries = 3, validate = null
   }, { tries, validate: null });  // validation handled inside (so the count isn't stashed on a validation fail)
 }
 
-async function quickTurnRetry(label, system, prompt, { tries = 3, validate = null } = {}) {
-  return withRetry(label, (attempt) => quickTurn(system, prompt), { tries, validate });
+async function quickTurnRetry(label, system, prompt, { tries = 3, validate = null, fallbackValue = undefined } = {}) {
+  return withRetry(label, (attempt) => quickTurn(system, prompt), { tries, validate, fallbackValue });
 }
+
+// F1: advisory debate turns (bull/bear/risk_agg/risk_con) are NOT in the parsed output
+// contract — they only feed the plan/PM turns. If glm-4.7-flash returns empty text 3x
+// (the DLR/BOT/VRT class-A failure), degrade to this placeholder instead of throwing +
+// sinking the whole ticker. CRITICAL turns (gather/proposal/plan/decision) pass NO
+// fallbackValue, so they still hard-fail -> analyze.py fail-safe ERROR on a real outage.
+const ADVISORY_UNAVAILABLE = "(unavailable — model returned no output after retries)";
 
 
 const HORIZON = `You are the Quiver decision brain: a LONG-HORIZON TREND FOLLOWER. You ride
@@ -233,7 +211,7 @@ Be specific and data-backed.
 REPORTS:
 ${reports}
 
-${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
+${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()), fallbackValue: ADVISORY_UNAVAILABLE });
 
   bear = await quickTurnRetry(`bear_r${i+1}`, HORIZON, `Round ${i+1} BEAR case for ${TICKER}. Steelman the bearish
 view against the same reports + memory. Where could the trend break? What drawdown risk,
@@ -242,7 +220,7 @@ regime-flip risk, or fundamental deterioration is the bull case ignoring? Be dat
 REPORTS:
 ${reports}
 
-${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
+${PAST}`, { tries: 3, validate: (t) => !!(t && t.trim()), fallbackValue: ADVISORY_UNAVAILABLE });
 }
 
 // --- Step 3: research plan (deep model) ---
@@ -290,7 +268,7 @@ PROPOSAL:
 ${proposal}
 
 PLAN:
-${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
+${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()), fallbackValue: ADVISORY_UNAVAILABLE });
 
 const riskCon = await quickTurnRetry("risk_con", HORIZON, `As a CONSERVATIVE risk reviewer for ${TICKER}, argue
 the risks of the proposal below. What's the downside the bull case is underweighting, the
@@ -300,7 +278,7 @@ PROPOSAL:
 ${proposal}
 
 PLAN:
-${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()) });
+${plan}`, { tries: 3, validate: (t) => !!(t && t.trim()), fallbackValue: ADVISORY_UNAVAILABLE });
 
 // --- Step 6: portfolio decision (deep model, reasoning ON) ---
 const PM_LABELS = ["Rating","Next Review Hours","Conviction","Uncertainty"];

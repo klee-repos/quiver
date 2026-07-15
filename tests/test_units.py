@@ -2760,6 +2760,26 @@ _az2._run_eve_analysis = _run
 out = _az2._run_eve_with_fallback("X", "2026-07-07", _FakeCfg(), "", "", deadline_s=None)
 check_true("F2: no-deadline fallback recovers", out.get("fallback_triggered") is True)
 
+# (e) F0: main() MUST forward the ABSOLUTE monotonic deadline UNCHANGED (regression for the
+# double-subtraction that made `remaining` always negative -> fallback ALWAYS skipped, the
+# real 07-13 BOT/VRT "no fallback (deadline)" error). run_analyses passes monotonic()+timeout.
+_dl_abs = _time.monotonic() + 3600
+check("F0: _resolve_deadline_s passes the absolute deadline through", _az2._resolve_deadline_s(_dl_abs), _dl_abs)
+check_true("F0: None deadline stays None", _az2._resolve_deadline_s(None) is None)
+check_true("F0: falsy (0) deadline -> None", _az2._resolve_deadline_s(0) is None)
+# Convention proof: (forwarded - monotonic()) is the REAL remaining budget (~3600 >> 600 FLOOR).
+# The old bug forwarded a ~3600 RELATIVE value, then downstream subtracted monotonic() again -> < 0.
+check_true("F0: forwarded deadline yields POSITIVE remaining (fallback not wrongly skipped)",
+           (_az2._resolve_deadline_s(_dl_abs) - _time.monotonic()) > 600.0)
+# End-to-end: a first-run failure under the value main() forwards ATTEMPTS the fallback (2 calls);
+# under the old double-subtraction this skips at run-1 (calls==1) -> this test goes red.
+_run, calls = _fake_run_eve([RuntimeError("turn_threw"), {}])
+_az2._run_eve_analysis = _run
+out = _az2._run_eve_with_fallback("F0T", "2026-07-07", _FakeCfg(), "", "",
+                                  deadline_s=_az2._resolve_deadline_s(_time.monotonic() + 3600))
+check("F0: fallback FIRES under a healthy forwarded deadline (2 calls)", calls["n"], 2)
+check_true("F0: fallback recovered (not wrongly skipped)", out.get("fallback_triggered") is True)
+
 # F3: error_mode classification
 check("F3: missing_sections classified", _az2._classify_failure(RuntimeError("EVE output missing final_trade_decision/trader_investment_plan sections")), "missing_sections")
 check("F3: contract_violation classified", _az2._classify_failure(RuntimeError("contract violation: missing labels")), "contract_violation")
@@ -2842,6 +2862,73 @@ _tail_uut = _qd._tail_csv(_csv_uut, max_rows=5)
 check_true("dh: tail keeps header+cols", _tail_uut.startswith("# hdr line\nDate,Close"))
 check_true("dh: tail keeps NEWEST row", "2026-01-25,125" in _tail_uut)
 check_true("dh: tail drops OLDEST row", "2026-01-01,101" not in _tail_uut)
+
+# === F2: market-fetch retry (_retry wraps the RAISING core fetch; class-B ERROR fix) ======
+# A transient yfinance miss used to become "core data unavailable: missing market" -> skip.
+# _retry retries the CORE price fetch (get_YFin_data_online), NOT the non-raising indicators.
+_orig_sleep = _qd.time.sleep
+_qd.time.sleep = lambda *_a, **_k: None   # no real backoff in tests
+try:
+    # (1) _retry unit: fail-twice-then-succeed recovers within tries.
+    _rn = {"c": 0}
+    def _flaky():
+        _rn["c"] += 1
+        if _rn["c"] < 3:
+            raise RuntimeError("transient")
+        return "OK"
+    check("F2: _retry recovers after transient fails", _qd._retry(_flaky, tries=3), "OK")
+    check("F2: _retry used exactly the needed attempts", _rn["c"], 3)
+    # always-fail -> re-raises after EXACTLY `tries` (fail-safe preserved, bounded).
+    _dn = {"c": 0}
+    def _dead():
+        _dn["c"] += 1
+        raise RuntimeError("down")
+    _r1 = False
+    try:
+        _qd._retry(_dead, tries=3)
+    except RuntimeError:
+        _r1 = True
+    check_true("F2: _retry re-raises after exhausting tries", _r1)
+    check("F2: _retry tried exactly `tries` times", _dn["c"], 3)
+
+    # (2) INTEGRATION: the REAL fetch_market wraps the PRICE fetch (:125) in _retry, not the
+    #     non-raising _latest_indicators (:127). Transient price miss -> recovers -> core True.
+    _CSV = ("Date,Open,High,Low,Close,Volume\n2026-07-10,1,2,0.5,1.5,100\n"
+            "2026-07-11,1.5,2,1,1.8,120\n")
+    _fm = {"c": 0}
+    def _flaky_price(t, s, e):
+        _fm["c"] += 1
+        if _fm["c"] < 2:
+            raise RuntimeError("yfinance transient")
+        return _CSV
+    _orig_price = _yfm.get_YFin_data_online
+    _orig_inds = _qd._latest_indicators
+    _yfm.get_YFin_data_online = _flaky_price
+    _qd._latest_indicators = lambda *a, **k: {}
+    try:
+        _rep, _core = _qd.fetch_market("TEST", "2026-07-14")
+    finally:
+        _yfm.get_YFin_data_online = _orig_price
+        _qd._latest_indicators = _orig_inds
+    check_true("F2: fetch_market recovers a transient price miss (core True)", _core is True)
+    check("F2: fetch_market retried the PRICE fetch", _fm["c"], 2)
+    check_true("F2: recovered report carries the real price rows", "2026-07-11" in _rep)
+    # persistent price outage -> fetch_market RAISES (so _safe -> UNAVAILABLE; gate still fires).
+    def _dead_price(t, s, e):
+        raise RuntimeError("yfinance down")
+    _yfm.get_YFin_data_online = _dead_price
+    _qd._latest_indicators = lambda *a, **k: {}
+    _r2 = False
+    try:
+        _qd.fetch_market("TEST", "2026-07-14")
+    except Exception:
+        _r2 = True
+    finally:
+        _yfm.get_YFin_data_online = _orig_price
+        _qd._latest_indicators = _orig_inds
+    check_true("F2: persistent price outage still raises (fail-safe -> UNAVAILABLE)", _r2)
+finally:
+    _qd.time.sleep = _orig_sleep
 
 # === Macro news tool (6th channel) — wired 2026-07-13 =============================
 # The macro_report section is recognized by the splitter + tracked (non-core).

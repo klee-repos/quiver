@@ -19,6 +19,7 @@ LIVE=0
 # name|file pairs. The live one is appended only when requested.
 SUITES=(
   "unit|tests/test_units.py"
+  "brain-node|quiver_eve/test"
   "run-analyses|tests/test_run_analyses.py"
   "e2e-dryrun|tests/test_e2e.py"
   "e2e-alerts|tests/test_e2e_alerts.py"
@@ -36,12 +37,22 @@ FAILED=()
 for entry in "${SUITES[@]}"; do
   name="${entry%%|*}"; file="${entry##*|}"
   printf '%-26s ' "$name"
-  if [ "$name" = "e2e-live(GLM)" ]; then
-    QUIVER_LIVE_E2E=1 "$PY" "$file" >"/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" 2>&1
+  log="/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log"
+  if [ "$name" = "brain-node" ]; then
+    # F1: the EVE brain's node contract + retry/fallback tests (deterministic, no LLM). The
+    # rest of the suite is Python-only, so without this branch these never run in the gate.
+    : >"$log"
+    rc=0
+    for t in quiver_eve/test/retry.test.mjs quiver_eve/test/contract.test.mjs; do
+      node "$t" >>"$log" 2>&1 || rc=1
+    done
+  elif [ "$name" = "e2e-live(GLM)" ]; then
+    QUIVER_LIVE_E2E=1 "$PY" "$file" >"$log" 2>&1
+    rc=$?
   else
-    "$PY" "$file" >"/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" 2>&1
+    "$PY" "$file" >"$log" 2>&1
+    rc=$?
   fi
-  rc=$?
   tail=$(grep -oE '[0-9]+ passed, [0-9]+ failed|[0-9]+ checks passed, [0-9]+ failed|PASS \(no-op\)' "/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" | tail -1)
   if [ "$rc" -eq 0 ]; then echo "OK    ${tail}"; else echo "FAIL  ${tail}  (see /tmp/quiver_${name//[^a-zA-Z0-9]/_}.log)"; FAILED+=("$name"); fi
 done
