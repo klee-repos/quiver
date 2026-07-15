@@ -1363,7 +1363,17 @@ check("pf: resolve_band per-name binds", _pf.resolve_band_pct(3.0, 7.0, 5.0), 3.
 check("pf: resolve_band fallback to config when 0", _pf.resolve_band_pct(0.0, 20.0, 5.0), 5.0)
 check("pf: resolve_band capped at weight*0.5", _pf.resolve_band_pct(8.0, 6.0, 5.0), 3.0)
 check("pf: resolve_band config fallback also capped", _pf.resolve_band_pct(0.0, 4.0, 5.0), 2.0)
-check("pf: resolve_band weight 0 keeps band (exit case)", _pf.resolve_band_pct(3.0, 0.0, 5.0), 3.0)
+check("pf: resolve_band weight 0 -> band 0 (no strand; full unwind to target 0)",
+      _pf.resolve_band_pct(3.0, 0.0, 5.0), 0.0)
+# regression (review): a conviction-zeroed but still-ACTIVE held name must not keep a band-sized
+# residual. band resolves to 0 at target 0, so the trim winds it fully to 0 (not stranded at 5% of eq).
+_bz = [{"ticker": "ZZZ", "sleeve": "s", "target_weight": 0, "band": 0, "status": "active", "quotable": True}]
+_bkz = {r["ticker"]: r for r in _pf.construct_target_book(_bz, {"ZZZ": 16.0}, 200.0, default_band_pct=5.0)}
+check("pf: target-0 active held name has band_dollars 0 (no strand)", _bkz["ZZZ"]["band_dollars"], 0.0)
+check("pf: target-0 active held name -> trim toward exact 0", _bkz["ZZZ"]["intent"], "trim")
+# and the sell sizing winds it fully out (excess over 0+0 = full held mv)
+check("sig: target-0 trim (band 0) sells the whole overshoot to 0",
+      signals.resolve_target_sell_quantity(1.6, 10.0, 16.0, 0.0, upper_band_dollars=0.0), 1.6)
 # A bandless (band=0) name must pick up the config fallback and emit band_dollars, so it
 # no longer churns on any drift and the trim pass can size to the edge.
 _bt = [{"ticker": "AAA", "sleeve": "S", "target_weight": 10, "band": 0, "status": "active", "quotable": True}]

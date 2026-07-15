@@ -77,15 +77,17 @@ def resolve_band_pct(per_name_band: float, weight_pct: float, default_band_pct: 
 
     Uses the per-name band when set (>0), else falls back to the config
     ``default_band_pct`` (so a row with no band is NOT churned on any drift), and
-    caps the result at ``weight*0.5`` so the band stays strictly inside the target
-    weight (the b < w invariant conviction sizing relies on). A zero/absent weight
-    keeps the resolved band as-is (an exiting name full-exits regardless).
+    caps the result at ``weight*0.5`` — UNCONDITIONALLY — so the band stays strictly
+    inside the target weight (the b < w invariant conviction sizing relies on). At
+    weight 0 this yields band 0, so a name the book targets at 0% (e.g. a conviction-
+    zeroed but still-``active`` holding) is trimmed to EXACTLY 0 and never stranded at
+    the band width by the trim-to-edge sizing. A genuinely exiting/removed name
+    full-exits in ``rebalance_intent`` regardless of the band.
     """
     band = float(per_name_band or 0.0)
     if band <= 0.0:
         band = float(default_band_pct or 0.0)
-    if weight_pct > 0.0:
-        band = min(band, weight_pct * 0.5)
+    band = min(band, weight_pct * 0.5)
     return max(0.0, band)
 
 
