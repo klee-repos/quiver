@@ -36,7 +36,8 @@ def ok(name, cond, detail=""):
 
 
 def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
-        auto_apply=False, rh="[AAA, BBB, NVDA, SGOV]", sleeves="", holdings=None):
+        auto_apply=False, rh="[AAA, BBB, NVDA, SGOV]", sleeves="", holdings=None,
+        smoothing_alpha=1.0, dep_min_factor=None):
     """Write a strategy + config and return a loaded Config + a freshly-seeded Ledger."""
     from lib.config import load_config
     from lib.strategy import load_strategy
@@ -52,7 +53,9 @@ def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
         "macro_thesis: {deploy_trigger_pce_pct: 2.5, standdown_trigger_pce_pct: 3.5}\n"
         f"rh_tradable_confirmed: {rh}\n"
         f"risk_policy: {{per_name_max_pct: {per_name}, sleeve_max_pct: {sleeve_max}, "
-        f"cash_floor_pct: {cash_floor}, smoothing_alpha: 1.0}}\n"
+        f"cash_floor_pct: {cash_floor}, smoothing_alpha: {smoothing_alpha}"
+        + (f", conviction_deploy_min_factor: {dep_min_factor}" if dep_min_factor is not None else "")
+        + "}\n"
         + (sleeves or "")
         + f"learning: {{auto_apply_universe_changes: {str(auto_apply).lower()}}}\n"
         "books:\n  core:\n    default: true\n    holdings:\n" + "\n".join(holdings) + "\n",
@@ -127,6 +130,58 @@ def main() -> int:
         out = tick._run_construct(cfg, led, {**base, "analyses": an})
         w = {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
         ok("Q1 per-name cap binds (both <= 40)", w["AAA"] <= 40.01 and w["BBB"] <= 40.01, w)
+
+    # --- F3: conviction-driven deployment (reallocation teeth) at PRODUCTION config ------------
+    # An all-Underweight book must DEPLOY LESS -> RAISE CASH. Proven by an A/B on the SAME book at
+    # SHIPPED rails (smoothing_alpha=0.4, conviction_rebalance_min_delta_pct=2.0 default): F3-ON
+    # (default floor 0.70) vs F3-OFF (min_factor=1.0). The A/B cancels book-size/normalization
+    # artifacts and — critically — GUARDS the v1 no-op the adversarial review caught: with F3 OFF
+    # the 2pt per-name hysteresis REVERTS the Underweight to the static book (0 cash raised); F3's
+    # post-hysteresis carve-out is what actually raises cash.
+    _bear_holds = [
+        "      - {sleeve: Tech, ticker: AAA, weight: 20, band: 3}",
+        "      - {sleeve: Tech, ticker: BBB, weight: 20, band: 3}",
+        "      - {sleeve: Pwr, ticker: CCC, weight: 20, band: 3}",
+        "      - {sleeve: Pwr, ticker: DDD, weight: 20, band: 3}",
+        "      - {sleeve: Cash, ticker: SGOV, weight: 20}"]
+    _bear_rh = "[AAA, BBB, CCC, DDD, SGOV]"
+    _engines = ("AAA", "BBB", "CCC", "DDD")
+    _an_uw = [{"ticker": t, "signal": "Underweight", "conviction": 40, "uncertainty": 30}
+              for t in _engines]
+    with tempfile.TemporaryDirectory() as d1:
+        cfg_on, led_on = _mk(Path(d1), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
+                             holdings=_bear_holds)
+        out_on = tick._run_construct(cfg_on, led_on, {**base, "analyses": _an_uw})
+        tw_on = out_on["target_weights"]
+        cash_on = tw_on["SGOV"]["target_weight"]
+        eng_on = sum(tw_on[t]["target_weight"] for t in _engines)
+    with tempfile.TemporaryDirectory() as d2:
+        cfg_off, led_off = _mk(Path(d2), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
+                               holdings=_bear_holds, dep_min_factor=1.0)  # F3 disabled
+        out_off = tick._run_construct(cfg_off, led_off, {**base, "analyses": _an_uw})
+        tw_off = out_off["target_weights"]
+        cash_off = tw_off["SGOV"]["target_weight"]
+        eng_off = sum(tw_off[t]["target_weight"] for t in _engines)
+    ok("F3 e2e: bearish book RAISES CASH vs F3-off", cash_on > cash_off + 2.0, (cash_on, cash_off))
+    ok("F3 e2e: bearish book DEPLOYS LESS vs F3-off", eng_on < eng_off - 2.0, (eng_on, eng_off))
+    ok("F3 e2e: F3-off reverts Underweight to ~static (the v1 no-op it guards)",
+       abs(cash_off - 20.0) < 3.0, cash_off)
+    ok("F3 e2e: book still conserves to ~100%", abs(cash_on + eng_on - 100.0) < 0.5, cash_on + eng_on)
+    # Drive construct->plan: positions AT the static book -> F3's lower targets emit trim orders
+    # that actually raise cash (proves it reaches the broker path, not just the target map).
+    with tempfile.TemporaryDirectory() as d3:
+        cfg_p, led_p = _mk(Path(d3), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
+                           holdings=_bear_holds)
+        snap = {"equity": 1000.0, "buying_power": 200.0,
+                "positions": {t: {"quantity": 2.0, "market_value": 200.0} for t in _engines},
+                "quotes": {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0, "DDD": 100.0, "SGOV": 1.0},
+                "now_iso": "2026-06-20T11:00:00-04:00"}
+        con = tick._run_construct(cfg_p, led_p, {**snap, "analyses": _an_uw})
+        plan = tick._run_plan(cfg_p, led_p, {**snap, "run_id": "E2E-F3", "analyses": _an_uw,
+                                             "target_weights": con["target_weights"]})
+        _trims = [o for o in plan["orders"] if o.get("order_kind") == "rebalance_trim"]
+        ok("F3 e2e: bearish book emits rebalance_trim orders (raises cash to the broker)",
+           len(_trims) > 0, [o.get("order_kind") for o in plan["orders"]])
 
     # --- Q3: screener ADD -> human-approve -> apply_add conserves -> in universe ---
     _sleeves = ('sleeves:\n  "US large cap": {screen: {sector: Technology, '

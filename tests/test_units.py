@@ -2393,6 +2393,25 @@ _alCal = _alloc.allocate_targets(
                                               "cash_floor_pct": 0, "smoothing_alpha": 1.0})
 check_true("calibration: the learned winner gets more weight", _alCal.weights["W"] > _alCal.weights["L"])
 
+# --- F3: conviction_deploy_factor (book-conviction deployment scalar; reallocation teeth) -----
+# A broadly-BEARISH book deploys less -> raises cash; a bullish book deploys full. Takes RAW
+# effective_conviction (0..1) so curve_k/calibration stay deployment-neutral. Defaults: full
+# deploy at mean 0.45, floor 0.70.
+_cdf = _alloc.conviction_deploy_factor
+check("F3 dep: bullish book (Buy 0.70) -> full deploy 1.0", _cdf([0.70, 0.70, 0.70]), 1.0)
+check("F3 dep: all-bearish book (Underweight ~0.175) -> floor 0.70", _cdf([0.175, 0.175, 0.175]), 0.70)
+_mixf = _cdf([0.50, 0.30])  # mean 0.40 -> 0.40/0.45 = 0.888...
+check_true("F3 dep: mixed book strictly between floor and 1.0", 0.70 < _mixf < 1.0)
+check("F3 dep: mixed value == mean/ref", round(_mixf, 4), round((0.40 / 0.45), 4))
+check("F3 dep: empty (no fresh conviction) -> 1.0", _cdf([]), 1.0)
+check("F3 dep: None values filtered", _cdf([None, 0.70, None]), 1.0)
+check_true("F3 dep: monotone (weaker book <= stronger book)", _cdf([0.30, 0.30]) <= _cdf([0.55, 0.55]))
+check("F3 dep: min_factor=1.0 DISABLES F3 (always full deploy)",
+      _cdf([0.10, 0.10], {"conviction_deploy_min_factor": 1.0}), 1.0)
+check("F3 dep: curve_k/calibration are deployment-neutral (RAW ec in)",
+      _cdf([0.175, 0.175], {"conviction_curve_k": 2.0, "smoothing_alpha": 0.9}), _cdf([0.175, 0.175]))
+check("F3 dep: ref<=0 guard -> 1.0", _cdf([0.10], {"conviction_full_deploy_at": 0.0}), 1.0)
+
 # --- regime scalar: STAND_DOWN derisks (more cash) --------------------------
 _alRegime = _alloc.allocate_targets(
     [{"ticker": "R", "sleeve": "a", "prior_weight": 0}], {"R": {"signal": "Buy", "conviction": 100}},

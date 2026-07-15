@@ -1156,6 +1156,33 @@ def _run_construct(cfg, led, data) -> dict:
                 alloc.weights, prior_map, cfg.risk.conviction_rebalance_min_delta_pct)
             cash_floor = float(policy["cash_floor_pct"]) if (policy and policy.get("cash_floor_pct") is not None) else 5.0
             eng_ceiling = max(0.0, 100.0 - cash_floor)
+            # F3: conviction-driven deployment (the reallocation teeth). regime_scalar sets
+            # deployment from the MACRO read; this adds a per-tick BOOK-CONVICTION scalar so a
+            # broadly-BEARISH book (weak mean fresh conviction) deploys LESS -> raises cash, while
+            # still rotating what it holds toward the relatively-stronger names. Applied HERE,
+            # AFTER apply_target_hysteresis, as a book-level cash CARVE-OUT on the FRESH-conviction
+            # names ONLY — scaling allocate's internal budget instead is absorbed by EWMA + the 2pt
+            # per-name dead-band (a no-op on a diversified book). D2 hold-prior + D3 hold_floor names
+            # are NEVER scaled (a data outage / suppressed reversal still never sells). base anchor is
+            # the FIXED eng_ceiling (100 - cash_floor), so a stable bearish book yields a STABLE cash
+            # target (no runaway decay). The downstream rebalance dead-band remains the anti-churn rail.
+            raw_convs = [ec for ec in (
+                allocate.effective_conviction(analyses_map.get(str(c["ticker"]).upper()), policy)
+                for c in candidates) if ec is not None]
+            dep_factor = allocate.conviction_deploy_factor(raw_convs, policy)
+            if dep_factor < 1.0 - 1e-9 and eng_weights:
+                deploy_target = dep_factor * eng_ceiling
+                protected = {t for t in eng_weights
+                             if str((alloc.detail.get(t) or {}).get("reason") or "").startswith("hold_prior")
+                             or hold_floors.get(t, 0.0) > 0.0}
+                protected_sum = sum(eng_weights[t] for t in protected)
+                scalable = [t for t in eng_weights if t not in protected]
+                scalable_sum = sum(eng_weights[t] for t in scalable)
+                target_scalable = max(0.0, deploy_target - protected_sum)
+                if scalable_sum > target_scalable + 1e-9 and scalable_sum > 0:
+                    scale = target_scalable / scalable_sum
+                    for t in scalable:
+                        eng_weights[t] = round(eng_weights[t] * scale, 4)
             eng_sum = sum(eng_weights.values())
             if eng_sum > eng_ceiling + 1e-9 and eng_sum > 0:
                 scale = eng_ceiling / eng_sum

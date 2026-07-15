@@ -38,6 +38,9 @@ _DEFAULTS = {
     "uncertainty_damp": 0.5,       # how much self-reported uncertainty shrinks conviction
     "regime_min_factor": 0.5,      # most a STAND_DOWN regime can cut deployment
     "min_weight_floor_pct": 0.5,   # a smoothed weight below this rounds to 0 (avoid dust)
+    # F3 (conviction-driven deployment): a broadly-BEARISH book deploys less -> raises cash.
+    "conviction_full_deploy_at": 0.45,   # mean fresh conviction (0..1) that earns FULL deployment
+    "conviction_deploy_min_factor": 0.70, # most a weak-conviction book can cut deployment (raise cash)
     "default_conviction": {        # used only when the model omits a numeric conviction
         "Buy": 70.0, "Overweight": 55.0, "Underweight": 35.0,
     },
@@ -101,6 +104,32 @@ def _deployed_budget(policy: Optional[dict], regime_scalar: float) -> float:
     rs = float(regime_scalar) if regime_scalar is not None else 1.0
     factor = min(1.0, max(float(_policy(policy, "regime_min_factor")), rs))
     return base * factor
+
+
+def conviction_deploy_factor(raw_convs, policy: Optional[dict] = None) -> float:
+    """F3 — the BOOK-CONVICTION deployment scalar in ``[conviction_deploy_min_factor, 1.0]``.
+
+    A sibling to the macro ``regime_scalar``: it scales TOTAL engine deployment by how bullish
+    vs bearish the book's FRESH convictions are, so a broadly-BEARISH book deploys less (raises
+    cash) instead of always water-filling to the full budget. The CALLER (tick.py) applies it as
+    a book-level cash carve-out AFTER the per-name hysteresis — scaling allocate's internal
+    budget instead is absorbed by EWMA + the 2pt dead-band (a no-op on a diversified book).
+
+    ``raw_convs``: the RAW ``effective_conviction`` values (0..1, PRE curve_k, PRE calibration)
+    for the names with a FRESH opinion — so curve_k (a within-budget concentration knob) and the
+    per-name calibration (relative-share only) stay DEPLOYMENT-neutral. Empty (no fresh
+    conviction) -> 1.0 (the all-Hold tick skips allocation upstream anyway). Bounded below by the
+    floor so it de-risks WITHOUT dumping; ``min_factor == 1.0`` disables F3 (full deploy always).
+    Pure, total, monotone in the mean conviction."""
+    convs = [float(c) for c in (raw_convs or []) if c is not None]
+    if not convs:
+        return 1.0
+    mean_c = sum(convs) / len(convs)                                   # 0..1, rating semantics
+    ref = float(_policy(policy, "conviction_full_deploy_at"))
+    floor = float(_policy(policy, "conviction_deploy_min_factor"))
+    if ref <= 0:
+        return 1.0
+    return max(floor, min(1.0, mean_c / ref))
 
 
 def _ewma(fresh: float, prior: float, alpha: float) -> float:
