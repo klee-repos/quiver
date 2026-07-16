@@ -28,6 +28,7 @@ SUITES=(
   "e2e-safety|tests/test_e2e_safety.py"
   "e2e-sellmin|tests/test_e2e_sellmin.py"
   "e2e-catalyst|tests/test_e2e_catalyst.py"
+  "e2e-wall-replay|tests/test_e2e_wall_replay.py"
   # llm-judge runs offline here (its LLM `judge()` stages SELF-SKIP without QUIVER_LIVE_E2E;
   # only the offline pipeline + deterministic det() checks run). Under --live it is run WITH
   # QUIVER_LIVE_E2E=1 (see the loop below) so the real `claude` judging kicks in.

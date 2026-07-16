@@ -13,13 +13,47 @@ from __future__ import annotations
 
 import json
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 
+# --- injectable clock (TEST / BACKTEST ONLY) --------------------------------
+# Live trading NEVER touches this. With the override unset (the only state a live
+# tick is ever in), now_et() is byte-identical to datetime.now(ET) — the sole added
+# cost is one `is not None` check. A historical replay pins the clock so that the
+# ledger day-key (market.trading_day_et(), read from the OS clock in tick.py, NOT
+# from now_iso) and every XNYS session check resolve to the SIMULATED instant.
+_now_override: "datetime | None" = None
+
+
+def set_clock(dt: "datetime | None") -> None:
+    """TEST/BACKTEST ONLY. Pin now_et() to a fixed ET instant (None restores the real
+    wall clock). Prefer the frozen_clock() context manager so the pin is always
+    restored. Naive datetimes are treated as ET; aware ones are converted to ET."""
+    global _now_override
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ET)
+    _now_override = dt.astimezone(ET) if dt is not None else None
+
+
+@contextmanager
+def frozen_clock(dt: "datetime | None"):
+    """TEST/BACKTEST ONLY. Pin the clock to `dt` for the duration of the block and
+    ALWAYS restore the prior value on exit (even on exception) so a replay can never
+    leak a pinned clock into later code."""
+    prev = _now_override
+    set_clock(dt)
+    try:
+        yield
+    finally:
+        set_clock(prev)
+
 
 def now_et() -> datetime:
+    if _now_override is not None:
+        return _now_override
     return datetime.now(ET)
 
 
