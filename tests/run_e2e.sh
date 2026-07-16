@@ -28,6 +28,9 @@ SUITES=(
   "e2e-safety|tests/test_e2e_safety.py"
   "e2e-sellmin|tests/test_e2e_sellmin.py"
   "e2e-catalyst|tests/test_e2e_catalyst.py"
+  # llm-judge runs offline here (its LLM `judge()` stages SELF-SKIP without QUIVER_LIVE_E2E;
+  # only the offline pipeline + deterministic det() checks run). Under --live it is run WITH
+  # QUIVER_LIVE_E2E=1 (see the loop below) so the real `claude` judging kicks in.
   "llm-judge|tests/test_llm_judge.py"
 )
 [ "$LIVE" = "1" ] && SUITES+=("e2e-live(GLM)|tests/test_e2e_live.py")
@@ -46,7 +49,9 @@ for entry in "${SUITES[@]}"; do
     for t in quiver_eve/test/retry.test.mjs quiver_eve/test/contract.test.mjs; do
       node "$t" >>"$log" 2>&1 || rc=1
     done
-  elif [ "$name" = "e2e-live(GLM)" ]; then
+  elif [ "$name" = "e2e-live(GLM)" ] || { [ "$name" = "llm-judge" ] && [ "$LIVE" = "1" ]; }; then
+    # Live path: run these WITH QUIVER_LIVE_E2E=1 so their real-LLM stages actually execute.
+    # (Without --live, llm-judge falls through to the plain `else` and its LLM stages self-skip.)
     QUIVER_LIVE_E2E=1 "$PY" "$file" >"$log" 2>&1
     rc=$?
   else

@@ -6,12 +6,20 @@ an independent LLM (the headless `claude` CLI) to judge that output against a st
 rubric. This catches semantic regressions a unit assert can miss ("does the plan
 output actually look safe?") with a second, reasoning set of eyes.
 
-Slow + non-deterministic (one LLM round-trip per stage), so it is SEPARATE from the
-fast offline suite. Requires the `claude` CLI on PATH. Run on demand:
-  .venv/bin/python tests/test_llm_judge.py
+Slow + non-deterministic (one LLM round-trip per stage), so the LLM `judge()` stages
+are GATED behind QUIVER_LIVE_E2E=1 / --live, exactly like tests/test_e2e_live.py.
+Without that flag they SELF-SKIP (no `claude` subprocess, no network) so this file is
+deterministic inside the fast offline suite (tests/run_e2e.sh): the offline pipeline
+stages still execute (they'd fail loudly if the Python brain broke) and the
+deterministic `det()` legislative human-gate checks still run — only the LLM opinions
+are skipped. Requires the `claude` CLI on PATH for the live judging. Run:
+  .venv/bin/python tests/test_llm_judge.py               # offline (LLM stages skipped)
+  QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_llm_judge.py   # full LLM judging
+  .venv/bin/python tests/test_llm_judge.py --live             # same, via a CLI flag
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,8 +37,13 @@ from lib.config import load_config  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 
 _REPO = Path(__file__).resolve().parent.parent
+# The LLM `judge()` stages make a real `claude` CLI round-trip → slow + non-deterministic,
+# so they only run in LIVE mode. Off by default so the fast offline suite stays reproducible
+# and network-free (the offline pipeline stages + deterministic det() checks still run).
+LIVE = os.environ.get("QUIVER_LIVE_E2E") == "1" or "--live" in sys.argv
 PASS = 0
 FAIL = 0
+SKIP = 0
 
 
 def _cfg():
@@ -53,8 +66,16 @@ def _tmp_led():
 
 
 def judge(name: str, rubric: str, data, *, timeout: int = 150) -> bool:
-    """Ask the headless `claude` CLI to PASS/FAIL the stage output against the rubric."""
-    global PASS, FAIL
+    """Ask the headless `claude` CLI to PASS/FAIL the stage output against the rubric.
+
+    In non-LIVE mode this SELF-SKIPS (no `claude` subprocess, no network) so the fast
+    offline suite is deterministic — the stage's Python already ran before this call, so
+    a broken pipeline still fails; only the LLM opinion is skipped."""
+    global PASS, FAIL, SKIP
+    if not LIVE:
+        SKIP += 1
+        print(f"  ⏭  [{name}] skipped (LLM judge; set QUIVER_LIVE_E2E=1 or --live)")
+        return True
     prompt = (
         "You are a STRICT QA auditor validating one stage of an autonomous, real-money "
         "trading bot. Evaluate whether the STAGE OUTPUT satisfies EVERY item in the RUBRIC. "
@@ -102,6 +123,9 @@ def det(name: str, cond: bool) -> bool:
 def main() -> int:
     print("=" * 70)
     print("LLM-JUDGE PIPELINE VALIDATION (every critical stage but trade execution)")
+    if not LIVE:
+        print("LIVE off — LLM judge stages SKIP; offline pipeline + det() checks still run.")
+        print("           (set QUIVER_LIVE_E2E=1 or pass --live for the real LLM judging)")
     print("=" * 70)
     cfg = _cfg()
     led = _tmp_led()
@@ -256,7 +280,8 @@ def main() -> int:
         _appr.get("applied") is True)
 
     print("\n" + "=" * 70)
-    print(f"LLM-JUDGE: {PASS} passed, {FAIL} failed")
+    print(f"LLM-JUDGE: {PASS} passed, {FAIL} failed, {SKIP} skipped"
+          + ("" if LIVE else " (LLM stages gated — run with --live)"))
     print("=" * 70)
     return 1 if FAIL else 0
 
