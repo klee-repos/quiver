@@ -174,9 +174,16 @@ def fetch_bill_detail(congress, bill_type, number, api_key, *, timeout: int = 30
     actions = bill.get("actions") or {}
     la = bill.get("latestAction") or {}
     tv = bill.get("textVersions") or {}
+    # sponsor bioguide (the KEY-PLAYER attribution key) — additive; sponsors_n stays for
+    # existing consumers. A bill has one sponsor; take the first sponsor's bioguideId.
+    sponsor_bio = ""
+    if isinstance(sponsors, list) and sponsors and isinstance(sponsors[0], dict):
+        sponsor_bio = str(sponsors[0].get("bioguideId", "") or "")
     detail = {
         "policy_codes": sorted(set(policy_codes)),
         "sponsors_n": len(sponsors) if isinstance(sponsors, list) else 0,
+        "sponsor_bioguide": sponsor_bio,
+        "introduced_date": str(bill.get("introducedDate", "") or ""),
         "cosponsors_n": int(cosponsors.get("count", 0) or 0) if isinstance(cosponsors, dict) else 0,
         "actions_n": int(actions.get("count", 0) or 0) if isinstance(actions, dict) else 0,
         "latest_action": str(la.get("text", "") or ""),

@@ -2682,28 +2682,77 @@ def cmd_intel_refresh(args) -> dict:
     if ic is None or not ic.enabled:
         return {"skipped": "intel disabled (config: intel.enabled)"}
     from lib.intel import refresh as _iref
-    from lib.dataflows import congress as _cong, fedreg as _fr
+    from lib.dataflows import congress as _cong
     data = _load_input(args)
     now_iso = market.now_et().isoformat()
     sc = cfg.strategy
     allow = sorted({t.upper() for t in (sc.rh_tradable_confirmed or [])}) if sc else []
     book_desc = "AI-infrastructure / semiconductors / nuclear power / data centers / grid / space"
-    # documents to process come from the input (already-listed) or the injected fakes in tests;
-    # a live run lists them via the congress/fedreg pollers, which the operator wires per cadence.
+    # Documents: from --input if provided (backfill/replay), else POLL recent bills live.
     docs = data.get("documents", [])
-
-    def _fetch_text(doc):
-        # bills: govinfo USLM; rules: Federal Register body — both stdlib fetchers, injectable.
-        url = doc.get("text_url") or doc.get("body_url") or ""
-        if not url:
-            from lib.dataflows.errors import DataUnavailableError
-            raise DataUnavailableError(f"no text url for {doc.get('doc_id')}")
-        return _cong._default_opener(url, 30)
+    polled = 0
+    if not docs:
+        docs, polled = _intel_poll_bill_docs(cfg, max_docs=int(data.get("max_docs", 25)))
 
     with led.intel_conn() as c:
         out = _iref.run_refresh(c, documents=docs, allow=allow, book_desc=book_desc,
-                                fetch_text=_fetch_text, now=now_iso)
-    return {"refreshed": True, **out}
+                                fetch_text=lambda d: _cong._default_opener(
+                                    d.get("text_url") or d.get("body_url") or "", 30),
+                                now=now_iso)
+    return {"refreshed": True, "polled_bills": polled, **out}
+
+
+def _intel_poll_bill_docs(cfg, *, max_docs=25):
+    """Discover recent bills to analyse: poll Congress.gov for changed bills, pull each sponsor
+    bioguide + introduced date, and construct the govinfo bulk USLM URL (the section-XML the
+    splitter reads). Best-effort + bounded — a bill that won't resolve is skipped. Returns
+    (documents, n_polled). Bills only; the Federal Register arm (lib/dataflows/fedreg) is built
+    and tested but its rule-body section splitter is a separate follow-up, so it is not in this
+    auto-loop yet."""
+    from lib.dataflows import congress as _cong
+    leg = cfg.legislative
+    api_key = getattr(leg, "api_key", "") or ""
+    if not api_key:
+        return [], 0
+    from datetime import timedelta
+    until = market.now_et()
+    since = (until - timedelta(days=int(getattr(leg, "lookback_days", 3) or 3)))
+    try:
+        bills = _cong.poll_changed_bills(since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                         until.strftime("%Y-%m-%dT%H:%M:%SZ"), api_key,
+                                         max_pages=2)
+    except Exception:  # noqa: BLE001 — best-effort; a poll outage yields no docs, never raises
+        return [], 0
+    # Only law-making instruments (bills + joint resolutions) — simple/concurrent resolutions
+    # can't become law and rarely touch a company, so they'd waste chain calls.
+    LAWMAKING = {"hr", "s", "hjres", "sjres"}
+    docs = []
+    for b in bills:
+        if len(docs) >= max_docs:
+            break
+        btype = b["bill_type"]
+        if btype not in LAWMAKING:
+            continue
+        try:
+            det = _cong.fetch_bill_detail(b["congress"], btype, b["number"], api_key)
+        except Exception:  # noqa: BLE001
+            continue
+        sponsor = det.get("sponsor_bioguide", "")
+        introduced = det.get("introduced_date", "")
+        if not sponsor or not introduced:
+            continue
+        # session 1 = odd (congress-start) year, 2 = even; the INTRODUCED version exists for
+        # essentially every freshly-introduced instrument — House-origin -> 'ih', Senate -> 'is'
+        # (the validated govinfo bulk USLM path with real <section> elements).
+        year = int(introduced[:4]) if introduced[:4].isdigit() else until.year
+        session = 1 if year % 2 == 1 else 2
+        ver = "ih" if btype.startswith("h") else "is"
+        url = (f"https://www.govinfo.gov/bulkdata/BILLS/{b['congress']}/{session}/{btype}/"
+               f"BILLS-{b['congress']}{btype}{b['number']}{ver}.xml")
+        docs.append({"doc_id": b["bill_id"], "kind": "bill", "title": b.get("title", ""),
+                     "published": introduced, "sponsor": sponsor, "congress": b["congress"],
+                     "text_url": url})
+    return docs, len(bills)
 
 
 def cmd_intel_profile(args) -> dict:

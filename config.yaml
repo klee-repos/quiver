@@ -191,7 +191,7 @@ legislative:
 # proposes ADDITIVE strategy.yaml changes (tier 'intel' = ALWAYS human --approve). It never trades
 # and never overwrites the seeded book: it can only ADD, funded from cash, capped by intel_max_total_pct.
 intel:
-  enabled: false                         # fail-safe OFF. Flip true only after a live shadow validation.
+  enabled: true                          # LIVE (propose-only, human --approve; scheduled run is shadow-only)
   min_score: 0.5                         # posture-score floor to act on a key-player tailwind
   add_weight: 4.0                        # default target weight for an intel-proposed ADD (%)
   intel_max_total_pct: 20.0              # aggregate cap on ADDs: seeded book can't be diluted below (100-this)%

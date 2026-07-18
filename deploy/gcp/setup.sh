@@ -154,8 +154,11 @@ seed_yaml STRATEGY_YAML "$QUIVER_HOME/strategy.yaml" "$QUIVER_HOME/strategy.yaml
 echo "[7/9] systemd units + timer"
 cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service
 cp "$QUIVER_HOME/deploy/quiver.timer" /etc/systemd/system/quiver.timer
+cp "$QUIVER_HOME/deploy/quiver-intel.service" /etc/systemd/system/quiver-intel.service
+cp "$QUIVER_HOME/deploy/quiver-intel.timer" /etc/systemd/system/quiver-intel.timer
 systemctl daemon-reload
 systemctl enable --now quiver.timer
+systemctl enable --now quiver-intel.timer
 
 echo "[8/9] Google Cloud Ops Agent — ship /var/log/quiver/tick.log to the 'quiver_tick' log"
 if [ ! -d /etc/google-cloud-ops-agent ]; then

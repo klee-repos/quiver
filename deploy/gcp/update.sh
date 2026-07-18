@@ -95,11 +95,15 @@ else
 fi
 
 echo "[5/6] systemd units"
-if grep -qE '^deploy/quiver\.(service|timer)$' <<<"$CHANGED"; then
+if grep -qE '^deploy/quiver(-intel)?\.(service|timer)$' <<<"$CHANGED"; then
   echo "  unit files changed -> reinstalling + daemon-reload"
-  cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service
-  cp "$QUIVER_HOME/deploy/quiver.timer"   /etc/systemd/system/quiver.timer
+  cp "$QUIVER_HOME/deploy/quiver.service"        /etc/systemd/system/quiver.service
+  cp "$QUIVER_HOME/deploy/quiver.timer"          /etc/systemd/system/quiver.timer
+  cp "$QUIVER_HOME/deploy/quiver-intel.service"  /etc/systemd/system/quiver-intel.service
+  cp "$QUIVER_HOME/deploy/quiver-intel.timer"    /etc/systemd/system/quiver-intel.timer
   systemctl daemon-reload
+  # the intel timer is separate from the trading timer; enable it so the daily refresh runs.
+  systemctl enable --now quiver-intel.timer 2>/dev/null || true
 else
   echo "  no unit changes — skipping"
 fi
