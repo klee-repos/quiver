@@ -44,11 +44,36 @@ _VOCAB = [
 _VOCAB_RE = re.compile("|".join(_VOCAB), re.I)
 
 
+# REGULATION uses a signal bills lack: the CFR is organized BY AGENCY, so a rule from one of
+# these regulators is presumptively relevant to a book sleeve regardless of the exact words in
+# its operative text (a spent-fuel-cask rule says "cask", not "nuclear reactor", yet is nuclear-
+# industry regulation). Substring-matched against the FR agency name -> the operative sections are
+# kept and the chain supplies precision. The authoritative agency->industry crosswalk.
+_BOOK_REGULATORS = (
+    "nuclear regulatory",            # NRC -> nuclear (CEG, URA, SMR, NLR)
+    "federal energy regulatory",     # FERC -> power / grid (CEG, GEV, VST)
+    "energy department",             # DOE -> power / nuclear / grid
+    "federal communications",        # FCC -> networking / spectrum (ANET)
+    "industry and security",         # BIS (Commerce) -> semiconductor export controls (SMH, SOXX)
+    "federal aviation",              # FAA -> space / launch (SPCX)
+    "securities and exchange",       # SEC -> digital assets (BSOL, IBIT)
+    "commodity futures",             # CFTC -> crypto derivatives
+    "environmental protection",      # EPA -> power / energy (indirect)
+)
+
+
 def matches(text: str) -> bool:
     """True if the text (a section's header + operative body) mentions the book's vocabulary.
     Case-insensitive. The section text as extracted already includes the header echo, so a
     header-only signal (e.g. §20308's "uranium") is seen."""
     return bool(_VOCAB_RE.search(text or ""))
+
+
+def agency_is_relevant(agency: str) -> bool:
+    """True if the issuing agency regulates a book sleeve (the CFR-by-agency crosswalk). Used to
+    keep a rule's operative sections even when its text uses domain jargon the vocab misses."""
+    a = (agency or "").lower()
+    return any(reg in a for reg in _BOOK_REGULATORS)
 
 
 def matched_terms(text: str) -> List[str]:

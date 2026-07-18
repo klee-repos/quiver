@@ -22,6 +22,7 @@ from lib.dataflows.errors import DataUnavailableError
 # are NOT the keyword gate (that's lib/intel/prefilter). Kept conservative — a miss drops a fact,
 # never a section.
 _USC_RE = re.compile(r"\d+\s+U\.S\.C\.\s+\d+[A-Za-z0-9-]*")
+_CFR_RE = re.compile(r"\d+\s+CFR\s+(?:Part\s+)?\d+[A-Za-z0-9.\-]*")
 _DEADLINE_RE = re.compile(r"[Nn]ot later than [^,.;]{3,60}")
 _DOLLAR_RE = re.compile(r"\$[\d,]+(?:\.\d+)?(?:\s*(?:million|billion|trillion))?")
 # An amended Act: a Capitalized phrase ending in "Act" optionally with a year. Real Act short
@@ -41,6 +42,7 @@ class Section:
     header: str
     text: str
     usc_cites: List[str] = field(default_factory=list)
+    cfr_cites: List[str] = field(default_factory=list)
     acts_amended: List[str] = field(default_factory=list)
     deadline: str = ""
     dollar_amounts: List[str] = field(default_factory=list)
@@ -93,6 +95,67 @@ def parse_sections(xml_bytes: bytes, *, min_chars: int = 1) -> List[Section]:
             header=header,
             text=text,
             usc_cites=_USC_RE.findall(text)[:12],
+            acts_amended=_acts(text)[:6],
+            deadline=deadline_m.group(0) if deadline_m else "",
+            dollar_amounts=_DOLLAR_RE.findall(text)[:8],
+        ))
+    return out
+
+
+def parse_fr_sections(xml_bytes: bytes, *, min_chars: int = 1) -> List[Section]:
+    """Split a Federal Register rule's full-text XML into Sections — the REGULATION analog of
+    parse_sections. FR rules aren't USLM: the operative regulatory changes live in ``<SECTION>``
+    elements (each with a ``<SECTNO>`` § number + a ``<SUBJECT>`` title) inside ``<REGTEXT>``, and
+    the agency's own ``SUMMARY`` heading block concisely states what the rule does. We emit one
+    Section per ``<SECTION>`` (the CFR amendment) plus a synthetic ``SUMMARY`` Section, so the
+    same prefilter + chain run over rules unchanged. Fail-SAFE: unparseable input raises."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError as e:
+        raise DataUnavailableError(f"FR rule XML unparseable: {e}") from e
+
+    out: List[Section] = []
+
+    # 1) The SUMMARY block: the <HD>SUMMARY:</HD> heading followed by its <P> siblings (FR XML is
+    #    flat, so collect paragraphs until the next <HD>). High-signal: the agency's own statement.
+    parent_map = {c: p for p in root.iter() for c in p}
+    for hd in root.iter("HD"):
+        if "summary" not in "".join(hd.itertext()).strip().lower()[:12]:
+            continue
+        parent = parent_map.get(hd)
+        if parent is None:
+            continue
+        kids = list(parent)
+        collecting = False
+        buf = []
+        for el in kids:
+            if el is hd:
+                collecting = True
+                continue
+            if collecting:
+                if el.tag == "HD":
+                    break
+                buf.append(_clean(el))
+        summary = " ".join(t for t in buf if t)
+        if len(summary) >= min_chars:
+            out.append(Section(enum="SUMMARY", header="Summary",
+                               text=summary, cfr_cites=_CFR_RE.findall(summary)[:12]))
+        break
+
+    # 2) Each operative <SECTION> (the amended CFR section): SECTNO -> enum, SUBJECT -> header.
+    for node in root.iter("SECTION"):
+        sectno = " ".join((node.findtext("SECTNO", "") or "").split())
+        subject = " ".join((node.findtext("SUBJECT", "") or "").split()).rstrip(".")
+        text = _clean(node)
+        if not sectno or len(text) < min_chars:
+            continue
+        deadline_m = _DEADLINE_RE.search(text)
+        out.append(Section(
+            enum=sectno.replace("§", "").strip() or sectno,
+            header=subject or sectno,
+            text=text,
+            usc_cites=_USC_RE.findall(text)[:12],
+            cfr_cites=_CFR_RE.findall(text)[:12],
             acts_amended=_acts(text)[:6],
             deadline=deadline_m.group(0) if deadline_m else "",
             dollar_amounts=_DOLLAR_RE.findall(text)[:8],

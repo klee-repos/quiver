@@ -32,21 +32,33 @@ def run_refresh(conn, *, documents: List[dict], allow: List[str], book_desc: str
     Returns counts: {documents, sections_seen, kept, impacts, errors}."""
     n_docs = n_seen = n_kept = n_imp = n_err = 0
     for doc in documents:
+        kind = doc.get("kind", "bill")
+        agency = doc.get("agency", "")
         try:
             raw = fetch_text(doc)
-            secs = _sections.parse_sections(raw, min_chars=min_section_chars)
+            # dispatch the splitter by document kind: bills are USLM <section>, Federal Register
+            # rules are the FR schema (<SECTION>/<SECTNO>/<SUBJECT> + the SUMMARY block).
+            if kind == "rule":
+                secs = _sections.parse_fr_sections(raw, min_chars=min_section_chars)
+            else:
+                secs = _sections.parse_sections(raw, min_chars=min_section_chars)
         except Exception:  # noqa: BLE001 — one bad doc never stops the pass
             n_err += 1
             continue
         _store.upsert_document(
-            conn, doc_id=doc["doc_id"], kind=doc.get("kind", "bill"), title=doc.get("title", ""),
+            conn, doc_id=doc["doc_id"], kind=kind, title=doc.get("title", ""),
             published=doc["published"], sponsor=doc.get("sponsor"), congress=doc.get("congress"),
-            agency=doc.get("agency"), url=doc.get("url", ""), fetched_at=now)
+            agency=agency, url=doc.get("url", ""), fetched_at=now)
         n_docs += 1
-        # substantive sections only, then the cost-gate prefilter
+        # substantive sections only, then the cost-gate prefilter. For a rule from a book-relevant
+        # regulator, keep its operative sections regardless of vocab (CFR-by-agency crosswalk);
+        # otherwise the keyword gate decides.
         subst = [s for s in secs[:max_sections_per_doc] if not s.is_boilerplate]
         n_seen += len(subst)
-        kept, _dropped = _prefilter.keep(subst)
+        if kind == "rule" and _prefilter.agency_is_relevant(agency):
+            kept = subst
+        else:
+            kept, _dropped = _prefilter.keep(subst)
         for s in kept:
             _store.upsert_section(conn, doc_id=doc["doc_id"], sec=s.enum, header=s.header,
                                   usc_cites=s.usc_cites, deadline=s.deadline, kept=True)

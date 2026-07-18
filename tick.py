@@ -2688,18 +2688,25 @@ def cmd_intel_refresh(args) -> dict:
     sc = cfg.strategy
     allow = sorted({t.upper() for t in (sc.rh_tradable_confirmed or [])}) if sc else []
     book_desc = "AI-infrastructure / semiconductors / nuclear power / data centers / grid / space"
-    # Documents: from --input if provided (backfill/replay), else POLL recent bills live.
+    # Documents: from --input if provided (backfill/replay), else POLL live — bills (Congress) AND
+    # rules (Federal Register). Both flow through the same split -> prefilter -> chain -> ingest.
     docs = data.get("documents", [])
-    polled = 0
+    polled_bills = polled_rules = 0
     if not docs:
-        docs, polled = _intel_poll_bill_docs(cfg, max_docs=int(data.get("max_docs", 25)))
+        maxd = int(data.get("max_docs", 25))
+        bdocs, polled_bills = _intel_poll_bill_docs(cfg, max_docs=maxd)
+        rdocs, polled_rules = _intel_poll_rule_docs(cfg, max_docs=maxd)
+        # ensure the agencies behind any polled rules exist as key players (so their profiles render)
+        if rdocs:
+            _intel_seed_agency_power(led, now_iso)
+        docs = bdocs + rdocs
 
     with led.intel_conn() as c:
         out = _iref.run_refresh(c, documents=docs, allow=allow, book_desc=book_desc,
                                 fetch_text=lambda d: _cong._default_opener(
                                     d.get("text_url") or d.get("body_url") or "", 30),
                                 now=now_iso)
-    return {"refreshed": True, "polled_bills": polled, **out}
+    return {"refreshed": True, "polled_bills": polled_bills, "polled_rules": polled_rules, **out}
 
 
 def _intel_poll_bill_docs(cfg, *, max_docs=25):
@@ -2753,6 +2760,77 @@ def _intel_poll_bill_docs(cfg, *, max_docs=25):
                      "published": introduced, "sponsor": sponsor, "congress": b["congress"],
                      "text_url": url})
     return docs, len(bills)
+
+
+# Agency -> short code + display name. The regulatory key players (the CFR-by-agency crosswalk):
+# a rule attributes to its issuing agency, whose "profile" is what industries its rules point at.
+_INTEL_AGENCIES = [
+    ("nuclear regulatory", "NRC", "Nuclear Regulatory Commission"),
+    ("federal energy regulatory", "FERC", "Federal Energy Regulatory Commission"),
+    ("energy department", "DOE", "Department of Energy"),
+    ("federal communications", "FCC", "Federal Communications Commission"),
+    ("industry and security", "BIS", "Bureau of Industry and Security"),
+    ("federal aviation", "FAA", "Federal Aviation Administration"),
+    ("securities and exchange", "SEC", "Securities and Exchange Commission"),
+    ("commodity futures", "CFTC", "Commodity Futures Trading Commission"),
+    ("environmental protection", "EPA", "Environmental Protection Agency"),
+]
+_INTEL_AGENCY_CONGRESS = 0  # sentinel "regulatory era" — rules aren't congress-scoped
+
+
+def _intel_agency_code(agency_name: str):
+    """Map an FR agency name to (code, display) if it's a book-relevant regulator, else None."""
+    a = (agency_name or "").lower()
+    for needle, code, disp in _INTEL_AGENCIES:
+        if needle in a:
+            return code, disp
+    return None
+
+
+def _intel_seed_agency_power(led, now_iso):
+    """Seed the book-relevant regulators as key players (congress=0), so a rule attributes to its
+    agency and an agency profile renders — mirroring the congressional power table."""
+    from lib.intel import store as _istore
+    with led.intel_conn() as c:
+        for _needle, code, disp in _INTEL_AGENCIES:
+            _istore.upsert_power(c, bioguide=code, congress=_INTEL_AGENCY_CONGRESS,
+                                 role="agency", committee=code, chamber="executive",
+                                 name=disp, source="intel-agency-map")
+
+
+def _intel_poll_rule_docs(cfg, *, max_docs=25):
+    """Discover recent Federal Register RULES from book-relevant agencies. Each rule attributes to
+    its agency code (the key player); the full-text XML is the FR-schema section source. Best-effort
+    + bounded. Returns (documents, n_polled)."""
+    from lib.dataflows import fedreg as _fr
+    from datetime import timedelta
+    until = market.now_et()
+    lookback = int(getattr(cfg.legislative, "lookback_days", 3) or 3)
+    since = (until - timedelta(days=lookback))
+    try:
+        rules = _fr.poll_rules(since.strftime("%Y-%m-%d"), until.strftime("%Y-%m-%d"),
+                               doc_type="RULE", per_page=100, max_pages=2)
+    except Exception:  # noqa: BLE001 — best-effort; an FR outage yields no docs, never raises
+        return [], 0
+    docs = []
+    for r in rules:
+        if len(docs) >= max_docs:
+            break
+        code_disp = _intel_agency_code(r.get("agency", ""))
+        if not code_disp:  # only agencies that regulate a book sleeve
+            continue
+        code, _disp = code_disp
+        dn = str(r["doc_id"]).replace("FR-", "")
+        pub = r.get("published", "")
+        # FR full-text XML: /documents/full_text/xml/YYYY/MM/DD/<docnum>.xml
+        text_url = (f"https://www.federalregister.gov/documents/full_text/xml/"
+                    f"{pub[:4]}/{pub[5:7]}/{pub[8:10]}/{dn}.xml") if len(pub) >= 10 else ""
+        if not text_url:
+            continue
+        docs.append({"doc_id": r["doc_id"], "kind": "rule", "title": r.get("title", ""),
+                     "published": pub, "sponsor": code, "congress": _INTEL_AGENCY_CONGRESS,
+                     "agency": r.get("agency", ""), "text_url": text_url})
+    return docs, len(rules)
 
 
 def cmd_intel_profile(args) -> dict:

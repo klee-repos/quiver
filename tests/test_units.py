@@ -3641,6 +3641,29 @@ check("intel: keep() reports the dropped count (over-filter visibility)", _dropp
 check("intel: 'natural gas' alone does not trip the gate (specificity)", _ipf.matches("natural gas pipeline permitting"), False)
 check("intel: 'covered sector' (FAST-41, §20304) trips the gate", _ipf.matches("designated as a covered sector"), True)
 
+# REGULATION arm: FR-rule splitter + the CFR-by-agency relevance crosswalk.
+_FR_XML = b"""<?xml version="1.0"?><RULE>
+  <PREAMB><AGENCY>Nuclear Regulatory Commission</AGENCY>
+    <HD SOURCE="HED">SUMMARY:</HD>
+    <P>The NRC is amending its regulations to approve a new spent fuel storage cask design for
+    commercial nuclear power reactors under 10 CFR Part 72.</P>
+    <HD SOURCE="HED">DATES:</HD><P>Effective August 1.</P></PREAMB>
+  <REGTEXT><SECTION><SECTNO>&#167; 72.214</SECTNO><SUBJECT>List of approved spent fuel storage casks.</SUBJECT>
+    <P>Certificate Number: 1032. The cask model is added to the list of approved storage casks for
+    spent nuclear fuel, effective under 10 CFR 72.214.</P></SECTION></REGTEXT></RULE>"""
+_frsecs = _isec.parse_fr_sections(_FR_XML, min_chars=20)
+_frby = {s.enum: s for s in _frsecs}
+check_true("intel: FR splitter emits a SUMMARY section", "SUMMARY" in _frby)
+check_true("intel: FR splitter emits the operative CFR section (SECTNO)", "72.214" in _frby)
+check_true("intel: FR SUMMARY carries the agency's statement of the rule",
+           "spent fuel storage cask" in _frby["SUMMARY"].text.lower())
+check("intel: FR section CFR cite extracted", any("72" in c for c in _frby["72.214"].cfr_cites), True)
+check_raises("intel: FR unparseable fails SAFE", lambda: _isec.parse_fr_sections(b"<not"), _isec.DataUnavailableError)
+# agency relevance (CFR-by-agency crosswalk): a book regulator is kept regardless of vocab
+check("intel: NRC is a book-relevant regulator", _ipf.agency_is_relevant("Nuclear Regulatory Commission"), True)
+check("intel: FERC is a book-relevant regulator", _ipf.agency_is_relevant("Federal Energy Regulatory Commission"), True)
+check("intel: an off-book agency is not relevant", _ipf.agency_is_relevant("United States Postal Service"), False)
+
 # --- aggregate: section impacts -> per-key-player posture (deterministic weighting) ---
 from lib.intel import aggregate as _iagg  # noqa: E402
 check("intel: impact_weight helps/high/UPHELD = +1.0", _iagg.impact_weight("helps", "high", "UPHELD"), 1.0)
@@ -3847,6 +3870,25 @@ with _refdb.intel_conn() as _rc:
     _referr = _iref.run_refresh(_rc, documents=[{"doc_id": "d2", "published": "2023-01-01"}],
                                 allow=["SMR"], book_desc="x", fetch_text=_boom, now="t")
 check("refresh: a failed fetch is best-effort (counted, pass continues)", _referr["errors"], 1)
+# REGULATION through refresh: a rule from a book regulator dispatches to the FR splitter and its
+# operative sections are kept via the agency crosswalk (even though "nuclear reactor" isn't in the
+# operative cask text) -> the chain fires and records the impact.
+_frdb = Ledger(tempfile.mktemp(suffix=".db"))
+def _fr_llm(prompt, timeout):
+    if "72.214" in prompt or "spent fuel" in prompt.lower():
+        return ('{"sec":"72.214","step1_span":"added to the list of approved storage casks for",'
+                '"step1_what_changes":"approves a cask design","step2_mechanism":"cask certified",'
+                '"book_hits":[{"ticker":"CEG","direction":"helps","confidence":"low","reasoning":"nuclear utility"}],'
+                '"no_impact":false}')
+    return '{"sec":"x","step1_span":"","book_hits":[],"no_impact":true}'
+with _frdb.intel_conn() as _rc:
+    _frout = _iref.run_refresh(_rc,
+        documents=[{"doc_id": "FR-9", "kind": "rule", "title": "Cask rule", "published": "2026-07-01",
+                    "sponsor": "NRC", "congress": 0, "agency": "Nuclear Regulatory Commission"}],
+        allow=["CEG", "URA"], book_desc="nuclear",
+        fetch_text=lambda d: _FR_XML, llm=_fr_llm, now="t", min_section_chars=20)
+check("refresh: rule from a book agency keeps sections via the CFR-agency crosswalk", _frout["kept"] >= 1, True)
+check("refresh: rule chain recorded the impact", _frout["impacts"], 1)
 
 
 print(f"\n{PASS} passed, {FAIL} failed")
