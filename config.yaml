@@ -183,3 +183,16 @@ legislative:
   # that make a bill RELEVANT to it — the ONLY structured (non-attacker-controlled) signal used
   # to bind a REMOVE to a bill. Required (non-empty) when remove_enabled: true.
   ticker_policy_areas: {}
+
+# Strategy-intelligence service (section-level power map -> ADDITIVE strategy proposals + per-key-
+# player markdown profiles). Runs on its OWN schedule (deploy/quiver-intel.timer), NOT in the tick.
+# Reads legislation (Congress.gov) + regulation (Federal Register), splits into sections, prefilters
+# to the book's vocabulary, chains each kept section -> book hits, aggregates per key player, and
+# proposes ADDITIVE strategy.yaml changes (tier 'intel' = ALWAYS human --approve). It never trades
+# and never overwrites the seeded book: it can only ADD, funded from cash, capped by intel_max_total_pct.
+intel:
+  enabled: false                         # fail-safe OFF. Flip true only after a live shadow validation.
+  min_score: 0.5                         # posture-score floor to act on a key-player tailwind
+  add_weight: 4.0                        # default target weight for an intel-proposed ADD (%)
+  intel_max_total_pct: 20.0              # aggregate cap: the seeded book can't be diluted below (100-this)%
+  new_sleeve_min_names: 2                # >= this many clustered tailwind names to propose a NEW sleeve

@@ -1,0 +1,15 @@
+[Unit]
+Description=Quiver intelligence refresh schedule (daily, NOT market-hours-gated)
+
+[Timer]
+# Congress + the Federal Register don't observe NYSE hours, and the intel service touches no
+# broker, so it runs on its OWN clock — daily at 06:00 UTC, well before the trading window
+# (Mon..Fri 13:40-21:40 UTC), so the two units never contend. Persistent=false: after downtime,
+# skip to the next daily fire rather than replaying a backlog of catch-up runs (a re-analysis
+# burst is worse than a skipped day; the ledger holds all prior evidence).
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=false
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

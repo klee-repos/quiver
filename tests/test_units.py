@@ -1112,14 +1112,54 @@ _sigsrc = Path(_sigmod.__file__).read_text(encoding="utf-8")
 check_true("signals.py never imports risk/reflect_memory (use-case-1/2 wall)",
            "import risk" not in _sigsrc and "reflect_memory" not in _sigsrc)
 
-# The pipeline-sizing + universe-discovery modules (Q1/Q3) stay on the right side of the
-# decision wall: the sizing engines + the screener never IMPORT the limit/broker-carrying
-# modules (lib.risk / lib.signals / lib.config). They take policy/values as args (pure) and
-# read only market data + the ledger's own decision memory. Checked via AST on the ACTUAL
-# import nodes (the modules describe the wall in their docstrings, so a text scan would
-# false-positive on "never import lib.risk").
+# --- THE DECISION WALL (enumerated over lib/, not hand-listed) ---------------
+# THE INVARIANT: every module under lib/ sits on the ANALYSIS side of the wall —
+# it must not IMPORT the limit/broker-carrying modules (Mechanism A: AST over the
+# real import nodes, because these modules describe the wall in their docstrings
+# and a text scan would false-positive on "never imports lib.risk"), and must not
+# REFERENCE a broker call or a trading limit (Mechanism B: word-boundary source
+# scan, so the ledger's active_target_portfolio is not read as get_portfolio).
+#
+# The roster is ENUMERATED FROM THE FILESYSTEM. This is the whole point: a NEW
+# module is INSIDE the wall by default and must be exempted ON PURPOSE below.
+# (The roster used to be a hand-maintained tuple, which silently left every
+# module nobody remembered to add — i.e. every new one — outside the wall.)
+#
+# Binding-side modules opt out via _WALL_GRANTS, and a grant is ITEMIZED rather
+# than a blanket pass: each names the exact wall items it may use, so an exempt
+# module stays walled against everything it was NOT granted. Three meta-checks
+# keep roster+grants honest: the roster can't be empty (a bad cwd would make
+# every check below pass vacuously), a grant can't name a module that no longer
+# exists, and a grant can't be dead weight.
 import ast as _ast  # noqa: E402
-_WALL_FORBIDDEN = {"lib.risk", "lib.signals", "lib.config", "lib.levers"}
+import re as _re  # noqa: E402  (used by the source-scans below + later blocks)
+
+_REPO = Path(__file__).resolve().parent.parent
+_WALL_IMPORTS = {"lib.risk", "lib.signals", "lib.config", "lib.levers"}
+_WALL_SYMBOLS = ("buying_power", "max_dollars_per_trade", "get_portfolio",
+                 "place_equity_order", "get_equity_positions", "get_equity_quotes",
+                 "RiskConfig", "remaining_daily_cap")
+
+# The ONLY binding-side opt-outs. Value = the exact wall items that module may
+# reach for; every other item still applies to it.
+_WALL_GRANTS = {
+    # Owns the limit values themselves — config IS the source of the dollar caps.
+    "lib/config.py":      {"lib.risk", "RiskConfig", "max_dollars_per_trade"},
+    # The limits / underperformance module: the binding side's own logic.
+    "lib/risk.py":        {"lib.signals"},
+    # The sizing/clamp engine: reads buying_power off a PASSED-IN snapshot dict
+    # (never the broker) and owns the daily-cap arithmetic.
+    "lib/signals.py":     {"buying_power", "remaining_daily_cap"},
+    # Offline wall REPLAY: its whole job is to re-run the deterministic wall over
+    # history, so it imports the wall and synthesizes a simulated broker snapshot.
+    "lib/wall_replay.py": {"lib.signals", "buying_power"},
+    # Continual-learning scorer: may read risk's underperformance helpers
+    # (reflect_memory's side of the wall) and NOTHING else. Narrow on purpose —
+    # a blanket exemption would drop its never-imports-lib.signals guarantee.
+    "lib/learn.py":       {"lib.risk"},
+}
+
+
 def _imported_modules(src: str) -> set:
     mods = set()
     for _node in _ast.walk(_ast.parse(src)):
@@ -1128,30 +1168,36 @@ def _imported_modules(src: str) -> set:
         elif isinstance(_node, _ast.ImportFrom) and _node.module:
             mods.add(_node.module)
     return mods
-for _mod in ("lib/allocate.py", "lib/portfolio.py", "lib/calibrate.py",
-             "lib/screener.py", "lib/screener_data.py",
-             # Legislative-catalyst analysis modules: bill ingest / store / LLM analysis+judge
-             # must NEVER import the sizing/limit/broker-carrying modules (the wall).
-             "lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
-                 "lib/legislative_backtest.py", "lib/legislative_judge_eval.py"):
-    _mp = Path(__file__).resolve().parent.parent / _mod
-    if not _mp.exists():
-        continue  # lib/screener_data.py lands at F8 (the gated retire step); until then skip
-    _src = _mp.read_text(encoding="utf-8")
-    _bad = _imported_modules(_src) & _WALL_FORBIDDEN
-    check_true(f"{_mod}: imports none of lib.risk/signals/config/levers (decision wall)", not _bad)
 
-# Source-scan: the legislative analysis modules must never READ a broker call or a trading
-# limit (the analysis side is blind to money), mirroring the strategy_context / learn scans.
-import re as _re  # noqa: E402  (used by the source-scans below + later blocks)
-for _legmod in ("lib/legislative.py", "lib/legislative_llm.py", "lib/dataflows/congress.py",
-                 "lib/legislative_backtest.py", "lib/legislative_judge_eval.py"):
-    _lp = Path(__file__).resolve().parent.parent / _legmod
-    _lsrc = _lp.read_text(encoding="utf-8")
-    for _forbidden in ("buying_power", "max_dollars_per_trade", "get_portfolio",
-                       "place_equity_order", "get_equity_positions"):
-        check_true(f"{_legmod}: source never reads '{_forbidden}' (analysis path reads no limits/broker)",
-                   _re.search(rf"\b{_re.escape(_forbidden)}\b", _lsrc) is None)
+
+def _wall_violations(src: str) -> set:
+    """Every wall item a module actually reaches for (imports + limit/broker symbols)."""
+    return ((_imported_modules(src) & _WALL_IMPORTS)
+            | {s for s in _WALL_SYMBOLS if _re.search(rf"\b{_re.escape(s)}\b", src)})
+
+
+_WALL_ROSTER = sorted(p.relative_to(_REPO).as_posix() for p in _REPO.glob("lib/**/*.py"))
+# Meta-guard: an empty/short roster would make every wall check below pass VACUOUSLY.
+check_true(f"wall: roster enumerates lib/ ({len(_WALL_ROSTER)} found, want >= 40)",
+           len(_WALL_ROSTER) >= 40)
+# Meta-guard: a grant naming a module that no longer exists is a stale exemption
+# sitting there pretending to protect something.
+for _g in sorted(_WALL_GRANTS):
+    check_true(f"wall: grant target {_g} still exists (no stale exemption)", _g in _WALL_ROSTER)
+
+for _mod in _WALL_ROSTER:
+    _src = (_REPO / _mod).read_text(encoding="utf-8")
+    _granted = _WALL_GRANTS.get(_mod, set())
+    _reached = _wall_violations(_src)
+    _bad = _reached - _granted
+    check_true(f"{_mod}: reaches no ungranted limit/broker item (decision wall)"
+               + (f" -> {sorted(_bad)}; it is analysis-side, or add an itemized grant" if _bad else ""),
+               not _bad)
+    # Meta-guard: a grant the module no longer needs must be REMOVED, not left to
+    # quietly widen the opt-out surface.
+    _dead = _granted - _reached
+    check_true(f"{_mod}: every wall grant is load-bearing"
+               + (f" -> drop {sorted(_dead)} from _WALL_GRANTS" if _dead else ""), not _dead)
 
 # REVERSE wall: the self-learning levers module must NOT import the sizing/gate
 # modules (a lever can't call sizing or the consistency gate; it only records
@@ -2163,6 +2209,20 @@ check("learn: healthy -> KEEP", _learn.classify_holding([0.05] * 8, 9.0, goal_be
 check("learn: content_hash stable across reason text",
       _learn.Proposal("PROPOSE_REMOVE", "SMH", "Semis", "universe", "x").content_hash(),
       _learn.Proposal("PROPOSE_REMOVE", "SMH", "Semis", "universe", "y").content_hash())
+# content_hash is tier-AWARE (so the open-row dedup index + the stored tier the apply gate
+# reads stay accurate); change_key is tier-FREE (so recurrence + cooldown pool across sources).
+# The same real change from two signals: DISTINCT content_hash, IDENTICAL change_key.
+_p_uni = _learn.Proposal("PROPOSE_ADD", "CEG", "Power", "universe", "screener")
+_p_leg = _learn.Proposal("PROPOSE_ADD", "CEG", "Power", "legislative", "catalyst")
+check_true("learn: content_hash DIFFERS across tiers (dedup stays tier-aware)",
+           _p_uni.content_hash() != _p_leg.content_hash())
+check("learn: change_key IDENTICAL across tiers (pooled read key)",
+      _p_uni.change_key(), _p_leg.change_key())
+check_true("learn: change_key differs from content_hash (distinct keys)",
+           _p_uni.change_key() != _p_uni.content_hash())
+check_true("learn: change_key varies by (kind,ticker)",
+           _p_uni.change_key() != _learn.Proposal("PROPOSE_REMOVE", "CEG", "Power", "universe", "x").change_key()
+           and _p_uni.change_key() != _learn.Proposal("PROPOSE_ADD", "URA", "Power", "universe", "x").change_key())
 
 # --- wall: learn.py never reaches the sizing side or the broker ---
 _learn_src = (_REPO / "lib" / "learn.py").read_text(encoding="utf-8")
@@ -2393,13 +2453,55 @@ check("cons: strategy_change_history records the regime change", len(_hist), 1)
 check("cons: change row carries from->to", (_hist[0]["from_value"], _hist[0]["to_value"]), ("HOLD", "STAND_DOWN"))
 check("cons: strategy_change_history filters by type",
       len(_lc2.strategy_change_history(_g5, change_type="weight")), 0)
-# universe-proposal history reads (E1/E2)
+# universe-proposal history reads (E1/E2). Recurrence + cooldown key on change_key
+# (pooled across tiers); the identity read stays on content_hash.
 _ch = "consid_hash"
+_ck = "consid_key"
 _lc2.record_universe_proposal(goal_id=_g5, proposed_at="2026-06-10T00:00:00Z", kind="PROPOSE_REMOVE",
     ticker="XYZ", sleeve="s", from_book=None, to_book=None, target_weight=5.0, tier="universe",
-    content_hash=_ch, reason="r", goal_gap_pct=-5.0)
-check("cons: count_proposal_recurrence = 1 distinct day", _lc2.count_proposal_recurrence(_g5, _ch), 1)
+    content_hash=_ch, change_key=_ck, reason="r", goal_gap_pct=-5.0)
+check("cons: count_proposal_recurrence = 1 distinct day", _lc2.count_proposal_recurrence(_g5, _ck), 1)
 check("cons: last_decided_universe_change None while proposed", _lc2.last_decided_universe_change(_g5, _ch), None)
+check("cons: last_decided_change_key None while proposed", _lc2.last_decided_change_key(_g5, _ck), None)
+# POOLING across tiers (the P0a fix): the SAME change proposed by two sources on two
+# distinct days pools its confirm-days (reuse goal _g5 from the block above).
+_pk = _learn.Proposal("PROPOSE_ADD", "CEG", "Power", "universe", "x").change_key()
+_lc2.record_universe_proposal(goal_id=_g5, proposed_at="2026-06-10T00:00:00Z", kind="PROPOSE_ADD",
+    ticker="CEG", sleeve="Power", from_book=None, to_book=None, target_weight=4.0, tier="universe",
+    content_hash=_learn.Proposal("PROPOSE_ADD","CEG","Power","universe","x").content_hash(),
+    change_key=_pk, reason="screener", goal_gap_pct=None)
+_lc2.record_universe_proposal(goal_id=_g5, proposed_at="2026-06-11T00:00:00Z", kind="PROPOSE_ADD",
+    ticker="CEG", sleeve="Power", from_book=None, to_book=None, target_weight=4.0, tier="legislative",
+    content_hash=_learn.Proposal("PROPOSE_ADD","CEG","Power","legislative","y").content_hash(),
+    change_key=_pk, reason="catalyst", goal_gap_pct=None)
+check("cons: recurrence POOLS the same change across tiers (2 distinct days)",
+      _lc2.count_proposal_recurrence(_g5, _pk), 2)
+
+# MIGRATION: an old universe_change_log with NO change_key column -> Ledger() adds it AND
+# backfills every row to match Proposal.change_key() byte-for-byte (so pre-migration rows
+# pool with post-migration ones). Mirrors the shipped migration-test precedent.
+import sqlite3 as _sqlite3
+_dbp_mig = tempfile.mktemp(suffix=".db")
+_mc = _sqlite3.connect(_dbp_mig)
+_mc.executescript("""
+CREATE TABLE universe_change_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, goal_id INTEGER NOT NULL, proposed_at TEXT,
+    kind TEXT, ticker TEXT, sleeve TEXT, from_book TEXT, to_book TEXT, target_weight REAL,
+    tier TEXT, content_hash TEXT NOT NULL, reason TEXT NOT NULL, goal_gap_pct REAL,
+    status TEXT NOT NULL DEFAULT 'proposed', decided_at TEXT, decided_by TEXT);
+INSERT INTO universe_change_log (goal_id, kind, ticker, tier, content_hash, reason)
+    VALUES (1, 'PROPOSE_ADD', 'CEG', 'legislative', 'oldhash', 'pre-migration row');
+""")
+_mc.commit(); _mc.close()
+Ledger(_dbp_mig)  # constructing runs ensure_schema -> _migrate_universe_change_key
+_mc2 = _sqlite3.connect(_dbp_mig)
+_mig_cols = {r[1] for r in _mc2.execute("PRAGMA table_info(universe_change_log)").fetchall()}
+check_true("migrate: change_key column added to legacy universe_change_log", "change_key" in _mig_cols)
+_mig_key = _mc2.execute("SELECT change_key FROM universe_change_log WHERE content_hash='oldhash'").fetchone()[0]
+_mc2.close()
+check("migrate: backfill matches Proposal.change_key() byte-for-byte",
+      _mig_key, _learn.Proposal("PROPOSE_ADD", "CEG", "Power", "legislative", "x").change_key())
+
 # migrations idempotent on a fresh + re-opened db
 _dbp2 = tempfile.mktemp(suffix=".db")
 Ledger(_dbp2)
@@ -3489,6 +3591,243 @@ check("legislative: cache 2nd fetch is a hit", _copener(_cu, 30), b'{"x":1}')
 check("legislative: cache hit survives api_key rotation", _copener(_cu.replace("SECRET", "ROT"), 30), b'{"x":1}')
 check("legislative: ONE network call for 3 cached fetches", _cache_calls["n"], 1)
 check("legislative: cache stats (1 miss, 2 hits)", _cstats, {"misses": 1, "hits": 2})
+
+
+# ============================ STRATEGY INTELLIGENCE (lib/intel) =============
+# Section splitter + the cost-gate prefilter. PURE — no network, no LLM, no clock.
+from lib.intel import sections as _isec  # noqa: E402
+from lib.intel import prefilter as _ipf  # noqa: E402
+
+# A tiny USLM bill: one boilerplate section, one that mimics H.R.1 §20308 (the SUBJECT
+# "uranium" lives ONLY in the header — the operative text names it by omission), and one
+# unrelated section. Proves splitting, fact extraction, boilerplate, and the header-recall
+# property the whole prefilter design turns on.
+_BILL_XML = b"""<?xml version="1.0"?>
+<bill><legis-body>
+  <section><enum>1.</enum><header>Short title</header><text>This Act may be cited as the Test Act.</text></section>
+  <section><enum>20308.</enum><header>Ensuring consideration of uranium as a critical mineral</header>
+    <text>Section 7002(a)(3)(B)(i) of the Energy Act of 2020 (30 U.S.C. 1606(a)(3)(B)(i)) is amended
+    to read as follows: oil, oil shale, coal, or natural gas. Not later than 60 days after enactment
+    the Secretary shall publish an update, and $50,000,000 is authorized.</text></section>
+  <section><enum>412.</enum><header>Fish hatchery maintenance schedule</header>
+    <text>The Secretary of the Interior shall maintain the regional fish hatchery on a quarterly basis.</text></section>
+</legis-body></bill>"""
+
+_secs = _isec.parse_sections(_BILL_XML)
+check("intel: parse_sections finds all 3 <section> elements", len(_secs), 3)
+_by = {s.enum: s for s in _secs}
+check("intel: section enum stripped of trailing dot", "20308" in _by, True)
+check("intel: short-title flagged boilerplate", _by["1"].is_boilerplate, True)
+check("intel: substantive section not boilerplate", _by["20308"].is_boilerplate, False)
+check("intel: US Code cite extracted", "30 U.S.C. 1606" in _by["20308"].usc_cites, True)
+check("intel: amended Act extracted", any("Energy Act of 2020" in a for a in _by["20308"].acts_amended), True)
+check("intel: deadline extracted", _by["20308"].deadline.startswith("Not later than 60 days"), True)
+check("intel: dollar amount extracted", any("50,000,000" in d for d in _by["20308"].dollar_amounts), True)
+check("intel: amended-Act regex rejects 'this Act' boilerplate", _by["1"].acts_amended, [])
+check_raises("intel: unparseable XML fails SAFE (raises, never fabricates)",
+             lambda: _isec.parse_sections(b"<not xml"), _isec.DataUnavailableError)
+
+# PREFILTER recall: §20308 survives ONLY because its header carries "uranium"/"critical mineral"
+# (the operative text has neither) — the exact property that forced header+body matching.
+check("intel: prefilter KEEPS the uranium section (header-recall)", _ipf.matches(_by["20308"].text), True)
+check("intel: prefilter DROPS the unrelated fish-hatchery section", _ipf.matches(_by["412"].text), False)
+check("intel: prefilter DROPS boilerplate short-title", _ipf.matches(_by["1"].text), False)
+check_true("intel: matched_terms records why a section was kept",
+           any("uranium" in t or "critical mineral" in t for t in _ipf.matched_terms(_by["20308"].text)))
+_kept, _dropped = _ipf.keep(_secs)
+check("intel: keep() partitions to the 1 book-relevant section", len(_kept), 1)
+check("intel: keep() reports the dropped count (over-filter visibility)", _dropped, 2)
+# Specificity: a bare energy word must NOT match (broad tokens defeat the gate).
+check("intel: 'natural gas' alone does not trip the gate (specificity)", _ipf.matches("natural gas pipeline permitting"), False)
+check("intel: 'covered sector' (FAST-41, §20304) trips the gate", _ipf.matches("designated as a covered sector"), True)
+
+# --- aggregate: section impacts -> per-key-player posture (deterministic weighting) ---
+from lib.intel import aggregate as _iagg  # noqa: E402
+check("intel: impact_weight helps/high/UPHELD = +1.0", _iagg.impact_weight("helps", "high", "UPHELD"), 1.0)
+check("intel: impact_weight hurts/medium/UPHELD = -0.6", round(_iagg.impact_weight("hurts", "medium", "UPHELD"), 4), -0.6)
+check("intel: impact_weight REJECTED contributes ZERO (verifier veto is absolute)",
+      _iagg.impact_weight("helps", "high", "REJECTED"), 0.0)
+check("intel: impact_weight ambiguous = 0", _iagg.impact_weight("ambiguous", "high", "UPHELD"), 0.0)
+check("intel: unverified impact discounted not zeroed", round(_iagg.impact_weight("helps", "high", ""), 4), 0.4)
+_imp_ura = [
+    {"ticker": "URA", "direction": "helps", "confidence": "low", "verify_verdict": "UPHELD",
+     "doc_id": "118-hr-1", "sec": "20304", "step1_span": "inserting mineral production", "title": "LEC Act"},
+    {"ticker": "URA", "direction": "helps", "confidence": "medium", "verify_verdict": "DOWNGRADED",
+     "doc_id": "118-hr-1", "sec": "20308", "step1_span": "oil, oil shale, coal", "title": "LEC Act"},
+]
+_pos = _iagg.posture_for_ticker(_imp_ura)
+check("intel: posture nets to helps (0.3*1.0 + 0.6*0.5 = 0.6)", _pos["score"], 0.6)
+check("intel: posture label helps", _pos["posture"], "helps")
+check("intel: posture keeps evidence trail", len(_pos["evidence"]), 2)
+# all-REJECTED nets to zero -> neutral, no evidence contributes
+_pos_rej = _iagg.posture_for_ticker([{"ticker": "X", "direction": "helps", "confidence": "high", "verify_verdict": "REJECTED"}])
+check("intel: all-REJECTED ticker -> neutral score 0", _pos_rej["score"], 0.0)
+check("intel: all-REJECTED ticker -> no evidence rows", len(_pos_rej["evidence"]), 0)
+# helps + hurts that cancel -> 'mixed'
+_pos_mix = _iagg.posture_for_ticker([
+    {"ticker": "Y", "direction": "helps", "confidence": "high", "verify_verdict": "UPHELD"},
+    {"ticker": "Y", "direction": "hurts", "confidence": "high", "verify_verdict": "UPHELD"}])
+check("intel: opposing evidence that cancels -> mixed", _pos_mix["posture"], "mixed")
+_prof = _iagg.build_profile(bioguide="S001176", congress=118,
+    power=[{"role": "leadership", "committee": "LEAD", "chamber": "house", "name": "Scalise"}], impacts=_imp_ura)
+check("intel: build_profile groups by ticker", list(_prof["tickers"]), ["URA"])
+check("intel: build_profile marks key player", _prof["is_key_player"], True)
+check("intel: build_profile name from power", _prof["name"], "Scalise")
+
+# --- profiles: pure dict -> markdown VIEW, diff-stable ---
+from lib.intel import profiles as _iprof  # noqa: E402
+_r1 = _iprof.render(_prof, as_of="2026-07-18")
+_r2 = _iprof.render(_prof, as_of="2099-12-31")  # different as_of, SAME body
+check("intel: profile content_hash excludes as_of (stable diffs)", _r1["content_hash"], _r2["content_hash"])
+check_true("intel: profile md carries the DO-NOT-EDIT view header", "A VIEW over intel.db" in _r1["md"])
+check_true("intel: profile md traces a claim to a section", "118-hr-1 §20304" in _r1["md"])
+check_true("intel: profile md shows the verbatim span", "inserting mineral production" in _r1["md"])
+check_true("intel: profile md has NO generated_at timestamp in body", "generated_at" not in _r1["md"])
+# an empty profile (key player, no book-relevant sections) still renders honestly
+_empty = _iagg.build_profile(bioguide="R000575", congress=118,
+    power=[{"role": "chair", "committee": "HSAS", "chamber": "house", "name": "Rogers"}], impacts=[])
+check_true("intel: empty profile says nothing-to-report (not a fabrication)",
+           "No sponsored section reached" in _iprof.render(_empty)["md"])
+
+# --- propose: additive-only, cash-capped, CONSERVATION is structural ---
+from lib.intel import propose as _iprop  # noqa: E402
+_book = _iprop.BookSnapshot(
+    held={"URA", "SMH", "SGOV"}, tradable={"URA", "SMH", "NLR", "SMR", "SGOV"},
+    sleeves={"Power": {"weight": 14.0, "protected": True, "tickers": ["URA"]},
+             "Cash": {"weight": 18.0, "protected": False, "tickers": ["SGOV"]}},
+    cash_pct=18.0, ticker_sleeve={"URA": "Power", "SMH": "Compute", "SGOV": "Cash"})
+# a tailwind on a NON-held tradable name -> one ADD; a tailwind on a HELD name -> skipped
+_props = _iprop.propose(
+    postures={"NLR": {"posture": "helps", "score": 0.9, "evidence": [{"span": "x"}]},
+              "URA": {"posture": "helps", "score": 0.9, "evidence": [{"span": "y"}]}},
+    book=_book, cfg=_iprop.ProposeConfig(min_score=0.5, add_weight=4.0, intel_max_total_pct=20.0))
+check("intel: propose ADDs the non-held tailwind name only", [p["ticker"] for p in _props], ["NLR"])
+check("intel: propose tier is 'intel' (always human-approve)", _props[0]["tier"], "intel")
+check("intel: propose funds from cash at add_weight", _props[0]["target_weight"], 4.0)
+check_true("intel: propose never touches a protected sleeve", not _iprop.would_overwrite_protected(_props, _book))
+# budget cap: many tailwind names, tiny cash -> total proposed weight <= min(cash, cap)
+_many = {f"T{i}": {"posture": "helps", "score": 0.9, "evidence": []} for i in range(10)}
+_smallcash = _iprop.BookSnapshot(held=set(), tradable={f"T{i}" for i in range(10)}, sleeves={},
+                                 cash_pct=6.0, ticker_sleeve={})
+_capped = _iprop.propose(postures=_many, book=_smallcash,
+                         cfg=_iprop.ProposeConfig(min_score=0.5, add_weight=4.0, intel_max_total_pct=20.0))
+check_true("intel: propose respects the cash budget (sum <= 6%)", sum(p["target_weight"] for p in _capped) <= 6.0 + 1e-9)
+# CONSERVATION REGRESSION: postures that (naively) want to gut the book produce ONLY additive
+# proposals; the protected sleeve's weight is untouched because propose CANNOT emit a reduction.
+_conserve = _iprop.propose(
+    postures={"URA": {"posture": "hurts", "score": -5.0, "evidence": []},   # would 'want' to cut URA
+              "SMH": {"posture": "hurts", "score": -5.0, "evidence": []}},  # would 'want' to cut SMH
+    book=_book, cfg=_iprop.ProposeConfig())
+check("intel: bearish postures on HELD protected names emit ZERO proposals (never overwrites)", len(_conserve), 0)
+check_true("intel: conservation holds — no proposal reduces a protected sleeve",
+           not _iprop.would_overwrite_protected(_conserve, _book))
+
+# --- fedreg: the regulation fetcher (offline, fake opener; stdlib urllib in prod) ---
+from lib.dataflows import fedreg as _fr  # noqa: E402
+def _fr_fake(url, timeout):
+    import json as _j
+    return _j.dumps({"results": [
+        {"document_number": "2026-1", "title": "Nuclear reactor licensing rule", "type": "Rule",
+         "publication_date": "2026-03-01", "agency_names": ["Nuclear Regulatory Commission"],
+         "cfr_references": [{"title": 10, "part": 50}], "significant": True, "html_url": "http://x"},
+        {"document_number": "2026-1", "title": "dup — same doc number", "type": "Rule",
+         "publication_date": "2026-03-01", "agency_names": ["NRC"], "cfr_references": []},
+    ]}).encode()
+_rules = _fr.poll_rules("2026-03-01", "2026-03-02", opener=_fr_fake, max_pages=1)
+check("fedreg: poll dedups by document_number", len(_rules), 1)
+check("fedreg: doc_id prefixed FR-", _rules[0]["doc_id"], "FR-2026-1")
+check("fedreg: agency captured (the regulatory key player)", _rules[0]["agency"], "Nuclear Regulatory Commission")
+check("fedreg: CFR reference normalized (industry map)", _rules[0]["cfr_references"], ["10 CFR 50"])
+check("fedreg: published date is the as-of anchor", _rules[0]["published"], "2026-03-01")
+check_raises("fedreg: non-JSON fails SAFE (raises, never fabricates)",
+             lambda: _fr.poll_rules("a", "b", opener=lambda u, t: b"<html>error", max_pages=1), Exception)
+
+# --- config: intel section fails SAFE + validates only when enabled ---
+def _cfg_with_intel(intel_block):
+    dd = {"account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/kintel",
+          "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
+                   "daily_capital_deploy_cap": 75, "min_buying_power_buffer": 5},
+          "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
+          "intel": intel_block}
+    return load_config(_write_config(dd))
+check("config: intel absent -> disabled (fail-safe)", _cfg_with_intel({}).intel.enabled, False)
+check("config: intel enabled reads knobs", _cfg_with_intel({"enabled": True, "add_weight": 3.0}).intel.add_weight, 3.0)
+check_raises("config: intel enabled + add_weight<=0 raises",
+             lambda: _cfg_with_intel({"enabled": True, "add_weight": 0}), ConfigError)
+check_raises("config: intel enabled + max_total>100 raises",
+             lambda: _cfg_with_intel({"enabled": True, "intel_max_total_pct": 150}), ConfigError)
+
+# --- chain: section -> book-hits, injectable LLM, deterministic span-verbatim veto ---
+from lib.intel import chain as _ichain  # noqa: E402
+class _Sec:  # a minimal Section-like object
+    def __init__(s, enum, header, text): s.enum, s.header, s.text = enum, header, text
+_sec_ura = _Sec("20308", "uranium as a critical mineral",
+                "Section 7002(a)(3)(B)(i) is amended to read: oil, oil shale, coal, or natural gas.")
+# a GOOD response: span is verbatim, ticker in allow-list -> hit survives
+_good = '```json\n{"sec":"20308","step1_span":"oil, oil shale, coal, or natural gas",' \
+        '"step1_what_changes":"strikes fuel-minerals exclusion","step2_mechanism":"uranium eligible",' \
+        '"book_hits":[{"ticker":"URA","direction":"helps","confidence":"low","reasoning":"uranium miners"}],' \
+        '"no_impact":false}\n```'
+_r = _ichain.analyze_section(_sec_ura, allow=["URA", "SMH"], book="AI+energy", llm=lambda p, t: _good)
+check("chain: verbatim span + allow-list ticker -> hit survives", [h["ticker"] for h in _r["book_hits"]], ["URA"])
+check("chain: span_verbatim True when quote is in the text", _r["span_verbatim"], True)
+# FABRICATED span (not in text) -> the deterministic veto drops ALL hits
+_fab = '```json\n{"sec":"20308","step1_span":"this text is nowhere in the section",' \
+       '"book_hits":[{"ticker":"URA","direction":"helps","confidence":"high","reasoning":"x"}],"no_impact":false}\n```'
+_rf = _ichain.analyze_section(_sec_ura, allow=["URA"], book="x", llm=lambda p, t: _fab)
+check("chain: fabricated span VETOES all hits (deterministic honesty gate)", _rf["book_hits"], [])
+check("chain: fabricated span -> span_verbatim False", _rf["span_verbatim"], False)
+# a ticker OUTSIDE the allow-list is dropped even with a good span
+_off = '```json\n{"sec":"20308","step1_span":"oil, oil shale, coal, or natural gas",' \
+       '"book_hits":[{"ticker":"XOM","direction":"helps","confidence":"high","reasoning":"x"}],"no_impact":false}\n```'
+_ro = _ichain.analyze_section(_sec_ura, allow=["URA"], book="x", llm=lambda p, t: _off)
+check("chain: off-allow-list ticker dropped", _ro["book_hits"], [])
+# unparseable model output -> fail SAFE to no_impact
+_ru = _ichain.analyze_section(_sec_ura, allow=["URA"], book="x", llm=lambda p, t: "sorry, I cannot")
+check("chain: unparseable output fails SAFE to no_impact", _ru["no_impact"], True)
+
+# --- refresh: the whole scheduled pass (fetch -> split -> prefilter -> chain -> ingest), faked ---
+from lib.intel import refresh as _iref  # noqa: E402
+_BILL2 = b"""<?xml version="1.0"?><bill><legis-body>
+  <section><enum>1.</enum><header>Short title</header><text>This Act may be cited as the X Act.</text></section>
+  <section><enum>10.</enum><header>Nuclear reactor licensing acceleration</header>
+    <text>The Nuclear Regulatory Commission shall issue a combined license for a small modular reactor
+    within 180 days. This section concerns nuclear reactor deployment and uranium fuel supply for
+    commercial power generation across the electricity grid.</text></section>
+  <section><enum>11.</enum><header>Post office naming</header>
+    <text>The facility at 100 Main Street shall be known as the John Doe Post Office Building.</text></section>
+</legis-body></bill>"""
+_refdb = Ledger(tempfile.mktemp(suffix=".db"))
+def _fake_llm(prompt, timeout):
+    # emit a hit ONLY when the prompt carries the nuclear section (span must be verbatim in it)
+    if "small modular reactor" in prompt:
+        return ('{"sec":"10","step1_span":"issue a combined license for a small modular reactor",'
+                '"step1_what_changes":"NRC licensing deadline","step2_mechanism":"180-day deadline",'
+                '"book_hits":[{"ticker":"SMR","direction":"helps","confidence":"medium","reasoning":"reactors"}],'
+                '"no_impact":false}')
+    return '{"sec":"x","step1_span":"","book_hits":[],"no_impact":true}'
+with _refdb.intel_conn() as _rc:
+    _refout = _iref.run_refresh(
+        _rc,
+        documents=[{"doc_id": "118-hr-99", "kind": "bill", "title": "X Act", "published": "2023-05-01",
+                    "sponsor": "R000575", "congress": 118}],
+        allow=["SMR", "URA"], book_desc="nuclear",
+        fetch_text=lambda doc: _BILL2, llm=_fake_llm, now="2026-07-18T00:00:00Z",
+        min_section_chars=50)
+check("refresh: one document processed", _refout["documents"], 1)
+check("refresh: prefilter kept the nuclear section, dropped post-office", _refout["kept"], 1)
+check("refresh: chain recorded the SMR impact", _refout["impacts"], 1)
+from lib.intel import store as _istore  # noqa: E402
+with _refdb.intel_conn() as _rc:
+    _rimp = _istore.impacts_for_sponsor(_rc, "R000575")
+check("refresh: impact persisted + joinable to sponsor", [i["ticker"] for i in _rimp], ["SMR"])
+check_true("refresh: persisted impact is span-verbatim", bool(_rimp[0]["span_verbatim"]))
+# fetch failure on a doc is best-effort (counted, never raises)
+with _refdb.intel_conn() as _rc:
+    def _boom(doc): raise RuntimeError("network down")
+    _referr = _iref.run_refresh(_rc, documents=[{"doc_id": "d2", "published": "2023-01-01"}],
+                                allow=["SMR"], book_desc="x", fetch_text=_boom, now="t")
+check("refresh: a failed fetch is best-effort (counted, pass continues)", _referr["errors"], 1)
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

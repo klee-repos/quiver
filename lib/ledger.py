@@ -14,6 +14,7 @@ sleep/reboot.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -235,7 +236,8 @@ CREATE TABLE IF NOT EXISTS universe_change_log (
     to_book      TEXT,
     target_weight REAL,
     tier         TEXT,                                   -- soft|derisk|universe
-    content_hash TEXT NOT NULL,
+    content_hash TEXT NOT NULL,                           -- (kind,ticker,tier): OPEN-row dedup
+    change_key   TEXT,                                    -- (kind,ticker): cross-tier pooled reads
     reason       TEXT NOT NULL,
     goal_gap_pct REAL,
     status       TEXT NOT NULL DEFAULT 'proposed',       -- proposed|approved|applied|rejected|expired
@@ -307,6 +309,13 @@ class Ledger:
         preserving the "SQL lives with the Ledger connection" convention."""
         return self._conn()
 
+    def intel_conn(self):
+        """Public context manager yielding the raw connection for lib.intel store ops
+        (which own their SQL + take the connection, exactly like lib.legislative). Same
+        ledger.db file — one sqlite database, so intel reads/writes join the trading state
+        with no second file to keep consistent."""
+        return self._conn()
+
     def ensure_schema(self) -> None:
         with self._conn() as c:
             c.executescript(_SCHEMA)
@@ -314,6 +323,7 @@ class Ledger:
             self._migrate_notifications(c)
             self._migrate_decisions(c)
             self._migrate_thesis_state(c)
+            self._migrate_universe_change_key(c)
             # Self-learning tail (lib/levers): eval-lever registry + uses. Owns
             # its own schema so it can evolve independently of the core tables.
             from lib import levers
@@ -322,6 +332,10 @@ class Ledger:
             # Owns its own schema, same pattern as levers.
             from lib import legislative
             legislative.ensure_schema(c)
+            # Strategy-intelligence store (lib/intel): documents + sections + section_impact +
+            # power map + shadow proposals. Owns its own schema; lives in this same ledger.db.
+            from lib.intel import store as _intel_store
+            _intel_store.ensure_schema(c)
 
     @staticmethod
     def _migrate_decisions(c) -> None:
@@ -379,6 +393,26 @@ class Ledger:
         for col, decl in additions.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_universe_change_key(c) -> None:
+        """Add universe_change_log.change_key = sha256(kind|ticker)[:16] on a table
+        created before the column existed, and backfill it from the stored kind/ticker.
+
+        SQLite has no ADD COLUMN IF NOT EXISTS, so diff PRAGMA table_info. Idempotent:
+        a no-op once change_key exists (fresh dbs get it from _SCHEMA). The backfill is
+        computed in Python (SQLite has no sha256) and MUST reproduce Proposal.change_key()
+        byte-for-byte so pre-migration rows pool with post-migration ones. Runs AFTER
+        executescript(_SCHEMA), so on an existing table the column is absent here and gets
+        added; we deliberately do NOT index it (the table is tiny and the pooled reads
+        full-scan a few dozen rows)."""
+        cols = {row[1] for row in c.execute("PRAGMA table_info(universe_change_log)").fetchall()}
+        if not cols or "change_key" in cols:
+            return
+        c.execute("ALTER TABLE universe_change_log ADD COLUMN change_key TEXT")
+        for row in c.execute("SELECT id, kind, ticker FROM universe_change_log").fetchall():
+            key = hashlib.sha256(f"{row[1]}|{row[2]}".encode()).hexdigest()[:16]
+            c.execute("UPDATE universe_change_log SET change_key=? WHERE id=?", (key, row[0]))
 
     @staticmethod
     def _migrate_notifications(c) -> None:
@@ -1180,17 +1214,19 @@ class Ledger:
 
     def record_universe_proposal(self, *, goal_id: int, proposed_at, kind, ticker, sleeve,
                                  from_book, to_book, target_weight, tier, content_hash,
-                                 reason, goal_gap_pct) -> Optional[int]:
+                                 reason, goal_gap_pct, change_key=None) -> Optional[int]:
         """Append a proposed change; deduped to ONE open row per (goal_id,
         content_hash) by the partial unique index. Returns the new id, or None when
-        an identical open proposal already exists (so re-proposing every tick is a no-op)."""
+        an identical open proposal already exists (so re-proposing every tick is a no-op).
+        ``change_key`` (tier-free (kind,ticker)) is stored for the pooled recurrence/cooldown
+        reads; it is optional only for back-compat, callers should pass ``p.change_key()``."""
         with self._conn() as c:
             cur = c.execute(
                 "INSERT OR IGNORE INTO universe_change_log (goal_id, proposed_at, kind, "
                 "ticker, sleeve, from_book, to_book, target_weight, tier, content_hash, "
-                "reason, goal_gap_pct, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'proposed')",
+                "change_key, reason, goal_gap_pct, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'proposed')",
                 (goal_id, proposed_at, kind, ticker, sleeve, from_book, to_book,
-                 target_weight, tier, content_hash, reason, goal_gap_pct),
+                 target_weight, tier, content_hash, change_key, reason, goal_gap_pct),
             )
             if cur.rowcount and cur.lastrowid is not None:
                 return int(cur.lastrowid)
@@ -1220,9 +1256,11 @@ class Ledger:
             return cur.rowcount
 
     def last_decided_universe_change(self, goal_id: int, content_hash: str) -> Optional[dict]:
-        """Most recent DECIDED (applied|rejected) row for a content_hash — the
-        anti-oscillation read (Component E1). A change rejected/applied recently is in
-        cooldown; re-proposing it before the window is suppressed. None if never decided."""
+        """Most recent DECIDED (applied|rejected) row for a specific content_hash — an
+        IDENTITY lookup keyed on the exact stored row. The GB2 legislative apply-reconcile
+        (tick.py) resolves a bill's linked proposal_hash through this, so it must stay
+        content_hash-keyed (that persisted FK carries no kind/ticker to derive a change_key
+        from). The pooled anti-oscillation cooldown uses ``last_decided_change_key`` instead."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT * FROM universe_change_log WHERE goal_id=? AND content_hash=? "
@@ -1230,16 +1268,30 @@ class Ledger:
                 (goal_id, content_hash)).fetchone()
             return dict(row) if row else None
 
-    def count_proposal_recurrence(self, goal_id: int, content_hash: str) -> int:
-        """Distinct DAYS a content_hash has been proposed (across all statuses) — the
-        confirm-over-N read (Component E2). A REMOVE/DERISK is actionable only once it
-        has recurred on >= universe_confirm_days distinct days, so one crossing can't
+    def last_decided_change_key(self, goal_id: int, change_key: str) -> Optional[dict]:
+        """Most recent DECIDED (applied|rejected) row for a change_key — the pooled
+        anti-oscillation read (Component E1). Keyed on (kind,ticker), so a change decided
+        under ANY tier puts the change into cooldown for every source: rejecting a screener
+        ``ADD CEG`` also suppresses a legislative ``ADD CEG`` for the window. None if never
+        decided. (The per-row identity variant is ``last_decided_universe_change``.)"""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM universe_change_log WHERE goal_id=? AND change_key=? "
+                "AND status IN ('applied','rejected') ORDER BY decided_at DESC, id DESC LIMIT 1",
+                (goal_id, change_key)).fetchone()
+            return dict(row) if row else None
+
+    def count_proposal_recurrence(self, goal_id: int, change_key: str) -> int:
+        """Distinct DAYS a change_key has been proposed (across all statuses AND all tiers)
+        — the confirm-over-N read (Component E2). Keyed on (kind,ticker) so the same change
+        from two sources pools its confirm-days; a REMOVE/DERISK/ADD is actionable only once
+        it has recurred on >= universe_confirm_days distinct days, so one crossing can't
         evict a sleeve."""
         with self._conn() as c:
             row = c.execute(
                 "SELECT COUNT(DISTINCT substr(proposed_at,1,10)) AS d "
-                "FROM universe_change_log WHERE goal_id=? AND content_hash=?",
-                (goal_id, content_hash)).fetchone()
+                "FROM universe_change_log WHERE goal_id=? AND change_key=?",
+                (goal_id, change_key)).fetchone()
             return int(row["d"] or 0)
 
     # --- run_lock: single-writer mutex (belt-and-suspenders; Stage 5) ---------

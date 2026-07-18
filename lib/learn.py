@@ -43,8 +43,19 @@ class Proposal:
 
     def content_hash(self) -> str:
         """Dedup key for an OPEN proposal — (kind, ticker, tier). Re-proposing the
-        same change every tick is then a ledger no-op (INSERT OR IGNORE)."""
+        same change every tick is then a ledger no-op (INSERT OR IGNORE). Keeps ``tier``
+        so the open-row unique index and the stored tier (which the apply gate reads)
+        stay accurate — two sources proposing the same change keep distinct open rows,
+        each carrying its true tier. Pooling across tiers is the job of ``change_key``."""
         return hashlib.sha256(f"{self.kind}|{self.ticker}|{self.tier}".encode()).hexdigest()[:16]
+
+    def change_key(self) -> str:
+        """Cross-tier identity of the underlying change — (kind, ticker), tier-FREE.
+        The recurrence (confirm-over-N) and cooldown (anti-oscillation) reads key on THIS,
+        so a screener ``ADD CEG`` and a legislative ``ADD CEG`` pool their confirm-days and
+        share one cooldown instead of each source counting independently. Deliberately NOT
+        the dedup key (that stays ``content_hash``, tier-aware) — only the pooled reads use it."""
+        return hashlib.sha256(f"{self.kind}|{self.ticker}".encode()).hexdigest()[:16]
 
 
 def _mean(xs) -> Optional[float]:

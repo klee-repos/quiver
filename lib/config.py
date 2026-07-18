@@ -180,6 +180,20 @@ class LegislativeConfig:
 
 
 @dataclass(frozen=True)
+class IntelConfig:
+    """Strategy-intelligence settings (section-level power-map -> ADDITIVE strategy proposals).
+    Analysis/proposal side only — NEVER trading. Fails SAFE: disabled unless ``intel.enabled`` is
+    exactly ``true``. Proposals are always tier 'intel' (human-approve only); the service can only
+    ADD (never overwrite the seeded book), and new positions draw from cash capped at
+    ``intel_max_total_pct``, so the seeded book can't be diluted below (100 - cap)%."""
+    enabled: bool
+    min_score: float
+    add_weight: float
+    intel_max_total_pct: float
+    new_sleeve_min_names: int
+
+
+@dataclass(frozen=True)
 class Config:
     account_number: str
     dry_run: bool
@@ -208,6 +222,7 @@ class Config:
     storage: StorageConfig
     memory: MemoryConfig
     legislative: LegislativeConfig
+    intel: IntelConfig
     raw: dict
     # Per-role LLM providers (mixed-provider support). Default to "glm" so an
     # absent block/key keeps today's single-provider GLM behavior byte-identical.
@@ -696,6 +711,30 @@ def load_config(path) -> Config:
         model=leg_model, remove_enabled=leg_remove_enabled, review_deadline_sec=leg_deadline,
         ticker_policy_areas=leg_tpa)
 
+    # Strategy-intelligence config — fail-safe OFF; validated only when enabled.
+    intel_d = d.get("intel", {}) or {}
+    intel_enabled = intel_d.get("enabled", False) is True
+
+    def _intel_num(key, default, cast):
+        v = intel_d.get(key, default)
+        try:
+            return cast(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    intel_min_score = _intel_num("min_score", 0.5, float)
+    intel_add_weight = _intel_num("add_weight", 4.0, float)
+    intel_max_total = _intel_num("intel_max_total_pct", 20.0, float)
+    intel_new_sleeve_min = _intel_num("new_sleeve_min_names", 2, int)
+    if intel_enabled:
+        if intel_add_weight <= 0:
+            raise ConfigError("config.yaml: intel.add_weight must be > 0")
+        if not (0.0 < intel_max_total <= 100.0):
+            raise ConfigError("config.yaml: intel.intel_max_total_pct must be in (0, 100]")
+    intel_cfg = IntelConfig(
+        enabled=intel_enabled, min_score=intel_min_score, add_weight=intel_add_weight,
+        intel_max_total_pct=intel_max_total, new_sleeve_min_names=intel_new_sleeve_min)
+
     # --- Goal / deposit-auto-capture (observability; fail-safe, MUST NOT raise) --------
     # load_config runs at the START of every subcommand (before the best-effort tail), so a
     # garbled goal: field here must NEVER raise ConfigError and stop a tick. Coerce each
@@ -751,6 +790,7 @@ def load_config(path) -> Config:
         storage=storage,
         memory=memory,
         legislative=legislative_cfg,
+        intel=intel_cfg,
         raw=d,
         strategy_path=strategy_path,
         strategy=strategy_obj,

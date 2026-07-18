@@ -1,0 +1,25 @@
+[Unit]
+Description=Quiver — one strategy-intelligence refresh (legislation + regulation -> profiles + shadow proposals)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=quiver
+Group=quiver
+WorkingDirectory=/opt/quiver
+EnvironmentFile=/etc/quiver/quiver.env
+Environment=QUIVER_INTEL_LOG=/var/log/quiver/intel.log
+Environment=npm_config_cache=/opt/quiver/state/.npm-cache
+ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_intel.py
+# This runs the LLM chain over prefiltered sections; a large learning day can take a while.
+# Sits well under a day; independent of the trading tick (different db tables, own timer).
+TimeoutStartSec=7200
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/quiver/state /opt/quiver/logs /var/log/quiver
+MemoryMax=2500M

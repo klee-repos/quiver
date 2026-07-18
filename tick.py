@@ -1403,17 +1403,19 @@ def _run_learn_review(cfg, led, data) -> dict:
                     - timedelta(days=cons.proposal_cooldown_days)).isoformat()
     for p in ps["all"]:
         chash = p.content_hash()
-        # E1 — anti-oscillation: if this exact change was applied/rejected within the
-        # cooldown window, do NOT re-propose it (stops propose->reject->propose churn).
-        last = led.last_decided_universe_change(goal["id"], chash)
+        ckey = p.change_key()
+        # E1 — anti-oscillation: if this change (kind,ticker, ANY tier) was applied/rejected
+        # within the cooldown window, do NOT re-propose it (stops propose->reject->propose
+        # churn, pooled across sources so one source's rejection cools the other too).
+        last = led.last_decided_change_key(goal["id"], ckey)
         if last and (last.get("decided_at") or "") >= cooldown_cut:
-            cooled.append(chash)
+            cooled.append(ckey)
             continue
         rid = led.record_universe_proposal(
             goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker,
             sleeve=p.sleeve, from_book=p.from_book, to_book=p.to_book,
             target_weight=p.target_weight, tier=p.tier, content_hash=chash,
-            reason=p.reason, goal_gap_pct=p.goal_gap_pct)
+            change_key=ckey, reason=p.reason, goal_gap_pct=p.goal_gap_pct)
         if rid:
             recorded.append(rid)
             new_proposals.append(p)
@@ -1604,13 +1606,14 @@ def _run_bills_review(cfg, led, data, *, poll=None, detail_fetch=None, text_fetc
         if p.ticker is None:
             continue
         chash = p.content_hash()
-        last = led.last_decided_universe_change(goal["id"], chash)
+        ckey = p.change_key()
+        last = led.last_decided_change_key(goal["id"], ckey)
         if last and (last.get("decided_at") or "") >= cooldown_cut:
-            continue  # E1 anti-oscillation: recently decided -> don't re-propose yet
+            continue  # E1 anti-oscillation (pooled across tiers): recently decided -> hold
         rid = led.record_universe_proposal(
             goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker, sleeve=p.sleeve,
             from_book=None, to_book=None, target_weight=p.target_weight, tier=p.tier,
-            content_hash=chash, reason=p.reason, goal_gap_pct=None)
+            content_hash=chash, change_key=ckey, reason=p.reason, goal_gap_pct=None)
         direction = "benefit" if p.kind == learn.ADD else "suffer"
         with led.legislative_conn() as c:
             for row in actionable:
@@ -1999,7 +2002,7 @@ def _run_universe_apply(cfg, led, *, change_id, approve) -> dict:
 
     # E2 — confirm-over-N: an AUTO REMOVE/DERISK is actionable only after it has recurred
     # on >= universe_confirm_days distinct days, so one bad crossing can't evict a sleeve.
-    recurrence = led.count_proposal_recurrence(goal["id"], change["content_hash"]) if goal else 0
+    recurrence = led.count_proposal_recurrence(goal["id"], change["change_key"]) if goal else 0
     if auto and change["kind"] in ("PROPOSE_REMOVE", "PROPOSE_DERISK", "PROPOSE_ADD"):
         if recurrence < cons.universe_confirm_days:
             return {"applied": False, "change": change,
@@ -2604,6 +2607,224 @@ def cmd_memory_rebuild(_args) -> dict:
     return {"ok": True, "dir": cfg.memory.dir, **summary}
 
 
+# ==================== STRATEGY INTELLIGENCE (lib/intel) glue ===============
+# Binding-side orchestration for the section-level intelligence service. Reads config + the
+# ledger and drives the PURE lib/intel modules. Best-effort + human-gated: intel proposals are
+# tier 'intel' which matches no auto-apply branch, so they ALWAYS need universe-apply --approve.
+def cmd_intel_ingest(args) -> dict:
+    """Load an analyzed-document bundle (one doc + its chained sections) into the intel store.
+
+    Input JSON: {"doc": {doc_id, kind, title, published, sponsor, congress[, agency]},
+                 "results": [{"sec","chain":{...},"verify":{...}}, ...]}
+    The `results` shape is exactly what the section chain emits, so live and backfill share this
+    path. Idempotent per (doc_id, sec, ticker)."""
+    cfg, led = _cfg_and_ledger()
+    data = _load_input(args)
+    from lib.intel import sections as _isec, prefilter as _ipf, store as _istore
+    doc = data.get("doc") or {}
+    now_iso = market.now_et().isoformat()
+    ndoc = nsec = nimp = 0
+    with led.intel_conn() as c:
+        _istore.upsert_document(c, doc_id=doc["doc_id"], kind=doc.get("kind", "bill"),
+                                title=doc.get("title", ""), published=doc["published"],
+                                sponsor=doc.get("sponsor"), congress=doc.get("congress"),
+                                agency=doc.get("agency"), fetched_at=now_iso)
+        ndoc = 1
+        for r in data.get("results", []):
+            ch = r.get("chain") or {}
+            vf = r.get("verify") or {}
+            sec = str(ch.get("sec") or r.get("sec") or "")
+            if not sec:
+                continue
+            _istore.upsert_section(c, doc_id=doc["doc_id"], sec=sec, header=ch.get("header", ""),
+                                   kept=True)
+            nsec += 1
+            # span-verbatim: deterministic char check the caller may have precomputed in verify
+            span = ch.get("step1_span", "")
+            verdicts = {h.get("ticker"): h.get("verdict") for h in (vf.get("hits_upheld") or [])}
+            for hit in (ch.get("step4_book_hits") or []):
+                _istore.record_impact(
+                    c, doc_id=doc["doc_id"], sec=sec, ticker=hit["ticker"],
+                    direction=hit.get("direction", ""), confidence=hit.get("confidence", ""),
+                    step1_what_changes=ch.get("step1_what_changes", ""), step1_span=span,
+                    step2_mechanism=ch.get("step2_mechanism", ""), reasoning=hit.get("reasoning", ""),
+                    verify_verdict=verdicts.get(hit["ticker"], ""),
+                    span_verbatim=bool(vf.get("span_is_verbatim")),
+                    model=doc.get("model", ""), prompt_version=doc.get("prompt_version", "v1"),
+                    scored_at=now_iso)
+                nimp += 1
+    return {"ingested": True, "documents": ndoc, "sections": nsec, "impacts": nimp}
+
+
+def cmd_intel_power_load(args) -> dict:
+    """Load point-in-time power rows (chairs/leadership/agency heads). Input: {"power": [
+    {bioguide, congress, role, committee, chamber, name, source}, ...]}."""
+    cfg, led = _cfg_and_ledger()
+    data = _load_input(args)
+    from lib.intel import store as _istore
+    n = 0
+    with led.intel_conn() as c:
+        for p in data.get("power", []):
+            _istore.upsert_power(c, bioguide=p["bioguide"], congress=int(p["congress"]),
+                                 role=p.get("role", ""), committee=p.get("committee", ""),
+                                 chamber=p.get("chamber", ""), name=p.get("name", ""),
+                                 source=p.get("source", ""))
+            n += 1
+    return {"loaded": True, "power_rows": n}
+
+
+def cmd_intel_refresh(args) -> dict:
+    """One live intelligence pass: poll recent bills (Congress.gov) + rules (Federal Register),
+    split -> prefilter -> chain -> ingest. Best-effort; writes only intel tables. Fail-SAFE OFF
+    unless intel.enabled. The allow-list + book description come from strategy.yaml."""
+    cfg, led = _cfg_and_ledger()
+    ic = getattr(cfg, "intel", None)
+    if ic is None or not ic.enabled:
+        return {"skipped": "intel disabled (config: intel.enabled)"}
+    from lib.intel import refresh as _iref
+    from lib.dataflows import congress as _cong, fedreg as _fr
+    data = _load_input(args)
+    now_iso = market.now_et().isoformat()
+    sc = cfg.strategy
+    allow = sorted({t.upper() for t in (sc.rh_tradable_confirmed or [])}) if sc else []
+    book_desc = "AI-infrastructure / semiconductors / nuclear power / data centers / grid / space"
+    # documents to process come from the input (already-listed) or the injected fakes in tests;
+    # a live run lists them via the congress/fedreg pollers, which the operator wires per cadence.
+    docs = data.get("documents", [])
+
+    def _fetch_text(doc):
+        # bills: govinfo USLM; rules: Federal Register body — both stdlib fetchers, injectable.
+        url = doc.get("text_url") or doc.get("body_url") or ""
+        if not url:
+            from lib.dataflows.errors import DataUnavailableError
+            raise DataUnavailableError(f"no text url for {doc.get('doc_id')}")
+        return _cong._default_opener(url, 30)
+
+    with led.intel_conn() as c:
+        out = _iref.run_refresh(c, documents=docs, allow=allow, book_desc=book_desc,
+                                fetch_text=_fetch_text, now=now_iso)
+    return {"refreshed": True, **out}
+
+
+def cmd_intel_profile(args) -> dict:
+    """Render one markdown profile per key player (a sponsor who held power) into
+    state/profiles/{bioguide}.md. Hash-gated: an unchanged profile is not rewritten."""
+    cfg, led = _cfg_and_ledger()
+    from lib.intel import aggregate as _iagg, profiles as _iprof, store as _istore
+    from lib import fsutil
+    as_of = market.trading_day_et()
+    outdir = Path(LEDGER_DB).resolve().parent / "profiles"
+    written, skipped = [], []
+    with led.intel_conn() as c:
+        players = _istore.all_key_player_sponsors(c)
+        for pl in players:
+            bio, cong = pl["bioguide"], int(pl["congress"])
+            power = _istore.power_for(c, bio, cong)
+            impacts = _istore.impacts_for_sponsor(c, bio)
+            prof = _iagg.build_profile(bioguide=bio, congress=cong, power=power, impacts=impacts)
+            rendered = _iprof.render(prof, as_of=as_of)
+            path = outdir / f"{bio}.md"
+            # hash-gate: skip rewrite when the semantic body is unchanged (stable diffs)
+            if path.exists() and f"input_hash: {rendered['content_hash']}" in path.read_text(encoding="utf-8"):
+                skipped.append(bio)
+                continue
+            fsutil.atomic_write_text(path, rendered["md"])
+            written.append(bio)
+    return {"profiles_written": written, "skipped_unchanged": skipped, "dir": str(outdir)}
+
+
+def cmd_intel_propose(args) -> dict:
+    """Aggregate the book-level key-player posture and emit ADDITIVE shadow proposals. With
+    --record, also mint them as tier='intel' universe proposals (human-approve only). Never
+    reduces a protected sleeve — the proposer can only add."""
+    cfg, led = _cfg_and_ledger()
+    from lib.intel import aggregate as _iagg, propose as _iprop, store as _istore
+    record = bool(getattr(args, "record", False))
+    now_iso = market.now_et().isoformat()
+    # book snapshot from strategy.yaml (weights + protected + cash + allow-list)
+    book = _intel_book_snapshot(cfg)
+    # aggregate every key player's impacts into a book-level per-ticker posture
+    agg: dict = {}
+    with led.intel_conn() as c:
+        for pl in _istore.all_key_player_sponsors(c):
+            impacts = _istore.impacts_for_sponsor(c, pl["bioguide"])
+            for tk in {i["ticker"] for i in impacts}:
+                p = _iagg.posture_for_ticker([i for i in impacts if i["ticker"] == tk])
+                if tk not in agg:
+                    agg[tk] = p
+                else:  # pool evidence across players
+                    agg[tk]["score"] = round(agg[tk]["score"] + p["score"], 4)
+                    agg[tk]["evidence"] += p["evidence"]
+                    agg[tk]["posture"] = ("helps" if agg[tk]["score"] > 1e-9
+                                          else "hurts" if agg[tk]["score"] < -1e-9 else "neutral")
+        proposals = _iprop.propose(postures=agg, book=book, cfg=_intel_propose_cfg(cfg))
+        assert not _iprop.would_overwrite_protected(proposals, book), "intel proposal touched a protected sleeve"
+        recorded = []
+        with led.intel_conn() as ic:
+            for pr in proposals:
+                _istore.record_shadow_proposal(
+                    ic, created_at=now_iso, kind=pr["kind"], ticker=pr["ticker"],
+                    sleeve=pr.get("sleeve"), target_weight=pr.get("target_weight"),
+                    direction=pr["direction"], evidence={"score": pr.get("score"),
+                                                         "evidence": pr.get("evidence", [])})
+        if record:
+            goal = led.get_active_goal()
+            if goal:
+                import lib.learn as learn
+                for pr in proposals:
+                    if pr["kind"] not in ("PROPOSE_ADD", "PROPOSE_SLEEVE"):
+                        continue
+                    p = learn.Proposal(kind="PROPOSE_ADD", ticker=pr["ticker"], sleeve=pr.get("sleeve"),
+                                       tier=_iprop.TIER_INTEL, reason=pr["reason"],
+                                       target_weight=pr.get("target_weight"))
+                    rid = led.record_universe_proposal(
+                        goal_id=goal["id"], proposed_at=now_iso, kind=p.kind, ticker=p.ticker,
+                        sleeve=p.sleeve, from_book=None, to_book=None, target_weight=p.target_weight,
+                        tier=p.tier, content_hash=p.content_hash(), change_key=p.change_key(),
+                        reason=p.reason, goal_gap_pct=None)
+                    if rid:
+                        recorded.append(rid)
+    return {"proposed": len(proposals), "shadow_written": len(proposals),
+            "recorded_ids": recorded, "postures": {t: p["posture"] for t, p in agg.items()}}
+
+
+def _intel_book_snapshot(cfg):
+    """Build a lib.intel.propose.BookSnapshot from strategy.yaml. PURE-ish glue (reads cfg only)."""
+    from lib.intel.propose import BookSnapshot
+    import lib.strategy as strategy
+    held, tradable, sleeves, tsleeve = set(), set(), {}, {}
+    cash_pct = 0.0
+    sc = cfg.strategy
+    if sc is not None:
+        tradable = {t.upper() for t in (sc.rh_tradable_confirmed or [])}
+        book = sc.book(sc.default_book) if hasattr(sc, "book") else None
+        holdings = getattr(book, "holdings", []) if book else []
+        cash_ticker = (getattr(cfg.risk, "cash_sleeve_ticker", None) or "SGOV").upper()
+        for h in holdings:
+            tk = str(getattr(h, "ticker", "")).upper()
+            w = float(getattr(h, "weight", 0.0) or 0.0)
+            sl = str(getattr(h, "sleeve", "") or "")
+            held.add(tk)
+            tsleeve[tk] = sl
+            sleeves.setdefault(sl, {"weight": 0.0, "protected": True, "tickers": []})
+            sleeves[sl]["weight"] += w
+            sleeves[sl]["tickers"].append(tk)
+            if tk == cash_ticker:
+                cash_pct += w
+    return BookSnapshot(held=held, tradable=tradable, sleeves=sleeves, cash_pct=cash_pct,
+                        ticker_sleeve=tsleeve)
+
+
+def _intel_propose_cfg(cfg):
+    from lib.intel.propose import ProposeConfig
+    ic = getattr(cfg, "intel", None)
+    if ic is None:
+        return ProposeConfig()
+    return ProposeConfig(min_score=ic.min_score, add_weight=ic.add_weight,
+                         intel_max_total_pct=ic.intel_max_total_pct,
+                         new_sleeve_min_names=ic.new_sleeve_min_names)
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2674,6 +2895,15 @@ def main(argv) -> int:
     p_sh = sub.add_parser("strategy-history")
     p_sh.add_argument("--limit", default="50")
     p_sh.add_argument("--type", default="")
+    p_ir = sub.add_parser("intel-refresh")
+    p_ir.add_argument("--input", default="")
+    p_ii = sub.add_parser("intel-ingest")
+    p_ii.add_argument("--input", required=True)
+    p_ipl = sub.add_parser("intel-power-load")
+    p_ipl.add_argument("--input", required=True)
+    sub.add_parser("intel-profile")
+    p_ipr = sub.add_parser("intel-propose")
+    p_ipr.add_argument("--record", action="store_true")
     args = ap.parse_args(argv)
 
     try:
@@ -2727,6 +2957,16 @@ def main(argv) -> int:
             out = cmd_decision_proof(args)
         elif args.cmd == "strategy-history":
             out = cmd_strategy_history(args)
+        elif args.cmd == "intel-refresh":
+            out = cmd_intel_refresh(args)
+        elif args.cmd == "intel-ingest":
+            out = cmd_intel_ingest(args)
+        elif args.cmd == "intel-power-load":
+            out = cmd_intel_power_load(args)
+        elif args.cmd == "intel-profile":
+            out = cmd_intel_profile(args)
+        elif args.cmd == "intel-propose":
+            out = cmd_intel_propose(args)
         else:  # unreachable
             raise SystemExit(2)
     except Exception as e:  # noqa: BLE001
