@@ -3763,6 +3763,13 @@ check("intel: moderate threat on an UNPROTECTED held name -> reduce (lower bar)"
 _noh = _iprop.propose(postures={"SMR": {"posture": "hurts", "score": -5.0, "evidence": []}},
                       book=_book, cfg=_cfg_t)
 check("intel: threat on a non-held name -> no reduce (nothing to sell)", len(_noh), 0)
+# INTEL-APPROVAL-01: a held name with an EMPTY/unknown sleeve fails SAFE to PROTECTED (higher bar),
+# so a moderate threat below the protected bar does NOT propose reducing it.
+_book_empty = _iprop.BookSnapshot(held={"ZZZ"}, tradable={"ZZZ"}, sleeves={},
+                                  cash_pct=5.0, ticker_sleeve={"ZZZ": ""})
+_emptythreat = _iprop.propose(postures={"ZZZ": {"posture": "hurts", "score": -0.9, "evidence": []}},
+                              book=_book_empty, cfg=_iprop.ProposeConfig(threat_score=0.6, protected_threat_score=1.5))
+check("intel: empty-sleeve held name is treated PROTECTED (no reduce below protected bar)", len(_emptythreat), 0)
 
 # --- fedreg: the regulation fetcher (offline, fake opener; stdlib urllib in prod) ---
 from lib.dataflows import fedreg as _fr  # noqa: E402
@@ -3827,6 +3834,13 @@ check("chain: off-allow-list ticker dropped", _ro["book_hits"], [])
 # unparseable model output -> fail SAFE to no_impact
 _ru = _ichain.analyze_section(_sec_ura, allow=["URA"], book="x", llm=lambda p, t: "sorry, I cannot")
 check("chain: unparseable output fails SAFE to no_impact", _ru["no_impact"], True)
+# F1: a TRIVIAL span (a single ubiquitous word that is in the text) must NOT launder a fabricated
+# hit past the veto — require a substantive multi-token quote.
+_sec_sec = _Sec("101", "appropriation", "Amends the appropriation for the Secretary of Energy for fiscal year 2026.")
+_trivial = '{"sec":"101","step1_span":"Secretary","book_hits":[{"ticker":"URA","direction":"helps","confidence":"high","reasoning":"x"}],"no_impact":false}'
+_rt = _ichain.analyze_section(_sec_sec, allow=["URA"], book="x", llm=lambda p, t: _trivial)
+check("chain: a one-word span is too trivial to admit a hit (F1)", _rt["book_hits"], [])
+check("chain: trivial span -> span_verbatim False", _rt["span_verbatim"], False)
 
 # --- refresh: the whole scheduled pass (fetch -> split -> prefilter -> chain -> ingest), faked ---
 from lib.intel import refresh as _iref  # noqa: E402
@@ -3848,28 +3862,46 @@ def _fake_llm(prompt, timeout):
                 '"book_hits":[{"ticker":"SMR","direction":"helps","confidence":"medium","reasoning":"reactors"}],'
                 '"no_impact":false}')
     return '{"sec":"x","step1_span":"","book_hits":[],"no_impact":true}'
-with _refdb.intel_conn() as _rc:
-    _refout = _iref.run_refresh(
-        _rc,
-        documents=[{"doc_id": "118-hr-99", "kind": "bill", "title": "X Act", "published": "2023-05-01",
-                    "sponsor": "R000575", "congress": 118}],
-        allow=["SMR", "URA"], book_desc="nuclear",
-        fetch_text=lambda doc: _BILL2, llm=_fake_llm, now="2026-07-18T00:00:00Z",
-        min_section_chars=50)
+# run_refresh takes a connection FACTORY (led.intel_conn) and commits per document — the slow
+# fetch + LLM I/O holds no lock, and a doc completed before a timeout persists.
+_refout = _iref.run_refresh(
+    _refdb.intel_conn,
+    documents=[{"doc_id": "118-hr-99", "kind": "bill", "title": "X Act", "published": "2023-05-01",
+                "sponsor": "R000575", "congress": 118}],
+    allow=["SMR", "URA"], book_desc="nuclear",
+    fetch_text=lambda doc: _BILL2, llm=_fake_llm, now="2026-07-18T00:00:00Z",
+    min_section_chars=50)
 check("refresh: one document processed", _refout["documents"], 1)
 check("refresh: prefilter kept the nuclear section, dropped post-office", _refout["kept"], 1)
 check("refresh: chain recorded the SMR impact", _refout["impacts"], 1)
 from lib.intel import store as _istore  # noqa: E402
 with _refdb.intel_conn() as _rc:
     _rimp = _istore.impacts_for_sponsor(_rc, "R000575")
-check("refresh: impact persisted + joinable to sponsor", [i["ticker"] for i in _rimp], ["SMR"])
+check("refresh: impact persisted + joinable to sponsor (per-doc commit)", [i["ticker"] for i in _rimp], ["SMR"])
 check_true("refresh: persisted impact is span-verbatim", bool(_rimp[0]["span_verbatim"]))
 # fetch failure on a doc is best-effort (counted, never raises)
-with _refdb.intel_conn() as _rc:
-    def _boom(doc): raise RuntimeError("network down")
-    _referr = _iref.run_refresh(_rc, documents=[{"doc_id": "d2", "published": "2023-01-01"}],
-                                allow=["SMR"], book_desc="x", fetch_text=_boom, now="t")
+def _boom(doc): raise RuntimeError("network down")
+_referr = _iref.run_refresh(_refdb.intel_conn, documents=[{"doc_id": "d2", "published": "2023-01-01"}],
+                            allow=["SMR"], book_desc="x", fetch_text=_boom, now="t")
 check("refresh: a failed fetch is best-effort (counted, pass continues)", _referr["errors"], 1)
+# COST BUDGET (INTEL-COST-1): max_chained_sections caps the LLM fan-out; excess sections are kept
+# but not chained (a later run picks them up). A 3-section bill with a budget of 1 -> 1 chained.
+_budhit = {"n": 0}
+def _count_llm(prompt, timeout):
+    _budhit["n"] += 1
+    return '{"sec":"x","step1_span":"","book_hits":[],"no_impact":true}'
+_BILL3 = b"""<?xml version="1.0"?><bill><legis-body>
+  <section><enum>1.</enum><header>Nuclear reactor A</header><text>This section concerns a nuclear reactor and uranium enrichment for commercial power generation across the grid one.</text></section>
+  <section><enum>2.</enum><header>Nuclear reactor B</header><text>This section concerns a nuclear reactor and uranium enrichment for commercial power generation across the grid two.</text></section>
+  <section><enum>3.</enum><header>Nuclear reactor C</header><text>This section concerns a nuclear reactor and uranium enrichment for commercial power generation across the grid three.</text></section>
+</legis-body></bill>"""
+_budout = _iref.run_refresh(Ledger(tempfile.mktemp(suffix=".db")).intel_conn,
+    documents=[{"doc_id": "b3", "kind": "bill", "published": "2023-01-01", "sponsor": "X", "congress": 118}],
+    allow=["URA"], book_desc="nuclear", fetch_text=lambda d: _BILL3, llm=_count_llm, now="t",
+    min_section_chars=20, max_chained_sections=1)
+check("refresh: max_chained_sections caps LLM calls", _budhit["n"], 1)
+check("refresh: budget_hit flag set when the cap bites", _budout["budget_hit"], True)
+check("refresh: over-budget sections still stored kept (chained later)", _budout["kept"], 3)
 # REGULATION through refresh: a rule from a book regulator dispatches to the FR splitter and its
 # operative sections are kept via the agency crosswalk (even though "nuclear reactor" isn't in the
 # operative cask text) -> the chain fires and records the impact.
@@ -3881,14 +3913,24 @@ def _fr_llm(prompt, timeout):
                 '"book_hits":[{"ticker":"CEG","direction":"helps","confidence":"low","reasoning":"nuclear utility"}],'
                 '"no_impact":false}')
     return '{"sec":"x","step1_span":"","book_hits":[],"no_impact":true}'
-with _frdb.intel_conn() as _rc:
-    _frout = _iref.run_refresh(_rc,
-        documents=[{"doc_id": "FR-9", "kind": "rule", "title": "Cask rule", "published": "2026-07-01",
-                    "sponsor": "NRC", "congress": 0, "agency": "Nuclear Regulatory Commission"}],
-        allow=["CEG", "URA"], book_desc="nuclear",
-        fetch_text=lambda d: _FR_XML, llm=_fr_llm, now="t", min_section_chars=20)
+_frout = _iref.run_refresh(_frdb.intel_conn,
+    documents=[{"doc_id": "FR-9", "kind": "rule", "title": "Cask rule", "published": "2026-07-01",
+                "sponsor": "NRC", "congress": 0, "agency": "Nuclear Regulatory Commission"}],
+    allow=["CEG", "URA"], book_desc="nuclear",
+    fetch_text=lambda d: _FR_XML, llm=_fr_llm, now="t", min_section_chars=20)
 check("refresh: rule from a book agency keeps sections via the CFR-agency crosswalk", _frout["kept"] >= 1, True)
 check("refresh: rule chain recorded the impact", _frout["impacts"], 1)
+# INTEL-1: a key player on MULTIPLE committees has multiple intel_power rows; all_key_player_sponsors
+# must return exactly ONE row for them, or cmd_intel_propose would double-count their conviction.
+_kpdb = Ledger(tempfile.mktemp(suffix=".db"))
+with _kpdb.intel_conn() as _rc:
+    _istore.upsert_document(_rc, doc_id="118-hr-7", kind="bill", title="t", published="2023-01-01",
+                            sponsor="R000575", congress=118)
+    _istore.upsert_power(_rc, bioguide="R000575", congress=118, role="chair", committee="HSAS", name="Rogers")
+    _istore.upsert_power(_rc, bioguide="R000575", congress=118, role="member", committee="HSHA", name="Rogers")
+    _kps = _istore.all_key_player_sponsors(_rc)
+check("intel: a multi-committee sponsor returns ONE row (no double-count)",
+      [(k["bioguide"], k["congress"]) for k in _kps], [("R000575", 118)])
 
 
 print(f"\n{PASS} passed, {FAIL} failed")

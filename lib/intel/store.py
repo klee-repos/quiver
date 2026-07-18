@@ -180,9 +180,14 @@ def impacts_for_sponsor(c: sqlite3.Connection, sponsor: str) -> List[dict]:
 
 def all_key_player_sponsors(c: sqlite3.Connection) -> List[dict]:
     """Every member who (a) sponsored a document we ingested AND (b) held power in that
-    document's congress — i.e. the key players whose profiles are worth rendering."""
+    document's congress — i.e. the key players whose profiles are worth rendering.
+
+    DISTINCT on (sponsor, congress) ONLY — a chair who sits on several committees has multiple
+    intel_power rows, and returning role/committee here would emit one row per committee, so a
+    caller iterating the result would double-count that player's impacts. Callers that need the
+    roles re-fetch them via ``power_for``."""
     rows = c.execute(
-        "SELECT DISTINCT d.sponsor AS bioguide, d.congress, p.role, p.committee, p.name "
+        "SELECT DISTINCT d.sponsor AS bioguide, d.congress "
         "FROM intel_documents d JOIN intel_power p "
         "  ON p.bioguide = d.sponsor AND p.congress = d.congress "
         "WHERE d.sponsor IS NOT NULL ORDER BY d.sponsor",

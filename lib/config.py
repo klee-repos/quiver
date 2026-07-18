@@ -193,6 +193,7 @@ class IntelConfig:
     new_sleeve_min_names: int
     threat_score: float
     protected_threat_score: float
+    max_sections_per_run: int
 
 
 @dataclass(frozen=True)
@@ -730,7 +731,10 @@ def load_config(path) -> Config:
     intel_new_sleeve_min = _intel_num("new_sleeve_min_names", 2, int)
     intel_threat = _intel_num("threat_score", 0.6, float)
     intel_protected_threat = _intel_num("protected_threat_score", 1.5, float)
+    intel_max_sections = _intel_num("max_sections_per_run", 120, int)
     if intel_enabled:
+        if intel_max_sections < 1:
+            raise ConfigError("config.yaml: intel.max_sections_per_run must be >= 1")
         if intel_add_weight <= 0:
             raise ConfigError("config.yaml: intel.add_weight must be > 0")
         if not (0.0 < intel_max_total <= 100.0):
@@ -743,7 +747,8 @@ def load_config(path) -> Config:
     intel_cfg = IntelConfig(
         enabled=intel_enabled, min_score=intel_min_score, add_weight=intel_add_weight,
         intel_max_total_pct=intel_max_total, new_sleeve_min_names=intel_new_sleeve_min,
-        threat_score=intel_threat, protected_threat_score=intel_protected_threat)
+        threat_score=intel_threat, protected_threat_score=intel_protected_threat,
+        max_sections_per_run=intel_max_sections)
 
     # --- Goal / deposit-auto-capture (observability; fail-safe, MUST NOT raise) --------
     # load_config runs at the START of every subcommand (before the best-effort tail), so a

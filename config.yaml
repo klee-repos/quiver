@@ -201,3 +201,5 @@ intel:
   # wall: a PROTECTED seeded sleeve needs the stronger bar (so noise can't churn the core book).
   threat_score: 0.6                      # threat magnitude to propose reducing an ordinary held name
   protected_threat_score: 1.5            # STRONGER threat to propose reducing a protected seeded name (>= threat_score)
+  max_sections_per_run: 120              # HARD per-run cap on sections sent to the LLM chain (cost bound;
+                                         # a big omnibus rule's extra sections are kept + chained a later run)

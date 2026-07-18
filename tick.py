@@ -2701,11 +2701,13 @@ def cmd_intel_refresh(args) -> dict:
             _intel_seed_agency_power(led, now_iso)
         docs = bdocs + rdocs
 
-    with led.intel_conn() as c:
-        out = _iref.run_refresh(c, documents=docs, allow=allow, book_desc=book_desc,
-                                fetch_text=lambda d: _cong._default_opener(
-                                    d.get("text_url") or d.get("body_url") or "", 30),
-                                now=now_iso)
+    # Pass the connection FACTORY (not an open conn): run_refresh commits per document, so the slow
+    # per-section fetch + claude -p I/O holds no ledger lock and a timeout keeps completed docs.
+    mx = getattr(ic, "max_sections_per_run", 120)
+    out = _iref.run_refresh(led.intel_conn, documents=docs, allow=allow, book_desc=book_desc,
+                            fetch_text=lambda d: _cong._default_opener(
+                                d.get("text_url") or d.get("body_url") or "", 30),
+                            now=now_iso, max_chained_sections=int(mx))
     return {"refreshed": True, "polled_bills": polled_bills, "polled_rules": polled_rules, **out}
 
 

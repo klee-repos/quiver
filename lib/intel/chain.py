@@ -105,9 +105,13 @@ def analyze_section(section, *, allow: List[str], book: str, llm: Optional[LLM] 
                 "book_hits": [], "span_verbatim": False, "step1_span": "",
                 "step1_what_changes": "", "step2_mechanism": "", "error": "unparseable"}
     span = str(obj.get("step1_span", "") or "")
-    span_ok = bool(_norm(span)) and _norm(span) in _norm(section.text)
+    # The span must be a SUBSTANTIVE verbatim quote, not a single ubiquitous word ("Secretary")
+    # that happens to appear in the section — otherwise a fabricated hit could be laundered past
+    # the veto by pairing it with any trivial real fragment. Require >= 5 tokens AND >= 25 chars.
+    _nspan = _norm(span)
+    span_ok = (len(_nspan) >= 25 and len(_nspan.split()) >= 5 and _nspan in _norm(section.text))
     hits = []
-    if span_ok:  # a fabricated citation drops ALL hits — the deterministic veto
+    if span_ok:  # a trivial or fabricated citation drops ALL hits — the deterministic veto
         for h in (obj.get("book_hits") or []):
             tk = str(h.get("ticker", "")).upper()
             if tk in allow_up and h.get("direction") in ("helps", "hurts", "ambiguous"):

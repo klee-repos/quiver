@@ -45,8 +45,14 @@ class ProposeConfig:
 
 
 def _is_protected(book: BookSnapshot, ticker: str) -> bool:
+    """Fail SAFE toward protection: a held name whose sleeve is unknown/empty (a data glitch, or a
+    ticker with no resolved sleeve) is treated as PROTECTED — it takes the HIGHER threat bar to
+    propose reducing it. Only a name in a sleeve explicitly marked protected=False (e.g. cash) uses
+    the ordinary bar. An empty-string sleeve must not slip past as unprotected."""
     sleeve = book.ticker_sleeve.get(ticker)
-    return bool(book.sleeves.get(sleeve, {}).get("protected")) if sleeve else False
+    if not sleeve or sleeve not in book.sleeves:
+        return True
+    return bool(book.sleeves[sleeve].get("protected"))
 
 
 def propose(*, postures: Dict[str, dict], book: BookSnapshot,
