@@ -2757,8 +2757,12 @@ def cmd_intel_propose(args) -> dict:
                     agg[tk]["evidence"] += p["evidence"]
                     agg[tk]["posture"] = ("helps" if agg[tk]["score"] > 1e-9
                                           else "hurts" if agg[tk]["score"] < -1e-9 else "neutral")
-        proposals = _iprop.propose(postures=agg, book=book, cfg=_intel_propose_cfg(cfg))
-        assert not _iprop.would_overwrite_protected(proposals, book), "intel proposal touched a protected sleeve"
+        pcfg = _intel_propose_cfg(cfg)
+        proposals = _iprop.propose(postures=agg, book=book, cfg=pcfg)
+        # A protected-name REMOVE must have cleared the higher threat bar (belt-and-suspenders on
+        # propose()'s own gate — conservation is a higher bar, not a wall).
+        _below = _iprop.protected_reduction_below_bar(proposals, book, pcfg)
+        assert not _below, f"intel protected reduction below the threat bar: {_below}"
         recorded = []
         with led.intel_conn() as ic:
             for pr in proposals:
@@ -2771,10 +2775,15 @@ def cmd_intel_propose(args) -> dict:
             goal = led.get_active_goal()
             if goal:
                 import lib.learn as learn
+                # ADD/SLEEVE mint as PROPOSE_ADD; a threat mints as PROPOSE_REMOVE (winds to cash
+                # via the shared exiting path at apply time). Both tier 'intel' -> human --approve.
+                _kindmap = {"PROPOSE_ADD": "PROPOSE_ADD", "PROPOSE_SLEEVE": "PROPOSE_ADD",
+                            "PROPOSE_REMOVE": "PROPOSE_REMOVE"}
                 for pr in proposals:
-                    if pr["kind"] not in ("PROPOSE_ADD", "PROPOSE_SLEEVE"):
+                    kind = _kindmap.get(pr["kind"])
+                    if not kind:
                         continue
-                    p = learn.Proposal(kind="PROPOSE_ADD", ticker=pr["ticker"], sleeve=pr.get("sleeve"),
+                    p = learn.Proposal(kind=kind, ticker=pr["ticker"], sleeve=pr.get("sleeve"),
                                        tier=_iprop.TIER_INTEL, reason=pr["reason"],
                                        target_weight=pr.get("target_weight"))
                     rid = led.record_universe_proposal(
@@ -2822,7 +2831,9 @@ def _intel_propose_cfg(cfg):
         return ProposeConfig()
     return ProposeConfig(min_score=ic.min_score, add_weight=ic.add_weight,
                          intel_max_total_pct=ic.intel_max_total_pct,
-                         new_sleeve_min_names=ic.new_sleeve_min_names)
+                         new_sleeve_min_names=ic.new_sleeve_min_names,
+                         threat_score=ic.threat_score,
+                         protected_threat_score=ic.protected_threat_score)
 
 
 def main(argv) -> int:

@@ -3704,7 +3704,7 @@ _props = _iprop.propose(
 check("intel: propose ADDs the non-held tailwind name only", [p["ticker"] for p in _props], ["NLR"])
 check("intel: propose tier is 'intel' (always human-approve)", _props[0]["tier"], "intel")
 check("intel: propose funds from cash at add_weight", _props[0]["target_weight"], 4.0)
-check_true("intel: propose never touches a protected sleeve", not _iprop.would_overwrite_protected(_props, _book))
+check_true("intel: tailwind ADDs never trigger a protected reduction", not _iprop.protected_reduction_below_bar(_props, _book))
 # budget cap: many tailwind names, tiny cash -> total proposed weight <= min(cash, cap)
 _many = {f"T{i}": {"posture": "helps", "score": 0.9, "evidence": []} for i in range(10)}
 _smallcash = _iprop.BookSnapshot(held=set(), tradable={f"T{i}" for i in range(10)}, sleeves={},
@@ -3712,15 +3712,34 @@ _smallcash = _iprop.BookSnapshot(held=set(), tradable={f"T{i}" for i in range(10
 _capped = _iprop.propose(postures=_many, book=_smallcash,
                          cfg=_iprop.ProposeConfig(min_score=0.5, add_weight=4.0, intel_max_total_pct=20.0))
 check_true("intel: propose respects the cash budget (sum <= 6%)", sum(p["target_weight"] for p in _capped) <= 6.0 + 1e-9)
-# CONSERVATION REGRESSION: postures that (naively) want to gut the book produce ONLY additive
-# proposals; the protected sleeve's weight is untouched because propose CANNOT emit a reduction.
-_conserve = _iprop.propose(
-    postures={"URA": {"posture": "hurts", "score": -5.0, "evidence": []},   # would 'want' to cut URA
-              "SMH": {"posture": "hurts", "score": -5.0, "evidence": []}},  # would 'want' to cut SMH
-    book=_book, cfg=_iprop.ProposeConfig())
-check("intel: bearish postures on HELD protected names emit ZERO proposals (never overwrites)", len(_conserve), 0)
-check_true("intel: conservation holds — no proposal reduces a protected sleeve",
-           not _iprop.would_overwrite_protected(_conserve, _book))
+# THREAT -> REDUCE: the service CAN reduce a held position to cash on a strong threat (the user's
+# "reduce our positions to cash"). Conservation is a HIGHER BAR, not a wall.
+_cfg_t = _iprop.ProposeConfig(threat_score=0.6, protected_threat_score=1.5)
+# a WEAK threat on a protected held name -> below the protected bar -> NO proposal (noise filtered)
+_weak = _iprop.propose(postures={"URA": {"posture": "hurts", "score": -0.9, "evidence": [{"span": "x"}]}},
+                       book=_book, cfg=_cfg_t)
+check("intel: weak threat on a PROTECTED name is below the bar -> no reduce", len(_weak), 0)
+# a STRONG threat on a protected held name -> clears the protected bar -> PROPOSE_REMOVE (to cash)
+_strong = _iprop.propose(postures={"URA": {"posture": "hurts", "score": -2.0, "evidence": [{"span": "regulation guts uranium"}]}},
+                         book=_book, cfg=_cfg_t)
+check("intel: STRONG threat on a protected name -> PROPOSE_REMOVE (reduce to cash)",
+      [(p["kind"], p["ticker"]) for p in _strong], [("PROPOSE_REMOVE", "URA")])
+check("intel: reduce proposal is tier 'intel' (human --approve winds it to cash)", _strong[0]["tier"], "intel")
+check("intel: reduce proposal carries no target_weight (full exit)", _strong[0]["target_weight"], None)
+check_true("intel: protected reduction cleared the higher bar (belt-and-suspenders empty)",
+           not _iprop.protected_reduction_below_bar(_strong, _book, _cfg_t))
+# a moderate threat on an UNPROTECTED held name clears the lower bar
+_book_unp = _iprop.BookSnapshot(held={"NLR"}, tradable={"NLR"},
+    sleeves={"Nuclear": {"weight": 5.0, "protected": False, "tickers": ["NLR"]}},
+    cash_pct=5.0, ticker_sleeve={"NLR": "Nuclear"})
+_unp = _iprop.propose(postures={"NLR": {"posture": "hurts", "score": -0.7, "evidence": []}},
+                      book=_book_unp, cfg=_cfg_t)
+check("intel: moderate threat on an UNPROTECTED held name -> reduce (lower bar)",
+      [p["kind"] for p in _unp], ["PROPOSE_REMOVE"])
+# a threat on a name we DON'T hold -> nothing to reduce
+_noh = _iprop.propose(postures={"SMR": {"posture": "hurts", "score": -5.0, "evidence": []}},
+                      book=_book, cfg=_cfg_t)
+check("intel: threat on a non-held name -> no reduce (nothing to sell)", len(_noh), 0)
 
 # --- fedreg: the regulation fetcher (offline, fake opener; stdlib urllib in prod) ---
 from lib.dataflows import fedreg as _fr  # noqa: E402

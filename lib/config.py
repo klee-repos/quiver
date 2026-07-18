@@ -191,6 +191,8 @@ class IntelConfig:
     add_weight: float
     intel_max_total_pct: float
     new_sleeve_min_names: int
+    threat_score: float
+    protected_threat_score: float
 
 
 @dataclass(frozen=True)
@@ -726,14 +728,22 @@ def load_config(path) -> Config:
     intel_add_weight = _intel_num("add_weight", 4.0, float)
     intel_max_total = _intel_num("intel_max_total_pct", 20.0, float)
     intel_new_sleeve_min = _intel_num("new_sleeve_min_names", 2, int)
+    intel_threat = _intel_num("threat_score", 0.6, float)
+    intel_protected_threat = _intel_num("protected_threat_score", 1.5, float)
     if intel_enabled:
         if intel_add_weight <= 0:
             raise ConfigError("config.yaml: intel.add_weight must be > 0")
         if not (0.0 < intel_max_total <= 100.0):
             raise ConfigError("config.yaml: intel.intel_max_total_pct must be in (0, 100]")
+        if intel_threat <= 0 or intel_protected_threat <= 0:
+            raise ConfigError("config.yaml: intel.threat_score and protected_threat_score must be > 0")
+        if intel_protected_threat < intel_threat:
+            raise ConfigError("config.yaml: intel.protected_threat_score must be >= threat_score "
+                              "(a protected seeded name needs a STRONGER threat to propose an exit)")
     intel_cfg = IntelConfig(
         enabled=intel_enabled, min_score=intel_min_score, add_weight=intel_add_weight,
-        intel_max_total_pct=intel_max_total, new_sleeve_min_names=intel_new_sleeve_min)
+        intel_max_total_pct=intel_max_total, new_sleeve_min_names=intel_new_sleeve_min,
+        threat_score=intel_threat, protected_threat_score=intel_protected_threat)
 
     # --- Goal / deposit-auto-capture (observability; fail-safe, MUST NOT raise) --------
     # load_config runs at the START of every subcommand (before the best-effort tail), so a
