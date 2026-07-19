@@ -1,0 +1,45 @@
+[Unit]
+Description=Quiver — read-only Telegram chat bridge (ask the bot about runs / strategy / decisions)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Always-on daemon (long-polls Telegram, outbound only — works behind the IAP-only firewall).
+Type=simple
+User=quiver
+Group=quiver
+WorkingDirectory=/opt/quiver
+EnvironmentFile=/etc/quiver/quiver.env
+# Chat writes its log to its OWN dir, NOT the tick's /var/log/quiver — so it can never touch the
+# shipped tick.log the Cloud Logging alarms key on (audit: log-forgery defense-in-depth).
+Environment=QUIVER_CHAT_LOG=/opt/quiver/state/chat/chat.log
+Environment=npm_config_cache=/opt/quiver/state/.npm-cache
+ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/chat_bridge.py
+# Restart only on an unexpected crash. A clean exit(0) means "not configured" (no
+# TELEGRAM_BOT_TOKEN / allowlist) — leave it stopped rather than crash-looping.
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+# --- Hardening: this service is STRICTLY read-only over the ledger + repo -----------------------
+# The ledger is a `journal_mode=delete` DB (no WAL), so a read-only open needs to write NOTHING
+# under state/. ProtectSystem=strict makes the WHOLE filesystem read-only; the only writable
+# paths are the claude/MCP OAuth store, the npm cache, and the logs. So even if every other wall
+# failed, the OS itself forbids this service from writing state/ledger.db or any repo file.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Writable set is minimal: the shared Claude OAuth store, the npm cache, and the chat's OWN log
+# dir. The ledger, the repo, config.yaml, and the tick's log dirs are all read-only here.
+ReadWritePaths=/opt/quiver/state/claude-config /opt/quiver/state/.npm-cache /opt/quiver/state/chat
+# The chat spawns one `claude -p` (sonnet) read session; light, but cap it so a spike can't
+# starve a concurrent trading tick on the 4 GiB box (the 2 GiB swapfile absorbs any overlap).
+MemoryMax=1536M
+
+[Install]
+WantedBy=multi-user.target

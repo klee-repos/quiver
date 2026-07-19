@@ -32,10 +32,15 @@ resource "google_service_account" "quiver" {
 locals {
   # Secrets the box reads (created out-of-band by bootstrap-gcp.sh). Per-secret accessor
   # grants = least privilege (the SA can read ONLY these, not every secret in the project).
-  # The OPTIONAL secrets quiver-CLAUDE_CODE_OAUTH_TOKEN / quiver-NOTIFY_ALERTS_TO are NOT
-  # listed here on purpose: they're usually unset (Claude auth is the on-box `claude login`;
-  # alerts fall back to NOTIFY_TO). To drive Claude auth from Secret Manager instead, create
-  # that secret AND add its name here, then re-apply — for_each requires the secret to exist.
+  # The OPTIONAL secrets quiver-CLAUDE_CODE_OAUTH_TOKEN / quiver-NOTIFY_ALERTS_TO /
+  # quiver-TELEGRAM_BOT_TOKEN / quiver-TELEGRAM_ALLOWED_CHAT_IDS are NOT listed here on purpose:
+  # they're usually unset (Claude auth is the on-box `claude login`; alerts fall back to
+  # NOTIFY_TO; the chat bridge is opt-in). To enable one from Secret Manager, create the secret
+  # AND add its name here, then re-apply — for_each requires the secret to exist. (Or, to avoid a
+  # full apply on the live box, grant just that secret manually:
+  #   gcloud secrets add-iam-policy-binding quiver-TELEGRAM_BOT_TOKEN \
+  #     --member=serviceAccount:<box-sa-email> --role=roles/secretmanager.secretAccessor
+  # then refresh /etc/quiver/quiver.env on the box — see docs/CHAT.md.)
   secrets = [
     "GLM_API_KEY", "DEEPSEEK_API_KEY", "RH_ACCOUNT_NUMBER", "RESEND_API_KEY",
     "NOTIFY_TO", "RESEND_FROM", "STRATEGY_YAML",

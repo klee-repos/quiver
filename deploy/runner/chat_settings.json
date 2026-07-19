@@ -1,0 +1,16 @@
+{
+  "_comment": "claude CLI settings for the READ-ONLY chat bridge (chat_bridge.py). The PreToolUse hook is the mechanical read-only gate (mirrors order_guard.py for the trading tick): chat_guard.py runs before EVERY tool call and DENIES anything that writes, trades, hits the network, reads a secret, or is not on the read-only Bash allowlist. Matcher is '.*' so nothing bypasses it. Fails CLOSED. Combined with --strict-mcp-config + an empty mcp.json (zero MCP servers -> no broker) and the systemd unit's read-only ReadWritePaths, the chat assistant cannot move money or mutate state.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".venv/bin/python deploy/runner/chat_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

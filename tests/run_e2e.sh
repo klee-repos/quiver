@@ -19,6 +19,7 @@ LIVE=0
 # name|file pairs. The live one is appended only when requested.
 SUITES=(
   "unit|tests/test_units.py"
+  "chat-guard|tests/test_chat_guard.py"
   "brain-node|quiver_eve/test"
   "run-analyses|tests/test_run_analyses.py"
   "e2e-dryrun|tests/test_e2e.py"

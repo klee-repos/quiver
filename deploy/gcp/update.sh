@@ -95,17 +95,28 @@ else
 fi
 
 echo "[5/6] systemd units"
-if grep -qE '^deploy/quiver(-intel)?\.(service|timer)$' <<<"$CHANGED"; then
+if grep -qE '^deploy/quiver(-intel|-chat)?\.(service|timer)$' <<<"$CHANGED"; then
   echo "  unit files changed -> reinstalling + daemon-reload"
   cp "$QUIVER_HOME/deploy/quiver.service"        /etc/systemd/system/quiver.service
   cp "$QUIVER_HOME/deploy/quiver.timer"          /etc/systemd/system/quiver.timer
   cp "$QUIVER_HOME/deploy/quiver-intel.service"  /etc/systemd/system/quiver-intel.service
   cp "$QUIVER_HOME/deploy/quiver-intel.timer"    /etc/systemd/system/quiver-intel.timer
+  cp "$QUIVER_HOME/deploy/quiver-chat.service"   /etc/systemd/system/quiver-chat.service
   systemctl daemon-reload
   # the intel timer is separate from the trading timer; enable it so the daily refresh runs.
   systemctl enable --now quiver-intel.timer 2>/dev/null || true
 else
   echo "  no unit changes — skipping"
+fi
+
+# The read-only chat bridge is a long-running daemon (not spawned fresh per tick), so its code
+# changes need an explicit restart to take effect. Only restart if it's already enabled (opt-in);
+# never START it here — that's setup.sh's job, gated on TELEGRAM_BOT_TOKEN.
+if grep -qE '^(deploy/quiver-chat\.service|deploy/runner/chat_(bridge|guard)\.py|deploy/runner/chat_(settings|mcp)\.json|prompts/chat\.md)$' <<<"$CHANGED"; then
+  if systemctl is-enabled quiver-chat.service >/dev/null 2>&1; then
+    echo "  chat bridge code changed -> restarting quiver-chat.service"
+    systemctl restart quiver-chat.service 2>/dev/null || true
+  fi
 fi
 
 # Gate the restart on the offline HEALTHCHECK — the purpose-built box self-test (config + XNYS

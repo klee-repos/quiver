@@ -105,6 +105,8 @@ CLAUDE_CONFIG_DIR="$QUIVER_HOME/state/claude-config"
 install -d -m 755 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state"
 install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$CLAUDE_CONFIG_DIR"
 install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/.npm-cache"
+# The read-only chat bridge writes its log here (its own dir — NOT the tick's /var/log/quiver).
+install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/chat"
 {
   [ -n "$CLAUDE_AUTH_LINE" ] && echo "$CLAUDE_AUTH_LINE"
   echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
@@ -115,6 +117,10 @@ install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/.npm-c
   echo "NOTIFY_TO=$NOTIFY_TO"
   echo "RESEND_FROM=$(fetch_opt RESEND_FROM)"
   echo "NOTIFY_ALERTS_TO=$(fetch_opt NOTIFY_ALERTS_TO)"
+  # Optional: the read-only Telegram chat bridge (deploy/quiver-chat.service). Both empty =>
+  # the bridge stays idle (it refuses to run without an allowlist). See docs/CHAT.md.
+  echo "TELEGRAM_BOT_TOKEN=$(fetch_opt TELEGRAM_BOT_TOKEN)"
+  echo "TELEGRAM_ALLOWED_CHAT_IDS=$(fetch_opt TELEGRAM_ALLOWED_CHAT_IDS)"
 } > /etc/quiver/quiver.env
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
@@ -156,9 +162,16 @@ cp "$QUIVER_HOME/deploy/quiver.service" /etc/systemd/system/quiver.service
 cp "$QUIVER_HOME/deploy/quiver.timer" /etc/systemd/system/quiver.timer
 cp "$QUIVER_HOME/deploy/quiver-intel.service" /etc/systemd/system/quiver-intel.service
 cp "$QUIVER_HOME/deploy/quiver-intel.timer" /etc/systemd/system/quiver-intel.timer
+cp "$QUIVER_HOME/deploy/quiver-chat.service" /etc/systemd/system/quiver-chat.service
 systemctl daemon-reload
 systemctl enable --now quiver.timer
 systemctl enable --now quiver-intel.timer
+# The read-only Telegram chat bridge is opt-in: only start it if a bot token is configured.
+if grep -q '^TELEGRAM_BOT_TOKEN=.\+' /etc/quiver/quiver.env; then
+  systemctl enable --now quiver-chat.service && echo "  chat bridge: enabled"
+else
+  echo "  chat bridge: idle (no TELEGRAM_BOT_TOKEN) — see docs/CHAT.md to enable"
+fi
 
 echo "[8/9] Google Cloud Ops Agent — ship /var/log/quiver/tick.log to the 'quiver_tick' log"
 if [ ! -d /etc/google-cloud-ops-agent ]; then

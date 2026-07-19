@@ -1,0 +1,4 @@
+{
+  "_comment": "The chat bridge loads ZERO MCP servers. Passed as `--mcp-config chat_mcp.json --strict-mcp-config`, this OVERRIDES all filesystem MCP config (including the USER-scope Robinhood OAuth server registered on the box) so the read-only chat assistant has no broker and no Resend — it structurally cannot place an order or send email. Do not add servers here.",
+  "mcpServers": {}
+}
