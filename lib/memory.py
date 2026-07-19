@@ -50,6 +50,36 @@ def is_hit(signal: Optional[str], ret: Optional[float]) -> Optional[bool]:
     return None  # Hold / Skip / unknown -> not a directional bet, excluded from hit-rate
 
 
+def plan_adherence(row: dict, price_now: Optional[float]) -> str:
+    """Coarse plan-adherence grade for a resolved decision (F7/P7): did price reach the
+    recorded TARGET or breach the recorded STOP since the decision? PTJ's "grade with no
+    curve" — feeds calibrate so the system learns which setups' plans actually held.
+
+    Pure over the decision row + a later price. Returns:
+      * 'target_hit'    -> price >= the recorded target_price (the plan's upside landed).
+      * 'stop_violated' -> price <= the recorded stop_loss (the downside the stop guards fired).
+      * 'within'        -> a stop/target was recorded but neither was reached.
+      * 'na'            -> no stop/target recorded, or no usable price (not gradeable).
+    """
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+    p = _f(price_now)
+    if not p or p <= 0:
+        return "na"
+    stop = _f((row or {}).get("stop_loss"))
+    target = _f((row or {}).get("target_price"))
+    if target and p >= target:
+        return "target_hit"
+    if stop and p <= stop:
+        return "stop_violated"
+    if stop or target:
+        return "within"
+    return "na"
+
+
 def _fmt_pct(x: Optional[float]) -> str:
     return f"{x * 100:+.1f}%" if x is not None else "n/a"
 

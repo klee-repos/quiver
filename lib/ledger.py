@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
     alpha              REAL,
     realized_pnl       REAL,                    -- position-level (broker basis); NULL in dry-run
     unrealized_pnl     REAL,
-    scored_against     TEXT                     -- 'directional' | 'both'
+    scored_against     TEXT,                    -- 'directional' | 'both'
+    adherence          TEXT                     -- F7/P7: 'honored'|'stop_violated'|'target_hit'|'na'
 );
 -- Append-only action event log (intraday multi-run). Feeds the cooldown,
 -- per-ticker action count, and on-change gate. `ticker_action` stays the
@@ -322,6 +323,7 @@ class Ledger:
             self._migrate_orders(c)
             self._migrate_notifications(c)
             self._migrate_decisions(c)
+            self._migrate_outcomes(c)
             self._migrate_thesis_state(c)
             self._migrate_universe_change_key(c)
             # Self-learning tail (lib/levers): eval-lever registry + uses. Owns
@@ -355,6 +357,17 @@ class Ledger:
         for col, decl in additions.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE decisions ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    def _migrate_outcomes(c) -> None:
+        """Back-fill the plan-adherence column (F7/P7) on an outcomes table created earlier.
+        PRAGMA-diff + ADD COLUMN, idempotent (same pattern as _migrate_decisions); old rows
+        read NULL. Runs after _SCHEMA, so it covers fresh dbs too."""
+        existing = {row[1] for row in c.execute("PRAGMA table_info(outcomes)").fetchall()}
+        if not existing:
+            return
+        if "adherence" not in existing:
+            c.execute("ALTER TABLE outcomes ADD COLUMN adherence TEXT")
 
     @staticmethod
     def _migrate_thesis_state(c) -> None:
@@ -657,14 +670,15 @@ class Ledger:
         directional_return: Optional[float] = None, benchmark_return: Optional[float] = None,
         alpha: Optional[float] = None, realized_pnl: Optional[float] = None,
         unrealized_pnl: Optional[float] = None, scored_against: str = "directional",
+        adherence: Optional[str] = None,
     ) -> None:
         with self._conn() as c:
             c.execute(
                 "INSERT OR REPLACE INTO outcomes (decision_id, resolved_at, holding_days, "
                 "directional_return, benchmark_return, alpha, realized_pnl, unrealized_pnl, "
-                "scored_against) VALUES (?,?,?,?,?,?,?,?,?)",
+                "scored_against, adherence) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (decision_id, resolved_at, holding_days, directional_return, benchmark_return,
-                 alpha, realized_pnl, unrealized_pnl, scored_against),
+                 alpha, realized_pnl, unrealized_pnl, scored_against, adherence),
             )
 
     def decisions_with_outcomes(self, ticker: str, limit: int = 8) -> list:
@@ -672,7 +686,7 @@ class Ledger:
         with self._conn() as c:
             return [dict(r) for r in c.execute(
                 "SELECT d.*, o.directional_return, o.alpha, o.holding_days, o.realized_pnl, "
-                "o.unrealized_pnl, o.scored_against FROM decisions d "
+                "o.unrealized_pnl, o.scored_against, o.adherence FROM decisions d "
                 "LEFT JOIN outcomes o ON o.decision_id = d.id "
                 "WHERE d.ticker = ? ORDER BY d.decided_at DESC, d.id DESC LIMIT ?",
                 (ticker, limit),
@@ -845,6 +859,18 @@ class Ledger:
                 (trade_date, ticker),
             ).fetchone()
             return int(row["n"] or 0)
+
+    def derisk_acted_today(self, trade_date: str, ticker: str) -> bool:
+        """True if the graduated de-risk pass TRIMMED this name today (any DERISK-signal
+        action event). The rebalance buy-to-target pass checks this so it never re-buys a
+        position the PTJ de-risk just protected the same day (B4). No DERISK rows exist
+        until the de-risk feature is enabled, so this is False (byte-identical) by default."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM actions WHERE trade_date=? AND ticker=? AND signal='DERISK' LIMIT 1",
+                (trade_date, ticker),
+            ).fetchone()
+            return row is not None
 
     def get_schedule(self, trade_date: str, ticker: str) -> Optional[dict]:
         with self._conn() as c:

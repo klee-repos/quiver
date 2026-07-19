@@ -44,6 +44,16 @@ _DEFAULTS = {
     "default_conviction": {        # used only when the model omits a numeric conviction
         "Buy": 70.0, "Overweight": 55.0, "Underweight": 35.0,
     },
+    # --- PTJ defense knobs (all OFF by default = a true NO-OP, so a strategy.yaml that
+    # predates them is BYTE-IDENTICAL; the operator opts in per the ENABLE CHECKLIST). The
+    # scalar three are float-coerced at load (strategy._RP_NUM); the rest pass through. ---
+    "min_reward_risk": 0.0,        # F1/P1: min reward:risk to allow a buy (0 = gate OFF; intended live 3.0)
+    "per_trade_risk_pct": 0.0,     # F2/P3: % equity at risk/trade -> stop-distance cap (0 = OFF; B1; intended 1.0)
+    "downside_vol_target": 0.0,    # F3/P5: downside-vol floor target (0 = OFF; B2)
+    "trend_gate_mode": "off",      # F4/P6: "off" | "soft" | "block" (off = no trend gate)
+    "require_target_for_buy": False,  # F1/C7: when True an uncomputable-R:R fresh buy is skipped (else ungraded->pass)
+    "derisk_tiers": [],            # F6/P4: [{"at_drawdown_pct":5,"trim_pct":25},...] ([] = de-risk OFF)
+    "event_risk_derisk_severity": 1.01,  # F8: event-risk severity that TRIMS a held name (>1.0 = OFF by default)
 }
 
 def _policy(policy: Optional[dict], key: str):

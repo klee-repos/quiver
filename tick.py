@@ -38,6 +38,7 @@ from lib.ledger import Ledger  # noqa: E402
 from lib import market  # noqa: E402
 from lib import notify  # noqa: E402
 from lib import signals  # noqa: E402
+from lib import allocate  # noqa: E402 — binding-side glue reads _DEFAULTS for the PTJ knobs
 from lib import storage  # noqa: E402
 from lib import memory  # noqa: E402
 from lib import universe  # noqa: E402
@@ -397,6 +398,72 @@ def _run_plan(cfg, led, data) -> dict:
     # Used as the one price source for sizing/decision_price (and Phase 5 limit/stop).
     quotes = data.get("quotes", {}) or {}
 
+    # --- PTJ defense (F1-F6): risk_policy knobs, analysis lookup, event-risk sidecar ---
+    # None-safe: cfg.strategy is None on a bare/garbled checkout, and every knob defaults OFF
+    # via allocate._DEFAULTS, so a strategy.yaml predating these knobs is BYTE-IDENTICAL. The
+    # glue reads the knobs and only passes a BINDING value (risk_cap not None / exposure_scalar
+    # < 1.0 / an R:R skip) when the operator opted in — the pure fns are otherwise no-ops.
+    _rp = (getattr(cfg.strategy, "risk_policy", None) or {}) if cfg.strategy is not None else {}
+
+    def _pol(key):
+        v = _rp.get(key)
+        return v if v is not None else allocate._DEFAULTS.get(key)
+
+    _min_rr = _to_float(_pol("min_reward_risk")) or 0.0
+    _risk_pct = _to_float(_pol("per_trade_risk_pct")) or 0.0
+    _vol_target = _to_float(_pol("downside_vol_target")) or 0.0
+    _trend_mode = str(_pol("trend_gate_mode") or "off")
+    _require_target = bool(_pol("require_target_for_buy"))
+    _derisk_tiers = _pol("derisk_tiers") or []
+
+    by_ticker = {str(a.get("ticker", "")).upper(): a
+                 for a in analyses if a.get("ticker")}
+    # Event-risk / non-confirmation sidecar (F8/F9), analysis-side + day-stamped. A stale-day
+    # or absent/garbled map is treated as EMPTY -> byte-identical (best-effort observability).
+    _er_raw = data.get("event_risk") or {}
+    if isinstance(_er_raw, dict) and str(_er_raw.get("trading_day") or day) == day:
+        _event_risk = {str(k).upper(): (v or {})
+                       for k, v in (_er_raw.get("names") or {}).items()}
+    else:
+        _event_risk = {}
+    # Names TRIMMED by the graduated de-risk pass THIS tick — the same-tick half of the B4
+    # re-buy guard (the committed `actions` log that derisk_acted_today reads isn't written
+    # until STEP 6 commit, so it can't see this run's DERISK order). Declared unconditionally
+    # so the buy pass can reference it even when de-risk is OFF (empty set -> byte-identical).
+    _derisked: set = set()
+
+    def _rr_verdict(a):
+        """(allowed, detail) for a BUY under the asymmetric R:R gate (F1). Gate OFF
+        (min_rr<=0) -> allow. Uncomputable R:R (missing target/stop) is VISIBLE, not
+        silent (C7): skip when require_target, else pass tagged 'ungraded_pass'."""
+        if _min_rr <= 0:
+            return (True, None)
+        rr = signals.reward_risk_ratio(_to_float(a.get("entry_price")),
+                                       _to_float(a.get("stop_loss")),
+                                       _to_float(a.get("target_price")))
+        if rr is None:
+            return (False, "reward_risk:ungraded") if _require_target else (True, "reward_risk:ungraded_pass")
+        if rr < _min_rr:
+            return (False, "reward_risk:below_floor")
+        return (True, None)
+
+    def _ptj_buy_clamps(a, ticker):
+        """(risk_cap, exposure_scalar) for a BUY — both no-op (None/None) when knobs OFF.
+        risk_cap = stop-distance risk budget (F2); exposure_scalar = downside-vol (F3) x
+        trend gate (F4) x event-risk shrink (F8), passed as None when it would be 1.0 so the
+        buy is byte-identical."""
+        risk_cap = signals.risk_budget_cap(baseline.baseline_equity, _risk_pct,
+                                           _to_float(a.get("entry_price")),
+                                           _to_float(a.get("stop_loss")))
+        desc = _event_risk.get(str(ticker).upper()) or {}
+        sc = (signals.downside_vol_scalar(_to_float(desc.get("downside_vol")), _vol_target)
+              * signals.trend_gate_scalar(desc.get("trend_regime"),
+                                          _to_float(desc.get("momentum")), _trend_mode))
+        sev = _to_float(desc.get("severity"))
+        if sev and sev > 0:
+            sc *= max(0.25, 1.0 - sev)   # shrink a buy INTO a known binary (F8/P10)
+        return (risk_cap, (None if sc >= 1.0 else sc))
+
     # Daily-loss halt must measure TOTAL account value (positions + idle cash), NOT the
     # broker's positions-only `equity`. With positions-only, a big rebalance-buy day
     # (cash -> positions) inflates the base and can MASK a real loss, and a big sell can
@@ -565,6 +632,16 @@ def _run_plan(cfg, led, data) -> dict:
                 decision.update(status="skipped", intent="buy", detail="deferred_to_rebalance_buy")
                 result["decisions"].append(decision)
                 continue
+            # PTJ asymmetric R:R gate (F1): a fresh buy below the reward:risk floor is a
+            # RANDOM/low-quality entry -> skip (visible detail, never silent). OFF -> allow.
+            _rr_ok, _rr_detail = _rr_verdict(a)
+            if not _rr_ok:
+                led.record_action(day, ticker, signal=signal, intent="buy", status="skipped",
+                                  detail=_rr_detail, now_iso=now_iso)
+                decision.update(status="skipped", intent="buy", detail=_rr_detail)
+                result["decisions"].append(decision)
+                continue
+            _risk_cap, _exposure = _ptj_buy_clamps(a, ticker)
             dollars, src = signals.resolve_buy_dollars(
                 a.get("position_sizing"), baseline.baseline_equity, frac,
                 ceiling=cfg.risk.max_dollars_per_trade,
@@ -573,6 +650,7 @@ def _run_plan(cfg, led, data) -> dict:
                 buffer=cfg.risk.min_buying_power_buffer,
                 position_pct=_to_float(a.get("position_pct")),
                 room_under_target=_target_room(target_weights, ticker, held_mv),
+                risk_cap=_risk_cap, exposure_scalar=_exposure,
             )
             if dollars <= 0:
                 led.record_action(day, ticker, signal=signal, intent="buy",
@@ -797,6 +875,59 @@ def _run_plan(cfg, led, data) -> dict:
                 "ticker": ticker, "signal": signal, "status": "order",
                 "intent": "sell", "quantity": qty, "detail": order_kind})
 
+    # PTJ graduated de-risk pass (F6/P4): BELOW the hard 20% halt (which already returned),
+    # a shallower drawdown that breaches a configured tier TRIMS held names — "cut before it's
+    # catastrophic; the market falls faster than it rises." OFF by default (derisk_tiers empty
+    # -> _trim_frac == 0.0) so this whole block is a no-op and plan is BYTE-IDENTICAL. Placed
+    # AFTER the rebalance SELL pass and BEFORE the buy pass (C4): a de-risk trim lands in
+    # result["orders"] + records a DERISK action, and the buy pass excludes it same-tick
+    # (_derisked) AND cross-tick (derisk_acted_today), never re-buying what the defense just
+    # protected. ONE de-risk action per name per day (has_trade_like_action dedup); the 20%
+    # halt stays the ultimate backstop. Trims are long-only sells, Python-clamped, stops cancelled.
+    _trim_frac = signals.derisk_trim_fraction(drop_pct, _derisk_tiers)
+    if _trim_frac > 0 and not result["halt"]:
+        _handled = {o.get("ticker") for o in result["orders"]}
+        _suppressed = {str(d.get("ticker")).upper() for d in result["decisions"]
+                       if str(d.get("detail") or "").startswith("consistency:")}
+        for raw_ticker, pos in positions.items():
+            ticker = str(raw_ticker).upper()
+            if ticker in _handled or ticker in _suppressed or led.has_trade_like_action(day, ticker):
+                continue
+            held_qty = float((pos or {}).get("quantity", 0) or 0)
+            if held_qty <= 0:
+                continue
+            quote = _to_float(quotes.get(ticker))
+            raw_qty = signals.resolve_sell_quantity(held_qty, _trim_frac)
+            # A de-risk TRIM (never a full exit) respects the economic floor + skips a
+            # sub-floor churn trim (F2 TRIM semantics: bump_to_min=False).
+            sell_min = max(signals.MIN_SELL_NOTIONAL_USD, cfg.risk.min_trade_notional)
+            qty, sreason = signals.resolve_sell_quantity_min_notional(
+                held_qty, raw_qty, quote, min_notional=sell_min, bump_to_min=False)
+            if qty <= 0:
+                led.record_action(day, ticker, signal="DERISK", intent="sell", status="skipped",
+                                  detail=f"derisk_below_min:{sreason}", now_iso=now_iso)
+                continue
+            cancel_ref_ids = [s["ref_id"] for s in led.open_protective_stops(ticker)]
+            ref_id = None
+            if not cfg.dry_run:
+                ref_id = led.new_ref_id()
+                led.reserve_order(ref_id, day, ticker, side="sell", type="market",
+                                  dollar_amount=None, quantity=qty, now_iso=now_iso,
+                                  order_kind="derisk_trim")
+            _derisked.add(ticker)   # same-tick re-buy guard (B4)
+            led.record_action(day, ticker, signal="DERISK", intent="sell", status="order",
+                              detail="daily_loss_derisk", now_iso=now_iso)
+            result["orders"].append({
+                "ticker": ticker, "signal": "DERISK", "intent": "sell",
+                "ref_id": ref_id, "side": "sell", "type": "market",
+                "dollar_amount": None, "quantity": qty,
+                "time_in_force": cfg.time_in_force, "market_hours": cfg.market_hours,
+                "order_kind": "derisk_trim", "cancel_ref_ids": cancel_ref_ids,
+                "plan_trigger": "daily_loss_derisk"})
+            result["decisions"].append({
+                "ticker": ticker, "signal": "DERISK", "status": "order",
+                "intent": "sell", "quantity": qty, "detail": "daily_loss_derisk"})
+
     # Rebalance BUY-TO-TARGET pass (Stage 3, the buy mirror of the SELL pass above).
     # The DETERMINISTIC deploy: for every book name construct flagged underweight
     # (intent=="buy"), buy toward its target weight in ONE pass — the book owns sizing,
@@ -831,6 +962,23 @@ def _run_plan(cfg, led, data) -> dict:
                 continue
             if tw.get("intent") != "buy" or not tw.get("quotable", True):
                 continue
+            # PTJ R:R gate on the LIVE book deploy (F1/C1): a rebalance buy below the
+            # reward:risk floor is skipped exactly like a classic buy. OFF -> allow.
+            a_rr = by_ticker.get(ticker)
+            if a_rr is not None:
+                _rr_ok, _rr_detail = _rr_verdict(a_rr)
+                if not _rr_ok:
+                    led.record_action(day, ticker, signal="REBALANCE", intent="buy",
+                                      status="skipped", detail=_rr_detail, now_iso=now_iso)
+                    result["decisions"].append({
+                        "ticker": ticker, "signal": "REBALANCE", "status": "skipped",
+                        "intent": "buy", "detail": _rr_detail})
+                    continue
+            # B4: never re-buy a name the graduated de-risk pass TRIMMED — same-tick (_derisked)
+            # or a prior committed tick today (derisk_acted_today) — or the deploy-to-target
+            # would undo the defense on the exact positions it just protected.
+            if ticker in _derisked or led.derisk_acted_today(day, ticker):
+                continue
             pos = positions.get(ticker) or {}
             held_qty = float(pos.get("quantity", 0) or 0)
             held_mv = float(pos.get("market_value", 0) or 0)
@@ -845,8 +993,17 @@ def _run_plan(cfg, led, data) -> dict:
             # account reaches its target weight the same day instead of dribbling toward it
             # over many ticks. Every clamp (per-trade ceiling, daily cap, running cash) stays
             # intact across the loop — the SUM still can't exceed buying_power - buffer.
-            name_budget = round(min(signals.room_under_target(td, held_mv),
-                                    remaining_daily_cap, avail_cash), 2)
+            # PTJ defense on the LIVE book deploy (F2/F3/F4/F8 via C1): shrink the room by the
+            # exposure scalar (downside-vol x trend x event) and add the stop-distance risk cap
+            # to the min(). Both no-op when the knobs are OFF -> name_budget BYTE-IDENTICAL.
+            _room = signals.room_under_target(td, held_mv)
+            _risk_cap_r, _exposure_r = (_ptj_buy_clamps(a_rr, ticker) if a_rr is not None else (None, None))
+            if _exposure_r is not None:
+                _room *= _exposure_r
+            _clamps_r = [_room, remaining_daily_cap, avail_cash]
+            if _risk_cap_r is not None:
+                _clamps_r.append(_risk_cap_r)
+            name_budget = round(min(_clamps_r), 2)
             if name_budget < buy_min:
                 # Below the economic minimum (F2; >= RH's $1 fractional floor). Skip pre-submit
                 # rather than dribble a tiny order. At full deployment no book weight lands here;
@@ -2524,11 +2681,14 @@ def cmd_reflect(args) -> dict:
         bench = _to_float(r.get("benchmark_return"))
         alpha = (dret - bench) if (dret is not None and bench is not None) else None
         scored = "both" if (unrealized is not None or realized is not None) else "directional"
+        # F7/P7: grade whether the recorded stop/target plan held (PTJ "no curve" accountability).
+        adherence = memory.plan_adherence(dec, price_now)
 
         led.record_outcome(
             did, resolved_at=now_iso, holding_days=holding_days,
             directional_return=dret, benchmark_return=bench, alpha=alpha,
             realized_pnl=realized, unrealized_pnl=unrealized, scored_against=scored,
+            adherence=adherence,
         )
         affected.add(dec.get("ticker"))
         results.append({"decision_id": did, "status": "resolved",
@@ -2558,6 +2718,73 @@ def cmd_reflect(args) -> dict:
 # retention window, optionally offloading first (S3 backend deferred). Like the
 # digest, this is observability only and must NEVER abort or alter a trading
 # tick — prune_dir/get_archiver never raise.
+
+def cmd_event_risk(_args) -> dict:
+    """PRODUCER for the event-risk / non-confirmation sidecar (F8/F9). Runs as its OWN subprocess
+    with an outer timeout (B3: a yfinance socket stall can't be caught by try/except, only bounded
+    by the subprocess), invoked by run_tick.py BEFORE the orchestrator. Best-effort per ticker;
+    ALWAYS writes state/tmp/event_risk.json (`{}` on total failure), day-stamped so tick.py plan
+    ignores a stale sidecar (B6). Analysis-side: event_risk.build_descriptor is wall-clean; the
+    yfinance/trend fetch is binding-side glue that only emits a descriptor the plan reads as an arg.
+    """
+    import socket
+    from lib import event_risk as _er
+    day = market.trading_day_et()
+    now_iso = market.now_et().isoformat()
+    names: dict = {}
+    try:
+        cfg = load_config(CONFIG_PATH)
+        led = Ledger(LEDGER_DB)
+        universe_tks = _analysis_universe(cfg, led)
+        socket.setdefaulttimeout(15)      # bound each yfinance call (belt-and-suspenders under the outer timeout)
+        import yfinance as yf             # noqa: F401 — best-effort optional dep
+        from lib import trend as _trend
+        for tk in universe_tks:
+            try:
+                hist = yf.Ticker(tk).history(period="1y", auto_adjust=True)
+                closes = [float(x) for x in list(hist["Close"]) if x and x == x]
+                if len(closes) < 30:
+                    continue
+                rets = [(closes[i] - closes[i - 1]) / closes[i - 1]
+                        for i in range(1, len(closes)) if closes[i - 1]]
+                bundle = _trend.trend_metrics(closes)
+                dvol = _trend.downside_deviation(rets)
+                recent = ((closes[-1] - closes[-6]) / closes[-6]) if len(closes) >= 6 and closes[-6] else None
+                # Earnings date = the nearest known binary event (F8). Best-effort; None -> no event.
+                ev_iso = None
+                try:
+                    cal = yf.Ticker(tk).calendar
+                    ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
+                    if isinstance(ed, (list, tuple)) and ed:
+                        ed = ed[0]
+                    ev_iso = str(ed)[:10] if ed else None
+                except Exception:  # noqa: BLE001 — earnings calendar is flaky; skip on any error
+                    ev_iso = None
+                desc = _er.build_descriptor(
+                    now_iso=now_iso, event_iso=ev_iso, downside_vol=dvol,
+                    trend_regime=bundle.trend_regime, momentum=bundle.mom_12_1,
+                    recent_return=recent, news_polarity=None)
+                if desc and (desc.get("severity") or desc.get("downside_vol") is not None
+                             or desc.get("trend_regime")):
+                    names[tk.upper()] = desc
+            except Exception:  # noqa: BLE001 — one ticker's fetch failing must not sink the rest
+                continue
+    except Exception as e:  # noqa: BLE001 — a total failure still writes {} so plan degrades cleanly
+        _write_event_risk({"trading_day": day, "names": {}})
+        return {"error": f"{type(e).__name__}: {e}", "written": 0, "day": day}
+    _write_event_risk({"trading_day": day, "names": names})
+    return {"written": len(names), "day": day}
+
+
+def _write_event_risk(payload: dict) -> None:
+    """Always-write the sidecar (B6): create state/tmp and write event_risk.json; best-effort."""
+    try:
+        tmp = REPO / "state" / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        (tmp / "event_risk.json").write_text(json.dumps(payload))
+    except OSError:
+        pass
+
 
 def cmd_prune(_args) -> dict:
     cfg = load_config(CONFIG_PATH)
@@ -2715,9 +2942,9 @@ def _intel_poll_bill_docs(cfg, *, max_docs=25):
     """Discover recent bills to analyse: poll Congress.gov for changed bills, pull each sponsor
     bioguide + introduced date, and construct the govinfo bulk USLM URL (the section-XML the
     splitter reads). Best-effort + bounded — a bill that won't resolve is skipped. Returns
-    (documents, n_polled). Bills only; the Federal Register arm (lib/dataflows/fedreg) is built
-    and tested but its rule-body section splitter is a separate follow-up, so it is not in this
-    auto-loop yet."""
+    (documents, n_polled). Bills only — the Federal Register arm (lib/dataflows/fedreg) is polled
+    separately by `_intel_poll_rule_docs` and IS in the intel auto-loop (cmd_intel_refresh; commit
+    9a39dac); this helper just covers the Congress-bill half."""
     from lib.dataflows import congress as _cong
     leg = cfg.legislative
     api_key = getattr(leg, "api_key", "") or ""
@@ -3025,6 +3252,7 @@ def main(argv) -> int:
     p_ua = sub.add_parser("universe-apply")
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
+    sub.add_parser("event-risk")
     sub.add_parser("prune")
     sub.add_parser("auth-stop")
     p_ms = sub.add_parser("memory-show")
@@ -3085,6 +3313,8 @@ def main(argv) -> int:
             out = cmd_catalyst_seed(args)
         elif args.cmd == "universe-apply":
             out = cmd_universe_apply(args)
+        elif args.cmd == "event-risk":
+            out = cmd_event_risk(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         elif args.cmd == "auth-stop":

@@ -1622,6 +1622,108 @@ check("sig: target room binds the buy (only ever reduces)",
       signals.resolve_buy_dollars(**_buy_args, room_under_target=3.0)[0], 3.0)
 
 
+# --- PTJ defense: R:R gate, risk-based sizing, vol/trend scalars, de-risk (pure) ---
+# F1 reward_risk_ratio
+check("ptj: R:R = (target-entry)/(entry-stop)", signals.reward_risk_ratio(100, 90, 130), 3.0)
+check("ptj: R:R missing target -> None (ungraded)", signals.reward_risk_ratio(100, 90, None), None)
+check("ptj: R:R missing stop -> None", signals.reward_risk_ratio(100, None, 130), None)
+check("ptj: R:R stop not below entry -> None", signals.reward_risk_ratio(100, 110, 130), None)
+check("ptj: R:R target not above entry -> None", signals.reward_risk_ratio(100, 90, 95), None)
+# F2 risk_budget_cap — B1: OFF (None) at pct<=0; C9: TIGHT stop -> LARGER cap
+check("ptj: risk_cap OFF at pct=0 -> None (B1)", signals.risk_budget_cap(10000, 0.0, 100, 90), None)
+check("ptj: risk_cap OFF at pct None -> None", signals.risk_budget_cap(10000, None, 100, 90), None)
+check("ptj: risk_cap 1% mid stop", signals.risk_budget_cap(10000, 1.0, 100, 90), 1000.0)
+check("ptj: risk_cap TIGHT stop -> LARGER cap (C9)", signals.risk_budget_cap(10000, 1.0, 100, 98), 5000.0)
+check("ptj: risk_cap WIDE stop -> smaller cap", signals.risk_budget_cap(10000, 1.0, 100, 80), 500.0)
+check_true("ptj: tight>mid>wide cap ordering",
+           signals.risk_budget_cap(10000, 1.0, 100, 98) > signals.risk_budget_cap(10000, 1.0, 100, 90)
+           > signals.risk_budget_cap(10000, 1.0, 100, 80))
+check("ptj: risk_cap invalid stop -> None", signals.risk_budget_cap(10000, 1.0, 100, 100), None)
+# F3 downside_vol_scalar — B2: 1.0 (true no-op) at target<=0/None
+check("ptj: vol_scalar OFF at target=0 -> 1.0 (B2)", signals.downside_vol_scalar(0.3, 0.0), 1.0)
+check("ptj: vol_scalar OFF at target None -> 1.0 (B2)", signals.downside_vol_scalar(0.3, None), 1.0)
+check("ptj: vol_scalar vol<=target -> 1.0", signals.downside_vol_scalar(0.1, 0.2), 1.0)
+check("ptj: vol_scalar shrinks on high vol", signals.downside_vol_scalar(0.4, 0.2), 0.5)
+check("ptj: vol_scalar floored", signals.downside_vol_scalar(10.0, 0.2), 0.25)
+check("ptj: vol_scalar unknown vol -> 1.0", signals.downside_vol_scalar(None, 0.2), 1.0)
+# F4 trend_gate_scalar — buy-only; off default -> 1.0
+check("ptj: trend OFF mode -> 1.0", signals.trend_gate_scalar("DOWNTREND", 0.1, "off"), 1.0)
+check("ptj: trend soft uptrend -> 1.0", signals.trend_gate_scalar("UPTREND", 0.1, "soft"), 1.0)
+check("ptj: trend soft downtrend -> 0.5", signals.trend_gate_scalar("DOWNTREND", 0.1, "soft"), 0.5)
+check("ptj: trend soft neg-momentum -> 0.5", signals.trend_gate_scalar("UPTREND", -0.1, "soft"), 0.5)
+check("ptj: trend block downtrend -> 0.0", signals.trend_gate_scalar("DOWNTREND", 0.1, "block"), 0.0)
+check("ptj: trend unknown -> 1.0 (fail-open)", signals.trend_gate_scalar(None, None, "soft"), 1.0)
+# F6 derisk_trim_fraction — deepest breached tier
+_tiers = [{"at_drawdown_pct": 5, "trim_pct": 25}, {"at_drawdown_pct": 10, "trim_pct": 50}]
+check("ptj: derisk -6% -> 25% tier", signals.derisk_trim_fraction(-6.0, _tiers), 0.25)
+check("ptj: derisk -11% -> deepest 50% tier", signals.derisk_trim_fraction(-11.0, _tiers), 0.5)
+check("ptj: derisk -3% -> no tier", signals.derisk_trim_fraction(-3.0, _tiers), 0.0)
+check("ptj: derisk gain (drop>=0) -> 0", signals.derisk_trim_fraction(2.0, _tiers), 0.0)
+check("ptj: derisk empty tiers -> 0", signals.derisk_trim_fraction(-9.0, []), 0.0)
+check("ptj: derisk None drop -> 0", signals.derisk_trim_fraction(None, _tiers), 0.0)
+# resolve_buy_dollars: new kwargs default None == omitted (BYTE-IDENTICAL); risk_cap binds;
+# exposure_scalar guarded (0.0 zeroes, NOT treated as 1.0 — C6)
+check("ptj: risk_cap/exposure None == omitted (byte-identical)",
+      signals.resolve_buy_dollars(**_buy_args, risk_cap=None, exposure_scalar=None),
+      signals.resolve_buy_dollars(**_buy_args))
+check("ptj: risk_cap binds the buy (only reduces)",
+      signals.resolve_buy_dollars(**_buy_args, risk_cap=3.0)[0], 3.0)
+check("ptj: exposure_scalar 0.5 shrinks base (10->5)",
+      signals.resolve_buy_dollars(**_buy_args, exposure_scalar=0.5)[0], 5.0)
+check("ptj: exposure_scalar 0.0 zeroes the buy (C6, not 1.0)",
+      signals.resolve_buy_dollars(**_buy_args, exposure_scalar=0.0)[0], 0.0)
+
+# F3 downside_deviation (lib/trend) — the arg the vol floor consumes
+import lib.trend as _trend  # noqa: E402
+check("ptj: downside_deviation None on no downside", _trend.downside_deviation([0.01, 0.02, 0.03]), None)
+check("ptj: downside_deviation None on empty", _trend.downside_deviation([]), None)
+check_true("ptj: downside_deviation positive when downside present",
+           (_trend.downside_deviation([-0.02, 0.01, -0.03]) or 0) > 0)
+
+# F7 plan_adherence (pure) + ledger adherence round-trip
+from lib import memory as _mem  # noqa: E402
+check("ptj: adherence target_hit", _mem.plan_adherence({"stop_loss": 90, "target_price": 130}, 135), "target_hit")
+check("ptj: adherence stop_violated", _mem.plan_adherence({"stop_loss": 90, "target_price": 130}, 88), "stop_violated")
+check("ptj: adherence within", _mem.plan_adherence({"stop_loss": 90, "target_price": 130}, 110), "within")
+check("ptj: adherence na (no plan)", _mem.plan_adherence({}, 110), "na")
+check("ptj: adherence na (no price)", _mem.plan_adherence({"stop_loss": 90}, None), "na")
+_adb = tempfile.mktemp(suffix=".db")
+_adl = Ledger(_adb)
+_adl.ensure_schema()
+_adid = _adl.record_decision(trade_date="2026-06-20", ticker="ZZZ", signal="Buy", intent="buy",
+                             decision_price=100.0, run_id="r", decided_at="t")
+_adl.record_outcome(_adid, resolved_at="t2", directional_return=0.05, adherence="target_hit")
+_adrow = [d for d in _adl.decisions_with_outcomes("ZZZ") if d["id"] == _adid][0]
+check("ptj: adherence persists + reads back via decisions_with_outcomes", _adrow.get("adherence"), "target_hit")
+
+# F8/F9 event_risk producer (pure, wall-clean)
+from lib import event_risk as _evr  # noqa: E402
+check("evr: days_until forward", _evr.days_until("2026-06-20", "2026-06-25"), 5)
+check("evr: days_until past -> None", _evr.days_until("2026-06-20", "2026-06-15"), None)
+check("evr: severity at event -> 1.0", _evr.event_severity(0), 1.0)
+check("evr: severity mid horizon", _evr.event_severity(5, horizon_days=10), 0.5)
+check("evr: severity beyond horizon -> 0", _evr.event_severity(15, horizon_days=10), 0.0)
+check("evr: severity no event -> 0", _evr.event_severity(None), 0.0)
+check("evr: non-confirm shrugs off bad news -> +", _evr.non_confirmation(0.05, -1), 0.5)
+check("evr: non-confirm can't rally on good news -> -", _evr.non_confirmation(-0.05, 1), -0.5)
+check("evr: non-confirm confirmed -> 0", _evr.non_confirmation(0.05, 1), 0.0)
+check("evr: non-confirm no news -> 0", _evr.non_confirmation(0.05, None), 0.0)
+_ed = _evr.build_descriptor(now_iso="2026-06-20", event_iso="2026-06-22", downside_vol=0.3, trend_regime="UPTREND")
+check("evr: descriptor severity from near event", _ed.get("severity"), 0.8)
+check("evr: descriptor carries downside_vol", _ed.get("downside_vol"), 0.3)
+check("evr: descriptor carries trend_regime", _ed.get("trend_regime"), "UPTREND")
+_ed2 = _evr.build_descriptor(now_iso="2026-06-20", recent_return=-0.05, news_polarity=1)  # bearish non-confirm, no event
+check("evr: bearish non-confirm raises severity even with no event", _ed2.get("severity"), 0.5)
+
+# F10 coordination-fade (shadow descriptor; NOT wired into the live gate)
+from lib.dataflows import congress as _cong  # noqa: E402
+check("f10: fade high for a fresh bill", _cong.coordination_fade({"status": "introduced"}), 1.0)
+check("f10: fade low once through both chambers", _cong.coordination_fade({"status": "passed_both"}), 0.1)
+check("f10: fade 0 once enacted", _cong.coordination_fade({"status": "became_law"}), 0.0)
+check("f10: fade monotone in progress",
+      _cong.coordination_fade({"status": "committee"}) > _cong.coordination_fade({"status": "passed_one"}), True)
+
+
 # ============================================================================
 # Stage 2 — read-only goal/target context into the analysis path.
 # ============================================================================

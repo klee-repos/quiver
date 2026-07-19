@@ -312,6 +312,22 @@ def main() -> int:
                              event_detail=f"could not write state/tmp/analyses.json: {e}")
                 return 1
 
+            # --- PTJ event-risk producer (F8/F9): write state/tmp/event_risk.json BEFORE the
+            # orchestrator so plan can consume it. Runs as its OWN subprocess with an outer timeout
+            # — a yfinance socket stall does NOT raise, so a try/except cannot bound it; only the
+            # subprocess timeout can (B3). Best-effort: it always writes the sidecar ({} on failure),
+            # and plan treats an absent/stale sidecar as empty -> byte-identical. Never blocks a tick.
+            try:
+                _er_budget = int(_deadline - time.monotonic())
+                if _er_budget >= 30:
+                    _er = _tick_json(["event-risk"], timeout=min(180, _er_budget))
+                    _emit({"stage": "event-risk", **{k: _er[k] for k in ("written", "day", "error")
+                                                     if k in _er}})
+                else:
+                    _emit({"stage": "event-risk", "skipped": "insufficient wall-clock budget"})
+            except Exception as e:  # noqa: BLE001 — best-effort; a producer hiccup never blocks a tick
+                _emit({"stage": "event-risk", "error": f"{type(e).__name__}: {e}"})
+
             # Drive ONE tick through the claude CLI over TICK.md (execution only).
             cmd = [
                 CLAUDE_BIN, "-p", "--output-format", "stream-json",

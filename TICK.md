@@ -194,9 +194,16 @@ Write a file `state/tmp/plan_input.json` containing:
   "positions": { "AAPL": {"quantity": 3, "market_value": 600.0}, ... },
   "quotes": { "AAPL": 196.4, ... },
   "analyses": [ <each analyze.py JSON from STEP 3> ],
-  "target_weights": <STEP 3b construct output; OMIT entirely on the classic path>
+  "target_weights": <STEP 3b construct output; OMIT entirely on the classic path>,
+  "event_risk": <contents of state/tmp/event_risk.json; OMIT if missing/unparseable>
 }
 ```
+`event_risk` is the PTJ defense sidecar (Python already wrote it before you ran). Best-effort,
+**NEVER STOP**: `cat state/tmp/event_risk.json` and drop it in verbatim under `"event_risk"`; if
+the file is **missing or unparseable, OMIT the key and proceed** (this is observability, not a
+required input — do NOT fire an alert or STOP, unlike the analyses.json guard in STEP 3). `plan`
+defaults `event_risk` to `{}` and ignores a sidecar whose stamped day != today, so an omitted or
+stale key is byte-identical.
 (`quotes` is the STEP 2.3 map. Omit a ticker only if its quote was unavailable —
 Python falls back to the model's entry_price for that ticker's decision price.
 `target_weights` is consumed when `rebalance_enabled` OR `reconcile_unmanaged` is

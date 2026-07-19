@@ -126,6 +126,20 @@ risk_policy:
   smoothing_alpha: 0.4         # EWMA weight on TODAY's target (lower = stickier day-to-day)
   uncertainty_damp: 0.5        # how much self-reported uncertainty shrinks conviction
   regime_min_factor: 0.5       # most a STAND_DOWN regime can cut deployment toward cash
+  # --- PTJ defense (F1-F6): ALL OFF by default (the values below are the no-ops). Uncomment/
+  # set the intended live values to ENABLE — this block IS the enable checklist. Every knob only
+  # ever REDUCES risk (skips/shrinks a buy, or trims into a drawdown); the code defaults keep a
+  # book that omits them BYTE-IDENTICAL, so turning them on is a deliberate opt-in. ---
+  # min_reward_risk: 3.0         # F1/P1: skip a buy whose (target-entry)/(entry-stop) < this (PTJ ~5:1; 0=off)
+  # require_target_for_buy: false # F1/C7: true = a fresh buy with no target is skipped (else 'ungraded' passes)
+  # per_trade_risk_pct: 1.0      # F2/P3: max % of equity lost if the stop hits -> stop-distance size cap (0=off)
+  # downside_vol_target: 0.30    # F3/P5: shrink a buy when a name's annualized downside-vol exceeds this (0=off)
+  # trend_gate_mode: soft        # F4/P6: off | soft (0.5x a downtrend buy) | block (veto a downtrend buy)
+  # derisk_tiers:                # F6/P4: graduated de-risk BELOW the 20% halt ([] = off). Trim the deepest
+  #   - {at_drawdown_pct: 5, trim_pct: 25}   # breached tier; one de-risk action per name per day.
+  #   - {at_drawdown_pct: 10, trim_pct: 50}
+  # Also, to fully arm the defense: set `order.protective_stop.enabled: true` in config.yaml (on the
+  # box), and enable the event-risk sidecar by populating `legislative.ticker_policy_areas` for holdings.
 
 # --- Continual-learning gates (Stage 4) -------------------------------------
 # Every universe-touching gate defaults SAFE; both auto_apply_* default FALSE (the

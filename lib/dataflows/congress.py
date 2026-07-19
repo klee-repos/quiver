@@ -293,3 +293,23 @@ def heuristic_passage_prob(detail: Optional[dict]) -> float:
     cosp = int(detail.get("cosponsors_n", 0) or 0)
     base += min(cosp, 100) / 100.0 * 0.10
     return round(max(0.0, min(1.0, base)), 4)
+
+
+def coordination_fade(detail: Optional[dict]) -> float:
+    """SHADOW descriptor (F10/P11) — PTJ's structural bet that coordination FAILS ("anytime you try
+    to get 13 people to agree... wild horses couldn't keep me from betting against them"). Returns a
+    'fade' score in [0,1] = how much to DISCOUNT the crowd's pricing of a contentious bill passing:
+    ~1 for a bill with many veto points still to clear, falling to 0 once it is through both chambers
+    (coordination already achieved) or enacted/failed.
+
+    DELIBERATELY NOT wired into the live passage gate (C10): heuristic_passage_prob already encodes
+    the chamber/committee ladder via _STATUS_BASE, so gating on this too would double-count. It is a
+    recorded/observable signal for the shadow intel layer only — never a trade. Pure + total."""
+    if not isinstance(detail, dict):
+        return 0.0
+    status = str(detail.get("status") or "introduced")
+    remaining = {
+        "introduced": 1.0, "committee": 0.9, "reported": 0.7, "passed_one": 0.4,
+        "passed_both": 0.1, "to_president": 0.0, "became_law": 0.0, "failed": 0.0,
+    }.get(status, 1.0)
+    return round(remaining, 3)

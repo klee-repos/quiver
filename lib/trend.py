@@ -115,6 +115,27 @@ def annualized_sortino(returns: Sequence[float], *, periods_per_year: float = 25
     return (m / dd) * math.sqrt(periods_per_year)
 
 
+def downside_deviation(returns: Sequence[float], *, periods_per_year: float = 252.0,
+                       rf: float = 0.0) -> Optional[float]:
+    """Annualized downside deviation = sqrt(mean(min(excess,0)^2)) * sqrt(ppy).
+
+    The denominator of Sortino, exposed on its own so the PTJ vol-aware sizing floor
+    (F3/P5, ``signals.downside_vol_scalar``) can consume it as a plain float argument.
+    Only DOWNSIDE moves count (upside vol is not risk — PTJ: "losses out the window").
+    None when there is no history or no downside move. Pure; reads no limit/broker.
+    """
+    if not returns:
+        return None
+    excess = [r - rf for r in returns]
+    downside = [e for e in excess if e < 0]
+    if not downside:
+        return None
+    dd = math.sqrt(sum(e * e for e in downside) / len(downside))
+    if dd <= 0:
+        return None
+    return dd * math.sqrt(periods_per_year)
+
+
 def cagr(prices: Sequence[float], *, periods_per_year: float = 252.0) -> Optional[float]:
     """Compound annual growth rate over the full series. None when <2 prices."""
     p = [float(x) for x in prices if x and x == x]

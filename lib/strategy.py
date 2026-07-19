@@ -310,7 +310,11 @@ def load_strategy(path) -> StrategyConfig:
     if not isinstance(rp_raw, dict):
         raise StrategyError("strategy.yaml: risk_policy must be a mapping")
     _RP_NUM = ("per_name_max_pct", "sleeve_max_pct", "cash_floor_pct", "conviction_curve_k",
-               "smoothing_alpha", "uncertainty_damp", "regime_min_factor", "min_weight_floor_pct")
+               "smoothing_alpha", "uncertainty_damp", "regime_min_factor", "min_weight_floor_pct",
+               # PTJ defense scalar knobs (float-coerced at load; trend_gate_mode/derisk_tiers/
+               # require_target_for_buy are non-scalar and pass through the else branch).
+               "min_reward_risk", "per_trade_risk_pct", "downside_vol_target",
+               "conviction_full_deploy_at", "conviction_deploy_min_factor", "event_risk_derisk_severity")
     risk_policy: Dict[str, object] = {}
     for rk, rv in rp_raw.items():
         risk_policy[rk] = _num(rv, f"risk_policy.{rk}") if rk in _RP_NUM else rv

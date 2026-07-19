@@ -74,6 +74,8 @@ def resolve_buy_dollars(
     fallback: float = 100.0,
     position_pct: Optional[float] = None,
     room_under_target: Optional[float] = None,
+    risk_cap: Optional[float] = None,
+    exposure_scalar: Optional[float] = None,
 ) -> Tuple[float, str]:
     """Resolve a clamped USD buy amount. Returns (dollars, sizing_source).
 
@@ -88,6 +90,14 @@ def resolve_buy_dollars(
     it is None (the default, and the classic non-rebalance path) the output is
     BYTE-IDENTICAL to before — the min() args are unchanged. Always >= 0; a
     non-positive result means "skip". Never fails open to a large size.
+
+    PTJ-defense clamps (both default None -> BYTE-IDENTICAL, same convention as
+    room_under_target): ``risk_cap`` is the stop-distance risk budget (F2/P3 —
+    ``risk_budget_cap``), appended to the SAME min() so it can only REDUCE a buy;
+    ``exposure_scalar`` (F3/F4/P5/P6 — downside-vol x trend x event severity, in
+    [floor,1.0]) multiplies ``base`` BEFORE the min(). The scalar is applied with an
+    explicit ``is not None`` guard (NOT ``or 1.0``) so a legitimate 0.0 block-scalar
+    zeroes the buy instead of being silently treated as 1.0.
     """
     if position_pct is not None and position_pct > 0:
         base = position_pct / 100.0 * baseline_equity
@@ -99,12 +109,18 @@ def resolve_buy_dollars(
         base = min(ceiling, fallback)
         source = "fallback"
     base *= buy_fraction
+    # Downside-vol / trend / event exposure scalar (F3/F4/F8). Guarded is-not-None
+    # multiply so a 0.0 block-scalar zeroes the buy; None -> untouched (byte-identical).
+    if exposure_scalar is not None:
+        base *= exposure_scalar
 
-    # The classic clamp stack. room_under_target is appended ONLY when supplied,
-    # so with it None the min() args are identical to before (byte-identical output).
+    # The classic clamp stack. room_under_target + risk_cap are appended ONLY when
+    # supplied, so with both None the min() args are identical to before (byte-identical).
     clamps = [base, ceiling, remaining_daily_cap, buying_power - buffer]
     if room_under_target is not None:
         clamps.append(room_under_target)
+    if risk_cap is not None:
+        clamps.append(risk_cap)
     capped = min(clamps)
     if capped <= 0:
         return (0.0, source)
@@ -432,3 +448,114 @@ def resolve_stop_price(fill_price, model_stop_loss, stop_pct) -> Optional[float]
         stop = default_stop
     stop = round(stop, 2)
     return stop if 0 < stop < fill_price else None
+
+
+# --- PTJ defense: asymmetric R:R gate, risk-based sizing, vol/trend scalars, de-risk ---
+# Pure + total + unit-tested. Every one is a NO-OP at its "off" value (None / <=0 / 1.0 /
+# empty tiers) so a book whose strategy.yaml predates these knobs is BYTE-IDENTICAL — the
+# tick.py glue reads the knobs (defaulting off via allocate._DEFAULTS) and only passes a
+# binding value when the operator opted in. These never read a limit/broker (the wall).
+
+def reward_risk_ratio(entry: Optional[float], stop: Optional[float],
+                      target: Optional[float]) -> Optional[float]:
+    """The reward:risk of a long entry = (target - entry) / (entry - stop).
+
+    PTJ's asymmetry test ("risk a little to make a lot"). Returns None when any leg is
+    missing/implausible (entry<=0, stop not strictly below entry, target not strictly
+    above entry) — i.e. UNCOMPUTABLE, which the caller treats as ungraded (a visible
+    skip/pass decision, never a silent one). A valid ratio is > 0.
+    """
+    if not entry or entry <= 0 or not stop or not target:
+        return None
+    if not (0 < stop < entry) or target <= entry:
+        return None
+    return (target - entry) / (entry - stop)
+
+
+def risk_budget_cap(equity: float, per_trade_risk_pct: Optional[float],
+                    entry: Optional[float], stop: Optional[float]) -> Optional[float]:
+    """Max buy dollars such that a stop-out loses <= per_trade_risk_pct% of equity (F2/P3).
+
+    Size by CAPITAL-AT-RISK, not notional: with loss-per-dollar = (entry-stop)/entry,
+    dollars = (per_trade_risk_pct/100 * equity) / ((entry-stop)/entry). A TIGHT stop
+    (small distance) yields a LARGER cap (each dollar risks less); a WIDE stop a smaller cap.
+
+    Returns None (the cap is OFF, never appended to the sizing min()) when
+    per_trade_risk_pct <= 0 (B1: the no-op default), the stop is invalid, or equity <= 0 —
+    so a disabled cap can never zero a buy. Always > 0 when returned.
+    """
+    if not per_trade_risk_pct or per_trade_risk_pct <= 0:
+        return None
+    if not equity or equity <= 0 or not entry or entry <= 0 or not stop or not (0 < stop < entry):
+        return None
+    loss_frac = (entry - stop) / entry
+    if loss_frac <= 0:
+        return None
+    return (per_trade_risk_pct / 100.0 * equity) / loss_frac
+
+
+def downside_vol_scalar(downside_vol: Optional[float], target: Optional[float],
+                        *, floor: float = 0.25) -> float:
+    """Exposure scalar in [floor, 1.0] that SHRINKS a buy as downside vol exceeds target (F5/P5).
+
+    Fat-tail-aware sizing: 1.0 when downside vol is at/under the target, shrinking toward
+    ``floor`` as it rises (min(1, target/vol)). B2: returns 1.0 (a TRUE no-op) when
+    ``target`` is None or <= 0 (the off default) OR the vol is unknown/<=0 — BEFORE any
+    division — so a disabled floor never shrinks a buy.
+    """
+    if target is None or target <= 0:
+        return 1.0
+    if downside_vol is None or downside_vol <= 0:
+        return 1.0
+    return max(floor, min(1.0, target / downside_vol))
+
+
+def trend_gate_scalar(trend_regime: Optional[str], momentum: Optional[float],
+                      mode: str = "off", *, soft_factor: float = 0.5) -> float:
+    """Buy-side trend-alignment scalar ("don't fight the train", F6/P6). BUY-ONLY — the
+    caller never applies it to a sell/de-risk (PTJ's asymmetry: cut freely, add with the trend).
+
+    mode "off" (default) -> always 1.0 (byte-identical). "soft" -> ``soft_factor`` (0.5) when
+    the deterministic regime is DOWNTREND or 12-1 momentum is negative, else 1.0. "block" ->
+    0.0 in those cases (a full veto), else 1.0. Unknown regime + None momentum -> 1.0 (fail-open;
+    a missing trend read never blocks a standing buy).
+    """
+    if mode not in ("soft", "block"):
+        return 1.0
+    regime = (trend_regime or "").strip().upper()
+    against = regime == "DOWNTREND" or (momentum is not None and momentum < 0)
+    if not against:
+        return 1.0
+    return 0.0 if mode == "block" else soft_factor
+
+
+def derisk_trim_fraction(drop_pct: Optional[float], tiers) -> float:
+    """Fraction of a held position to TRIM given the account drawdown vs today's baseline (F4/P4).
+
+    ``drop_pct`` is signed (a drawdown is negative, e.g. -6.0). ``tiers`` is a list of
+    ``{"at_drawdown_pct": <positive %>, "trim_pct": <0..100>}``; the DEEPEST breached tier's
+    trim fraction is returned (a tier is breached when the drawdown magnitude >= its
+    at_drawdown_pct). Empty/absent tiers or a non-drawdown (drop_pct >= 0) -> 0.0 (no de-risk,
+    byte-identical). Robust to unordered tiers and missing/garbled keys. Result in [0.0, 1.0].
+    """
+    if not tiers or drop_pct is None or drop_pct >= 0:
+        return 0.0
+    mag = -float(drop_pct)  # drawdown magnitude, positive
+    best = 0.0
+    for t in tiers:
+        if not isinstance(t, dict):
+            continue
+        at_raw = t.get("at_drawdown_pct")
+        trim_raw = t.get("trim_pct")
+        if at_raw is None or trim_raw is None:
+            continue
+        try:
+            at = float(at_raw)
+            trim = float(trim_raw)
+        except (TypeError, ValueError):
+            continue
+        if at <= 0:
+            continue
+        if mag >= at:
+            best = max(best, trim)
+    return max(0.0, min(1.0, best / 100.0))

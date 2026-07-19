@@ -49,8 +49,8 @@ order:
   sell_mode: "close_position"
   time_in_force: "gfd"
   market_hours: "regular_hours"        # fractional/dollar orders only fill in RTH
-  protective_stop:                     # GTC stop placed AFTER an entry fills; price Python-clamped. OFF by default.
-    enabled: false
+  protective_stop:                     # GTC stop placed AFTER an entry fills; price Python-clamped. ENABLED 2026-07-19 (PTJ defense).
+    enabled: true
     stop_pct: 8.0                      # target distance below fill; clamped to a safe band
     time_in_force: "gtc"
 
