@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""End-to-end coverage for the email ALERTING logic — WHEN emails are sent.
+"""End-to-end coverage for the ALERTING logic — WHEN/WHERE alerts are sent (now Telegram).
 
 Drives the real deterministic pipeline offline (no network, no `claude`, no MCP):
 
   * tick.py `_run_report` — the should_send / dedup / per-event-toggle / recipient-
     routing decisions, across the run-complete + alert scenarios.
-  * run_tick.py `_maybe_alert` — the headless last-resort sender: dedup against the
+  * run_tick.py `_maybe_alert` — the headless last-resort Telegram sender: dedup against the
     SAME ledger row the in-tick path uses, injectable transport, never-raises, and the
-    "pager unconfigured" path.
+    "pager unconfigured" (no token) path.
   * the ledger stage-keyed dedup + the (date, kind) -> (date, kind, stage) migration.
-  * lib/mailer payload construction + best-effort no-raise (QUIVER_MAILER_DISABLE).
-  * the import-graph invariant: the trading brain never imports lib.mailer.
+  * lib/mailer payload construction + best-effort no-raise (QUIVER_MAILER_DISABLE) — kept as
+    the email rollback path.
+  * the import-graph invariant: the trading brain never imports lib.mailer NOR lib.telegram.
+  * (opt-in) LIVE Telegram delivery of one of each alert kind via the production egress.
 
 Run: .venv/bin/python tests/test_e2e_alerts.py
+Live Telegram delivery (opt-in): QUIVER_E2E_TELEGRAM=1 TELEGRAM_BOT_TOKEN=... \
+    TELEGRAM_ALERT_CHAT_IDS=<chat id> .venv/bin/python tests/test_e2e_alerts.py
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import sqlite3
 import subprocess
@@ -29,7 +35,7 @@ sys.path.insert(0, str(_REPO))
 import yaml  # noqa: E402
 
 import tick as T  # noqa: E402
-from lib import mailer, notify  # noqa: E402
+from lib import mailer, notify, telegram  # noqa: E402
 from lib.config import load_config  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 
@@ -190,13 +196,19 @@ def main() -> int:
     print("\n[G] run_tick._maybe_alert (the headless safety net)")
     rt = _run_tick_module()
     led_g = _led()
-    os.environ.update(NOTIFY_ALERTS_TO="me@x.com", RESEND_FROM="bot@q.dev", RESEND_API_KEY="k")
+    # Snapshot + restore so this block never clobbers a real .env token for a later LIVE block.
+    _saved_tg = {_k: os.environ.get(_k) for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALERT_CHAT_IDS")}
+    os.environ.update(TELEGRAM_BOT_TOKEN="tok", TELEGRAM_ALERT_CHAT_IDS="560501084")
     sent = []
     rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
-                    event_detail="401", send=lambda **k: sent.append(k) or {"ok": True, "id": "1"})
+                    event_detail="401", send=lambda **k: sent.append(k) or {"ok": True})
     ok("last-resort sends once", len(sent) == 1)
-    ok("alert copy is actionable (/mcp + remote desktop in html & text)",
-       "/mcp" in sent[0]["text"] and "remotedesktop.google.com" in sent[0]["html"])
+    ok("alert copy is actionable (/mcp + remote desktop in the Telegram body)",
+       "/mcp" in sent[0]["text"] and "remotedesktop.google.com" in sent[0]["text"])
+    ok("last-resort targets Telegram (token + chat ids, not email)",
+       sent[0].get("token") == "tok" and sent[0].get("chat_ids") == ["560501084"])
+    ok("critical alert is LOUD (disable_notification False)",
+       sent[0].get("disable_notification") is False)
     rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
                     event_detail="different", send=lambda **k: sent.append(k) or {"ok": True})
     ok("last-resort dedups against the shared row (no double page)", len(sent) == 1)
@@ -210,16 +222,18 @@ def main() -> int:
     rt._maybe_alert(led_g, kind="error", stage="commit", day=DAY, now_iso=NOW,
                     event_detail="y", send=_boom)  # must not raise
     ok("a raising transport is swallowed (never crashes the supervisor)", len(sent) == before)
-    # Simulate an UNCONFIGURED box by blanking the key (not popping it): _maybe_alert
-    # calls load_config -> load_dotenv, which would re-inject RESEND_API_KEY from a real
-    # .env (dotenv only fills UNSET vars; override=False leaves a present-but-empty one).
-    os.environ["RESEND_API_KEY"] = ""
+    # Simulate an UNCONFIGURED box by blanking the token (present-but-empty, not popped):
+    # _maybe_alert calls load_config -> load_dotenv, which would re-inject TELEGRAM_BOT_TOKEN from
+    # a real .env (dotenv only fills UNSET vars; override=False leaves a present-but-empty one).
+    os.environ["TELEGRAM_BOT_TOKEN"] = ""
     rt._maybe_alert(led_g, kind="error", stage="reflect", day=DAY, now_iso=NOW,
                     event_detail="z", send=lambda **k: sent.append(k) or {"ok": True})
-    ok("unconfigured (no key) -> no send, no raise", len(sent) == before)
-    os.environ.pop("RESEND_API_KEY", None)
-    os.environ.pop("NOTIFY_ALERTS_TO", None)
-    os.environ.pop("RESEND_FROM", None)
+    ok("unconfigured (no token) -> no send, no raise", len(sent) == before)
+    for _k, _v in _saved_tg.items():  # restore (don't leak into a later LIVE block)
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
     # generic orchestrator-crash alert is suppressed when the in-tick path already paged
     # a hard-stop error (so it can't double-page the same failure under a different stage)
     led_gate = _led()
@@ -228,6 +242,57 @@ def main() -> int:
     led_gate.mark_notified(DAY, "error", "h", "p", NOW, stage="plan")
     ok("in-tick plan error -> generic orchestrator alert suppressed",
        rt._in_tick_error_paged(led_gate, DAY) is True)
+
+    # ---- G2. run_tick.main brain-outage branch: the all-ERROR page must be REACHED ----
+    # Regression for a NameError: main() built the brain-outage alert detail with
+    # `_brain_engine(cfg)`, but `cfg` was never bound in main() (it lived only in
+    # _alert_target). On a total brain outage (every analysis == "ERROR") that f-string
+    # arg raised NameError BEFORE _maybe_alert ran, and — being outside the RunLockError
+    # except — it crashed the supervisor instead of paging. Drive the full main() path
+    # with a stubbed preflight (proceed + a pending ticker) and an all-ERROR fan-out, and
+    # assert the brain-outage page is REACHED (its detail evaluated) without raising.
+    print("\n[G2] run_tick.main brain-outage page is reached without a NameError")
+    _tmp_led2 = _led()
+    _saved = {"Ledger": rt.Ledger, "tick_json": rt._tick_json,
+              "run_analyses": rt.run_analyses, "subprocess": rt.subprocess,
+              "maybe_alert": rt._maybe_alert}
+
+    class _FakeProc:  # a clean orchestrator exit (rc 0, no stdout/stderr)
+        returncode, stdout, stderr = 0, "", ""
+
+    class _FakeSub:  # only .run is exercised (the orchestrator call); _tick_json is stubbed out
+        run = staticmethod(lambda *a, **k: _FakeProc())
+        TimeoutExpired = rt.subprocess.TimeoutExpired  # keep the `except` type valid
+
+    class _FakeRA:  # every pending ticker returns signal ERROR -> total brain outage
+        run = staticmethod(lambda pending, timeout=None: [{"ticker": t, "signal": "ERROR"}
+                                                          for t in pending])
+
+    alerts = []
+    rt.Ledger = lambda *a, **k: _tmp_led2  # never touch the real state/ledger.db
+    rt._tick_json = lambda args, timeout=None: (
+        {"proceed": True, "pending": ["AAPL"]} if args and args[0] == "preflight" else {})
+    rt.run_analyses = _FakeRA
+    rt.subprocess = _FakeSub
+    rt._maybe_alert = lambda led, **kw: alerts.append(kw)  # recorder: kw is built BEFORE this runs
+    raised, rc = None, None
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):  # swallow the per-stage _emit chatter
+            rc = rt.main()
+    except Exception as e:  # noqa: BLE001 — the pre-fix failure surfaced here as a NameError
+        raised = e
+    finally:
+        rt.Ledger, rt._tick_json = _saved["Ledger"], _saved["tick_json"]
+        rt.run_analyses, rt.subprocess = _saved["run_analyses"], _saved["subprocess"]
+        rt._maybe_alert = _saved["maybe_alert"]
+    ok(f"main() reaches the brain-outage page without raising (cfg is bound), got rc={rc}",
+       raised is None)
+    _brain_pages = [a for a in alerts if a.get("stage") == "analyze"
+                    and "brain outage" in (a.get("event_detail") or "")]
+    ok("brain-outage alert is reached exactly once (event_detail evaluated)",
+       len(_brain_pages) == 1)
+    ok("brain-outage detail names the engine (brain_engine=...)",
+       bool(_brain_pages) and "brain_engine=" in _brain_pages[0]["event_detail"])
 
     # ---- H. ledger: stage isolation + (date,kind)->(date,kind,stage) migration ----
     print("\n[H] ledger stage-keyed dedup + schema migration preserves old rows")
@@ -281,14 +346,14 @@ def main() -> int:
        dis["ok"] and dis.get("disabled") and dis["payload"]["to"] == ["x@a.com"])
     os.environ.pop("QUIVER_MAILER_DISABLE", None)
 
-    # ---- J. import-graph invariant: the trading brain never imports lib.mailer ----
-    print("\n[J] import-graph: lib.mailer is ops-layer only (not in the trading brain)")
+    # ---- J. import-graph invariant: the trading brain never imports the network egress ----
+    print("\n[J] import-graph: lib.mailer + lib.telegram are ops-layer only (not in the brain)")
     code = ("import sys; import tick, lib.signals, lib.memory; "
-            "bad=[m for m in sys.modules if m=='lib.mailer']; "
-            "print('LOADED' if bad else 'CLEAN')")
+            "bad=[m for m in sys.modules if m in ('lib.mailer','lib.telegram')]; "
+            "print('LOADED:'+','.join(bad) if bad else 'CLEAN')")
     proc = subprocess.run([sys.executable, "-c", code], cwd=str(_REPO),
                           capture_output=True, text=True)
-    ok("importing tick/signals/memory does NOT load lib.mailer",
+    ok("importing tick/signals/memory loads NEITHER lib.mailer NOR lib.telegram",
        "CLEAN" in proc.stdout and "LOADED" not in proc.stdout)
 
     # ---- K. LIVE delivery (opt-in) — actually send one of EACH kind ----
@@ -306,6 +371,22 @@ def main() -> int:
                                     subject="[E2E] " + built["subject"],
                                     html=built["html"], text=built["text"])
             ok(f"live send '{kind}' -> {res.get('id') or res.get('error')}", bool(res.get("ok")))
+
+    # ---- K2. LIVE Telegram delivery (opt-in) — the PRODUCTION alert channel ----
+    # QUIVER_E2E_TELEGRAM=1 + TELEGRAM_BOT_TOKEN + TELEGRAM_ALERT_CHAT_IDS (or _ALLOWED) sends one
+    # of EACH kind through the real lib.telegram HTTPS path — the actual deploy acceptance gate.
+    if os.environ.get("QUIVER_E2E_TELEGRAM", "").strip().lower() in ("1", "true", "yes", "on"):
+        tok, chats = telegram.resolve_env()
+        print(f"\n[K2] LIVE Telegram delivery -> chats {chats} (production lib.telegram path)")
+        ok("TELEGRAM_BOT_TOKEN present for live Telegram send", bool(tok))
+        ok("a chat id present for live Telegram send", bool(chats))
+        for kind, m in _LIVE_SAMPLES().items():
+            built = notify.build_digest(m)
+            res = telegram.send_message(token=tok, chat_ids=chats,
+                                        text="[E2E] " + built["telegram"],
+                                        disable_notification=notify.is_silent(m))
+            ok(f"live Telegram send '{kind}' -> ok={res.get('ok')} {res.get('error') or ''}",
+               bool(res.get("ok")))
 
     print("\n" + "=" * 70)
     print(f"E2E ALERTS: {PASS} passed, {FAIL} failed")

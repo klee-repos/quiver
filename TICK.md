@@ -16,8 +16,8 @@ Run everything from the repo dir.
 
 ## ALERT PROCEDURE (best-effort; referenced from every STOP point)
 
-When a step below says "**fire the alert**", email the operator using the SAME
-machinery as the digest (STEP 7b), but with an alert `kind`/`stage`. This is
+When a step below says "**fire the alert**", page the operator on **Telegram** using the
+SAME machinery as the digest (STEP 7b), but with an alert `kind`/`stage`. This is
 **best-effort**: if any part errors, log it and continue the STOP — an alert must
 NEVER change what the tick does. Steps:
 
@@ -30,18 +30,17 @@ NEVER change what the tick does. Steps:
    (Use EXACTLY the `stage` string the STOP point names — never invent one; the
    dedup is keyed on it. `auth_error`/`halt` may omit `severity`/`stage`; Python
    fills `broker_auth`/`daily_loss_halt` + `critical`.)
-2. `~/dev/quiver/.venv/bin/python tick.py report --input state/tmp/report_input.json`
-   — if it errors, log `ALERT_SKIPPED <error>` and continue. If `should_send` is
-   `false` (`error_disabled` / `warning_disabled` / `already_sent`) → done.
-3. If `should_send` is `true` → send via the Resend MCP
-   `send-email(to=<recipients>, subject=<subject>, html=<html>, text=<text>)`
-   (`from=<from>` only if non-empty), then record it:
-   `tick.py report-commit --date <date> --kind <kind> --stage <stage> --hash <content_hash> --recipients "<recipients>"`.
-   On send failure → log `ALERT_FAILED <error>` and continue (do NOT report-commit).
+2. `~/dev/quiver/.venv/bin/python tick.py report-send --input state/tmp/report_input.json`
+   — this ONE Python command builds the Telegram alert, sends it (plain HTTPS POST; there is
+   NO Telegram MCP, and you must NOT send anything yourself), and records the dedup row. It is
+   best-effort and prints one JSON line: `{"sent":true,...}` on delivery, else
+   `{"sent":false,"reason":"already_sent"|"unconfigured"|"send_failed"|...}`. Whatever it
+   prints, log it (`ALERT_SENT` / `ALERT_SKIPPED <reason>`) and continue the STOP. Do NOT
+   retry and do NOT `report-commit` (report-send records the row itself).
 
 The headless supervisor (`run_tick.py`) is the SAFETY NET for failures that prevent
 you from reaching this procedure (a crash/timeout, a preflight error) — it pages the
-same `(date, kind, stage)` row via the Python last-resort sender, so it dedups
+same `(date, kind, stage)` row via the Python last-resort Telegram sender, so it dedups
 against whatever you already sent. You still fire the alert here whenever you can.
 
 ---
@@ -74,8 +73,10 @@ Parse the JSON.
 
 ## STEP 2 — Broker snapshot (MCP, read-only)
 
-The Robinhood (and Resend) MCP tools may be **deferred** — listed by name but not
-directly callable until loaded. If `get_portfolio` / `get_equity_positions` /
+The Robinhood MCP tools may be **deferred** — listed by name but not
+directly callable until loaded. (There is no Resend/Telegram MCP anymore: all alerting is a
+Python HTTPS POST via `tick.py report-send` + the supervisor's last-resort sender.) If
+`get_portfolio` / `get_equity_positions` /
 `get_equity_quotes` / `review_equity_order` / `place_equity_order` /
 `cancel_equity_order` aren't directly available, FIRST load them with ToolSearch
 (`select:mcp__robinhood-trading__get_portfolio,mcp__robinhood-trading__get_equity_positions,mcp__robinhood-trading__get_equity_quotes,mcp__robinhood-trading__review_equity_order,mcp__robinhood-trading__place_equity_order,mcp__robinhood-trading__cancel_equity_order`),
@@ -91,7 +92,7 @@ Call the Robinhood MCP with the `account_number` from preflight:
      `~/dev/quiver/.venv/bin/python tick.py auth-stop` (it prints a machine sentinel to
      stdout that the headless supervisor keys on — just run it; do NOT transcribe or quote
      its output). Then log `AUTH_ERROR`, **fire the alert** with `kind:"auth_error"`,
-     `stage:"broker_auth"` (severity is critical; the email's "what to do" block carries
+     `stage:"broker_auth"` (severity is critical; the alert's "what to do" block carries
      the Chrome Remote Desktop re-auth steps), `event_detail`=the error text, and **STOP**
      (never trade on stale auth).
      Recovery: a human connects to the box's Chrome Remote Desktop
@@ -222,7 +223,7 @@ Parse the JSON:
 - If `halt` is `true` → the daily-loss kill-switch fired. If `write_kill` is true,
   create the kill file: `touch ~/dev/quiver/KILL`. Log loudly, then **fire the alert**
   with `kind:"halt"`, `stage:"daily_loss_halt"` (include the plan JSON as `plan` so the
-  email shows equity + the trip), and **STOP**.
+  alert shows equity + the trip), and **STOP**.
 - `orders` is the explicit list to execute. `decisions` are the holds/skips/errors
   already recorded — just log them. A decision with `detail` starting `consistency:`
   (e.g. `consistency:ungrounded_reversal` / `consistency:basis_churn`) is the
@@ -338,7 +339,7 @@ if a refresh hiccuped — either way the tick continues).
 7a. Append a one-line summary to `logs/orchestrator.log`:
 `<now_iso> mode=<dry_run|live> acted=[...] skipped=[...] halted=<bool>`.
 
-7b. **Email the digest (best-effort — this must NEVER abort or change the tick).**
+7b. **Send the digest to Telegram (best-effort — this must NEVER abort or change the tick).**
 Run only on a substantive tick (you reached here after STEP 4). The /loop's hourly
 no-op wakes STOP at STEP 1 and never get here, so this fires ~once per trading day.
 
@@ -362,28 +363,19 @@ not this digest input.
 
 Run:
 ```
-~/dev/quiver/.venv/bin/python tick.py report --input state/tmp/report_input.json
+~/dev/quiver/.venv/bin/python tick.py report-send --input state/tmp/report_input.json
 ```
-- If the command **errors** → log `EMAIL_SKIPPED <error>` and end the tick normally.
-  A report error is NOT a tick error; never STOP for it.
-- Parse the JSON. If `should_send` is `false` (e.g. `notify_disabled`,
-  `complete_disabled`, `nothing_to_report`, or `already_sent` — the daily digest
-  already went out on an earlier tick) → done.
-- If `should_send` is `true` → send via the **Resend MCP** (registered in your Claude
-  config via `claude mcp add`, like the Robinhood MCP — not shipped in this repo):
-  `send-email(to=<recipients>, subject=<subject>, html=<html>, text=<text>)`. Include
-  `from=<from>` ONLY if the report's `from` field is non-empty; blank means the Resend
-  MCP uses its own configured sender.
-  - On send **success** → record it so the next wake won't resend (pass the report's
-    `stage` too — `""` for the digest, the alert stage for an alert):
-    ```
-    ~/dev/quiver/.venv/bin/python tick.py report-commit \
-      --date <date> --kind <kind> --stage "<stage>" --hash <content_hash> \
-      --recipients "<recipients joined by commas>"
-    ```
-  - On send **failure** (incl. Resend MCP missing/unauthorized, or unverified `from`
-    domain) → log `EMAIL_FAILED <error>` and continue. Do NOT `report-commit` — it will
-    retry on the next substantive tick.
+This ONE Python command builds the compact Telegram digest, sends it (a plain HTTPS POST —
+there is NO Telegram MCP, and you must NOT send anything yourself), and records the dedup row
+so the next wake won't resend. It prints one JSON line and is strictly best-effort:
+- On any error, or `{"sent": false, ...}` with a benign reason (`notify_disabled`,
+  `complete_disabled`, `nothing_to_report`, `already_sent` — the digest already went out on an
+  earlier tick) → log `ALERT_SKIPPED <reason>` and end the tick normally.
+- On `{"sent": false, "reason": "unconfigured"|"send_failed", ...}` → log `ALERT_FAILED <detail>`
+  and end the tick normally; it retries on the next substantive tick (Python re-checks the dedup
+  row). The headless supervisor's Telegram pager is the backstop for a total failure.
+- On `{"sent": true, ...}` → log `ALERT_SENT`. A `report-send` error is NEVER a tick error;
+  never STOP for it, and never `report-commit` (report-send records the row itself).
 
 7c. **Prune old artifacts (best-effort — never abort the tick).**
 Run:

@@ -1,10 +1,4 @@
 {
-  "_comment": "Copy to mcp.json at provision time. Resend ONLY — it is a static-key stdio server (no OAuth). The Robinhood MCP is NOT here: it is an OAuth http server registered at USER scope (deploy/gcp/setup.sh: `claude mcp add robinhood-trading --scope user`) and authenticated once in the on-box browser via /mcp; run_tick.py drops --strict-mcp-config so the headless tick layers that user-scope server + its stored OAuth on top of this file. The claude CLI interpolates ${ENV} from the process env (loaded from /etc/quiver/quiver.env).",
-  "mcpServers": {
-    "resend": {
-      "command": "npx",
-      "args": ["-y", "resend-mcp"],
-      "env": { "RESEND_API_KEY": "${RESEND_API_KEY}" }
-    }
-  }
+  "_comment": "Copy to mcp.json at provision time. This file layers in NO extra MCP servers: the orchestrator no longer sends email — ALL alerting is now a Python HTTPS POST to Telegram (tick.py report-send in-tick + run_tick.py's last-resort sender), so there is NO Resend MCP. The Robinhood MCP is NOT here either: it is an OAuth http server registered at USER scope (deploy/gcp/setup.sh: `claude mcp add robinhood-trading --scope user`) and authenticated once in the on-box browser via /mcp; run_tick.py drops --strict-mcp-config so the headless tick layers that user-scope server + its stored OAuth on top of this file. Keep mcpServers empty unless a NEW stdio MCP is genuinely needed.",
+  "mcpServers": {}
 }

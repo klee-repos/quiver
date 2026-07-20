@@ -500,34 +500,18 @@ def load_config(path) -> Config:
         elif isinstance(alerts_raw, str):
             alerts_raw = [alerts_raw]
     alerts_to = [str(x).strip() for x in (alerts_raw or []) if str(x).strip()]
-    if notify_enabled:
-        if not to or any("@" not in addr for addr in to):
-            raise ConfigError(
-                "config.yaml: notify.to must be a non-empty list of email "
-                "addresses when notify.enabled is true"
-            )
-        # `from` is optional for the in-tick MCP path (blank means the Resend MCP's own
-        # SENDER_EMAIL_ADDRESS is used). The Python last-resort HTTP sender, however,
-        # has no implicit sender — it resolves RESEND_FROM/notify.from at send time and
-        # skips loudly if both are blank (see lib/mailer). Only validate the override.
-        if from_addr and "@" not in from_addr:
-            raise ConfigError(
-                "config.yaml: notify.from, if set, must be a sender email address "
-                "(or leave it blank to use the Resend MCP's configured sender)"
-            )
-        # When critical alerts are enabled, the resolved alert recipients (post-fallback)
-        # must be valid — else a real incident would page no one.
-        if on_error and (not alerts_to or any("@" not in addr for addr in alerts_to)):
-            raise ConfigError(
-                "config.yaml: notify.alerts_to (or its fallback notify.to / NOTIFY_TO) "
-                "must be a non-empty list of email addresses when notify.on_error is true"
-            )
-        # NOTE: a blank `from` is deliberately allowed even with on_error — the in-tick
-        # MCP path has an implicit sender. The Python last-resort pager (run_tick.py)
-        # has none, so a blank from + no RESEND_FROM leaves THAT path unconfigured; that
-        # is surfaced at runtime (run_tick emits `alert_unconfigured`, the digest footer
-        # shows "last-resort alerting: NOT configured") and is gated by `tick.py
-        # send-test` at deploy — not hard-failed here, so the MCP-only config stays valid.
+    # The alert CHANNEL is Telegram, and its creds/recipients are resolved from ENV at send
+    # time (TELEGRAM_BOT_TOKEN + TELEGRAM_ALERT_CHAT_IDS/TELEGRAM_ALLOWED_CHAT_IDS via
+    # lib.telegram.resolve_env), NOT from config.yaml — mirroring how the last-resort sender
+    # already resolves its own creds. So enabling notifications no longer hard-requires an email
+    # address here. That relaxation is deliberate and load-bearing: _cfg_and_ledger() (hence
+    # every preflight/plan/commit) calls load_config, so a hard-raise on a missing recipient
+    # would let a stale/absent NOTIFY_TO abort the WHOLE tick — a real footgun once email is off.
+    # A missing/unreachable channel is instead surfaced at RUNTIME (tick.py report-send +
+    # run_tick.py _maybe_alert emit `unconfigured`/`no_token`/`no_chats`; the digest footer shows
+    # `pager: NOT configured`) and gated at DEPLOY by `tick.py send-test`. The email fields
+    # (to/alerts_to/from_addr) are still parsed above so a rollback-to-email needs no config
+    # surgery, but they are no longer validated as addresses.
     notify = NotifyConfig(
         enabled=notify_enabled, to=to, from_addr=from_addr, subject_prefix=subject_prefix,
         on_complete=on_complete, on_error=on_error, on_warning=on_warning,

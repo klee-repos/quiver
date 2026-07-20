@@ -214,27 +214,30 @@ You can see everything Quiver does:
   sqlite3 state/ledger.db "SELECT * FROM ticker_action ORDER BY updated_at DESC LIMIT 20;"
   sqlite3 state/ledger.db "SELECT * FROM orders        ORDER BY submitted_at DESC LIMIT 20;"
   ```
-- **Get a daily email** (optional) — a short summary of each real day: what it looked at, what
-  it decided, what it traded, and how the account did. See below to switch it on.
+- **Get a daily Telegram message** (optional) — a short recap of each real day: what it looked
+  at, what it decided, what it traded, and how the account did — plus a loud page if it ever
+  halts itself or the broker login expires. See below to switch it on.
 
-### Daily email summary (optional)
+### Daily Telegram recap + alerts (optional)
 
-Quiver can email you a recap after each real trading day (plus an alert if it ever halts
-itself). It's off until you turn it on, and it's totally separate from trading — if an email
-fails to send, trading carries on as normal.
+Quiver messages you on **Telegram** after each real trading day (and pages you on a halt /
+auth-error / error). It's a plain HTTPS message from the bot — no email, no extra service. It's
+off until you turn it on, and it's totally separate from trading — if a message fails to send,
+trading carries on as normal. It reuses the **same bot** as the read-only "chat with Quiver"
+bridge (see [docs/CHAT.md](docs/CHAT.md)).
 
-1. **Connect the email service once:**
-   ```bash
-   claude mcp add resend -s user \
-     -e RESEND_API_KEY=re_xxxxxxxx \
-     -e SENDER_EMAIL_ADDRESS=you@your-verified-domain \
-     -- npx -y resend-mcp
+1. **Create the bot + get your chat id** (one-time) — message **@BotFather** → `/newbot` for a
+   token, and grab your numeric chat id (see docs/CHAT.md). Put them in `.env`:
    ```
-   Grab a key at <https://resend.com/api-keys>. Then run `/mcp` and check that **resend** shows
-   as connected.
-2. **Switch it on:** in `config.yaml`, set `notify.enabled: true` and put your email under
-   `notify.to`.
-3. **Preview first:** you can build a sample email and read it without sending anything.
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   TELEGRAM_ALLOWED_CHAT_IDS=123456789   # your chat id (also the alert recipient)
+   ```
+2. **Switch it on:** in `config.yaml`, set `notify.enabled: true`.
+3. **Test it:** `.venv/bin/python tick.py send-test --kind auth_error` sends a real sample alert
+   to your Telegram and prints `{"sent": true, ...}`.
+
+(Email via Resend is kept as a dormant rollback only — `lib/mailer.py` + `RESEND_*` — and is no
+longer used by the live alert path.)
 
 ---
 

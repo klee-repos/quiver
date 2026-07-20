@@ -2388,10 +2388,12 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
     null-safe so the auth_error path (which stops before any ledger write)
     still renders a minimal alert.
     """
+    from lib import telegram  # local: keep `import tick` free of the egress (block-J import graph)
     plan = data.get("plan") or {}
     baseline = led.get_baseline(date)
     actions = led.day_actions(date)
     orders = led.day_orders(date)
+    _tg_token, _tg_chats = telegram.resolve_env()
 
     equity = data.get("equity")
     if equity is None:
@@ -2464,12 +2466,11 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
         "severity": data.get("severity"),
         "warnings": data.get("warnings") or [],
         "host": data.get("host"),
-        # Digest footer hint: is the Python last-resort sender actually armed on this
-        # box? (RESEND_API_KEY + a resolvable from). So every healthy digest passively
-        # confirms the backup pager — a NOT-configured footer is itself a signal.
-        "mailer_armed": bool(os.environ.get("RESEND_API_KEY")
-                             and (os.environ.get("RESEND_FROM") or cfg.notify.from_addr))
-        if kind == "digest" else None,
+        # Digest footer hint: is the Telegram pager actually armed on this box? (a bot token
+        # + at least one resolvable chat id). So every healthy digest passively confirms the
+        # alert channel — a NOT-configured footer is itself a signal (the box needs the
+        # TELEGRAM_* secrets in /etc/quiver/quiver.env; see F7 / docs/DEPLOY.md).
+        "pager_armed": bool(_tg_token and _tg_chats) if kind == "digest" else None,
         "account_risk": _account_risk(led),
         "tickers": [rows[t] for t in sorted(rows)],
     }
@@ -2527,8 +2528,58 @@ def _run_report(cfg, led, data: dict) -> dict:
         "subject": digest["subject"],
         "html": digest["html"],
         "text": digest["text"],
+        "telegram": digest["telegram"],
+        "silent": notify.is_silent(model),
         "content_hash": digest["content_hash"],
     }
+
+
+def _run_report_send(cfg, led, data: dict) -> dict:
+    """Build + SEND the digest/alert to Telegram + record the dedup row — ONE atomic,
+    best-effort Python step. Replaces the orchestrator's old report -> Resend-MCP send ->
+    report-commit dance (there is no Telegram MCP; Telegram is a plain HTTPS POST).
+
+    NEVER lets a failure become a tick error: a send failure / missing token / malformed input
+    returns ``{"sent": False, ...}`` (not an exception), so ``main`` prints it with exit 0 and a
+    report/alert can never abort or alter a trading tick. The dedup row is written only after a
+    confirmed delivery to the PRIMARY chat (at-least-once); a secondary-chat failure is surfaced
+    as ``partial`` but never blocks the row (else a dead extra chat would re-spam the primary).
+    """
+    from lib import telegram  # local: ops-layer egress, NOT the trading brain (block-J graph)
+    try:
+        rep = _run_report(cfg, led, data)
+        if not rep.get("should_send"):
+            return {"sent": False, "reason": rep.get("reason"),
+                    "kind": rep.get("kind"), "stage": rep.get("stage", "")}
+        kind, stage, date = rep["kind"], rep.get("stage", ""), rep["date"]
+        now_iso = data.get("now_iso") or market.now_et().isoformat()
+        token, chat_ids = telegram.resolve_env()
+        if not token or not chat_ids:
+            return {"sent": False, "reason": "unconfigured",
+                    "detail": "no_token" if not token else "no_chats",
+                    "kind": kind, "stage": stage}
+        res = telegram.send_message(token=token, chat_ids=chat_ids, text=rep["telegram"],
+                                    disable_notification=bool(rep.get("silent")))
+        if res.get("ok"):
+            led.mark_notified(date, kind, rep["content_hash"], ",".join(chat_ids),
+                              now_iso, stage=stage)
+            return {"sent": True, "partial": bool(res.get("partial")), "kind": kind,
+                    "stage": stage, "hash": rep["content_hash"], "chats": len(chat_ids)}
+        return {"sent": False, "reason": "send_failed", "detail": res.get("error"),
+                "kind": kind, "stage": stage}
+    except Exception as e:  # noqa: BLE001 — report-send is observability; NEVER fail a tick
+        return {"sent": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def cmd_report_send(args) -> dict:
+    # Fully defensive: even a broken config / missing input file returns {sent:False} (exit 0),
+    # so `report-send` can NEVER abort a tick — it is strictly observability (TICK.md STEP 7b).
+    try:
+        cfg, led = _cfg_and_ledger()
+        data = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 — never fail a tick on a report input/config error
+        return {"sent": False, "error": f"{type(e).__name__}: {e}"}
+    return _run_report_send(cfg, led, data)
 
 
 def cmd_report(args) -> dict:
@@ -2548,14 +2599,15 @@ def cmd_report_commit(args) -> dict:
 
 
 def cmd_send_test(args) -> dict:
-    """Send a REAL alert through lib.mailer using the production env resolution.
+    """Send a REAL alert through lib.telegram using the production env resolution.
 
-    The deploy acceptance gate: it exercises the exact RESEND_API_KEY / RESEND_FROM
-    path the last-resort sender uses, so an unverified from-domain or a stale key is
-    caught now, not during a real 2am incident. (QUIVER_MAILER_DISABLE=1 builds the
-    payload without sending — used by the offline tests.)
+    The deploy acceptance gate: it exercises the exact TELEGRAM_BOT_TOKEN / chat-id path the
+    live alert senders use, so a missing token or a wrong chat id is caught now, not during a
+    real 2am incident (the [6/6] healthcheck can't see it — it only load_config's). Pass
+    ``--to`` to target specific chat id(s) for the test. (QUIVER_TELEGRAM_DISABLE=1 builds the
+    message without sending — used by the offline tests.)
     """
-    from lib import mailer  # local: ops-layer network egress, not the trading brain
+    from lib import telegram  # local: ops-layer network egress, not the trading brain
     cfg, led = _cfg_and_ledger()
     date = market.trading_day_et()
     now_iso = market.now_et().isoformat()
@@ -2568,15 +2620,14 @@ def cmd_send_test(args) -> dict:
     }
     model = _build_report_model(cfg, led, data, date, now_iso, kind)
     built = notify.build_digest(model)
-    to = [a.strip() for a in (args.to or "").split(",") if a.strip()] \
-        or cfg.notify.alerts_to or cfg.notify.to
-    from_addr = os.environ.get("RESEND_FROM", "").strip() or cfg.notify.from_addr
-    api_key = os.environ.get("RESEND_API_KEY", "").strip()
-    res = mailer.send_email(api_key=api_key, from_addr=from_addr, to=to,
-                            subject="[SELF-TEST] " + built["subject"],
-                            html=built["html"], text=built["text"])
-    return {"sent": bool(res.get("ok")), "result": res, "to": to,
-            "from": from_addr, "kind": kind, "stage": notify.stage_of(model)}
+    token, chat_ids = telegram.resolve_env()
+    if args.to:  # explicit override: comma/space-separated chat id(s) for the test
+        chat_ids = telegram._recipients(args.to)
+    res = telegram.send_message(token=token, chat_ids=chat_ids,
+                                text="[SELF-TEST] " + built["telegram"],
+                                disable_notification=False)
+    return {"sent": bool(res.get("ok")), "result": res, "chats": chat_ids,
+            "partial": bool(res.get("partial")), "kind": kind, "stage": notify.stage_of(model)}
 
 
 def cmd_auth_stop(_args) -> dict:
@@ -3202,6 +3253,8 @@ def main(argv) -> int:
     p_commit.add_argument("--input", required=True)
     p_report = sub.add_parser("report")
     p_report.add_argument("--input", required=True)
+    p_rsend = sub.add_parser("report-send")
+    p_rsend.add_argument("--input", required=True)
     p_rc = sub.add_parser("report-commit")
     p_rc.add_argument("--date", required=True)
     p_rc.add_argument("--kind", default="digest")
@@ -3283,6 +3336,8 @@ def main(argv) -> int:
             out = cmd_commit(args)
         elif args.cmd == "report":
             out = cmd_report(args)
+        elif args.cmd == "report-send":
+            out = cmd_report_send(args)
         elif args.cmd == "report-commit":
             out = cmd_report_commit(args)
         elif args.cmd == "send-test":

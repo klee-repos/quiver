@@ -225,12 +225,99 @@ check("summarize None -> empty", notify.summarize(None), "")
 
 # --- notify.build_digest ---
 _d = notify.build_digest(MODEL)
-check("digest has all keys", set(_d.keys()), {"subject", "html", "text", "content_hash", "kind"})
+check("digest has all keys", set(_d.keys()),
+      {"subject", "html", "text", "telegram", "content_hash", "kind"})
 check_true("subject has prefix + date", "[Quiver]" in _d["subject"] and "2026-05-30" in _d["subject"])
 check_true("subject carries DRY RUN tag", "[DRY RUN]" in _d["subject"])
 check_true("text shows ticker + signal", "AAPL" in _d["text"] and "Buy" in _d["text"])
 check_true("dry-run renders 'no order placed'", "no order placed" in _d["text"])
 check_true("html is summarized (~1 screen)", len(_d["html"]) < 20000)
+
+# --- notify Telegram render + lib/telegram egress ---------------------------
+_tg = _d["telegram"]
+check_true("digest telegram is compact + under the 4096 cap", 0 < len(_tg) <= 4096)
+check_true("digest telegram shows ticker + signal (compact line)", "AAPL" in _tg and "Buy" in _tg)
+check_true("digest telegram uses a <b> headline (Telegram HTML)", "<b>Quiver" in _tg)
+# escaping: a stray <b> in dynamic ticker detail is NEVER emitted as a live tag
+_m_evil = copy.deepcopy(MODEL)
+_m_evil["tickers"][0].update(detail="<b>evil</b> & co", status="skipped", intent="skip")
+_tg_evil = notify.build_digest(_m_evil)["telegram"]
+check_true("telegram escapes dynamic text (no injected <b>)", "&lt;b&gt;evil&lt;/b&gt;" in _tg_evil)
+# account-risk line carried to Telegram when present (adversarial LOW patch)
+_m_ar = copy.deepcopy(MODEL)
+_m_ar["account_risk"] = {"drawdown_pct": 3.2, "sharpe": 1.1, "sharpe_n": 9}
+check_true("telegram digest carries the account-risk line",
+           "Account risk" in notify.build_digest(_m_ar)["telegram"])
+# adding the telegram render must NOT perturb the dedup hash
+check("telegram addition leaves content_hash unchanged", notify.build_digest(MODEL)["content_hash"],
+      notify.digest_hash(MODEL))
+# is_silent policy: routine digest silent; halted digest + every alert LOUD
+check("routine digest is silent", notify.is_silent(MODEL), True)
+check("halted digest is loud", notify.is_silent({**MODEL, "halted": True}), False)
+check("auth_error alert is loud", notify.is_silent({"kind": "auth_error"}), False)
+# telegram alert kinds: escaped detail, under cap, re-auth URL for auth_error
+for _k, _ex in (("auth_error", {"event_detail": "401 <t> & x"}),
+                ("halt", {"halted": True, "halt_reason": "-6% <x>"}),
+                ("error", {"severity": "critical", "stage": "plan", "event_detail": "<boom> & bust"})):
+    _mm = {"date": "2026-05-30", "now_iso": "t", "kind": _k, "dry_run": False,
+           "subject_prefix": "[Quiver]", "tickers": [], **_ex}
+    _r = notify.build_digest(_mm)["telegram"]
+    check_true(f"telegram {_k} under the cap", len(_r) <= 4096)
+    check_true(f"telegram {_k} escapes raw < in detail", "<t>" not in _r and "<boom>" not in _r)
+check_true("telegram auth_error carries the re-auth URL",
+           "remotedesktop.google.com" in notify.build_digest(
+               {"date": "d", "now_iso": "t", "kind": "auth_error", "dry_run": False,
+                "event_detail": "401", "tickers": []})["telegram"])
+
+import os as _os  # noqa: E402 — module top imports os only locally in make_config
+from lib import telegram as _tgm  # noqa: E402
+check("telegram _recipients: CSV/space split", _tgm._recipients("1, 2 3"), ["1", "2", "3"])
+check("telegram _recipients: list drops junk", _tgm._recipients([1, None, " 2 "]), ["1", "2"])
+check("telegram _recipients: scalar int", _tgm._recipients(9), ["9"])
+check("telegram _recipients: None -> []", _tgm._recipients(None), [])
+check("send_message no token -> not ok (never raises)",
+      _tgm.send_message(token="", chat_ids="1", text="x")["ok"], False)
+check("send_message no chats -> not ok",
+      _tgm.send_message(token="t", chat_ids="", text="x")["ok"], False)
+check_true("send_message unconfigured errors are labelled",
+           "unconfigured" in _tgm.send_message(token="", chat_ids="1", text="x")["error"])
+# offline disable: ok True (dedup row still writes), no network
+_os.environ["QUIVER_TELEGRAM_DISABLE"] = "1"
+_off = _tgm.send_message(token="t", chat_ids="42, 43", text="a\nb")
+check("disable -> ok True (row still writes)", _off["ok"], True)
+check_true("disable -> no send + chunk count", bool(_off.get("disabled")) and _off["chunks"] == 1)
+_os.environ["QUIVER_TELEGRAM_DISABLE"] = "0"
+check("explicit-falsy disable is ignored", _tgm._disabled(), False)
+del _os.environ["QUIVER_TELEGRAM_DISABLE"]
+# chunking: over-long single line hard-splits under the limit; line-join round-trips
+_cks = _tgm._chunks("Z" * 8000, 3500)
+check_true("chunks never exceed the limit",
+           all(len(c) <= 3500 for c in _cks) and "".join(_cks) == "Z" * 8000)
+_multi = "\n".join("row%d" % i for i in range(1500))
+check("chunks split on line boundaries (round-trip)", "\n".join(_tgm._chunks(_multi, 3500)), _multi)
+check("telegram _strip_html unescapes + drops tags", _tgm._strip_html("<b>A &amp; B</b>"), "A & B")
+# resolve_env: alert override wins, else allowlist fallback, else empty
+check("resolve_env: token + alert override",
+      _tgm.resolve_env({"TELEGRAM_BOT_TOKEN": "tk", "TELEGRAM_ALERT_CHAT_IDS": "7,8",
+                        "TELEGRAM_ALLOWED_CHAT_IDS": "9"}), ("tk", ["7", "8"]))
+check("resolve_env: falls back to allowlist",
+      _tgm.resolve_env({"TELEGRAM_BOT_TOKEN": "tk", "TELEGRAM_ALLOWED_CHAT_IDS": "9"}), ("tk", ["9"]))
+check("resolve_env: empty env -> no creds", _tgm.resolve_env({}), ("", []))
+# partial-delivery dedup semantics (adversarial MEDIUM patch): ok tracks ONLY the PRIMARY chat —
+# a dead SECONDARY sets `partial` but must NOT flip `ok` (else it re-spams the primary every tick).
+_orig_post = _tgm.post
+try:
+    _dead_chats = {"43"}
+    _tgm.post = (lambda **k: ({"ok": False, "error": "http 403: blocked"}
+                              if str(k.get("chat_id")) in _dead_chats else {"ok": True, "id": "1"}))
+    _pr = _tgm.send_message(token="t", chat_ids="42, 43", text="hello")
+    check("partial: ok tracks the healthy PRIMARY chat", _pr["ok"], True)
+    check("partial: a failed secondary is flagged", _pr["partial"], True)
+    _dead_chats = {"42"}  # primary dead -> ok False (re-send next tick; at-least-once)
+    check("partial: dead primary -> ok False",
+          _tgm.send_message(token="t", chat_ids="42, 43", text="hi")["ok"], False)
+finally:
+    _tgm.post = _orig_post
 
 # --- content_hash: deterministic, ignores time/equity, reacts to decisions ---
 _h = notify.digest_hash(MODEL)
@@ -266,12 +353,15 @@ check("notify parsed when enabled",
       (True, ["a@b.com"], "x@y.com", "[BW]"))
 check("enabled must be exactly True (string -> off)",
       make_config({"enabled": "yes", "to": ["a@b.com"], "from": "x@y.com"}).notify.enabled, False)
-check_raises("bad recipient address raises",
-             lambda: make_config({"enabled": True, "to": ["nope"], "from": "x@y.com"}), ConfigError)
-check_raises("empty recipients raises",
-             lambda: make_config({"enabled": True, "to": [], "from": "x@y.com"}), ConfigError)
-check_raises("malformed from (if set) raises",
-             lambda: make_config({"enabled": True, "to": ["a@b.com"], "from": "nope"}), ConfigError)
+# Recipients/creds are now Telegram (resolved from env at send time), so notify.enabled no
+# longer HARD-requires an email address — a missing channel is surfaced at runtime + gated by
+# send-test (see lib/config). These no longer raise (the load-time email validation was dropped):
+check("enabled with no email is OK (Telegram channel)",
+      make_config({"enabled": True, "to": []}).notify.enabled, True)
+check("enabled with a non-email `to` is OK (parsed, not validated)",
+      make_config({"enabled": True, "to": ["nope"]}).notify.to, ["nope"])
+check("enabled still fail-safe (only explicit True enables)",
+      make_config({"enabled": "yes", "to": []}).notify.enabled, False)
 check("blank from ok when enabled (MCP sender used)",
       make_config({"enabled": True, "to": ["a@b.com"], "from": ""}).notify.from_addr, "")
 check("omitted from ok when enabled",
@@ -366,8 +456,10 @@ check("on_complete fail-safe (only explicit false disables)",
       make_config({"enabled": True, "to": ["a@b.com"], "on_complete": "nope"}).notify.on_complete, True)
 check("alerts_to override parsed",
       make_config({"enabled": True, "to": ["a@b.com"], "alerts_to": ["p@b.com"]}).notify.alerts_to, ["p@b.com"])
-check_raises("on_error with explicit-empty alerts_to raises",
-             lambda: make_config({"enabled": True, "to": ["a@b.com"], "alerts_to": []}), ConfigError)
+# on_error + explicit-empty alerts_to no longer raises (Telegram alert recipients come from env,
+# not config.yaml) — the toggle still parses; a missing channel is a runtime/send-test concern.
+check("on_error + empty alerts_to no longer raises (Telegram channel)",
+      make_config({"enabled": True, "to": ["a@b.com"], "alerts_to": [], "on_error": True}).notify.on_error, True)
 
 # --- design system: email-client-safety invariants (shared across all kinds) ---
 for _k, _extra in (("digest", {"tickers": MODEL["tickers"]}),

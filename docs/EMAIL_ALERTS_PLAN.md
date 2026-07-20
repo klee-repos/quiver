@@ -1,5 +1,13 @@
 # Plan — Unified email alerts: run-complete + on-error (defense-in-depth)
 
+> **SUPERSEDED (2026-07-19): alerting moved from EMAIL to TELEGRAM.** All alerts (digest + halt/
+> auth_error/error) now go to the operator's Telegram chat via the bot — a plain HTTPS POST
+> (`lib/telegram`), sent in-tick by `tick.py report-send` and last-resort by `run_tick.py`
+> `_maybe_alert`; there is no more Resend MCP. The dedup / best-effort / at-least-once / stage-keyed
+> `notifications` machinery described below still applies (it is channel-agnostic) — only the
+> transport changed. `lib/mailer.py` + `RESEND_*` are kept as a dormant rollback. This doc is
+> retained for the still-accurate dedup/severity/stage design.
+>
 > **Note (2026-06):** the deploy moved from AWS to GCP — see `docs/DEPLOY.md` and `deploy/gcp/`. AWS/EC2/SSM/CloudWatch references below are historical design notes.
 
 **Status:** proposed (pending /autoplan review → implement e2e)

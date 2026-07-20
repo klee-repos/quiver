@@ -49,9 +49,26 @@ stack: venv, claude CLI, secrets→`/etc/quiver/quiver.env`, systemd timer, Ops 
 `deploy/setup-desktop.sh` (XFCE + Chrome + CRD).
 
 **Click the GCP Monitoring verification email** Google sends to `alert_email` — the email
-notification channel is created UNVERIFIED and delivers nothing until confirmed. (The Resend
-pager — in-tick + last-resort — is the primary, cloud-agnostic alert path; these Cloud
-Monitoring policies are a secondary net.)
+notification channel is created UNVERIFIED and delivers nothing until confirmed. (The **Telegram
+pager** — in-tick `tick.py report-send` + the last-resort sender in `run_tick.py` — is the primary,
+cloud-agnostic alert path; these Cloud Monitoring policies are a secondary net.)
+
+**Turn on the Telegram pager (one-time).** All alerting (daily digest + halt/auth/error pages) is a
+Telegram HTTPS POST — no email, no MCP. It reuses the chat-bridge bot: set `TELEGRAM_BOT_TOKEN` +
+`TELEGRAM_ALLOWED_CHAT_IDS` (see docs/CHAT.md to create the bot / find your chat id), then:
+1. Push the secrets: `./deploy/gcp/bootstrap-gcp.sh` (already lists both).
+2. **Grant the box SA `secretAccessor` on both** — `terraform/main.tf` excludes them by default, so:
+   ```bash
+   SA="quiver-box@eighth-duality-354701.iam.gserviceaccount.com"
+   for S in TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_CHAT_IDS; do
+     gcloud secrets add-iam-policy-binding "quiver-$S" \
+       --member="serviceAccount:$SA" --role=roles/secretmanager.secretAccessor
+   done
+   ```
+3. **Refresh `/etc/quiver/quiver.env` on the box** (setup.sh runs only at provision; update.sh never
+   rewrites it) — over IAP SSH, for each of the two vars use the CLAUDE.md `grep -v`/append one-liner,
+   then `sudo systemctl restart quiver.timer quiver-chat.service`.
+4. **Gate it** with the send-test below — the `[6/6]` healthcheck can NOT see a missing token.
 
 ## 3. Verify the box (admin via IAP — no public inbound)
 IAP-tunneled SSH is the ONLY shell (no public SSH). The principal running it needs
@@ -64,7 +81,7 @@ sudo tail -50 /var/log/quiver-startup.log          # provisioning log
 sudo -u quiver bash -c 'set -a; . /etc/quiver/quiver.env; set +a; \
   /opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/healthcheck.py'   # -> ok:true
 systemctl status quiver.timer
-# PAGER ACCEPTANCE GATE (really sends via Resend):
+# PAGER ACCEPTANCE GATE (really sends a Telegram message to your chat):
 sudo -u quiver bash -c 'set -a; . /etc/quiver/quiver.env; set +a; \
   /opt/quiver/.venv/bin/python /opt/quiver/tick.py send-test --kind auth_error'  # -> sent:true
 ```

@@ -117,10 +117,16 @@ install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/chat"
   echo "NOTIFY_TO=$NOTIFY_TO"
   echo "RESEND_FROM=$(fetch_opt RESEND_FROM)"
   echo "NOTIFY_ALERTS_TO=$(fetch_opt NOTIFY_ALERTS_TO)"
-  # Optional: the read-only Telegram chat bridge (deploy/quiver-chat.service). Both empty =>
-  # the bridge stays idle (it refuses to run without an allowlist). See docs/CHAT.md.
+  # Telegram: the SAME token/chat id power BOTH the read-only chat bridge
+  # (deploy/quiver-chat.service) AND — now — ALL of the tick's alerting (digest + halt/auth/error
+  # via tick.py report-send + run_tick.py's last-resort sender; there is no more email/Resend MCP).
+  # Both empty => the bridge stays idle AND alerts are best-effort-skipped (`unconfigured`). The two
+  # secrets must have a box-SA secretAccessor IAM grant (terraform/main.tf excludes them by default;
+  # grant via `gcloud secrets add-iam-policy-binding` — see main.tf comment). See docs/CHAT.md +
+  # docs/DEPLOY.md; validate on the box with `tick.py send-test`.
   echo "TELEGRAM_BOT_TOKEN=$(fetch_opt TELEGRAM_BOT_TOKEN)"
   echo "TELEGRAM_ALLOWED_CHAT_IDS=$(fetch_opt TELEGRAM_ALLOWED_CHAT_IDS)"
+  echo "TELEGRAM_ALERT_CHAT_IDS=$(fetch_opt TELEGRAM_ALERT_CHAT_IDS)"  # optional alert-only override
 } > /etc/quiver/quiver.env
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env

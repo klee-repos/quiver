@@ -27,7 +27,7 @@ if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
 from lib import market, runlock  # noqa: E402
-from lib import mailer, notify  # noqa: E402 — ops-layer last-resort alerting
+from lib import notify, telegram  # noqa: E402 — ops-layer last-resort alerting (Telegram egress)
 from lib.config import load_config  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 from lib.prompts import load_prompt  # noqa: E402
@@ -127,29 +127,23 @@ def _emit(d):
 
 
 def _alert_target():
-    """Resolve alert recipients / from / dry_run DEFENSIVELY (env first, then config).
+    """Resolve Telegram alert creds DEFENSIVELY (env for creds, config for the on_error toggle).
 
-    Must work even when config validation is the very thing that's broken (a missing
-    NOTIFY_TO makes load_config raise) — that's a common reason the orchestrator died,
-    so we never let a config error stop us from paging. Env wins; config fills gaps.
-    Returns (recipients, from_addr, on_error, dry_run).
+    Must work even when config validation is the very thing that's broken (a load_config raise
+    is a common reason the orchestrator died) — so we never let a config error stop us from
+    paging: creds come from the env (never config), and on_error defaults ON when cfg is None.
+    Chat ids: TELEGRAM_ALERT_CHAT_IDS → TELEGRAM_ALLOWED_CHAT_IDS (lib.telegram.resolve_env).
+    Returns (token, chat_ids, on_error, dry_run).
     """
     cfg = None
     try:
         cfg = load_config(_REPO / "config.yaml")
     except Exception:  # noqa: BLE001 — a broken config must not silence the pager
         cfg = None
-    to = (os.environ.get("NOTIFY_ALERTS_TO", "").strip()
-          or os.environ.get("NOTIFY_TO", "").strip())
-    recips = [a.strip() for a in to.split(",") if a.strip()]
-    if not recips and cfg is not None:
-        recips = list(cfg.notify.alerts_to or cfg.notify.to)
-    from_addr = os.environ.get("RESEND_FROM", "").strip()
-    if not from_addr and cfg is not None:
-        from_addr = cfg.notify.from_addr
+    token, chat_ids = telegram.resolve_env()
     on_error = True if cfg is None else bool(cfg.notify.enabled and cfg.notify.on_error)
     dry_run = bool(cfg.dry_run) if cfg is not None else False
-    return recips, from_addr, on_error, dry_run
+    return token, chat_ids, on_error, dry_run
 
 
 def _brain_engine(cfg) -> str:
@@ -187,25 +181,25 @@ def _in_tick_error_paged(led, day) -> bool:
         return False
 
 
-def _maybe_alert(led, *, kind, stage, day, now_iso, event_detail, send=mailer.send_email):
-    """Last-resort operator alert for a failure the in-tick orchestrator couldn't email.
+def _maybe_alert(led, *, kind, stage, day, now_iso, event_detail, send=telegram.send_message):
+    """Last-resort operator alert (Telegram) for a failure the in-tick orchestrator couldn't send.
 
-    BEST-EFFORT: never raises, never changes the caller's exit code. Dedups against the
-    SAME (date, kind, stage) notifications row the in-tick sender uses, so if the
-    orchestrator already paged this event there is no double email; if it died before
-    paging, this fires. ``send`` is injectable so the path is testable with zero network.
+    BEST-EFFORT: never raises, never changes the caller's exit code. Dedups against the SAME
+    (date, kind, stage) notifications row the in-tick sender uses, so if the orchestrator already
+    paged this event there is no double message; if it died before paging, this fires. These are
+    all CRITICAL alerts → sent LOUD (disable_notification False). ``send`` is injectable so the
+    path is testable with zero network. The dedup row is written only after a confirmed delivery
+    to the PRIMARY chat; a secondary-chat failure is surfaced as ``alert_partial`` (non-gating).
     """
     try:
-        recips, from_addr, on_error, dry_run = _alert_target()
+        token, chat_ids, on_error, dry_run = _alert_target()
         if not on_error:
             _emit({"event": "alert_skipped", "kind": kind, "stage": stage,
                    "reason": "disabled"})
             return
-        api_key = os.environ.get("RESEND_API_KEY", "").strip()
-        if not api_key or not from_addr or not recips:
+        if not token or not chat_ids:
             _emit({"event": "alert_unconfigured", "kind": kind, "stage": stage,
-                   "reason": ("no_key" if not api_key
-                              else "no_from" if not from_addr else "no_recipients")})
+                   "reason": ("no_token" if not token else "no_chats")})
             return
         model = {
             "date": day, "now_iso": now_iso, "kind": kind, "stage": stage,
@@ -218,13 +212,14 @@ def _maybe_alert(led, *, kind, stage, day, now_iso, event_detail, send=mailer.se
             _emit({"event": "alert_skipped", "kind": kind, "stage": stage,
                    "reason": "already_sent"})
             return
-        res = send(api_key=api_key, from_addr=from_addr, to=recips,
-                   subject=built["subject"], html=built["html"], text=built["text"])
+        res = send(token=token, chat_ids=chat_ids, text=built["telegram"],
+                   disable_notification=False)
         if res.get("ok"):
-            led.mark_notified(day, kind, built["content_hash"], ",".join(recips),
+            led.mark_notified(day, kind, built["content_hash"], ",".join(chat_ids),
                               now_iso, stage=stage)
-            _emit({"event": "alert_sent", "kind": kind, "stage": stage,
-                   "id": res.get("id", "")})
+            _emit({"event": "alert_sent", "kind": kind, "stage": stage})
+            if res.get("partial"):
+                _emit({"event": "alert_partial", "kind": kind, "stage": stage})
         else:
             _emit({"event": "alert_failed", "kind": kind, "stage": stage,
                    "alert_detail": res.get("error", "")})
@@ -237,6 +232,13 @@ def main() -> int:
     now_iso = market.now_et().isoformat()
     day = market.trading_day_et()
     led = Ledger(_REPO / "state" / "ledger.db")
+    # Load config ONCE, DEFENSIVELY (mirror _alert_target): a broken/garbled config must never
+    # crash a tick — it degrades to None and any config-derived label falls back safely. This is
+    # the `cfg` the brain-outage page below reads (it previously referenced an undefined name).
+    try:
+        cfg = load_config(_REPO / "config.yaml")
+    except Exception:  # noqa: BLE001 — a broken config must not crash the supervisor
+        cfg = None
     holder = f"run-{now_iso}"
     try:
         # TTL must EXCEED the max tick wall-clock so a legit long tick (STEP 3 now blocks
@@ -279,12 +281,10 @@ def main() -> int:
                 # Per-ticker analyze timeout comes from config.yaml
                 # (loop.analyze_timeout_sec — set very high so a normal high-reasoning
                 # GLM run never hits it). QUIVER_ANALYZE_TIMEOUT still overrides inside
-                # run_analyses. Best-effort: a config read hiccup falls back to
-                # run_analyses' own default rather than blocking the fan-out.
-                try:
-                    _analyze_timeout = load_config(_REPO / "config.yaml").analyze_timeout_sec
-                except Exception:  # noqa: BLE001 — never block the fan-out on a config read
-                    _analyze_timeout = None
+                # run_analyses. Reuses the single defensive `cfg` loaded at the top of
+                # main(): a broken config (cfg is None) falls back to run_analyses' own
+                # default rather than blocking the fan-out.
+                _analyze_timeout = cfg.analyze_timeout_sec if cfg is not None else None
                 try:
                     analyses = run_analyses.run(pending, timeout=_analyze_timeout)
                 except Exception as e:  # noqa: BLE001 — never crash the supervisor on analysis

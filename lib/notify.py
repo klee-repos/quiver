@@ -553,7 +553,7 @@ def _render_html(model: dict) -> str:
             f'<ul style="margin:6px 0 0;padding-left:18px;color:#6b7280;font:400 13px/1.5 {_FONT}">'
             f'{items}</ul>', accent="#fcd34d")
     footer_extra = ""
-    pager = model.get("mailer_armed")
+    pager = model.get("pager_armed", model.get("mailer_armed"))
     if pager is not None:
         footer_extra = " · last-resort alerting: " + ("armed" if pager else "NOT configured")
     footer_extra += " · reports in state/analyze_logs/"
@@ -561,12 +561,122 @@ def _render_html(model: dict) -> str:
                   footer_extra=footer_extra)
 
 
+# --- Telegram render (the alert channel) -------------------------------------
+# A COMPACT, mobile-first restructuring — NOT the email HTML. Telegram caps a message at
+# 4096 chars and renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>), so the digest drops
+# the per-ticker decision/debate prose (recoverable via the read-only chat bridge) and keeps
+# one glanceable line per ticker; the alert kinds keep their headline + "what to do" + detail.
+# The sender (lib/telegram) chunks anything that still overflows and falls back to plain text
+# on a parse error, so nothing is ever lost.
+_TG_DETAIL_CAP = 600
+
+
+def _te(v) -> str:
+    """Escape dynamic text for Telegram HTML. ``quote=False`` matches the proven
+    ``chat_bridge`` transport — Telegram's HTML parser does not require quotes escaped."""
+    return _html.escape(str(v if v is not None else ""), quote=False)
+
+
+def is_silent(model: dict) -> bool:
+    """Telegram ``disable_notification`` policy: a routine, NON-halted digest is delivered
+    SILENTLY (a glanceable daily record — don't buzz the operator every day); every alert
+    kind, and a halted digest, pings LOUD."""
+    if model.get("kind", "digest") != "digest":
+        return False
+    return not model.get("halted")
+
+
+def _render_telegram(model: dict) -> str:
+    """Render ``model`` into a compact Telegram-HTML message (restructured for a phone).
+
+    All dynamic text is escaped via ``_te``; only fixed tags are literal. Bare URLs in the
+    action steps are auto-linked by Telegram. A per-field length guard plus the sender's
+    chunker keep it under the 4096 cap.
+    """
+    kind = model.get("kind", "digest")
+    date = _te(model.get("date", ""))
+    mode = "DRY RUN" if model.get("dry_run") else "LIVE"
+    lines: list = []
+
+    if kind in ("auth_error", "halt", "error"):
+        sev = severity_of(model)
+        stg = stage_of(model) or "tick"
+        if kind == "auth_error":
+            lines.append(f"<b>⚠ Quiver — AUTH ERROR</b> · {date}")
+            lines.append("The broker token was rejected; the tick stopped without trading.")
+        elif kind == "halt":
+            lines.append(f"<b>🛑 Quiver — HALT</b> · {date}")
+            lines.append("Trading stopped and will NOT auto-resume: "
+                         f"{_te(model.get('halt_reason') or 'daily-loss kill-switch fired')}.")
+        elif sev == "warning":
+            lines.append(f"<b>⚠ Quiver — {_te(stg)} hiccup</b> (tick continued) · {date}")
+            lines.append("A best-effort step hiccuped; the tick was unaffected and self-heals.")
+        else:
+            lines.append(f"<b>✖ Quiver — TICK FAILED at {_te(stg)}</b> · {date}")
+            lines.append("The tick stopped. Trading is paused for this wake.")
+        steps = action_steps(model)
+        if steps:
+            lines.append("")
+            lines.append("<b>What to do</b>")
+            for i, s in enumerate(steps, 1):
+                lines.append(f"{i}. {_te(s)}")
+        detail = model.get("event_detail")
+        if detail:
+            lines.append("")
+            lines.append(f"<pre>{_te(summarize(detail, _TG_DETAIL_CAP))}</pre>")
+        lines.append("")
+        lines.append(f"<i>generated {_te(model.get('now_iso', ''))}</i>")
+        return "\n".join(lines)
+
+    # digest (run complete)
+    nbuy, nsell, nhold = _counts(model.get("tickers", []))
+    tag = " [DRY RUN]" if model.get("dry_run") else ""
+    money = (f"{_fmt_pct(model.get('drop_pct'))} {_fmt_money(model.get('equity'))} · "
+             if model.get("equity") is not None else "")
+    lines.append(f"<b>Quiver · {money}{nbuy} buy / {nsell} sell / {nhold} hold{tag}</b> · {date}")
+    lines.append(f"[{mode}] equity {_te(_fmt_money(model.get('equity')))} "
+                 f"(baseline {_te(_fmt_money(model.get('baseline_equity')))}, "
+                 f"{_te(_fmt_pct(model.get('drop_pct')))})")
+    ar = model.get("account_risk") or {}
+    if ar.get("drawdown_pct") is not None or ar.get("sharpe") is not None:
+        lines.append(_te(_account_risk_line(ar)))
+    if model.get("halted"):
+        lines.append(f"🛑 HALT: {_te(model.get('halt_reason') or 'daily-loss kill-switch fired')}")
+    tickers = model.get("tickers", [])
+    if not tickers:
+        lines.append("(no tickers analyzed this run)")
+    else:
+        lines.append("")
+        for r in tickers:
+            lines.append(f"• <b>{_te(r.get('ticker', '?'))}</b> {_te(r.get('signal', '?'))} "
+                         f"→ {_te(_traded_line(r, bool(model.get('dry_run'))))}")
+    warnings = model.get("warnings") or []
+    if warnings:
+        ws = "; ".join(f"{_te(w.get('stage', '?'))}: {_te(summarize(w.get('detail'), 120))}"
+                       for w in warnings)
+        lines.append("")
+        lines.append(f"<i>FYI (tick unaffected)</i>: {ws}")
+    lines.append("")
+    foot = "reasoning in state/analyze_logs/ · ask the chat bot for details"
+    pager = model.get("pager_armed")
+    if pager is not None:
+        foot += f" · pager: {'armed' if pager else 'NOT configured'}"
+    lines.append(f"<i>{_te(foot)}</i>")
+    return "\n".join(lines)
+
+
 def build_digest(model: dict) -> dict:
-    """Render ``model`` into ``{subject, html, text, content_hash, kind}``."""
+    """Render ``model`` into ``{subject, html, text, telegram, content_hash, kind}``.
+
+    ``telegram`` is the compact Telegram-HTML alert body (the live channel); ``html``/``text``
+    remain the email renders (kept for rollback + offline tests). ``content_hash`` is
+    unchanged by the Telegram addition, so the dedup identity the two senders share holds.
+    """
     return {
         "subject": _subject(model),
         "html": _render_html(model),
         "text": _render_text(model),
+        "telegram": _render_telegram(model),
         "content_hash": digest_hash(model),
         "kind": model.get("kind", "digest"),
     }
