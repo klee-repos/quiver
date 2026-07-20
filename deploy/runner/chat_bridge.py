@@ -23,14 +23,22 @@ Local smoke test (no Telegram, no token needed):
 
 from __future__ import annotations
 
+import html as _htmllib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# The bridge runs as a script (systemd ExecStart / `python .../chat_bridge.py`), so its own dir is
+# on sys.path[0]; insert it explicitly too so the sibling import also resolves when a test imports
+# this module (mirrors tests/test_chat_guard.py's sys.path convention).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import chat_history  # noqa: E402 — sibling module: per-thread conversation memory
 
 _REPO = Path(__file__).resolve().parent.parent.parent
 
@@ -50,6 +58,19 @@ TIMEOUT_SEC = int(os.environ.get("QUIVER_CHAT_TIMEOUT_SEC", "240"))
 LONG_POLL_SEC = int(os.environ.get("QUIVER_CHAT_POLL_SEC", "50"))
 MAX_INPUT_CHARS = int(os.environ.get("QUIVER_CHAT_MAX_INPUT", "2000"))
 LOG = os.environ.get("QUIVER_CHAT_LOG", str(_REPO / "logs" / "chat.log"))
+
+# --- per-thread conversation memory (chat_history) --------------------------------------------
+# Default ON: the whole point is that follow-ups carry context. Set QUIVER_CHAT_HISTORY=0 to get the
+# classic stateless bridge (byte-identical single-question prompt). The store lives under the chat's
+# OWN writable dir — derived from the log path so it lands in state/chat/ on the box (the one place
+# the systemd unit's ReadWritePaths allows), logs/ locally; NEVER the read-only repo or ledger.
+HISTORY_ENABLED = (os.environ.get("QUIVER_CHAT_HISTORY", "1").strip().lower()
+                   not in ("0", "false", "no", "off", ""))
+HISTORY_DIR = os.environ.get("QUIVER_CHAT_HISTORY_DIR") or str(Path(LOG).parent / "history")
+HISTORY_TURNS = int(os.environ.get("QUIVER_CHAT_HISTORY_TURNS", "30"))
+HISTORY_CHARS = int(os.environ.get("QUIVER_CHAT_HISTORY_CHARS", "12000"))
+HISTORY_TURN_CHARS = int(os.environ.get("QUIVER_CHAT_HISTORY_TURN_CHARS", "1500"))
+HISTORY_STORE = int(os.environ.get("QUIVER_CHAT_HISTORY_STORE", "500"))
 
 CHAT_MCP = str(_REPO / "deploy" / "runner" / "chat_mcp.json")
 CHAT_SETTINGS = str(_REPO / "deploy" / "runner" / "chat_settings.json")
@@ -117,20 +138,25 @@ def _claude_cmd(question: str) -> list:
     ]
 
 
-def answer(question: str) -> str:
-    """Run one read-only claude pass and return its final text (a friendly note on error)."""
+def answer(question: str, history_block: str = "") -> tuple[str, bool]:
+    """Run one read-only claude pass and return (final_text, ok). `history_block` is a prior-thread
+    context block (empty for a stateless call) prepended to the question via chat_history — with an
+    empty block the prompt is byte-identical to the classic single-question prompt. The `ok` flag
+    lets callers record only real answers (never an error/timeout note) into thread memory."""
     q = (question or "").strip()[:MAX_INPUT_CHARS]
     if not q:
-        return "Ask me something about the bot — today's run, the strategy, or a decision trace."
+        return ("Ask me something about the bot — today's run, the strategy, or a decision trace.",
+                False)
+    prompt = chat_history.compose_prompt(history_block, q)
     # Run in its OWN process group (start_new_session) so a timeout can kill the WHOLE tree —
     # otherwise a heavy grandchild (e.g. a runaway chat_query.py) would orphan and keep burning.
     try:
-        proc = subprocess.Popen(_claude_cmd(q), cwd=str(_REPO), stdout=subprocess.PIPE,
+        proc = subprocess.Popen(_claude_cmd(prompt), cwd=str(_REPO), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env=_child_env(),
                                 start_new_session=True)
     except Exception as e:  # noqa: BLE001 — a spawn failure must not crash the bridge
         _log({"event": "answer", "ok": False, "reason": f"{type(e).__name__}: {e}", "q": q[:200]})
-        return "I couldn't reach my reasoning engine just now. Try again in a moment."
+        return ("I couldn't reach my reasoning engine just now. Try again in a moment.", False)
     try:
         stdout, stderr = proc.communicate(timeout=TIMEOUT_SEC)
     except subprocess.TimeoutExpired:
@@ -143,7 +169,7 @@ def answer(question: str) -> str:
         except Exception:  # noqa: BLE001
             pass
         _log({"event": "answer", "ok": False, "reason": "timeout", "q": q[:200]})
-        return "That took too long to work out — try a narrower question."
+        return ("That took too long to work out — try a narrower question.", False)
 
     out = (stdout or "").strip()
     try:
@@ -158,8 +184,8 @@ def answer(question: str) -> str:
     if not ok:
         # A common real cause is expired box Claude auth — surface a hint, not a stack trace.
         return ("I hit an error answering that. If this keeps happening the box's Claude login "
-                "may need a refresh (/mcp on the box).")
-    return text
+                "may need a refresh (/mcp on the box).", False)
+    return (text, True)
 
 
 # --- Telegram transport (stdlib urllib) -------------------------------------------------------
@@ -185,13 +211,88 @@ def _tg(method: str, params: dict, timeout: float) -> dict | None:
     return payload.get("result")
 
 
+_MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def _to_telegram_html(text: str) -> str:
+    """Convert the model's GitHub-flavored markdown to the SMALL subset Telegram renders
+    (<b>, <code>, <pre>). Everything else is HTML-escaped or flattened — so literal `**`/backticks
+    stop showing, tables collapse to readable lines, and no markdown Telegram ignores leaks
+    through. Markdown links become `text (url)` (visible URL, never a hidden href)."""
+    stash: list = []
+
+    def _stash(tag, content):
+        stash.append((tag, content))
+        return f"\x00{len(stash) - 1}\x00"
+
+    # 1) pull code blocks/spans out BEFORE escaping so their contents aren't transformed.
+    text = re.sub(r"```[^\n]*\n?(.*?)```", lambda m: _stash("pre", m.group(1).rstrip("\n")),
+                  text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", lambda m: _stash("code", m.group(1)), text)
+    # 2) links -> "text (url)" (URL stays visible; no deceptive hidden href)
+    text = _MD_LINK.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+    # 3) escape the remaining prose (so any <, >, & in the answer is safe)
+    text = _htmllib.escape(text, quote=False)
+    # 4) bold: **x** / __x__
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", text)
+    # 5) line-level: headers -> bold, bullets -> •, drop table separators, flatten table rows
+    out = []
+    for ln in text.split("\n"):
+        s = ln.rstrip()
+        stripped = s.strip()
+        if stripped and set(stripped) <= set("|:- ") and "-" in stripped:
+            continue  # markdown table separator (|---|:--:|) or horizontal rule
+        h = re.match(r"#{1,6}\s+(.*)", stripped)
+        if h:
+            out.append(f"<b>{h.group(1)}</b>"); continue
+        s = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", s)  # bullet
+        if s.count("|") >= 2:  # a table data row -> space-separated cells
+            s = "  ".join(c.strip() for c in s.strip().strip("|").split("|"))
+        out.append(s)
+    text = "\n".join(out)
+    # 6) restore code (escaped, wrapped in the tag)
+    text = re.sub(r"\x00(\d+)\x00",
+                  lambda m: (lambda tg, c: f"<{tg}>{_htmllib.escape(c, quote=False)}</{tg}>")(*stash[int(m.group(1))]),
+                  text)
+    return text
+
+
+def _strip_md(text: str) -> str:
+    """Plain-text fallback: drop markup so a Telegram HTML parse failure still delivers a clean
+    message (no literal ** / backticks)."""
+    text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL).replace("`", "")
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.M)
+    text = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", text, flags=re.M)
+    return _MD_LINK.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
+
+
+def _chunks(text: str, limit: int):
+    """Split at line boundaries so an HTML tag is never cut across two messages."""
+    out, buf, cur = [], [], 0
+    for ln in text.split("\n"):
+        while len(ln) > limit:  # a single over-long line: hard-split
+            out.append(ln[:limit]); ln = ln[limit:]
+        if cur + len(ln) + 1 > limit and buf:
+            out.append("\n".join(buf)); buf, cur = [], 0
+        buf.append(ln); cur += len(ln) + 1
+    if buf:
+        out.append("\n".join(buf))
+    return out or [text]
+
+
 def send_message(chat_id, text: str) -> None:
     text = text or "(no answer)"
-    # Split long answers into <=4000-char chunks (plain text — no parse_mode, so ledger/news
-    # content can never break Telegram markdown or smuggle formatting).
-    for i in range(0, len(text), _MSG_LIMIT):
-        _tg("sendMessage", {"chat_id": chat_id, "text": text[i:i + _MSG_LIMIT],
-                            "disable_web_page_preview": True}, timeout=30)
+    # Chunk the ORIGINAL below the 4096 cap with headroom for the <b>/<code> tags we add.
+    for chunk in _chunks(text, _MSG_LIMIT - 400):
+        # Try Telegram HTML (renders bold/monospace); on ANY failure resend as clean plain text
+        # so a message is never lost to a parse error.
+        r = _tg("sendMessage", {"chat_id": chat_id, "text": _to_telegram_html(chunk),
+                                "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=30)
+        if r is None:
+            _tg("sendMessage", {"chat_id": chat_id, "text": _strip_md(chunk),
+                                "disable_web_page_preview": True}, timeout=30)
 
 
 def _typing(chat_id) -> None:
@@ -205,8 +306,30 @@ HELP = (
     "• what's the current strategy / book?\n"
     "• why did it buy NVDA? (I'll trace the decision)\n"
     "• are we halted? any trades this week?\n\n"
-    "I can look at the ledger, strategy, and logs — but I can't trade or change anything."
+    "I can look at the ledger, strategy, and logs — but I can't trade or change anything.\n"
+    "I remember our conversation in this chat, so follow-ups work — send /clear to start fresh."
 )
+
+
+def _answer_with_memory(chat_id, question: str) -> str:
+    """Answer one question WITH this chat's thread context, then record the exchange. Shared by the
+    Telegram handler and the `--ask --chat-id` CLI so both drive the identical stateful path.
+
+    The history READ is gated on HISTORY_ENABLED (not just the write): with history off — or an
+    unusable chat id — `hp` is None, so nothing is loaded or written and the prompt is byte-identical
+    to the classic stateless bridge (chat_history.compose_prompt("", q) == q). Only a real answer
+    (`ok`) is recorded, so error/timeout notes never pollute the thread."""
+    hp = (chat_history.path_for(HISTORY_DIR, chat_id)
+          if (HISTORY_ENABLED and chat_id is not None) else None)
+    block = ""
+    if hp is not None:
+        block = chat_history.render_context(chat_history.load_turns(hp),
+                                            HISTORY_TURNS, HISTORY_CHARS, HISTORY_TURN_CHARS)
+    reply, ok = answer(question, block)
+    if ok and hp is not None:
+        chat_history.append_turn(hp, "user", (question or "").strip()[:MAX_INPUT_CHARS], HISTORY_STORE)
+        chat_history.append_turn(hp, "assistant", reply, HISTORY_STORE)
+    return reply
 
 
 def _handle_message(msg: dict, notified_unauth: set) -> None:
@@ -230,12 +353,20 @@ def _handle_message(msg: dict, notified_unauth: set) -> None:
                                   "TELEGRAM_ALLOWED_CHAT_IDS to enable this bot.")
         _log({"event": "unauthorized", "chat_id": chat_id})
         return
-    if text.lower() in ("/start", "/help", "start", "help"):
+    low = text.lower()
+    if low in ("/start", "/help", "start", "help"):
         send_message(chat_id, HELP)
+        return
+    if low in ("/clear", "/reset", "/new"):
+        hp = chat_history.path_for(HISTORY_DIR, chat_id) if HISTORY_ENABLED else None
+        if hp is not None:
+            chat_history.clear(hp)
+        _log({"event": "clear", "chat_id": chat_id})
+        send_message(chat_id, "Cleared this thread's context — starting fresh.")
         return
     _log({"event": "question", "chat_id": chat_id, "text": text[:200]})
     _typing(chat_id)
-    send_message(chat_id, answer(text))
+    send_message(chat_id, _answer_with_memory(chat_id, text))
 
 
 def _drain(offset_holder: list) -> None:
@@ -284,7 +415,14 @@ def main(argv: list) -> int:
     if "--ask" in argv:
         i = argv.index("--ask")
         q = argv[i + 1] if i + 1 < len(argv) else ""
-        print(answer(q))
+        # Optional `--chat-id N` drives the SAME stateful thread path the Telegram handler uses
+        # (load context → answer → record), so a two-turn CLI run proves memory carries. Without
+        # it, chat_id is None → stateless, byte-identical to the classic smoke test.
+        cid = None
+        if "--chat-id" in argv:
+            j = argv.index("--chat-id")
+            cid = argv[j + 1] if j + 1 < len(argv) else None
+        print(_answer_with_memory(cid, q))
         return 0
     return run()
 

@@ -58,8 +58,30 @@ bridge its **own** `CLAUDE_CONFIG_DIR` with a separate `claude login` and no bro
 — at the cost of a second ~weekly re-auth to maintain. The layered walls above make this optional.
 
 One caveat worth knowing: Telegram cloud chats are TLS in transit but **not end-to-end
-encrypted**, and answers include your positions/P&L (from the ledger). That's the normal tradeoff
-for a bot front-end; if that matters to you, keep the chat to non-sensitive questions.
+encrypted**, and answers include your positions/P&L (from the ledger). Those answers are now also
+persisted at rest on the box (see "Conversation memory" below). That's the normal tradeoff for a
+bot front-end; if that matters to you, keep the chat to non-sensitive questions, or send `/clear`.
+
+## Conversation memory (thread context)
+
+The bridge keeps a **per-chat conversation thread** so follow-ups work — ask "why did it buy NVDA?"
+and then just "and last week?" or "show me the numbers" and it carries the context. Each
+`[operator]`/`[Quiver]` turn is persisted as one JSON line per chat under the chat's own writable
+dir (`state/chat/history/<chat-id>.jsonl` on the box — the same `ReadWritePaths` mount as the log;
+never the read-only ledger/repo). On the next message the bridge prepends a bounded
+`<thread_context>` block to the question. It is a **rolling window** (defaults below), which in
+practice is the whole thread for any real phone conversation; the model is told the block is
+context/data, not instructions, and the block defangs its own delimiters so a quoted headline can't
+forge the boundary.
+
+- Send **`/clear`** (or `/reset`, `/new`) to wipe this chat's context and start fresh.
+- It stays **read-only + best-effort**: the memory is written by the bridge (the parent), never by
+  the sandboxed `claude` child; any IO error just degrades to a stateless answer, never a crash.
+- Tunables (in `quiver.env`, all optional): `QUIVER_CHAT_HISTORY=0` turns it off entirely (restoring
+  the classic byte-identical single-question prompt); `QUIVER_CHAT_HISTORY_TURNS` (default 30),
+  `QUIVER_CHAT_HISTORY_CHARS` (12000), `QUIVER_CHAT_HISTORY_TURN_CHARS` (1500) size the injected
+  window; `QUIVER_CHAT_HISTORY_STORE` (500) caps stored turns; `QUIVER_CHAT_HISTORY_DIR` overrides
+  the location. Cost scales with the window, so a bigger window means a slightly pricier question.
 
 ## One-time setup
 
