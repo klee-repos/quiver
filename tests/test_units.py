@@ -251,9 +251,13 @@ check_true("telegram digest carries the account-risk line",
 # adding the telegram render must NOT perturb the dedup hash
 check("telegram addition leaves content_hash unchanged", notify.build_digest(MODEL)["content_hash"],
       notify.digest_hash(MODEL))
-# is_silent policy: routine digest silent; halted digest + every alert LOUD
-check("routine digest is silent", notify.is_silent(MODEL), True)
-check("halted digest is loud", notify.is_silent({**MODEL, "halted": True}), False)
+# is_silent policy: routine digest pings LOUD by default (daily heartbeat); only an explicit
+# loud_digest=False silences it; halted digest + every alert ALWAYS loud.
+check("routine digest pings loud by default", notify.is_silent(MODEL), False)
+check("digest silenced only when loud_digest is False",
+      notify.is_silent({**MODEL, "loud_digest": False}), True)
+check("halted digest is loud even when loud_digest is False",
+      notify.is_silent({**MODEL, "loud_digest": False, "halted": True}), False)
 check("auth_error alert is loud", notify.is_silent({"kind": "auth_error"}), False)
 # telegram alert kinds: escaped detail, under cap, re-auth URL for auth_error
 for _k, _ex in (("auth_error", {"event_detail": "401 <t> & x"}),

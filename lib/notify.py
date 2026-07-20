@@ -578,12 +578,16 @@ def _te(v) -> str:
 
 
 def is_silent(model: dict) -> bool:
-    """Telegram ``disable_notification`` policy: a routine, NON-halted digest is delivered
-    SILENTLY (a glanceable daily record — don't buzz the operator every day); every alert
-    kind, and a halted digest, pings LOUD."""
+    """Telegram ``disable_notification`` policy. Every alert kind, and a halted digest,
+    ALWAYS pings LOUD. A routine (non-halted) digest pings LOUD by default so the operator
+    gets a daily heartbeat and never mistakes a quiet do-nothing day for a dead bot; set
+    ``notify.loud_digest: false`` (carried into the model as ``loud_digest``) to restore the
+    old silent-daily-record behavior."""
     if model.get("kind", "digest") != "digest":
         return False
-    return not model.get("halted")
+    if model.get("halted"):
+        return False
+    return not model.get("loud_digest", True)
 
 
 def _render_telegram(model: dict) -> str:

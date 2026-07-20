@@ -110,6 +110,7 @@ notify:
   enabled: true
   from: ""                             # blank -> the Resend MCP's own sender is used
   subject_prefix: "[Quiver]"
+  loud_digest: true                    # daily digest pings LOUD (heartbeat) even on 0-order days; false = silent
 
 # --- Storage retention (observability housekeeping; never blocks a tick) ---
 storage:

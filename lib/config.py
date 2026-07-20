@@ -98,6 +98,10 @@ class NotifyConfig:
     on_error: bool = True
     on_warning: bool = False
     alerts_to: List[str] = field(default_factory=list)
+    # ``loud_digest`` (default True): the daily run-complete digest pings LOUD so the
+    # operator gets a heartbeat every trading day, incl. quiet 0-order days — a silent
+    # digest reads as "the bot is dead". Set false to restore the silent-daily-record mode.
+    loud_digest: bool = True
 
 
 @dataclass(frozen=True)
@@ -488,6 +492,8 @@ def load_config(path) -> Config:
     on_complete = notify_d.get("on_complete", True) is not False
     on_error = notify_d.get("on_error", True) is not False
     on_warning = notify_d.get("on_warning", False) is True
+    # Daily digest pings LOUD by default; only an explicit false silences it.
+    loud_digest = notify_d.get("loud_digest", True) is not False
     # Critical alerts can route to a separate pager list. Env NOTIFY_ALERTS_TO wins,
     # then config notify.alerts_to, else fall back to the digest recipients (`to`).
     alerts_env = os.environ.get("NOTIFY_ALERTS_TO", "").strip()
@@ -515,7 +521,7 @@ def load_config(path) -> Config:
     notify = NotifyConfig(
         enabled=notify_enabled, to=to, from_addr=from_addr, subject_prefix=subject_prefix,
         on_complete=on_complete, on_error=on_error, on_warning=on_warning,
-        alerts_to=alerts_to,
+        alerts_to=alerts_to, loud_digest=loud_digest,
     )
 
     # Storage retention + optional archival. Observability housekeeping only;

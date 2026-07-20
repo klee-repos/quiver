@@ -2471,6 +2471,9 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
         # alert channel — a NOT-configured footer is itself a signal (the box needs the
         # TELEGRAM_* secrets in /etc/quiver/quiver.env; see F7 / docs/DEPLOY.md).
         "pager_armed": bool(_tg_token and _tg_chats) if kind == "digest" else None,
+        # Telegram loudness policy input (is_silent): a routine digest pings LOUD unless
+        # the operator opted into the quiet-daily-record mode via notify.loud_digest: false.
+        "loud_digest": cfg.notify.loud_digest,
         "account_risk": _account_risk(led),
         "tickers": [rows[t] for t in sorted(rows)],
     }
