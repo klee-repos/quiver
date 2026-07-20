@@ -2615,7 +2615,8 @@ def cmd_send_test(args) -> dict:
     data = {
         "date": date, "now_iso": now_iso, "kind": kind,
         "stage": args.stage or None, "severity": args.severity or "critical",
-        "event_detail": "send-test: Quiver alerting self-test (no real failure).",
+        "event_detail": (getattr(args, "detail", "") or
+                         "send-test: Quiver alerting self-test (no real failure)."),
         "equity": 100.0, "host": os.environ.get("QUIVER_HOST_HINT") or None,
     }
     model = _build_report_model(cfg, led, data, date, now_iso, kind)
@@ -3266,6 +3267,8 @@ def main(argv) -> int:
     p_st.add_argument("--stage", default="")
     p_st.add_argument("--severity", default="critical")
     p_st.add_argument("--to", default="")
+    p_st.add_argument("--detail", default="",
+                      help="override the alert body detail (preview a real failure message)")
     p_reflect = sub.add_parser("reflect")
     p_reflect.add_argument("--input", required=True)
     p_protect = sub.add_parser("protect")

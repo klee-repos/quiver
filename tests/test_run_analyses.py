@@ -133,6 +133,33 @@ def main() -> int:
     check(rt._is_silent_noop(P, None, 0) is False, "unknown before snapshot -> never false-trip")
     check(rt._is_silent_noop(P, 0, None) is False, "unknown after snapshot -> never false-trip")
 
+    # --- run_tick._orchestrator_reason (pull the real failure message out of stream-json) ---
+    # A spend-limit failure: the token-count tail is opaque, but the result event carries the text.
+    spend = (
+        '{"type":"system","subtype":"init"}\n'
+        '{"type":"assistant","message":{"content":[{"type":"text",'
+        '"text":"You\'ve hit your monthly spend limit \\u00b7 raise it at claude.ai/settings/usage"}]}}\n'
+        '{"type":"result","subtype":"error","is_error":true,'
+        '"result":"You\'ve hit your monthly spend limit \\u00b7 raise it at claude.ai/settings/usage",'
+        '"usage":{"output_tokens":0},"modelUsage":{}}\n')
+    check("monthly spend limit" in (rt._orchestrator_reason(spend) or ""),
+          "spend-limit failure -> reason names the spend limit (not the token-count tail)")
+    check("claude.ai/settings/usage" in (rt._orchestrator_reason(spend) or ""),
+          "spend-limit failure -> reason keeps the actionable URL")
+    # result event preferred over an earlier assistant block; whitespace collapsed to one line.
+    both = ('{"type":"assistant","message":{"content":[{"type":"text","text":"working..."}]}}\n'
+            '{"type":"result","result":"final\\n  reason\\ttext"}\n')
+    check(rt._orchestrator_reason(both) == "final reason text",
+          "result text preferred + whitespace collapsed to a compact line")
+    # Assistant-text fallback when there is no usable result field.
+    only_asst = ('{"type":"assistant","message":{"content":[{"type":"text","text":"just this"}]}}\n'
+                 '{"type":"result","result":""}\n')
+    check(rt._orchestrator_reason(only_asst) == "just this",
+          "empty result -> falls back to the last assistant text")
+    # Unparseable / empty -> None so the caller falls back to the raw tail.
+    check(rt._orchestrator_reason("") is None, "empty stdout -> None")
+    check(rt._orchestrator_reason("not json\n{oops\n") is None, "garbage stdout -> None (never raises)")
+
     print(f"{_PASS} checks passed, {_FAIL} failed")
     return 1 if _FAIL else 0
 

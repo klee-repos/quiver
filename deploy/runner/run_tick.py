@@ -181,6 +181,45 @@ def _in_tick_error_paged(led, day) -> bool:
         return False
 
 
+def _orchestrator_reason(stdout):
+    """Pull the orchestrator's human-readable closing message out of its stream-json stdout.
+
+    ``claude -p --output-format stream-json`` emits one JSON object per line; the final
+    ``{"type":"result",...}`` event carries the assistant's last text in its ``result`` field
+    (e.g. "You've hit your monthly spend limit · raise it at claude.ai/settings/usage"). A FAILED
+    tick's raw *tail* is the END of that object (token-count JSON) — opaque in an alert — so we
+    parse the ``result`` text instead, falling back to the last assistant text block. Returns a
+    whitespace-collapsed one-liner (<=300 chars) or None when nothing usable is found (the caller
+    then falls back to the raw tail). Pure + defensive: a malformed line is skipped, never raised."""
+    if not stdout:
+        return None
+    result_text = None
+    assistant_text = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == "result":
+            r = obj.get("result")
+            if isinstance(r, str) and r.strip():
+                result_text = r.strip()  # last result event wins
+        elif obj.get("type") == "assistant":
+            for c in ((obj.get("message") or {}).get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "text" \
+                        and isinstance(c.get("text"), str) and c["text"].strip():
+                    assistant_text = c["text"].strip()
+    reason = result_text or assistant_text
+    if not reason:
+        return None
+    return " ".join(reason.split())[:300]
+
+
 def _maybe_alert(led, *, kind, stage, day, now_iso, event_detail, send=telegram.send_message):
     """Last-resort operator alert (Telegram) for a failure the in-tick orchestrator couldn't send.
 
@@ -407,10 +446,15 @@ def main() -> int:
                 # ("orchestrator") so it would NOT dedup against that row and would
                 # double-page the same logical failure.
                 if not ok and not auth_error and not halted and not _in_tick_error_paged(led, day):
+                    # Prefer the orchestrator's OWN closing message (e.g. "You've hit your monthly
+                    # spend limit ...") over the raw token-count tail, so the page says WHY — the
+                    # spend-limit and OAuth-expiry failures both surface as output_tokens:0 and are
+                    # only distinguishable by this text. Fall back to the tail when unparseable.
+                    reason = _orchestrator_reason(proc.stdout or "")
+                    detail = f"orchestrator exited {proc.returncode}"
+                    detail += f" — {reason}" if reason else f"; tail: {combined[-300:]}"
                     _maybe_alert(led, kind="error", stage="orchestrator", day=day,
-                                 now_iso=now_iso,
-                                 event_detail=f"orchestrator exited {proc.returncode}; "
-                                              f"tail: {combined[-300:]}")
+                                 now_iso=now_iso, event_detail=detail)
                 # Silent-noop guard: a tick that preflight let PROCEED with pending tickers
                 # but recorded NOTHING NEW this run did no analysis — the 2026-06-17 failure
                 # (analyses backgrounded then reaped when the orchestrator ended its turn).
