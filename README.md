@@ -168,7 +168,7 @@ automatically as you add or lose money. Nothing to bump by hand.
 | Setting | Example | What it means (in plain words) |
 |---|---|---|
 | `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
-| *(per-trade limit)* | *calculated* | No knob. The most any single buy can be = your book's max-per-name % (`strategy.yaml` `per_name_max_pct`, default 25%) of your live account. Scales with the account. |
+| *(per-trade limit)* | *none* | No knob, and no per-trade cap at all. How much goes into a name is set by its **target weight** in `strategy.yaml` (which is already capped at `per_name_max_pct`), bounded by your available cash. |
 | *(per-day limit)* | *calculated* | No knob. Total buys in a day are bounded by your live cash and your target weights, not a fixed dollar figure. |
 | `daily_loss_halt_pct` | `5.0` | If you're down this much in a day, it stops everything. |
 | `min_buying_power_buffer` | `5` | Always leave at least this much cash untouched. |

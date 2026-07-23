@@ -66,55 +66,43 @@ check("bare dollars word", signals.parse_sizing_to_dollars("300 dollars", 10000)
 check("unparseable -> None", signals.parse_sizing_to_dollars("a modest position", 10000), None)
 check("empty -> None", signals.parse_sizing_to_dollars(None, 10000), None)
 
-# --- resolve_buy_dollars clamps ---
-# 5% of 10k = 500, ceiling 500 -> 500
-d, src = signals.resolve_buy_dollars("5%", 10000, 1.0, ceiling=500,
+# --- resolve_buy_dollars clamps (NO per-trade ceiling — the target weight is the per-name bound) ---
+# 5% of 10k = 500; cash + daily-cap don't bind here -> 500 (the model's own size wins).
+d, src = signals.resolve_buy_dollars("5%", 10000, 1.0,
                                      remaining_daily_cap=1500, buying_power=5000,
                                      buffer=200)
-check("buy clamps to ceiling", (d, src), (500.0, "parsed"))
+check("buy uses the parsed size (5% of 10k)", (d, src), (500.0, "parsed"))
 
-# ceiling lower than parsed size
-d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=300,
+# remaining daily cap is the binding constraint (50% of 10k = 5000, capped to the 1500 daily budget)
+d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0,
                                    remaining_daily_cap=1500, buying_power=5000,
                                    buffer=200)
-check("ceiling wins", d, 300.0)
+check("daily cap binds", d, 1500.0)
 
 # buying power - buffer is the binding constraint
-d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
+d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0,
                                    remaining_daily_cap=9000, buying_power=450,
                                    buffer=200)
 check("buying-power buffer binds", d, 250.0)
 
 # Overweight tilt halves the parsed size
-d, _ = signals.resolve_buy_dollars("4%", 10000, 0.5, ceiling=5000,
+d, _ = signals.resolve_buy_dollars("4%", 10000, 0.5,
                                    remaining_daily_cap=9000, buying_power=9000,
                                    buffer=0)
 check("overweight halves (4% of 10k = 400 -> 200)", d, 200.0)
 
-# unparseable sizing -> conservative fallback (min(ceiling, 100)), never fails open
-d, src = signals.resolve_buy_dollars("a small starter", 10000, 1.0, ceiling=500,
+# unparseable sizing -> conservative fallback ($100), never fails open
+d, src = signals.resolve_buy_dollars("a small starter", 10000, 1.0,
                                      remaining_daily_cap=1500, buying_power=5000,
                                      buffer=200)
 check("fallback amount", d, 100.0)
 check("fallback source tagged", src, "fallback")
 
 # daily cap exhausted -> zero -> skip
-d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
+d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0,
                                    remaining_daily_cap=0, buying_power=9000,
                                    buffer=0)
 check("daily cap exhausted -> 0", d, 0.0)
-
-# --- per_trade_ceiling: the per-trade cap is CALCULATED from live equity, not hardcoded ---
-# = per_name_max_pct% of equity; scales with the account; fails CLOSED (0 = skip) on bad input.
-check("per_trade_ceiling scales with equity (25% of 10k)", signals.per_trade_ceiling(10000, 25), 2500.0)
-check("per_trade_ceiling small account (25% of 220)", signals.per_trade_ceiling(220, 25), 55.0)
-check("per_trade_ceiling large account (25% of 100k)", signals.per_trade_ceiling(100000, 25), 25000.0)
-check("per_trade_ceiling honors a custom per_name_max_pct (80% of 500)", signals.per_trade_ceiling(500, 80), 400.0)
-check("per_trade_ceiling fail-closed on zero equity", signals.per_trade_ceiling(0, 25), 0.0)
-check("per_trade_ceiling fail-closed on negative equity", signals.per_trade_ceiling(-10, 25), 0.0)
-check("per_trade_ceiling fail-closed on None equity", signals.per_trade_ceiling(None, 25), 0.0)
-check("per_trade_ceiling fail-closed on zero pct", signals.per_trade_ceiling(1000, 0), 0.0)
-check("per_trade_ceiling fail-closed on None pct", signals.per_trade_ceiling(1000, None), 0.0)
 
 # --- resolve_sell_quantity ---
 check("full close", signals.resolve_sell_quantity(3.0, 1.0), 3.0)
@@ -882,23 +870,23 @@ check_raises("analysis cap <= 0 raises",
 
 # ===================== STRUCTURED SIZING via position_pct (D6) ==============
 # Structured position_pct (% of equity) takes precedence over prose, tagged 'structured'.
-_d, _src = signals.resolve_buy_dollars("ignored prose", 1000, 1.0, ceiling=500,
+_d, _src = signals.resolve_buy_dollars("ignored prose", 1000, 1.0,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
                                        position_pct=10)
 check("structured pct used (10% of 1000)", (_d, _src), (100.0, "structured"))
-_d, _ = signals.resolve_buy_dollars(None, 1000, 1.0, ceiling=50,
-                                    remaining_daily_cap=500, buying_power=900, buffer=0,
+_d, _ = signals.resolve_buy_dollars(None, 1000, 1.0,
+                                    remaining_daily_cap=50, buying_power=900, buffer=0,
                                     position_pct=20)
-check("structured pct still clamped by ceiling", _d, 50.0)
-_d, _ = signals.resolve_buy_dollars(None, 1000, 0.5, ceiling=500,
+check("structured pct clamped by remaining daily cap (200 -> 50)", _d, 50.0)
+_d, _ = signals.resolve_buy_dollars(None, 1000, 0.5,
                                     remaining_daily_cap=500, buying_power=900, buffer=0,
                                     position_pct=10)
 check("structured pct * overweight tilt", _d, 50.0)
-_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
+_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
                                        position_pct=None)
 check("prose path unchanged when no position_pct", (_d, _src), (50.0, "parsed"))
-_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0, ceiling=500,
+_d, _src = signals.resolve_buy_dollars("5%", 1000, 1.0,
                                        remaining_daily_cap=500, buying_power=900, buffer=0,
                                        position_pct=0)
 check("non-positive position_pct -> prose fallback", (_d, _src), (50.0, "parsed"))
@@ -1721,7 +1709,7 @@ check("sig: band=0 == classic trim-to-target (byte-identical)",
       signals.resolve_target_sell_quantity(10.0, 5.0, 60.0, 45.0, upper_band_dollars=0.0), 3.0)
 # buy->target is unchanged: room_under_target with no band fills to the EXACT target
 check("sig: buy fills to exact target (buy->target, no band)", signals.room_under_target(45.0, 30.0), 15.0)
-_buy_args = dict(position_sizing=None, baseline_equity=100.0, buy_fraction=1.0, ceiling=25.0,
+_buy_args = dict(position_sizing=None, baseline_equity=100.0, buy_fraction=1.0,
                  remaining_daily_cap=75.0, buying_power=100.0, buffer=5.0,
                  position_pct=10.0)
 check("sig: resolve_buy_dollars room=None == omitted (byte-identical)",
@@ -1967,20 +1955,22 @@ _p_tw["target_weights"] = {"SMH": {"intent": "buy", "target_dollars": 9.0}}
 _out_base = _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_base))
 _out_disabled = _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_tw))
 check("plan: BYTE-IDENTICAL when rebalance OFF (target_weights ignored)", _out_base, _out_disabled)
-check("plan: classic buy clamps to ceiling 25",
-      next(o for o in _out_base["orders"] if o["ticker"] == "SMH")["dollar_amount"], 25.0)
+check("plan: classic buy sized by position_pct (50% of 100, no per-trade ceiling)",
+      next(o for o in _out_base["orders"] if o["ticker"] == "SMH")["dollar_amount"], 50.0)
 
 # rebalance ON: the deterministic buy-to-target pass OWNS the book name (the LLM's
-# dribble buy is suppressed) and deploys it to its target dollars, clamped by the caps.
+# dribble buy is suppressed) and deploys it to its target dollars, bounded by cash.
 _out_on = _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_tw))
 _smh_on = next(o for o in _out_on["orders"] if o["ticker"] == "SMH")
-check("plan: rebalance deploys book name to target (9 < ceiling 25)", _smh_on["dollar_amount"], 9.0)
+check("plan: rebalance deploys book name to its target (9)", _smh_on["dollar_amount"], 9.0)
 check("plan: book-name buy routed through the rebalance pass", _smh_on["order_kind"], "rebalance_buy")
+# No per-trade ceiling: a huge target is bounded by AVAILABLE CASH (buying_power 100 - buffer 5 =
+# 95), not an artificial per-order dollar cap. The name deploys 95 in ONE order (as much as cash allows).
 _p_big = _copy.deepcopy(_p_base)
 _p_big["target_weights"] = {"SMH": {"intent": "buy", "target_dollars": 1000.0}}
-check("plan: target NEVER overrides the per-trade ceiling",
+check("plan: rebalance buy bounded by available cash, not a fixed ceiling",
       next(o for o in _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _p_big)["orders"]
-           if o["ticker"] == "SMH")["dollar_amount"], 25.0)
+           if o["ticker"] == "SMH")["dollar_amount"], 95.0)
 
 # HALT precedence: a daily-loss-halt day -> zero orders even with target_weights
 _led_h = _tmp_ledger()
@@ -2025,11 +2015,10 @@ check("plan: rebalance buy signal tag", _smh_dep["signal"], "REBALANCE")
 check("plan: rebalance OFF -> held book name not deployed",
       [o for o in _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_dep))["orders"]
        if o["ticker"] == "SMH"], [])
-# Running cash pool bounds total buys — the LIVE avail_cash pool, not a fixed daily $ cap. Held
-# $85 + $15 cash -> deployable $100 -> eff_ceiling = 25% x 100 = $25 (>= both $25 targets, so the
-# calculated ceiling does not bind here). avail = buying_power(15) - buffer(5) = $10: SMH deploys
-# $10 of its $25 room, exhausting the cash, so SOXX is SKIPPED for lack of cash (not bounced).
-# (HELD is off-target -> _run_plan never touches it; it only inflates deployable.)
+# Running cash pool bounds total buys — the LIVE avail_cash pool, not a fixed daily $ cap and (with
+# the per-trade ceiling gone) not a per-order cap either. avail = buying_power(15) - buffer(5) = $10:
+# SMH deploys $10 of its $25 room in ONE order, exhausting the cash, so SOXX is SKIPPED for lack of
+# cash (not bounced). (HELD is off-target -> _run_plan never touches it; it only inflates deployable.)
 _p_x = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
         "buying_power": 15.0, "positions": {"HELD": {"quantity": 1.0, "market_value": 85.0}},
         "quotes": {"SMH": 50.0, "SOXX": 50.0, "HELD": 85.0}, "analyses": [],

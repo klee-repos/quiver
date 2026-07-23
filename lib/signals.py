@@ -67,7 +67,6 @@ def resolve_buy_dollars(
     baseline_equity: float,
     buy_fraction: float,
     *,
-    ceiling: float,
     remaining_daily_cap: float,
     buying_power: float,
     buffer: float,
@@ -81,23 +80,24 @@ def resolve_buy_dollars(
 
     Sizing source preference: the model's STRUCTURED ``position_pct`` (% of equity)
     wins when present; otherwise the prose ``position_sizing`` is parsed; otherwise
-    a conservative fallback. Final amount = min(that size, per-trade ceiling,
-    remaining daily deploy cap, buying_power - buffer).
+    a conservative fallback. There is NO per-trade notional ceiling — per-name
+    exposure is governed by the % target weight (``room_under_target``, capped at
+    ``per_name_max_pct`` inside the allocator), not a redundant per-order dollar cap.
+    Final amount = min(that size, remaining daily deploy cap, buying_power - buffer,
+    and — when supplied — room_under_target and the stop-distance risk_cap).
 
-    ``room_under_target`` is the strategy layer's extra clamp (Stage 3): the room
-    left before this name hits its target weight. It is folded into the SAME min()
-    when supplied, so a target can only ever REDUCE a buy, never bypass a cap. When
-    it is None (the default, and the classic non-rebalance path) the output is
-    BYTE-IDENTICAL to before — the min() args are unchanged. Always >= 0; a
-    non-positive result means "skip". Never fails open to a large size.
+    ``room_under_target`` is the strategy layer's clamp (Stage 3): the room left
+    before this name hits its target weight. Folded into the SAME min() when supplied,
+    so a target can only ever REDUCE a buy. When None (the classic non-rebalance path)
+    the size is the model's position_pct/prose, bounded only by cash + risk_cap.
+    Always >= 0; a non-positive result means "skip". Never fails open.
 
-    PTJ-defense clamps (both default None -> BYTE-IDENTICAL, same convention as
-    room_under_target): ``risk_cap`` is the stop-distance risk budget (F2/P3 —
-    ``risk_budget_cap``), appended to the SAME min() so it can only REDUCE a buy;
-    ``exposure_scalar`` (F3/F4/P5/P6 — downside-vol x trend x event severity, in
-    [floor,1.0]) multiplies ``base`` BEFORE the min(). The scalar is applied with an
-    explicit ``is not None`` guard (NOT ``or 1.0``) so a legitimate 0.0 block-scalar
-    zeroes the buy instead of being silently treated as 1.0.
+    PTJ-defense clamps (both default None -> no-op): ``risk_cap`` is the stop-distance
+    risk budget (F2/P3 — ``risk_budget_cap``), appended to the SAME min() so it can
+    only REDUCE a buy; ``exposure_scalar`` (F3/F4/P5/P6 — downside-vol x trend x event
+    severity, in [floor,1.0]) multiplies ``base`` BEFORE the min(). The scalar is
+    applied with an explicit ``is not None`` guard (NOT ``or 1.0``) so a legitimate
+    0.0 block-scalar zeroes the buy instead of being silently treated as 1.0.
     """
     if position_pct is not None and position_pct > 0:
         base = position_pct / 100.0 * baseline_equity
@@ -106,17 +106,18 @@ def resolve_buy_dollars(
         base = parse_sizing_to_dollars(position_sizing, baseline_equity)
         source = "parsed"
     if base is None or base <= 0:
-        base = min(ceiling, fallback)
+        base = fallback
         source = "fallback"
     base *= buy_fraction
     # Downside-vol / trend / event exposure scalar (F3/F4/F8). Guarded is-not-None
-    # multiply so a 0.0 block-scalar zeroes the buy; None -> untouched (byte-identical).
+    # multiply so a 0.0 block-scalar zeroes the buy; None -> untouched.
     if exposure_scalar is not None:
         base *= exposure_scalar
 
-    # The classic clamp stack. room_under_target + risk_cap are appended ONLY when
-    # supplied, so with both None the min() args are identical to before (byte-identical).
-    clamps = [base, ceiling, remaining_daily_cap, buying_power - buffer]
+    # The clamp stack — cash + (when the rebalance layer is on) the target-room and the
+    # stop-distance risk cap. NO per-trade notional ceiling: the target weight itself is
+    # the per-name bound. room_under_target + risk_cap are appended ONLY when supplied.
+    clamps = [base, remaining_daily_cap, buying_power - buffer]
     if room_under_target is not None:
         clamps.append(room_under_target)
     if risk_cap is not None:
@@ -125,25 +126,6 @@ def resolve_buy_dollars(
     if capped <= 0:
         return (0.0, source)
     return (round(capped, 2), source)
-
-
-def per_trade_ceiling(equity: Optional[float], per_name_max_pct: Optional[float]) -> float:
-    """Largest notional a single order may be — CALCULATED from the live account, no fixed cap.
-
-    = ``per_name_max_pct`` % of ``equity``: a single order can never exceed what the book's
-    OWN max-per-name concentration (strategy.yaml ``risk_policy.per_name_max_pct`` — the same %
-    the allocator caps a name's target WEIGHT at) allows a single position to be. There is no
-    hardcoded dollar cap; the ceiling scales with the account every tick. In the live book it is
-    >= any name's target room (target weight <= per_name_max_pct), so a name deploys to target in
-    ONE order instead of dribbling in fixed-size tranches.
-
-    Fails CLOSED: non-positive ``equity`` or ``per_name_max_pct`` -> 0.0, which every caller
-    treats as SKIP (min() collapses to 0 / the tranche loop emits nothing). A broken or zero
-    account snapshot can therefore never fail OPEN to an unbounded order. Pure + total; unit-tested.
-    """
-    if not equity or equity <= 0 or not per_name_max_pct or per_name_max_pct <= 0:
-        return 0.0
-    return round(per_name_max_pct / 100.0 * equity, 2)
 
 
 def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:

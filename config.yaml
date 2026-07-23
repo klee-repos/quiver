@@ -9,15 +9,13 @@ dry_run: false                         # false = LIVE (places orders); true = pa
 kill_switch_file: "KILL"               # `touch KILL` halts the next tick; `rm KILL` resumes
 
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
-# NO fixed per-trade or daily-deploy DOLLAR cap here — a hardcoded dollar figure is meaningless as
-# the account grows, so both are CALCULATED from the live account every tick (in tick.py):
-#   * per-trade ceiling = per_name_max_pct% of live DEPLOYABLE equity (positions + idle cash) — the
-#     book's OWN max-per-name concentration (strategy.yaml risk_policy.per_name_max_pct, default
-#     25%), so a single order can never exceed what any one position is allowed to be, and it scales
-#     with the account. In the live book it is >= any name's target, so a name deploys in ONE order.
-#   * daily deploy budget = live deployable equity itself (idle cash + the target weights are the
-#     real bounds). The 20% daily-loss halt + KILL remain the circuit breaker.
-# Per-name exposure is already governed by the % target weight / per_name_max_pct / per_trade_risk_pct.
+# There is NO per-trade dollar cap at all — per-name exposure is governed by the % TARGET WEIGHT
+# (capped at strategy.yaml risk_policy.per_name_max_pct inside the allocator) + per_trade_risk_pct,
+# which already scale with the account. A redundant per-order dollar/percent ceiling was removed
+# 2026-07-23. A rebalance name deploys to its target in ONE order, bounded only by available cash
+# (buying_power - min_buying_power_buffer). The only calculated budget is the daily deploy total =
+# live deployable equity (positions + idle cash), and the 20% daily-loss halt + KILL are the
+# circuit breaker. Nothing here is a fixed dollar trade cap.
 risk:
   daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
   min_buying_power_buffer: 5           # never spend below this much remaining buying power

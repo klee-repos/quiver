@@ -29,14 +29,13 @@ _SUPPORTED_LLM_PROVIDERS = (
 
 @dataclass(frozen=True)
 class RiskConfig:
-    # NOTE: there is deliberately NO fixed per-trade or daily-deploy DOLLAR cap here. Both were
-    # removed (2026-07-23): a hardcoded dollar figure is meaningless as the account grows, and the
-    # meaningful bounds are all already CALCULATED from live equity + the book's own percentages —
-    # the per-trade ceiling is per_name_max_pct% of live equity (signals.per_trade_ceiling, wired
-    # in tick.py), the daily budget is live deployable equity, per-name exposure is the target
-    # weight / per_name_max_pct / per_trade_risk_pct, and the hard stops are available-cash-minus-
-    # buffer + the daily-loss halt below. The loader ignores any legacy per-trade / daily-deploy
-    # fixed-dollar cap keys still present in an old config file.
+    # NOTE: there is deliberately NO per-trade dollar cap here, and no fixed daily-deploy cap. Both
+    # were removed (2026-07-23): a hardcoded dollar figure is meaningless as the account grows, AND a
+    # per-order notional ceiling is redundant — per-name exposure is already governed by the % TARGET
+    # WEIGHT (capped at per_name_max_pct inside the allocator) + per_trade_risk_pct, and the hard
+    # stops are available-cash-minus-buffer + the daily-loss halt below. The daily deploy budget is
+    # just live deployable equity. The loader ignores any legacy fixed-dollar cap keys still present
+    # in an old config file.
     daily_loss_halt_pct: float
     min_buying_power_buffer: float
     # Intraday-only caps (default 1 == classic once-a-day behavior). max_actions
