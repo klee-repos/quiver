@@ -36,15 +36,15 @@ import lib.wall_replay as wr  # noqa: E402
 import tick  # noqa: E402
 
 
-def _temp_config(strategy_path: str, rebalance: bool, per_trade: float, daily_cap: float,
-                 halt_pct: float, buffer: float) -> str:
+def _temp_config(strategy_path: str, rebalance: bool, halt_pct: float, buffer: float) -> str:
     scratch_mem = Path(tempfile.mkdtemp(prefix="wr_mem_"))
     d = {
         "account_number": "12345678", "dry_run": True,
         "kill_switch_file": str(Path(tempfile.mkdtemp(prefix="wr_kill_")) / "KILL"),
         "strategy_path": strategy_path,
-        "risk": {"max_dollars_per_trade": per_trade, "daily_loss_halt_pct": halt_pct,
-                 "daily_capital_deploy_cap": daily_cap, "min_buying_power_buffer": buffer,
+        # No fixed per-trade / daily-deploy dollar cap: both are calculated from live equity in the
+        # wall (per_name_max_pct% of deployable / deployable), so there is nothing to pass here.
+        "risk": {"daily_loss_halt_pct": halt_pct, "min_buying_power_buffer": buffer,
                  "rebalance_enabled": rebalance},
         "memory": {"dir": str(scratch_mem)},
         "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
@@ -66,8 +66,6 @@ def main(argv=None) -> int:
                     help="strategy yaml (default ./strategy.yaml; falls back to the test fixture)")
     ap.add_argument("--benchmark", default="SPY")
     ap.add_argument("--no-rebalance", action="store_true", help="disable the rebalance/construct pass")
-    ap.add_argument("--per-trade", type=float, default=100.0)
-    ap.add_argument("--daily-cap", type=float, default=1000.0)
     ap.add_argument("--halt-pct", type=float, default=20.0)
     ap.add_argument("--buffer", type=float, default=5.0)
     ap.add_argument("--fast", type=int, default=5)
@@ -80,8 +78,7 @@ def main(argv=None) -> int:
         strategy_path = str(REPO / "tests" / "fixtures" / "strategy_fixture.yaml")
         print(f"[note] {args.strategy} not found; using fixture {strategy_path}", file=sys.stderr)
 
-    cfg_path = _temp_config(strategy_path, not args.no_rebalance, args.per_trade,
-                            args.daily_cap, args.halt_pct, args.buffer)
+    cfg_path = _temp_config(strategy_path, not args.no_rebalance, args.halt_pct, args.buffer)
     cfg = load_config(cfg_path)
     if not cfg.dry_run:                       # defence-in-depth: never reach the broker
         print("FATAL: config is not dry_run; refusing to run.", file=sys.stderr)

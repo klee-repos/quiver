@@ -168,9 +168,9 @@ def _run_preflight(cfg, led) -> dict:
         "pending_outcomes": pending_outcomes,
         "unfinalized": led.unfinalized_orders(day),
         "risk": {
-            "max_dollars_per_trade": cfg.risk.max_dollars_per_trade,
+            # No fixed per-trade / daily-deploy dollar cap: both are CALCULATED live at plan time
+            # (per_name_max_pct% of deployable equity / deployable equity) — nothing to echo here.
             "daily_loss_halt_pct": cfg.risk.daily_loss_halt_pct,
-            "daily_capital_deploy_cap": cfg.risk.daily_capital_deploy_cap,
             "min_buying_power_buffer": cfg.risk.min_buying_power_buffer,
         },
         "order": {
@@ -477,6 +477,23 @@ def _run_plan(cfg, led, data) -> dict:
     drop_pct = ((total_equity - baseline.baseline_equity) / baseline.baseline_equity * 100.0
                 if baseline.baseline_equity else 0.0)
 
+    # The per-trade + daily-deploy caps are CALCULATED from the live account every tick — there is
+    # NO fixed dollar cap. Base = DEPLOYABLE capital (held positions + idle cash), mirroring
+    # _run_construct (tick.py:_run_construct) so the ceiling scales off the SAME number the book's
+    # target_dollars do (weight% x deployable) — no baseline-vs-deployable mismatch — and a freshly
+    # funded ALL-CASH account (positions {}) sizes off its cash instead of collapsing to ~0 (the
+    # broker's positions-only `equity`). eff_ceiling = per_name_max_pct% of deployable: a single
+    # order can never exceed what the book's own max-per-name concentration allows a position to be
+    # (default 25% via allocate._DEFAULTS; None-safe through _pol). In the live book this is >= any
+    # name's target room, so the rebalance pass deploys a name to target in ONE order. Fails CLOSED
+    # (bad/zero equity -> 0 -> skip), never open. The daily budget is deployable itself (idle cash +
+    # target weights are the real bounds); the 20% daily-loss halt + KILL stay the circuit breaker.
+    deployable_equity = positions_mv_sum + buying_power
+    if deployable_equity <= 0:
+        deployable_equity = equity   # back-compat fallback (mirrors _run_construct)
+    _per_name_max_pct = _to_float(_pol("per_name_max_pct")) or allocate._DEFAULTS["per_name_max_pct"]
+    eff_ceiling = signals.per_trade_ceiling(deployable_equity, _per_name_max_pct)
+
     result = {
         "halt": False,
         "write_kill": False,
@@ -500,7 +517,7 @@ def _run_plan(cfg, led, data) -> dict:
         result["write_kill"] = True
         return result
 
-    remaining_daily_cap = cfg.risk.daily_capital_deploy_cap - led.day_buys_total(day)
+    remaining_daily_cap = deployable_equity - led.day_buys_total(day)
 
     for a in analyses:
         ticker = str(a.get("ticker", "")).upper()
@@ -644,7 +661,7 @@ def _run_plan(cfg, led, data) -> dict:
             _risk_cap, _exposure = _ptj_buy_clamps(a, ticker)
             dollars, src = signals.resolve_buy_dollars(
                 a.get("position_sizing"), baseline.baseline_equity, frac,
-                ceiling=cfg.risk.max_dollars_per_trade,
+                ceiling=eff_ceiling,
                 remaining_daily_cap=remaining_daily_cap,
                 buying_power=buying_power,
                 buffer=cfg.risk.min_buying_power_buffer,
@@ -1014,7 +1031,7 @@ def _run_plan(cfg, led, data) -> dict:
                     "ticker": ticker, "signal": "REBALANCE", "status": "skipped",
                     "intent": "buy", "detail": "rebalance_buy_below_min"})
                 continue
-            ceiling = cfg.risk.max_dollars_per_trade
+            ceiling = eff_ceiling
             tranches = 0
             spent_name = 0.0
             while (name_budget - spent_name) >= buy_min and remaining_daily_cap >= 1.0 and avail_cash >= 1.0:
@@ -1040,11 +1057,23 @@ def _run_plan(cfg, led, data) -> dict:
                     "sizing_source": "rebalance_target", "order_kind": "rebalance_buy",
                     "tranche": tranches})
             # One latest-state ticker_action snapshot + one decision summarizing the fill.
-            led.record_action(day, ticker, signal="REBALANCE", intent="buy", status="order",
-                              detail=f"rebalance_buy x{tranches}", now_iso=now_iso)
-            result["decisions"].append({
-                "ticker": ticker, "signal": "REBALANCE", "status": "order", "intent": "buy",
-                "dollar_amount": spent_name, "tranches": tranches, "detail": "rebalance_buy"})
+            # Guard against a 0-tranche loop: when eff_ceiling < the economic minimum (a sub-~$20
+            # deployable account), the tranche `while` can break having placed NOTHING while the
+            # name still cleared the name_budget gate above. Record the SYMMETRIC visible skip (same
+            # detail as the pre-loop below-min guard) — never a phantom status="order" x0 / $0 row
+            # in the ledger + digest, and never claim a fill that did not happen.
+            if tranches > 0:
+                led.record_action(day, ticker, signal="REBALANCE", intent="buy", status="order",
+                                  detail=f"rebalance_buy x{tranches}", now_iso=now_iso)
+                result["decisions"].append({
+                    "ticker": ticker, "signal": "REBALANCE", "status": "order", "intent": "buy",
+                    "dollar_amount": spent_name, "tranches": tranches, "detail": "rebalance_buy"})
+            else:
+                led.record_action(day, ticker, signal="REBALANCE", intent="buy", status="skipped",
+                                  detail="rebalance_buy_below_min", now_iso=now_iso)
+                result["decisions"].append({
+                    "ticker": ticker, "signal": "REBALANCE", "status": "skipped", "intent": "buy",
+                    "detail": "rebalance_buy_below_min"})
 
     # Loop cadence: wake at the soonest re-look the model asked for (clamped),
     # snapped to market hours. The orchestrator schedules the next tick at this.

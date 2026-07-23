@@ -9,11 +9,17 @@ dry_run: false                         # false = LIVE (places orders); true = pa
 kill_switch_file: "KILL"               # `touch KILL` halts the next tick; `rm KILL` resumes
 
 # --- Risk guardrails (coded backstops around the model's own sizing) -------
-# Sized for the ~$100 Agentic account; bump proportionally if funded with more.
+# NO fixed per-trade or daily-deploy DOLLAR cap here — a hardcoded dollar figure is meaningless as
+# the account grows, so both are CALCULATED from the live account every tick (in tick.py):
+#   * per-trade ceiling = per_name_max_pct% of live DEPLOYABLE equity (positions + idle cash) — the
+#     book's OWN max-per-name concentration (strategy.yaml risk_policy.per_name_max_pct, default
+#     25%), so a single order can never exceed what any one position is allowed to be, and it scales
+#     with the account. In the live book it is >= any name's target, so a name deploys in ONE order.
+#   * daily deploy budget = live deployable equity itself (idle cash + the target weights are the
+#     real bounds). The 20% daily-loss halt + KILL remain the circuit breaker.
+# Per-name exposure is already governed by the % target weight / per_name_max_pct / per_trade_risk_pct.
 risk:
-  max_dollars_per_trade: 100           # hard per-trade ceiling
   daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
-  daily_capital_deploy_cap: 1000       # max total $ of BUYS across all tickers per day
   min_buying_power_buffer: 5           # never spend below this much remaining buying power
   max_actions_per_ticker_per_day: 10   # intraday-only: repeat TRADES/ticker/day
   max_analyses_per_ticker_per_day: 10  # intraday-only: LLM-cost circuit breaker

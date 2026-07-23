@@ -29,9 +29,15 @@ _SUPPORTED_LLM_PROVIDERS = (
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_dollars_per_trade: float
+    # NOTE: there is deliberately NO fixed per-trade or daily-deploy DOLLAR cap here. Both were
+    # removed (2026-07-23): a hardcoded dollar figure is meaningless as the account grows, and the
+    # meaningful bounds are all already CALCULATED from live equity + the book's own percentages —
+    # the per-trade ceiling is per_name_max_pct% of live equity (signals.per_trade_ceiling, wired
+    # in tick.py), the daily budget is live deployable equity, per-name exposure is the target
+    # weight / per_name_max_pct / per_trade_risk_pct, and the hard stops are available-cash-minus-
+    # buffer + the daily-loss halt below. The loader ignores any legacy per-trade / daily-deploy
+    # fixed-dollar cap keys still present in an old config file.
     daily_loss_halt_pct: float
-    daily_capital_deploy_cap: float
     min_buying_power_buffer: float
     # Intraday-only caps (default 1 == classic once-a-day behavior). max_actions
     # bounds repeat TRADES per ticker/day; max_analyses is the LLM-cost circuit
@@ -388,9 +394,7 @@ def load_config(path) -> Config:
     if conviction_rebalance_min_delta_pct < 0:
         raise ConfigError("config.yaml: risk.conviction_rebalance_min_delta_pct must be >= 0")
     risk = RiskConfig(
-        max_dollars_per_trade=_pos_num(risk_d, "max_dollars_per_trade"),
         daily_loss_halt_pct=_pos_num(risk_d, "daily_loss_halt_pct"),
-        daily_capital_deploy_cap=_pos_num(risk_d, "daily_capital_deploy_cap"),
         min_buying_power_buffer=float(risk_d.get("min_buying_power_buffer", 0) or 0),
         max_actions_per_ticker_per_day=_pos_int(risk_d, "max_actions_per_ticker_per_day", 1),
         max_analyses_per_ticker_per_day=_pos_int(risk_d, "max_analyses_per_ticker_per_day", 1),

@@ -104,6 +104,18 @@ d, _ = signals.resolve_buy_dollars("50%", 10000, 1.0, ceiling=5000,
                                    buffer=0)
 check("daily cap exhausted -> 0", d, 0.0)
 
+# --- per_trade_ceiling: the per-trade cap is CALCULATED from live equity, not hardcoded ---
+# = per_name_max_pct% of equity; scales with the account; fails CLOSED (0 = skip) on bad input.
+check("per_trade_ceiling scales with equity (25% of 10k)", signals.per_trade_ceiling(10000, 25), 2500.0)
+check("per_trade_ceiling small account (25% of 220)", signals.per_trade_ceiling(220, 25), 55.0)
+check("per_trade_ceiling large account (25% of 100k)", signals.per_trade_ceiling(100000, 25), 25000.0)
+check("per_trade_ceiling honors a custom per_name_max_pct (80% of 500)", signals.per_trade_ceiling(500, 80), 400.0)
+check("per_trade_ceiling fail-closed on zero equity", signals.per_trade_ceiling(0, 25), 0.0)
+check("per_trade_ceiling fail-closed on negative equity", signals.per_trade_ceiling(-10, 25), 0.0)
+check("per_trade_ceiling fail-closed on None equity", signals.per_trade_ceiling(None, 25), 0.0)
+check("per_trade_ceiling fail-closed on zero pct", signals.per_trade_ceiling(1000, 0), 0.0)
+check("per_trade_ceiling fail-closed on None pct", signals.per_trade_ceiling(1000, None), 0.0)
+
 # --- resolve_sell_quantity ---
 check("full close", signals.resolve_sell_quantity(3.0, 1.0), 3.0)
 check("trim half", signals.resolve_sell_quantity(3.0, 0.5), 1.5)
@@ -1239,8 +1251,10 @@ _WALL_SYMBOLS = ("buying_power", "max_dollars_per_trade", "get_portfolio",
 # The ONLY binding-side opt-outs. Value = the exact wall items that module may
 # reach for; every other item still applies to it.
 _WALL_GRANTS = {
-    # Owns the limit values themselves — config IS the source of the dollar caps.
-    "lib/config.py":      {"lib.risk", "RiskConfig", "max_dollars_per_trade"},
+    # Owns the RiskConfig limit dataclass + imports lib.risk for GuidanceThresholds. (The fixed
+    # dollar caps were removed 2026-07-23 — the per-trade/daily caps are now calculated from live
+    # equity in tick.py, so config.py no longer names max_dollars_per_trade.)
+    "lib/config.py":      {"lib.risk", "RiskConfig"},
     # The limits / underperformance module: the binding side's own logic.
     "lib/risk.py":        {"lib.signals"},
     # The sizing/clamp engine: reads buying_power off a PASSED-IN snapshot dict
@@ -1421,8 +1435,7 @@ def _safe_strategy(path):  # mirrors the load_config wrapper: garbled -> None
 
 check("config: garbled strategy.yaml -> None (fail-safe contract)",
       _safe_strategy(_write_tmp("schema: 2\nnonsense: [")), None)
-_rc = _RiskConfig(max_dollars_per_trade=100, daily_loss_halt_pct=20, daily_capital_deploy_cap=1000,
-                  min_buying_power_buffer=5,
+_rc = _RiskConfig(daily_loss_halt_pct=20, min_buying_power_buffer=5,
                   max_actions_per_ticker_per_day=1, max_analyses_per_ticker_per_day=1)
 check("config: RiskConfig rebalance knobs default to today's behavior",
       (_rc.rebalance_enabled, _rc.cash_sleeve_ticker, _rc.rebalance_drift_band_pct, _rc.reconcile_unmanaged),
@@ -2012,14 +2025,18 @@ check("plan: rebalance buy signal tag", _smh_dep["signal"], "REBALANCE")
 check("plan: rebalance OFF -> held book name not deployed",
       [o for o in _tick._run_plan(_cfg_rebal(False), _tmp_ledger(), _copy.deepcopy(_p_dep))["orders"]
        if o["ticker"] == "SMH"], [])
-# Running cash pool bounds total buys: avail = buying_power(15.5) - buffer(5) = 10.5; SMH takes
-# its $10 target, leaving $0.5 — below the $1 broker minimum, so SOXX is skipped (not bounced).
+# Running cash pool bounds total buys — the LIVE avail_cash pool, not a fixed daily $ cap. Held
+# $85 + $15 cash -> deployable $100 -> eff_ceiling = 25% x 100 = $25 (>= both $25 targets, so the
+# calculated ceiling does not bind here). avail = buying_power(15) - buffer(5) = $10: SMH deploys
+# $10 of its $25 room, exhausting the cash, so SOXX is SKIPPED for lack of cash (not bounced).
+# (HELD is off-target -> _run_plan never touches it; it only inflates deployable.)
 _p_x = {"run_id": "FIX", "now_iso": "2026-06-15T10:00:00-04:00", "equity": 100.0,
-        "buying_power": 15.5, "positions": {}, "quotes": {"SMH": 50.0, "SOXX": 50.0}, "analyses": [],
-        "target_weights": {"SMH": {"intent": "buy", "target_dollars": 10.0},
-                           "SOXX": {"intent": "buy", "target_dollars": 10.0}}}
+        "buying_power": 15.0, "positions": {"HELD": {"quantity": 1.0, "market_value": 85.0}},
+        "quotes": {"SMH": 50.0, "SOXX": 50.0, "HELD": 85.0}, "analyses": [],
+        "target_weights": {"SMH": {"intent": "buy", "target_dollars": 25.0},
+                           "SOXX": {"intent": "buy", "target_dollars": 25.0}}}
 _o_x = _tick._run_plan(_cfg_rebal(True), _tmp_ledger(), _copy.deepcopy(_p_x))["orders"]
-check("plan: cash pool — first name deploys to target",
+check("plan: cash pool — first name deploys (avail-cash-bound, one order)",
       next(o["dollar_amount"] for o in _o_x if o["ticker"] == "SMH"), 10.0)
 check("plan: cash pool exhausted — second name skipped (no sub-$1 bounce)",
       [o for o in _o_x if o["ticker"] == "SOXX"], [])

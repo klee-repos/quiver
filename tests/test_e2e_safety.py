@@ -44,7 +44,7 @@ def ok(name, cond, detail: object = ""):
         print(f"  ✗ FAIL: {name}{(' — ' + str(detail)) if detail else ''}")
 
 
-def _mk(tmp: Path, *, daily_loss=20, holdings=None, rh="[AAA, BBB, SGOV]"):
+def _mk(tmp: Path, *, daily_loss=20, holdings=None, rh="[AAA, BBB, SGOV]", per_name_max_pct=80):
     """Write a strategy + config and return (Config, freshly-seeded Ledger)."""
     from lib.config import load_config
     from lib.strategy import load_strategy
@@ -59,7 +59,7 @@ def _mk(tmp: Path, *, daily_loss=20, holdings=None, rh="[AAA, BBB, SGOV]"):
         "goal: {target_return_pct: 15, horizon_months: 12, benchmark: SGOV, benchmark_annual_pct: 3.6}\n"
         "macro_thesis: {deploy_trigger_pce_pct: 2.5, standdown_trigger_pce_pct: 3.5}\n"
         f"rh_tradable_confirmed: {rh}\n"
-        "risk_policy: {per_name_max_pct: 80, sleeve_max_pct: 100, cash_floor_pct: 10, smoothing_alpha: 1.0}\n"
+        f"risk_policy: {{per_name_max_pct: {per_name_max_pct}, sleeve_max_pct: 100, cash_floor_pct: 10, smoothing_alpha: 1.0}}\n"
         "learning: {min_resolved_n: 5}\n"
         "books:\n  core:\n    default: true\n    holdings:\n" + "\n".join(holdings) + "\n",
         encoding="utf-8")
@@ -230,11 +230,25 @@ def main() -> int:
             "positions": {}, "quotes": {"AAA": 50.0}, "analyses": [],
             "target_weights": {"AAA": {"intent": "buy", "target_dollars": 350.0, "quotable": True}}})
         aaa = [o for o in out["orders"] if o["ticker"] == "AAA"]
-        ok("T9 multi-tranche emits multiple child orders (350 / 100 ceiling -> 4)", len(aaa) == 4, len(aaa))
-        ok("T9 every tranche <= the per-trade ceiling", all(o["dollar_amount"] <= 100.0 for o in aaa), aaa)
-        ok("T9 tranche sum == the name's room (350)", abs(sum(o["dollar_amount"] for o in aaa) - 350.0) < 0.01)
-        ok("T9 each tranche is a rebalance_buy with its own tranche index",
-           all(o["order_kind"] == "rebalance_buy" for o in aaa) and {o["tranche"] for o in aaa} == {1, 2, 3, 4})
+        # The per-trade ceiling is now CALCULATED: _mk sets per_name_max_pct=80, deployable =
+        # positions(0)+buying_power(500) = 500, so eff_ceiling = 80% x 500 = $400. The $350 room is
+        # BELOW the ceiling, so it deploys in ONE clean order (the old fixed $100 ceiling sprayed 4).
+        ok("T9 room <= calculated ceiling -> ONE order to target (no tranche spam)", len(aaa) == 1, len(aaa))
+        ok("T9 the single order deploys the full room (350)",
+           abs(sum(o["dollar_amount"] for o in aaa) - 350.0) < 0.01)
+        ok("T9 order kind rebalance_buy", all(o["order_kind"] == "rebalance_buy" for o in aaa))
+        # A room ABOVE the calculated ceiling STILL tranches (the loop stays correct): target $450 >
+        # eff_ceiling $400 -> two child orders (400 + 50), each <= the ceiling, summing to the room.
+        out_hi = tick._run_plan(cfg, led, {
+            "now_iso": "2026-06-20T10:00:00-04:00", "equity": 0.0, "buying_power": 500.0,
+            "positions": {}, "quotes": {"AAA": 50.0}, "analyses": [],
+            "target_weights": {"AAA": {"intent": "buy", "target_dollars": 450.0, "quotable": True}}})
+        aaa_hi = [o for o in out_hi["orders"] if o["ticker"] == "AAA"]
+        ok("T9 room > ceiling still tranches (450 / 400 -> 2)", len(aaa_hi) == 2, len(aaa_hi))
+        ok("T9 every tranche <= the calculated ceiling (400)",
+           all(o["dollar_amount"] <= 400.0 for o in aaa_hi), aaa_hi)
+        ok("T9 tranche sum == the name's room (450)", abs(sum(o["dollar_amount"] for o in aaa_hi) - 450.0) < 0.01)
+        ok("T9 each tranche indexed", {o["tranche"] for o in aaa_hi} == {1, 2})
         # cash-bound: tranches never exceed buying_power - buffer
         out2 = tick._run_plan(cfg, led, {
             "now_iso": "2026-06-20T10:00:00-04:00", "equity": 0.0, "buying_power": 120.0,
@@ -242,6 +256,39 @@ def main() -> int:
             "target_weights": {"AAA": {"intent": "buy", "target_dollars": 350.0, "quotable": True}}})
         spent = sum(o["dollar_amount"] for o in out2["orders"] if o["ticker"] == "AAA")
         ok("T9 multi-tranche still bounded by buying_power - buffer (<=115)", spent <= 115.0 + 1e-6, spent)
+
+    # --- CAP: per-trade + daily caps are CALCULATED from live equity (no fixed $ knob) ----------
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d))  # per_name_max_pct=80
+        # A funded ALL-CASH account: deployable = buying_power = $10,000. positions {} does NOT
+        # collapse the base to ~0 (the freshly-funded fix — the base is DEPLOYABLE, not the broker's
+        # positions-only equity). eff_ceiling = 80% x 10k = $8,000, so a $2,000 target deploys in ONE
+        # order — 20x what the deleted fixed $100 cap allowed, scaling with the account automatically.
+        out = tick._run_plan(cfg, led, {
+            "now_iso": "2026-06-20T10:00:00-04:00", "equity": 0.0, "buying_power": 10000.0,
+            "positions": {}, "quotes": {"AAA": 50.0}, "analyses": [],
+            "target_weights": {"AAA": {"intent": "buy", "target_dollars": 2000.0, "quotable": True}}})
+        aaa = [o for o in out["orders"] if o["ticker"] == "AAA"]
+        ok("cap: funded all-cash account DEPLOYS (base is deployable, not $0)",
+           sum(o["dollar_amount"] for o in aaa) > 0, aaa)
+        ok("cap: $2k target on a $10k account -> ONE order (calculated ceiling $8k > room)",
+           len(aaa) == 1 and abs(aaa[0]["dollar_amount"] - 2000.0) < 0.01, aaa)
+
+    with tempfile.TemporaryDirectory() as d:
+        # Phantom-order guard (adversarial survivor): a tiny account where eff_ceiling < the economic
+        # minimum. per_name_max_pct=25, deployable = $15 -> eff_ceiling = 25% x 15 = $3.75 < buy_min
+        # $5. A $7.5 target clears the name_budget gate (avail cash $10) but every tranche is < $5, so
+        # the loop places NOTHING. It must record a clean SKIP — never a phantom status="order" $0 row.
+        cfg, led = _mk(Path(d), per_name_max_pct=25)
+        out = tick._run_plan(cfg, led, {
+            "now_iso": "2026-06-20T10:00:00-04:00", "equity": 0.0, "buying_power": 15.0,
+            "positions": {}, "quotes": {"AAA": 50.0}, "analyses": [],
+            "target_weights": {"AAA": {"intent": "buy", "target_dollars": 7.5, "quotable": True}}})
+        aaa_orders = [o for o in out["orders"] if o["ticker"] == "AAA"]
+        aaa_decs = [x for x in out["decisions"] if x.get("ticker") == "AAA"]
+        ok("cap: eff_ceiling < buy_min emits NO order", aaa_orders == [], aaa_orders)
+        ok("cap: eff_ceiling < buy_min records a SKIP, not a phantom 'order'",
+           len(aaa_decs) >= 1 and all(x.get("status") == "skipped" for x in aaa_decs), aaa_decs)
 
     # --- T9: run_lock atomic acquire + stale steal -----------------------------
     with tempfile.TemporaryDirectory() as d:

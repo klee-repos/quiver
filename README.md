@@ -161,14 +161,15 @@ still inside every limit you set.
 
 ## Settings (`config.yaml`)
 
-Everything Quiver does is set here. The starting values are small and careful — made for a tiny
-account. If you fund it with more, raise the dollar limits to match.
+Everything Quiver does is set here. There is **no fixed dollar cap on trade size** — the per-trade
+and per-day limits are worked out from your live account every time it runs, so they scale
+automatically as you add or lose money. Nothing to bump by hand.
 
 | Setting | Example | What it means (in plain words) |
 |---|---|---|
 | `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
-| `max_dollars_per_trade` | `25` | The most it can spend on any single buy. |
-| `daily_capital_deploy_cap` | `75` | The most it can spend buying in one day, total. |
+| *(per-trade limit)* | *calculated* | No knob. The most any single buy can be = your book's max-per-name % (`strategy.yaml` `per_name_max_pct`, default 25%) of your live account. Scales with the account. |
+| *(per-day limit)* | *calculated* | No knob. Total buys in a day are bounded by your live cash and your target weights, not a fixed dollar figure. |
 | `daily_loss_halt_pct` | `5.0` | If you're down this much in a day, it stops everything. |
 | `min_buying_power_buffer` | `5` | Always leave at least this much cash untouched. |
 | `intraday_enabled` | `false` | `false` = trade once a day. `true` = let it check a few times a day. |

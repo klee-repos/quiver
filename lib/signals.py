@@ -127,6 +127,25 @@ def resolve_buy_dollars(
     return (round(capped, 2), source)
 
 
+def per_trade_ceiling(equity: Optional[float], per_name_max_pct: Optional[float]) -> float:
+    """Largest notional a single order may be — CALCULATED from the live account, no fixed cap.
+
+    = ``per_name_max_pct`` % of ``equity``: a single order can never exceed what the book's
+    OWN max-per-name concentration (strategy.yaml ``risk_policy.per_name_max_pct`` — the same %
+    the allocator caps a name's target WEIGHT at) allows a single position to be. There is no
+    hardcoded dollar cap; the ceiling scales with the account every tick. In the live book it is
+    >= any name's target room (target weight <= per_name_max_pct), so a name deploys to target in
+    ONE order instead of dribbling in fixed-size tranches.
+
+    Fails CLOSED: non-positive ``equity`` or ``per_name_max_pct`` -> 0.0, which every caller
+    treats as SKIP (min() collapses to 0 / the tranche loop emits nothing). A broken or zero
+    account snapshot can therefore never fail OPEN to an unbounded order. Pure + total; unit-tested.
+    """
+    if not equity or equity <= 0 or not per_name_max_pct or per_name_max_pct <= 0:
+        return 0.0
+    return round(per_name_max_pct / 100.0 * equity, 2)
+
+
 def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:
     """Shares to sell. Full close -> all held; trim -> a fraction of held.
 
