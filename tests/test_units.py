@@ -233,23 +233,93 @@ check_true("text shows ticker + signal", "AAPL" in _d["text"] and "Buy" in _d["t
 check_true("dry-run renders 'no order placed'", "no order placed" in _d["text"])
 check_true("html is summarized (~1 screen)", len(_d["html"]) < 20000)
 
-# --- notify Telegram render + lib/telegram egress ---------------------------
+# --- notify Telegram render: HUMAN PROSE (sentences, not templated lists) ----
+# The Telegram body reads like a person texting the summary. These asserts run ONLY against
+# build_digest(m)["telegram"] (never the email html/text renders, whose palette legitimately
+# contains a `•` glyph), and cover the render that actually changed.
 _tg = _d["telegram"]
-check_true("digest telegram is compact + under the 4096 cap", 0 < len(_tg) <= 4096)
-check_true("digest telegram shows ticker + signal (compact line)", "AAPL" in _tg and "Buy" in _tg)
-check_true("digest telegram uses a <b> headline (Telegram HTML)", "<b>Quiver" in _tg)
+check_true("digest telegram under the 4096 cap", 0 < len(_tg) <= 4096)
+check_true("digest telegram keeps a <b>Quiver headline", "<b>Quiver" in _tg)
+# prose, NOT a templated list: no bullet char, no U+2192 arrow, no 'N buy / N sell' slash header,
+# no numbered '1. ' step list
+check_true("digest telegram has NO bullet/arrow/slash-count/numbered-list markers",
+           "•" not in _tg and "→" not in _tg and " buy / " not in _tg and "1. " not in _tg)
+check_true("digest telegram reads as sentences (has '. ' and closes on a tag)",
+           ". " in _tg and _tg.rstrip().endswith("</i>"))
+# names the ticker + conveys the action in words (AAPL is a paper buy, MSFT a hold)
+check_true("digest telegram names ticker + action in prose",
+           "AAPL" in _tg and "bought" in _tg.lower() and "MSFT" in _tg and "held" in _tg.lower())
 # escaping: a stray <b> in dynamic ticker detail is NEVER emitted as a live tag
 _m_evil = copy.deepcopy(MODEL)
 _m_evil["tickers"][0].update(detail="<b>evil</b> & co", status="skipped", intent="skip")
 _tg_evil = notify.build_digest(_m_evil)["telegram"]
-check_true("telegram escapes dynamic text (no injected <b>)", "&lt;b&gt;evil&lt;/b&gt;" in _tg_evil)
-# account-risk line carried to Telegram when present (adversarial LOW patch)
+check_true("telegram escapes dynamic detail (no injected <b>)",
+           "&lt;b&gt;evil&lt;/b&gt;" in _tg_evil and "<b>evil" not in _tg_evil)
+# a NON-dry-run PLACED live fill renders as prose with a SHORT greppable order ref — never the
+# full UUID wall, and never mislabeled 'would have' (live != paper). Covers the real-trade
+# branch + the broker_order_id[:8] slice + sell verb.
+_m_live = copy.deepcopy(MODEL)
+_m_live["dry_run"] = False
+_m_live["tickers"] = [{"ticker": "NVDA", "signal": "Sell", "intent": "sell", "status": "placed",
+                       "detail": None, "amount": 50.0, "qty": None, "side": "sell",
+                       "broker_order_id": "abcd1234-ef56-7890-1234-567890abcdef"}]
+_tg_live = notify.build_digest(_m_live)["telegram"]
+check_true("telegram placed fill: prose + short order ref, no UUID wall, not 'would have'",
+           "Sold $50.00 of NVDA" in _tg_live and "order #abcd1234" in _tg_live
+           and "567890abcdef" not in _tg_live and "would have" not in _tg_live.lower())
+# a single-share whole-share order is singular ("1 share", never "1 shares")
+_m_1sh = copy.deepcopy(MODEL)
+_m_1sh["dry_run"] = False
+_m_1sh["tickers"] = [{"ticker": "BRKB", "signal": "Buy", "intent": "buy", "status": "placed",
+                      "amount": None, "qty": 1, "side": "buy", "broker_order_id": "z9"}]
+check_true("telegram singularizes a single-share order",
+           "1 share of BRKB" in notify.build_digest(_m_1sh)["telegram"]
+           and "1 shares" not in notify.build_digest(_m_1sh)["telegram"])
+# blocked_guardrail + per-ticker error surface a HUMANIZED reason; a None detail never emits
+# empty parens "()"
+_m_bx = copy.deepcopy(MODEL)
+_m_bx["tickers"] = [
+    {"ticker": "TSLA", "signal": "Buy", "intent": "buy", "status": "blocked_guardrail",
+     "detail": "consistency:ungrounded_reversal"},
+    {"ticker": "AMD", "signal": "ERROR", "intent": "skip", "status": "error", "detail": None}]
+_tg_bx = notify.build_digest(_m_bx)["telegram"]
+check_true("telegram surfaces blocked + error with humanized reason, no empty parens",
+           "Held off on TSLA (consistency ungrounded reversal)" in _tg_bx
+           and "Hit a snag on AMD (see logs)" in _tg_bx and "()" not in _tg_bx)
+# grouped no-trades: identical deferral reason collapses into ONE prose sentence (not per-line)
+_m_grp = copy.deepcopy(MODEL)
+_m_grp["tickers"] = [
+    {"ticker": t, "signal": "Underweight", "intent": "sell", "status": "skipped",
+     "detail": "deferred_to_rebalance_trim"} for t in ("BSOL", "CEG", "DLR")]
+check_true("telegram groups same-reason no-trades into one sentence",
+           "Left BSOL, CEG and DLR alone (deferred to rebalance trim)."
+           in notify.build_digest(_m_grp)["telegram"])
+# a DOWN day says 'down 6.10%' — the mood word carries the sign; NO '-6.10%' collision
+_m_dn = copy.deepcopy(MODEL)
+_m_dn.update(dry_run=False, equity=961.0, baseline_equity=1024.0, drop_pct=-6.1,
+             halted=False, halt_reason=None, tickers=[])
+_tg_dn = notify.build_digest(_m_dn)["telegram"]
+check_true("telegram down-day uses 'down 6.10%', no signed-percent collision",
+           "down 6.10% today" in _tg_dn and "-6.10%" not in _tg_dn)
+# 'started at' clause is gated on a baseline being present (no 'started at —.')
+_m_nob = copy.deepcopy(MODEL)
+_m_nob.update(baseline_equity=None, tickers=[])
+check_true("telegram omits 'started at' when baseline is absent",
+           "started at" not in notify.build_digest(_m_nob)["telegram"])
+# account-risk numbers carried to Telegram in prose; a fresh box (drawdown only, Sharpe None)
+# reads cleanly with no dangling 'Sharpe None over 0 days'
 _m_ar = copy.deepcopy(MODEL)
 _m_ar["account_risk"] = {"drawdown_pct": 3.2, "sharpe": 1.1, "sharpe_n": 9}
-check_true("telegram digest carries the account-risk line",
-           "Account risk" in notify.build_digest(_m_ar)["telegram"])
-# adding the telegram render must NOT perturb the dedup hash
-check("telegram addition leaves content_hash unchanged", notify.build_digest(MODEL)["content_hash"],
+check_true("telegram digest carries the account-risk numbers in prose",
+           "3.2% max drawdown" in notify.build_digest(_m_ar)["telegram"]
+           and "Sharpe" in notify.build_digest(_m_ar)["telegram"])
+_m_ar2 = copy.deepcopy(MODEL)
+_m_ar2["account_risk"] = {"drawdown_pct": 0.0, "sharpe": None, "sharpe_n": 0}
+_tg_ar2 = notify.build_digest(_m_ar2)["telegram"]
+check_true("telegram risk line omits Sharpe cleanly when it is None (fresh box)",
+           "0.0% max drawdown" in _tg_ar2 and "Sharpe" not in _tg_ar2 and "None" not in _tg_ar2)
+# the render must NOT perturb the dedup hash (content_hash derives from the MODEL, not prose)
+check("telegram render leaves content_hash unchanged", notify.build_digest(MODEL)["content_hash"],
       notify.digest_hash(MODEL))
 # is_silent policy: routine digest pings LOUD by default (daily heartbeat); only an explicit
 # loud_digest=False silences it; halted digest + every alert ALWAYS loud.
@@ -259,7 +329,7 @@ check("digest silenced only when loud_digest is False",
 check("halted digest is loud even when loud_digest is False",
       notify.is_silent({**MODEL, "loud_digest": False, "halted": True}), False)
 check("auth_error alert is loud", notify.is_silent({"kind": "auth_error"}), False)
-# telegram alert kinds: escaped detail, under cap, re-auth URL for auth_error
+# telegram alert kinds: prose (no numbered list), escaped detail, under cap, re-auth URL
 for _k, _ex in (("auth_error", {"event_detail": "401 <t> & x"}),
                 ("halt", {"halted": True, "halt_reason": "-6% <x>"}),
                 ("error", {"severity": "critical", "stage": "plan", "event_detail": "<boom> & bust"})):
@@ -267,7 +337,11 @@ for _k, _ex in (("auth_error", {"event_detail": "401 <t> & x"}),
            "subject_prefix": "[Quiver]", "tickers": [], **_ex}
     _r = notify.build_digest(_mm)["telegram"]
     check_true(f"telegram {_k} under the cap", len(_r) <= 4096)
-    check_true(f"telegram {_k} escapes raw < in detail", "<t>" not in _r and "<boom>" not in _r)
+    check_true(f"telegram {_k} escapes raw < in detail",
+               "<t>" not in _r and "<boom>" not in _r and "<x>" not in _r)
+    check_true(f"telegram {_k} is prose, not a numbered step list",
+               "1. " not in _r and "2. " not in _r)
+    check_true(f"telegram {_k} leads with a bold headline sentence", _r.startswith("<b>"))
 check_true("telegram auth_error carries the re-auth URL",
            "remotedesktop.google.com" in notify.build_digest(
                {"date": "d", "now_iso": "t", "kind": "auth_error", "dry_run": False,

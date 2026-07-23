@@ -562,12 +562,15 @@ def _render_html(model: dict) -> str:
 
 
 # --- Telegram render (the alert channel) -------------------------------------
-# A COMPACT, mobile-first restructuring — NOT the email HTML. Telegram caps a message at
-# 4096 chars and renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>), so the digest drops
-# the per-ticker decision/debate prose (recoverable via the read-only chat bridge) and keeps
-# one glanceable line per ticker; the alert kinds keep their headline + "what to do" + detail.
-# The sender (lib/telegram) chunks anything that still overflows and falls back to plain text
-# on a parse error, so nothing is ever lost.
+# The Telegram messages read like a person texting you the day's summary — flowing
+# SENTENCES, never a templated bullet list, a "N buy / N sell / N hold" header, a numbered
+# step list, or a raw machine code / UUID wall. It is still deterministic Python prose (NO
+# LLM, NO network): lib/notify stays a pure renderer, so content_hash (digest_hash, computed
+# off the MODEL) is unaffected by any wording here. Telegram caps a message at 4096 chars and
+# renders a small HTML subset (<b>/<i>/<code>/<pre>/<a>); the sender (lib/telegram) chunks any
+# overflow and falls back to plain text on a parse error, so nothing is ever lost. Per-ticker
+# decision/debate prose is dropped (recoverable via the read-only chat bridge). EVERY dynamic
+# value is escaped via _te; only the fixed tags are literal.
 _TG_DETAIL_CAP = 600
 
 
@@ -590,83 +593,251 @@ def is_silent(model: dict) -> bool:
     return not model.get("loud_digest", True)
 
 
-def _render_telegram(model: dict) -> str:
-    """Render ``model`` into a compact Telegram-HTML message (restructured for a phone).
+def _tg_join(names) -> str:
+    """English list-join of ESCAPED names: ``[]`` -> "", ``[A]`` -> "A", ``[A, B]`` ->
+    "A and B", ``[A, B, C]`` -> "A, B and C". Each name is escaped via ``_te``. Falsy names
+    are dropped, so an empty/whitespace ticker never yields a dangling comma."""
+    xs = [_te(n) for n in names if n is not None and str(n).strip()]
+    if not xs:
+        return ""
+    if len(xs) == 1:
+        return xs[0]
+    if len(xs) == 2:
+        return f"{xs[0]} and {xs[1]}"
+    return ", ".join(xs[:-1]) + f" and {xs[-1]}"
 
-    All dynamic text is escaped via ``_te``; only fixed tags are literal. Bare URLs in the
-    action steps are auto-linked by Telegram. A per-field length guard plus the sender's
-    chunker keep it under the 4096 cap.
-    """
-    kind = model.get("kind", "digest")
+
+def _tg_join_clauses(items) -> str:
+    """Like ``_tg_join`` but for ALREADY-composed/escaped clauses (e.g. "TSLA (guardrail)"),
+    which are emitted verbatim rather than re-escaped."""
+    xs = [c for c in items if c]
+    if not xs:
+        return ""
+    if len(xs) == 1:
+        return xs[0]
+    if len(xs) == 2:
+        return f"{xs[0]} and {xs[1]}"
+    return ", ".join(xs[:-1]) + f" and {xs[-1]}"
+
+
+def _tg_humanize(detail) -> str:
+    """Turn a machine detail code into readable words for a human sentence:
+    ``deferred_to_rebalance_trim`` -> "deferred to rebalance trim",
+    ``consistency:ungrounded_reversal`` -> "consistency ungrounded reversal". Returns ""
+    for a falsy / plain-hold detail. NOT escaped here — the caller escapes at interpolation."""
+    return re.sub(r"\s+", " ", re.sub(r"[_:]+", " ", str(detail or ""))).strip()
+
+
+def _tg_sized(r: dict) -> str:
+    """The human size of an order: "$8.93" (dollar), or "3 shares" / "1 share" (whole-share
+    limit order, singular/plural agreed), or "" when neither is known. Never spells the count
+    as a word (would read "one shares")."""
+    amount, qty = r.get("amount"), r.get("qty")
+    if amount is not None:
+        return _fmt_money(amount)
+    if qty is not None:
+        try:
+            q = float(qty)
+            n = int(q) if q == int(q) else q
+        except (TypeError, ValueError):
+            n = qty
+        return f"{n} share" + ("" if str(n) == "1" else "s")
+    return ""
+
+
+def _tg_order_phrase(verb: str, sized: str, ticker: str, suffix: str = "") -> str:
+    """"bought $8.93 of BOT (order #6a62…)" — or "bought BOT" when the size is unknown (no
+    dangling "of")."""
+    if sized:
+        return f"{verb} {sized} of {ticker}{suffix}"
+    return f"{verb} {ticker}{suffix}"
+
+
+def _tg_steps_prose(model: dict) -> str:
+    """Fold the operator-recovery ``action_steps`` (already full sentences) into ONE flowing
+    paragraph — a person texting you how to fix it, not a numbered list. Each step is escaped;
+    bare URLs in them are auto-linked by Telegram. Returns "" when there are no steps (a
+    warning-severity hiccup)."""
+    return " ".join(_te(s) for s in action_steps(model))
+
+
+def _tg_actions(tickers, dry_run: bool) -> list:
+    """Describe what happened to the book as prose sentences, grouped by OBSERVED OUTCOME
+    (honest — not the intent counts): each real/paper order is its own capitalized sentence
+    (commas inside money like "$1,024.00" make a comma-joined clause list ambiguous), while
+    holds and same-reason no-trades collapse into one grouped sentence each."""
+    real, paper, blocked, errored, held = [], [], [], [], []
+    stood: dict = {}  # humanized reason -> [ticker, ...]
+    for r in tickers:
+        t = _te(r.get("ticker") or "?")
+        raw_t = r.get("ticker") or "?"
+        status = (r.get("status") or "").lower()
+        intent = (r.get("intent") or "").lower()
+        side = (r.get("side") or intent or "").lower()
+        verb = {"buy": "bought", "sell": "sold"}.get(side, "traded")
+        sized = _tg_sized(r)
+        if status == "error":
+            errored.append(f"{t} ({_te(_tg_humanize(r.get('detail')) or 'see logs')})")
+        elif status == "blocked_guardrail":
+            blocked.append(f"{t} ({_te(_tg_humanize(r.get('detail')) or 'guardrail')})")
+        elif status in ("hold", "skipped") or intent in ("hold", "skip"):
+            reason = _tg_humanize(r.get("detail"))
+            if reason and reason.lower() != "hold":
+                stood.setdefault(reason, []).append(raw_t)
+            else:
+                held.append(raw_t)
+        elif status == "dry_run" or dry_run:  # a simulated (paper) order — dry-run wins
+            paper.append(_tg_order_phrase("would have " + verb, sized, t))
+        elif status == "placed":
+            bid = r.get("broker_order_id")
+            suffix = f" (order #{_te(str(bid)[:8])})" if bid else ""  # short greppable ref
+            real.append(_tg_order_phrase(verb, sized, t, suffix))
+        elif sized:  # a real order in flight (pending/other) that carries a size
+            real.append(_tg_order_phrase(verb, sized, t, f" ({_te(status or 'pending')})"))
+        else:  # nothing sized and not a recognized no-trade — treat as held, never a bare clause
+            held.append(raw_t)
+
+    sentences = []
+    for clause in real + paper:  # each order its own sentence (capitalized) — no comma-join
+        sentences.append(clause[:1].upper() + clause[1:] + ".")
+    if blocked:
+        sentences.append("Held off on " + _tg_join_clauses(blocked) + ".")
+    if errored:
+        sentences.append("Hit a snag on " + _tg_join_clauses(errored) + ".")
+    if held:
+        sentences.append("Held " + _tg_join(sorted(held)) + ".")
+    for reason in sorted(stood):
+        sentences.append("Left " + _tg_join(sorted(stood[reason])) + f" alone ({_te(reason)}).")
+    if not (real or paper) and not blocked and not errored and (held or stood):
+        sentences.insert(0, "Quiet session — no orders placed.")
+    return sentences
+
+
+def _tg_risk_sentence(ar: dict) -> str:
+    """One prose risk line, each clause composed independently so a fresh box (drawdown present
+    but Sharpe still None) reads cleanly, and day(s) agrees on N."""
+    dd, sh = ar.get("drawdown_pct"), ar.get("sharpe")
+    bits = []
+    if dd is not None:
+        bits.append(f"{dd:.1f}% max drawdown")
+    if sh is not None:
+        n = ar.get("sharpe_n", 0)
+        bits.append(f"a {sh:.2f} daily Sharpe over {n} day" + ("" if n == 1 else "s"))
+    return "Risk check: " + " and ".join(bits) + "." if bits else ""
+
+
+def _render_telegram_alert(model: dict, kind: str) -> str:
+    """A halt / auth_error / error page as a human text: a bold headline sentence, a plain
+    explanation, the recovery folded into a flowing paragraph, the raw detail in a code block,
+    and a generated-at footer. NO numbered list."""
+    sev = severity_of(model)
+    stg = _te(stage_of(model) or "tick")
+    lines = []
+    if kind == "auth_error":
+        lines.append("<b>⚠️ Quiver stopped — broker login expired.</b>")
+        lines.append("The broker token was rejected, so the tick stopped without placing any "
+                     "trades. It'll pick back up on its own once you re-auth.")
+    elif kind == "halt":
+        lines.append("<b>🛑 Quiver halted trading — it won't restart on its own.</b>")
+        lines.append("The daily-loss kill-switch fired: "
+                     f"{_te(model.get('halt_reason') or 'daily-loss limit hit')}. "
+                     "Nothing will trade until you step in.")
+    elif sev == "warning":
+        lines.append(f"<b>⚠️ Quiver had a hiccup at the {stg} step.</b>")
+        lines.append("It was a best-effort step, so the tick was unaffected and it self-heals "
+                     "on the next wake.")
+    else:
+        lines.append(f"<b>✖️ Quiver's tick failed at the {stg} stage.</b>")
+        lines.append("It stopped, so nothing traded this wake — it'll retry from the top on "
+                     "the next wake.")
+    steps = _tg_steps_prose(model)
+    if steps:
+        lines.append(("To fix it: " if kind == "auth_error" else "What to do: ") + steps)
+    detail = model.get("event_detail")
+    if detail:
+        lines.append(f"Detail: <pre>{_te(summarize(detail, _TG_DETAIL_CAP))}</pre>")
+    lines.append(f"<i>generated {_te(model.get('now_iso', ''))}</i>")
+    return "\n".join(lines)
+
+
+def _render_telegram_digest(model: dict) -> str:
+    """The run-complete digest as a human text: a bold P&L lead, the day's actions grouped by
+    outcome into flowing sentences, a short risk/warnings paragraph, and an italic footer."""
+    dry = bool(model.get("dry_run"))
     date = _te(model.get("date", ""))
-    mode = "DRY RUN" if model.get("dry_run") else "LIVE"
-    lines: list = []
+    eq, base, drop = model.get("equity"), model.get("baseline_equity"), model.get("drop_pct")
+    paras = []  # each entry is one flowing paragraph; joined with a blank line
 
-    if kind in ("auth_error", "halt", "error"):
-        sev = severity_of(model)
-        stg = stage_of(model) or "tick"
-        if kind == "auth_error":
-            lines.append(f"<b>⚠ Quiver — AUTH ERROR</b> · {date}")
-            lines.append("The broker token was rejected; the tick stopped without trading.")
-        elif kind == "halt":
-            lines.append(f"<b>🛑 Quiver — HALT</b> · {date}")
-            lines.append("Trading stopped and will NOT auto-resume: "
-                         f"{_te(model.get('halt_reason') or 'daily-loss kill-switch fired')}.")
-        elif sev == "warning":
-            lines.append(f"<b>⚠ Quiver — {_te(stg)} hiccup</b> (tick continued) · {date}")
-            lines.append("A best-effort step hiccuped; the tick was unaffected and self-heals.")
-        else:
-            lines.append(f"<b>✖ Quiver — TICK FAILED at {_te(stg)}</b> · {date}")
-            lines.append("The tick stopped. Trading is paused for this wake.")
-        steps = action_steps(model)
-        if steps:
-            lines.append("")
-            lines.append("<b>What to do</b>")
-            for i, s in enumerate(steps, 1):
-                lines.append(f"{i}. {_te(s)}")
-        detail = model.get("event_detail")
-        if detail:
-            lines.append("")
-            lines.append(f"<pre>{_te(summarize(detail, _TG_DETAIL_CAP))}</pre>")
-        lines.append("")
-        lines.append(f"<i>generated {_te(model.get('now_iso', ''))}</i>")
-        return "\n".join(lines)
-
-    # digest (run complete)
-    nbuy, nsell, nhold = _counts(model.get("tickers", []))
-    tag = " [DRY RUN]" if model.get("dry_run") else ""
-    money = (f"{_fmt_pct(model.get('drop_pct'))} {_fmt_money(model.get('equity'))} · "
-             if model.get("equity") is not None else "")
-    lines.append(f"<b>Quiver · {money}{nbuy} buy / {nsell} sell / {nhold} hold{tag}</b> · {date}")
-    lines.append(f"[{mode}] equity {_te(_fmt_money(model.get('equity')))} "
-                 f"(baseline {_te(_fmt_money(model.get('baseline_equity')))}, "
-                 f"{_te(_fmt_pct(model.get('drop_pct')))})")
-    ar = model.get("account_risk") or {}
-    if ar.get("drawdown_pct") is not None or ar.get("sharpe") is not None:
-        lines.append(_te(_account_risk_line(ar)))
     if model.get("halted"):
-        lines.append(f"🛑 HALT: {_te(model.get('halt_reason') or 'daily-loss kill-switch fired')}")
+        paras.append("🛑 <b>Quiver halted trading</b> — the daily-loss kill-switch fired "
+                     f"({_te(model.get('halt_reason') or 'daily loss')}).")
+
+    # Lead P&L sentence + the action sentences flow together as ONE paragraph (a human text).
+    paper = " (paper run)" if dry else ""
+    if eq is not None:
+        try:
+            d = float(drop) if drop is not None else None
+        except (TypeError, ValueError):
+            d = None
+        # The mood WORD carries direction, so the percent is a sign-stripped magnitude (never
+        # _fmt_pct, which would force "down -6.10%").
+        if d is None:
+            pnl = f" — sitting at {_fmt_money(eq)}"
+        elif d > 0.05:
+            pnl = f" — up {abs(d):.2f}% today, now at {_fmt_money(eq)}"
+        elif d < -0.05:
+            pnl = f" — down {abs(d):.2f}% today, at {_fmt_money(eq)}"
+        else:
+            pnl = f" — flat on the day at {_fmt_money(eq)}"
+        base_s = f", started at {_fmt_money(base)}" if base is not None else ""
+        lead = f"<b>Quiver</b>{paper}{pnl}{base_s}."
+    else:
+        lead = f"<b>Quiver</b>{paper} — daily run for {date}."
+
     tickers = model.get("tickers", [])
     if not tickers:
-        lines.append("(no tickers analyzed this run)")
+        actions = ["No tickers were analyzed this run."]
     else:
-        lines.append("")
-        for r in tickers:
-            lines.append(f"• <b>{_te(r.get('ticker', '?'))}</b> {_te(r.get('signal', '?'))} "
-                         f"→ {_te(_traded_line(r, bool(model.get('dry_run'))))}")
+        actions = []
+        # A qualitative directional lean (from intent counts) — the at-a-glance stance, honest
+        # and number-free so it never contradicts the outcome grouping below.
+        nb, ns, _ = _counts(tickers)
+        if nb != ns and (nb + ns) > 0:
+            actions.append(f"Signals leaned {'bullish' if nb > ns else 'cautious'} today.")
+        actions += _tg_actions(tickers, dry)
+    paras.append(" ".join([lead] + actions))
+
+    # A second short paragraph: account risk + any best-effort warnings.
+    ctx = []
+    risk = _tg_risk_sentence(model.get("account_risk") or {})
+    if risk:
+        ctx.append(risk)
     warnings = model.get("warnings") or []
     if warnings:
-        ws = "; ".join(f"{_te(w.get('stage', '?'))}: {_te(summarize(w.get('detail'), 120))}"
-                       for w in warnings)
-        lines.append("")
-        lines.append(f"<i>FYI (tick unaffected)</i>: {ws}")
-    lines.append("")
-    foot = "reasoning in state/analyze_logs/ · ask the chat bot for details"
+        ws = _tg_join_clauses([f"{_te(_tg_humanize(w.get('stage')) or '?')} "
+                               f"({_te(summarize(w.get('detail'), 120))})" for w in warnings])
+        ctx.append(f"Heads up — {ws}, but the tick was unaffected.")
+    if ctx:
+        paras.append(" ".join(ctx))
+
+    foot = "Full reasoning's in state/analyze_logs/ — ask the chat bot for details."
     pager = model.get("pager_armed")
     if pager is not None:
-        foot += f" · pager: {'armed' if pager else 'NOT configured'}"
-    lines.append(f"<i>{_te(foot)}</i>")
-    return "\n".join(lines)
+        foot += " Pager armed." if pager else " Pager NOT configured."
+    paras.append(f"<i>{_te(foot)}</i>")
+    return "\n\n".join(paras)
+
+
+def _render_telegram(model: dict) -> str:
+    """Render ``model`` into a human-text Telegram-HTML message (prose, not a templated list).
+
+    All dynamic text is escaped via ``_te``; only fixed tags are literal. Bare URLs in the
+    recovery prose are auto-linked by Telegram. The sender's chunker keeps it under 4096.
+    """
+    kind = model.get("kind", "digest")
+    if kind in ("auth_error", "halt", "error"):
+        return _render_telegram_alert(model, kind)
+    return _render_telegram_digest(model)
 
 
 def build_digest(model: dict) -> dict:
