@@ -1235,6 +1235,17 @@ _cfg_full = make_memory_config({"low_confidence_min_n": 2})
 _ctx = rmem.safe_build_context(_rmled, "AAPL", _cfg_full)
 check("safe_build_context source enriched", _ctx.source, "enriched")
 check_true("full context >= compact (more recent decisions)", len(_ctx.full) >= len(_ctx.compact))
+
+# F4: the advisory stance block now states the BIDIRECTIONAL consistency contract (a reversal is
+# grounded by a named catalyst OR a named trend-structure change; a stale stance the current trend
+# contradicts is itself an inconsistency). STILL advisory — the BINDING gate is Python, unchanged.
+_stance = rmem._stance_block(_rmled, "AAPL")
+check_true("F4: stance block non-empty (>=2 directional decisions)", bool(_stance))
+check_true("F4: contract cuts BOTH ways", "cuts BOTH ways" in _stance)
+check_true("F4: reversal grounded by catalyst OR trend-structure change",
+           "trend STRUCTURE" in _stance and "regime flip" in _stance)
+check_true("F4: a stance the trend contradicts is itself inconsistent",
+           "itself an inconsistency" in _stance)
 check_true("enriched context carries the per-ticker block", "deterministic risk/return" in _ctx.full)
 check_true("bundle returned for snapshot reuse", _ctx.bundle is not None)
 
@@ -3195,6 +3206,10 @@ check("rating: label tolerant of markdown bold", _rating.parse_rating("blah\n**R
 check("rating: falls back to first 5-tier word", _rating.parse_rating("we rate this a Hold for now"), "Hold")
 check("rating: no rating word -> default Hold", _rating.parse_rating("nothing here"), "Hold")
 check("rating: default arg respected", _rating.parse_rating("nothing", default="Sell"), "Sell")
+# F7: default=None makes a total-miss FAIL-SAFE (None -> contract violation -> signal:ERROR) instead
+# of a silent bearish Hold; a present rating still parses (the other call sites keep default="Hold").
+check("rating F7: default=None -> None on total-miss", _rating.parse_rating("nothing here", default=None), None)
+check("rating F7: default=None still returns a present rating", _rating.parse_rating("**Rating**: Buy", default=None), "Buy")
 
 # lib/levers: the self-learning registry. Pure, wall-side, Python owns the SQLite.
 from lib import levers as _lev  # noqa: E402
@@ -3340,6 +3355,69 @@ check_true("trend: 12-1 computable on 280", _tr.momentum_12_1(_line(280, slope=0
 _md_tr = _tr.render_trend_report(_up)
 check_true("trend: render has no ## subheadings", not any(l.startswith("## ") for l in _md_tr.splitlines()))
 check("trend: None ADX -> RANGE", _tr.trend_regime(None, _tr.MAStats(None, None, None, None, None, None, None)), "RANGE")
+
+
+# === F1: structure-first trend_regime (the RANGE->UPTREND fix + H4/H5 guardrails) =====
+# The bug: a smooth multi-quarter uptrend in a normal pullback runs a MODERATE ADX (15-25)
+# and/or a temporarily-negative 50d slope, so the OLD ADX-first classifier stamped it RANGE
+# — and the HORIZON prompt made RANGE ineligible for a bullish rating. struct_up now reads
+# long-horizon STRUCTURE first (above a rising 200d + golden cross + positive 12-1), ADX second.
+_rg = _tr.trend_regime
+def _ma_fix(above, gc, s50, s200, off):
+    return _tr.MAStats(100.0, 90.0, s50, s200, above, gc, off)
+
+# BINDING PROOF: adx=19 (< REGIME_RANGE_ADX=20) — under the OLD `adx<20 -> RANGE` gate this was
+# forced RANGE; the ONLY path to UPTREND now is the new structure-first branch running FIRST.
+check("trend F1: SMH pullback adx19 -> UPTREND (old gate forced RANGE)",
+      _rg(19.0, _ma_fix(0.05, True, -0.01, 0.10, 0.12), mom_12_1=0.58, plus_di=39, minus_di=39), "UPTREND")
+# 50d-slope veto case: adx 22 (>=20) but negative 50d slope -> OLD `up` failed -> RANGE; now UPTREND.
+check("trend F1: pullback 50d-veto adx22 -> UPTREND (was RANGE)",
+      _rg(22.0, _ma_fix(0.03, True, -0.02, 0.11, 0.13), mom_12_1=0.60, plus_di=40, minus_di=41), "UPTREND")
+# H4 GUARDRAIL: a distributing top (DI- dominant AND >15% off the 52w high) is NOT a clean uptrend.
+check("trend F1/H4: distributing top (DI- dom, deep) -> RANGE (not UPTREND)",
+      _rg(23.0, _ma_fix(0.03, True, -0.02, 0.10, 0.22), mom_12_1=0.80, plus_di=21, minus_di=47), "RANGE")
+# GUARDRAIL: a rolled-over name (death cross, neg 12-1, falling+below 200d) stays DOWNTREND (L3: above<0).
+check("trend F1: CEG death-cross -> DOWNTREND (guardrail; above_200d<0)",
+      _rg(30.0, _ma_fix(-0.20, False, -0.05, -0.03, 0.30), mom_12_1=-0.16, plus_di=15, minus_di=40), "DOWNTREND")
+# young name (valid 200d but <253 rows so mom None) qualifies on structure alone (mom tolerant-None).
+check("trend F1: young mom=None on structure -> UPTREND",
+      _rg(15.0, _ma_fix(0.08, True, 0.01, 0.05, 0.05), mom_12_1=None, plus_di=25, minus_di=20), "UPTREND")
+# NO false positive: negative 12-1 despite up-structure blocks struct_up.
+check("trend F1: neg 12-1 blocks struct_up -> RANGE",
+      _rg(18.0, _ma_fix(0.05, True, -0.01, 0.10, 0.10), mom_12_1=-0.05, plus_di=30, minus_di=28), "RANGE")
+# NO false positive: falling 200d despite price above blocks struct_up.
+check("trend F1: falling 200d blocks struct_up -> RANGE",
+      _rg(18.0, _ma_fix(0.05, True, -0.01, -0.02, 0.10), mom_12_1=0.50, plus_di=30, minus_di=28), "RANGE")
+# genuine low-ADX chop (mixed 200d slope) stays RANGE.
+check("trend F1: low-adx chop -> RANGE",
+      _rg(12.0, _ma_fix(0.01, True, 0.0, -0.001, 0.10), mom_12_1=0.02, plus_di=22, minus_di=21), "RANGE")
+# existing steep fixtures unchanged (regression).
+check("trend F1: steep uptrend still UPTREND", _up.trend_regime, "UPTREND")
+check("trend F1: steep downtrend still DOWNTREND", _down.trend_regime, "DOWNTREND")
+
+# H5 wall-safety: F1 feeds signals.trend_gate_scalar (BUY-only, soft) — it is MONOTONICALLY
+# conservative: a DOWNTREND damps a buy to 0.5, UPTREND leaves it 1.0, and F1 never flips a real
+# downtrend UP (struct_up requires a rising 200d + positive 12-1), so it can only ADD damping.
+import lib.signals as _sig_h5
+check("trend F1/H5: DOWNTREND damps BUY (soft) -> 0.5", _sig_h5.trend_gate_scalar("DOWNTREND", None, "soft"), 0.5)
+check("trend F1/H5: UPTREND leaves BUY undamped (soft) -> 1.0", _sig_h5.trend_gate_scalar("UPTREND", 0.5, "soft"), 1.0)
+
+# integration through trend_metrics: proves mom_12_1 + DI are wired into the classifier at the
+# call site (H1) — a shallow pullback-in-uptrend now classifies UPTREND end-to-end.
+_rsF1 = _np.random.RandomState(3)
+_upF1 = 100 * _np.exp(_np.cumsum(_np.log(1.9) / 252 + _rsF1.normal(0, 0.02, 286)))
+_pullF1 = _upF1[-1] * _np.exp(_np.cumsum(-0.004 + _rsF1.normal(0, 0.02, 14)))
+_pxF1 = list(_upF1) + list(_pullF1)
+_bF1 = _tr.trend_metrics(_pxF1, high=[x * 1.008 for x in _pxF1], low=[x * 0.992 for x in _pxF1])
+check("trend F1: integration shallow-pullback -> UPTREND (mom wired at call site)", _bF1.trend_regime, "UPTREND")
+check_true("trend F1: integration mom_12_1 positive", _bF1.mom_12_1 is not None and _bF1.mom_12_1 > 0)
+
+# F2 renderer: separates trend STRENGTH from existence; DI- inside an uptrend reads as consolidation.
+import dataclasses as _dcF2
+_renderF1 = _tr.render_trend_report(_bF1)
+check_true("trend F2: ADX reframed as strength-not-existence", "STRENGTH" in _renderF1 and "existence" in _renderF1.lower())
+_bnoteUp = _dcF2.replace(_bF1, plus_di=30.0, minus_di=45.0, trend_regime="UPTREND")
+check_true("trend F2: DI- in uptrend = consolidation-not-reversal", "consolidation" in _tr._di_pressure_note(_bnoteUp).lower())
 
 
 # === F3: _split_eve_markdown section tolerance ==============================

@@ -1,8 +1,11 @@
 // Standalone Quiver decision brain — REAL multi-agent deep-research pipeline.
 //
-// WHY multi-turn (not the prior single generateText): instructions.md describes
-// a genuine gather -> bull/bear debate -> research plan -> trade proposal ->
-// risk debate -> PM decision flow. The prior decide.mjs collapsed that into one
+// WHY multi-turn (not the prior single generateText): the pipeline is a genuine
+// gather -> bull/bear debate -> research plan -> trade proposal -> risk debate ->
+// PM decision flow. (NOTE: quiver_eve/agent/instructions.md is DOCUMENTATION ONLY —
+// it is NEVER loaded at runtime; the LIVE prompts are the inline HORIZON + per-turn
+// strings in THIS file. Keep both in sync, but this file is the source of truth.)
+// The prior decide.mjs collapsed that into one
 // shot. This version runs each phase as its own model call, threading the
 // report text + the read-only past_context forward, and assembles the FINAL
 // markdown to carry EXACTLY the 8 `## section` blocks + 12 labels analyze.py
@@ -26,6 +29,7 @@ import { generateText, tool, isStepCount } from "ai";
 import { z } from "zod";
 import { runPythonDataTool } from "./quill_data.mjs";
 import { withRetry } from "./retry.mjs";
+import { readFileSync } from "node:fs";
 
 const TICKER = process.argv[2] || "AAPL";
 const DATE = process.argv[3] || "";
@@ -92,6 +96,9 @@ async function deepTurn(system, prompt) {
     model: DEEP,
     maxOutputTokens: 16000,
     providerOptions: { openrouter: { max_tokens: 16000, reasoning: { effort: "high" } } },
+    // temperature 0 ONLY under the offline replay seam (deterministic before/after diffs);
+    // undefined in production keeps the live provider default (unchanged brain behavior).
+    temperature: process.env.QUIVER_REPLAY_REPORTS ? 0 : undefined,
     system, prompt,
     stopWhen: isStepCount(1),
   });
@@ -106,6 +113,7 @@ async function quickTurn(system, prompt) {
     model: QUICK,
     maxOutputTokens: 6000,
     providerOptions: { openrouter: { max_tokens: 6000 } },
+    temperature: process.env.QUIVER_REPLAY_REPORTS ? 0 : undefined,
     system, prompt,
     stopWhen: isStepCount(1),
   });
@@ -140,11 +148,22 @@ const ADVISORY_UNAVAILABLE = "(unavailable — model returned no output after re
 
 const HORIZON = `You are the Quiver decision brain: a LONG-HORIZON TREND FOLLOWER. You ride
 multi-quarter to multi-year trends, NOT daily pops. Treat short-term noise (RSI overbought,
-Bollinger pops, single-day moves) as CONTEXT, never a thesis. Favor names with:
-a persistent trend (high ADX), constructive risk-adjusted return (Sharpe/Sortino/Calmar),
-tolerable drawdowns (depth AND duration), and positive multi-horizon momentum. A name with
-no clear trend edge is a HOLD — do not manufacture a trade. You NEVER see trading caps, the
-broker, or buying power; risk management is Python's job, downstream.`;
+Bollinger pops, single-day moves) as CONTEXT, never a thesis. "Edge" is a durable trend
+CONFIRMED BY STRUCTURE — price above a RISING 200-day SMA, a golden cross, and positive 12-1
+momentum, with constructive risk-adjusted return (Sharpe/Sortino/Calmar) and tolerable drawdowns
+(depth AND duration). Edge is NOT a high ADX: a smooth multi-quarter grind-up runs only a MODERATE
+14-period ADX (~15-25), so read the trend_report's REGIME LABEL as the trend read, not the ADX
+number. Your judgement cuts BOTH ways — you are as wrong to miss a standing uptrend as to chase a
+broken one:
+- A name in a CONFIRMED uptrend (constructive/UPTREND regime, positive 12-1 momentum, above a
+  rising 200d, tolerable drawdown) IS the edge a trend-follower exists to capture — rate it
+  Overweight, and a clear leader breaking out a Buy. A pullback INSIDE an intact uptrend is a place
+  to RIDE or ADD; do NOT default a healthy uptrend to Hold just because it paused for a week or two.
+- A name with genuinely NO durable trend (RANGE / no structural edge either way) is a HOLD — do
+  not manufacture a trade.
+- A name whose long-horizon trend has BROKEN (DOWNTREND regime, negative 12-1, below a falling
+  200d, a death cross) is Underweight/Sell.
+You NEVER see trading caps, the broker, or buying power; risk management is Python's job, downstream.`;
 
 const PAST = `Your prior calls on ${TICKER} (read-only memory scorecard — your own past
 decisions + outcomes, NOT limits):
@@ -196,7 +215,18 @@ oil spike or rate move that helps/hurts this name). If a tool returned UNAVAILAB
   });
   return r.text;
 }
-const reports = await withRetry("gather", runGather, { tries: 2, validate: (t) => hasSubheads(t, GATHER_NAMES) });
+// Offline eval seam (test infra; INERT in production — only fires when QUIVER_REPLAY_REPORTS is
+// set). Loads the 6 cached analyst reports from a prior audit JSON and reconstructs the
+// `### <name>` gather-turn text the downstream turns consume, so prompt changes can be replayed
+// against FIXED inputs with NO network/tool calls. Production (env unset) still runs runGather.
+function loadReplayReports(path) {
+  const j = JSON.parse(readFileSync(path, "utf8"));
+  const names = ["market_report", "trend_report", "fundamentals_report", "news_report", "sentiment_report", "macro_report"];
+  return names.map((n) => `### ${n}\n${(j[n] || "UNAVAILABLE: not in replay fixture").trim()}`).join("\n\n");
+}
+const reports = process.env.QUIVER_REPLAY_REPORTS
+  ? loadReplayReports(process.env.QUIVER_REPLAY_REPORTS)
+  : await withRetry("gather", runGather, { tries: 2, validate: (t) => hasSubheads(t, GATHER_NAMES) });
 
 process.stderr.write(`[decide] ticker=${TICKER} date=${DATE} rounds=${ROUNDS} deep=${process.env.QUIVER_REASONER_MODEL || "z-ai/glm-5.2"}\n`);
 
@@ -251,18 +281,25 @@ else for this block:
 **Position Sizing**: <e.g. "~5% of capital" | "$200">
 **Position Pct**: <number, % of equity>
 **Strategy Basis**: <short stable thesis tag — MUST be non-empty; keep the SAME tag across runs
-  for this ticker while the thesis holds; change it only on a real new catalyst>
-**Catalyst**: <named new catalyst, OR "none">  (REQUIRED when reversing your prior stance)
+  for this ticker while the thesis holds; change it on a real new catalyst OR a material change in
+  trend STRUCTURE (a regime flip, a new golden/death cross, a 200d-slope sign change)>
+**Catalyst**: <named new catalyst OR named trend-structure change, OR "none">  (REQUIRED when reversing your prior stance)
 **Target Price**: <number or "none">
 Frame entry/stop as trend-ride levels, not scalp levels. Python prices the stop; you only seed it.
+Consistency cuts BOTH ways: a reversal of your prior stance needs a named catalyst OR a named
+trend-structure change (regime flip / new cross / 200d-slope sign change) — but a stale stance the
+CURRENT trend now CONTRADICTS is itself an inconsistency. If the setup has turned constructive (or
+broken), say so and name the structural change; do not cling to a prior call the trend has outrun.
 
 PLAN:
 ${plan}`, { tries: 3, validate: (t) => hasRequiredLabels(t, TRADER_LABELS) });
 
 // --- Step 5: risk debate (quick model, aggressive + conservative) ---
-const riskAgg = await quickTurnRetry("risk_agg", HORIZON, `As an AGGRESSIVE risk reviewer for ${TICKER}, argue the
-risks of the proposal below. What's the worst realistic outcome, the stop that's too tight, the
-drawdown that'd force an exit? Be concrete.
+const riskAgg = await quickTurnRetry("risk_agg", HORIZON, `As a RISK-ON UPSIDE reviewer for ${TICKER}, argue the
+proposal is TOO CAUTIOUS. Where is the position too SMALL, the upside underpriced, the durable trend
+with further to run? What is the bear/conservative case UNDERWEIGHTING — a confirmed uptrend, positive
+12-1 momentum, a pullback that is a buying opportunity inside an intact trend rather than a top? Make
+the strongest data-backed case FOR more exposure. Be concrete.
 
 PROPOSAL:
 ${proposal}
@@ -290,7 +327,10 @@ then a one-paragraph executive summary:
 **Conviction**: <0-100>
 **Uncertainty**: <0-100>
 The Rating is the 5-tier signal Python derives. If core market/price data was UNAVAILABLE, set
-**Rating**: Hold and note the failure. A non-trending name with no edge should be Hold.
+**Rating**: Hold and note the failure. Otherwise rate the NAME's long-horizon trend honestly and
+symmetrically: a name with no durable trend (RANGE) is Hold, but a name in a CONFIRMED uptrend
+(UPTREND regime, positive 12-1, above a rising 200d) is Overweight/Buy — do NOT default an intact
+uptrend to Hold; a BROKEN trend (DOWNTREND, negative 12-1, below a falling 200d) is Underweight/Sell.
 
 REPORTS:
 ${reports}
@@ -299,8 +339,8 @@ PLAN:
 ${plan}
 PROPOSAL:
 ${proposal}
-RISKS (aggressive): ${riskAgg}
-RISKS (conservative): ${riskCon}
+UPSIDE case (risk-on — the bull argument for MORE exposure): ${riskAgg}
+DOWNSIDE risks (conservative): ${riskCon}
 
 ${PAST}`, { tries: 3, validate: (t) => hasRequiredLabels(t, PM_LABELS) });
 

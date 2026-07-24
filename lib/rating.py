@@ -17,7 +17,7 @@ Centralising it here avoids drift between those call sites.
 from __future__ import annotations
 
 import re
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 # Canonical, ordered 5-tier scale (most bullish to most bearish).
@@ -32,7 +32,7 @@ _RATING_SET = {r.lower() for r in RATINGS_5_TIER}
 _RATING_LABEL_RE = re.compile(r"rating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
 
 
-def parse_rating(text: str, default: str = "Hold") -> str:
+def parse_rating(text: str, default: Optional[str] = "Hold") -> Optional[str]:
     """Heuristically extract a 5-tier rating from prose text.
 
     Two-pass strategy:
@@ -40,6 +40,9 @@ def parse_rating(text: str, default: str = "Hold") -> str:
     2. Fall back to the first 5-tier rating word found anywhere in the text.
 
     Returns a Title-cased rating string, or ``default`` if no rating word appears.
+    Callers that must FAIL-SAFE on a malformed rating pass ``default=None`` so a
+    total-miss surfaces as None (→ contract violation → signal:ERROR) instead of a
+    silent bearish Hold; the default ``"Hold"`` preserves every other call site.
     """
     for line in text.splitlines():
         m = _RATING_LABEL_RE.search(line)

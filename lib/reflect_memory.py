@@ -310,9 +310,13 @@ def _stance_block(led, ticker: str, *, compact: bool = False) -> str:
     intents_oldest_first = [r["intent"] for r in reversed(directional)]
     metric = risk.signal_stability(intents_oldest_first)
     seq = " <- ".join(f"{r.get('trade_date')}:{r.get('signal')}" for r in directional[:5])
-    contract = ("Consistency contract: a REVERSAL of your prior stance needs a NAMED new "
-                "catalyst (state it in Catalyst); absent one, hold your prior stance — the "
-                "execution layer suppresses ungrounded flips.")
+    contract = ("Consistency contract (cuts BOTH ways): a REVERSAL of your prior stance needs a "
+                "NAMED new catalyst OR a named change in trend STRUCTURE (a regime flip, a new "
+                "golden/death cross, a 200d-slope sign change) — state it in Catalyst; absent "
+                "either, hold your prior stance. BUT a stale stance the CURRENT trend now "
+                "contradicts is itself an inconsistency: if the trend has turned constructive (or "
+                "broken), reverse and NAME the structural change. The execution layer still "
+                "suppresses ungrounded flips.")
     return (f"Your recent stance on {ticker} (newest first): {seq}.\n"
             f"{metric.render()}\n{contract}")
 

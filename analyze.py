@@ -333,7 +333,11 @@ def _validate_contract(pseudo: dict) -> None:
     if missing:
         raise RuntimeError(
             f"contract violation: missing labels {missing}")
-    rating = parse_rating(pm_md)
+    # default=None (not "Hold") so a total-miss — a **Rating**: line present (hasRequiredLabels
+    # passed) but carrying a NON-vocabulary word — fails the contract here and maps to signal:ERROR
+    # (fail-safe skip) rather than silently defaulting to a bearish Hold. The live derive at the
+    # bottom of run_eve keeps default="Hold", but this gate runs first, so it never sees a miss.
+    rating = parse_rating(pm_md, default=None)
     if rating is None or rating == "ERROR":
         raise RuntimeError(f"contract violation: no valid **Rating** (got {rating!r})")
 
@@ -559,7 +563,10 @@ def _run_eve_analysis(ticker: str, date: str, cfg, past_context: str,
         # (parse_rating, ported to lib/rating.py so it survives tradingagents/
         # deletion). WITHOUT this, extract_fields gets signal=None -> plan_action
         # skips every ticker -> the bot silently stops trading.
-        signal = parse_rating(str(final_state.get("final_trade_decision") or ""))
+        # default "Hold" (unchanged) so this live derive is always a str; the contract gate
+        # (_validate_contract, run earlier) already fail-safes a total-miss to ERROR, so a miss
+        # never reaches here. `or "Hold"` keeps the type str-narrowed for extract_fields.
+        signal = parse_rating(str(final_state.get("final_trade_decision") or "")) or "Hold"
     finally:
         if reasoning_log is not None:
             try:

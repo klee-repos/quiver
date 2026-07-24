@@ -354,28 +354,64 @@ ADX_TRENDING = 25.0      # ADX >= this = a real trend, not chop
 ADX_VERY_STRONG = 35.0
 REGIME_RANGE_ADX = 20.0  # below this = range/no trend
 MIN_ANNUALIZED_ROWS = 60  # min daily returns before annualized ratios are meaningful (~3mo)
+# >this far off the 52w high WHILE DI- dominates (an active down-leg) disqualifies the
+# clean UPTREND label even if the lagging structure (200d/golden/12-1) is still positive
+# — a distributing top is not a grind-up (F1/H4). A shallower pullback still rides UPTREND.
+REGIME_DETERIORATION_OFF_HIGH = 0.15
 
 
-def trend_regime(adx: Optional[float], ma: MAStats) -> str:
-    """ONE deterministic label. ``trend_regime`` (named to avoid shadowing the
-    macro regime_label). Rules (explicit, auditable, directional-trend-first):
-      - ADX < 20 -> RANGE (no real trend strength)
-      - directional trend (ADX >= 20, position + cross + slope agree) -> UPTREND / DOWNTREND
-      - BREAKOUT: ADX >= 35 AND at a 52w extreme (pct_off < 3%) BUT the directional
-        trend is NOT already established (slope and position disagree) — i.e. a FRESH
-        break, not a mature trend that simply happens to be at its highs
-      - otherwise -> RANGE
-    A mature persistent uptrend that sits at its highs stays UPTREND (directional
-    agreement wins over the at-high flag). Falls back to RANGE when inputs are
-    insufficient (None). Never raises.
+def trend_regime(adx: Optional[float], ma: MAStats, mom_12_1: Optional[float] = None,
+                 plus_di: Optional[float] = None, minus_di: Optional[float] = None) -> str:
+    """ONE deterministic label (``trend_regime``, named to avoid shadowing the macro
+    regime_label). STRUCTURE-FIRST: a durable trend is defined by its long-horizon
+    STRUCTURE (price above a RISING 200d + golden cross + positive 12-1 momentum), NOT
+    by a high ADX. A smooth multi-quarter grind-up runs only a MODERATE 14-period ADX
+    (~15-25), so an ADX-first gate mislabels exactly the names a trend-follower rides
+    (this was the F1 bug: SMH at ADX ~20 with +110% 12-1 was stamped RANGE). ADX is
+    trend STRENGTH, evaluated SECOND as a fast-path fallback.
+
+    Order:
+      1. adx is None -> RANGE (insufficient data; also guards the None comparisons below).
+      2. struct_up / struct_down: long-horizon directional STRUCTURE, ADX-independent.
+         A temporarily-negative 50d slope (a pullback) does NOT disqualify a name above a
+         rising 200d. GUARDRAILS: struct_up needs a RISING 200d AND (mom None or mom>0),
+         so a rolled-over name (negative 12-1 / falling 200d / death cross) can never be
+         UPTREND; and an ACTIVE, DEEP down-leg (DI- > DI+ AND > REGIME_DETERIORATION_OFF_HIGH
+         off the 52w high) is excluded as ``deteriorating`` so a distributing top is not
+         called a clean uptrend.
+      3. fast path (ORIGINAL behavior, preserved byte-for-byte): ADX>=20 + position/cross/
+         50d-slope agreement -> UPTREND/DOWNTREND; ADX>=35 at a 52w extreme with
+         disagreement -> BREAKOUT; else RANGE. Catches young names (no 200d/mom) and pure
+         short-term agreement.
+    Never raises.
     """
     if adx is None:
-        return "RANGE"
-    if adx < REGIME_RANGE_ADX:
         return "RANGE"
     above = ma.above_200d_pct
     gc = ma.golden_cross
     s50_slope = ma.sma50_slope_20d
+    s200_slope = ma.sma200_slope_60d
+    off_high = ma.pct_off_52w_high
+    # Active, DEEP down-leg: DI- dominant AND meaningfully off the 52w high (F1/H4 guardrail
+    # against labeling a distributing top an UPTREND on lagging 200d/golden/12-1 signals).
+    deteriorating = (minus_di is not None and plus_di is not None and minus_di > plus_di) \
+        and (off_high is not None and off_high > REGIME_DETERIORATION_OFF_HIGH)
+    # Long-horizon structural trend (ADX-independent). Every term is None-guarded; the 200d
+    # slope is REQUIRED-present (the rising/falling-200d guardrail) while mom is tolerant-None
+    # (a name with a valid 200d but <253 rows still qualifies on structure alone).
+    struct_up = (above is not None and above > 0) and (gc is not False) \
+        and (s200_slope is not None and s200_slope >= 0) \
+        and (mom_12_1 is None or mom_12_1 > 0) and not deteriorating
+    struct_down = (above is not None and above < 0) and (gc is not True) \
+        and (s200_slope is not None and s200_slope <= 0) \
+        and (mom_12_1 is None or mom_12_1 < 0)
+    if struct_up:
+        return "UPTREND"
+    if struct_down:
+        return "DOWNTREND"
+    # --- fast path: ORIGINAL ADX-gated directional logic (preserved) ---
+    if adx < REGIME_RANGE_ADX:
+        return "RANGE"
     # directional trend: position, cross, AND slope all agree
     up = (above is not None and above > 0) and (gc is not False) and \
         (s50_slope is None or s50_slope > 0)
@@ -386,7 +422,7 @@ def trend_regime(adx: Optional[float], ma: MAStats) -> str:
     if down:
         return "DOWNTREND"
     # directional signals disagree but strength is very high + at an extreme -> fresh BREAKOUT
-    at_high = ma.pct_off_52w_high is not None and ma.pct_off_52w_high < 0.03
+    at_high = off_high is not None and off_high < 0.03
     at_low = above is not None and above < -0.03
     if adx >= ADX_VERY_STRONG and (at_high or at_low):
         return "BREAKOUT"
@@ -439,13 +475,17 @@ def trend_metrics(prices: Sequence[float], *, high: Optional[Sequence[float]] = 
     # meaningless figures (a name down 15% can print a +Sharpe from vol-drag sign
     # artifacts). Gate them behind a minimum sample -> render "n/a" below it.
     have_ratio_n = len(rets) >= MIN_ANNUALIZED_ROWS
+    # Compute 12-1 momentum ONCE (H1): the bundle field AND the structure-first regime
+    # classifier both consume it. `b.mom_12_1` cannot be used at the call — the bundle is
+    # not bound until the constructor returns — so it is hoisted to a local here.
+    _mom = momentum_12_1(p)
     return TrendBundle(
         n_rows=n,
         ret_6m=total_return(p, 126),
         ret_1y=total_return(p, 252),
         ret_2y=total_return(p, 504),
         ret_3y=total_return(p, 756),
-        mom_12_1=momentum_12_1(p),
+        mom_12_1=_mom,
         sharpe=annualized_sharpe(rets, periods_per_year=periods_per_year) if have_ratio_n else None,
         sortino=annualized_sortino(rets, periods_per_year=periods_per_year) if have_ratio_n else None,
         calmar=calmar(p, periods_per_year=periods_per_year) if have_ratio_n else None,
@@ -456,7 +496,8 @@ def trend_metrics(prices: Sequence[float], *, high: Optional[Sequence[float]] = 
         adx=adx.adx,
         plus_di=adx.plus_di,
         minus_di=adx.minus_di,
-        trend_regime=trend_regime(adx.adx, ma),
+        trend_regime=trend_regime(adx.adx, ma, mom_12_1=_mom,
+                                  plus_di=adx.plus_di, minus_di=adx.minus_di),
         ma=ma,
     )
 
@@ -471,6 +512,23 @@ def _pctu(x: Optional[float]) -> str:
 
 def _ratio(x: Optional[float]) -> str:
     return f"{x:.2f}" if x is not None else "n/a"
+
+
+def _di_pressure_note(b: TrendBundle) -> str:
+    """One-line DI read for the renderer (F2): DI- > DI+ INSIDE an UPTREND is a near-term
+    pullback, not a reversal — so the model stops mis-reading a healthy consolidation on a
+    +100%-momentum name as a topping signal. Pure; never raises."""
+    pd, md = b.plus_di, b.minus_di
+    if pd is None or md is None:
+        return "DI n/a"
+    if md > pd:
+        if b.trend_regime == "UPTREND":
+            return ("DI- above DI+ inside an UPTREND is a near-term pullback/consolidation, "
+                    "NOT a reversal — the long-horizon 200d structure still governs")
+        if b.trend_regime == "DOWNTREND":
+            return "DI- above DI+ confirms the active down-leg"
+        return "DI- above DI+ = near-term downward pressure"
+    return "DI+ >= DI- = upward pressure intact"
 
 
 def render_trend_report(b: TrendBundle) -> str:
@@ -489,9 +547,12 @@ def render_trend_report(b: TrendBundle) -> str:
         _cov = f"~{b.n_rows / 21.0:.0f}mo"
     else:
         _cov = f"{b.n_rows} rows"
+    _di_note = _di_pressure_note(b)
     lines = [
         f"Long-horizon trend guideposts (N={b.n_rows} rows; yfinance close, {_cov}).",
-        f"**Trend regime**: {b.trend_regime}",
+        f"**Trend regime**: {b.trend_regime}  (the durable trend read from long-horizon STRUCTURE "
+        f"— 200d position + slope, golden/death cross, 12-1 momentum — this is the PRIMARY read; "
+        f"ADX magnitude is strength, not existence)",
         "",
         "### Returns (multi-horizon)",
         f"- 6m: {_pct(b.ret_6m)} | 1y: {_pct(b.ret_1y)} | 2y: {_pct(b.ret_2y)} | 3y: {_pct(b.ret_3y)}",
@@ -504,7 +565,9 @@ def render_trend_report(b: TrendBundle) -> str:
         f"- current DD: {_pctu(b.dd_current)} | max DD: {_pctu(b.dd_max)} | max duration underwater: {b.dd_max_duration_days if b.dd_max_duration_days is not None else 'n/a'} days",
         "",
         "### Trend strength (ADX 14, Wilder)",
-        f"- ADX: {_ratio(b.adx)} | DI+: {_ratio(b.plus_di)} | DI-: {_ratio(b.minus_di)} (ADX>~25 = trending)",
+        f"- ADX: {_ratio(b.adx)} | DI+: {_ratio(b.plus_di)} | DI-: {_ratio(b.minus_di)}",
+        f"  (ADX measures trend STRENGTH/steepness, NOT existence — a smooth multi-quarter "
+        f"grind-up runs a MODERATE ADX ~15-25, so a moderate ADX is not 'no trend'. {_di_note})",
         "",
         "### MA structure",
         f"- 50d SMA: {_ratio(ma.sma50)} | 200d SMA: {_ratio(ma.sma200)}",
