@@ -18,6 +18,19 @@ from lib.ledger import Ledger  # noqa: E402
 
 PASS = 0
 FAIL = 0
+SKIP = 0
+
+
+def skip(name, reason):
+    """Record a test that could NOT run, and say so out loud.
+
+    A silently-skipped test is indistinguishable from a passing one, which is how
+    an optional dependency turns into fake green. Every skip prints and is counted
+    in the summary line (which tests/run_e2e.sh parses).
+    """
+    global SKIP
+    SKIP += 1
+    print(f"  SKIP {name}: {reason}")
 
 
 def check(name, got, want):
@@ -4289,5 +4302,279 @@ check("intel: a multi-committee sponsor returns ONE row (no double-count)",
       [(k["bioguide"], k["congress"]) for k in _kps], [("R000575", 118)])
 
 
-print(f"\n{PASS} passed, {FAIL} failed")
+
+# --- FACTOR ATTRIBUTION (lib/attribution.py) --------------------------------
+# A DIAGNOSTIC, never a gate. These cases pin the three properties that make the
+# difference between a usable estimator and a confident wrong number:
+#   (1) the HAC convention (no small-sample correction) -- against GOLDEN
+#       constants, so the check can never skip on a box without statsmodels;
+#   (2) refusal on degenerate input -- pinv silently returns a plausible answer
+#       on a rank-deficient design, so the rank check is load-bearing;
+#   (3) the residual-df floor -- below it a point estimate is still reported but
+#       every inference field is withheld.
+import json as _json  # noqa: E402
+
+from lib import attribution as _attr  # noqa: E402
+from lib import goal as _goal_attr  # noqa: E402
+
+_GOLD = _json.loads(
+    (Path(__file__).resolve().parent / "fixtures" / "hac_golden.json").read_text()
+)
+
+for _case in _GOLD["cases"]:
+    _f = _attr.ols_hac(_case["y"], _case["X"], lag=_case["lag"])
+    _tag = f"n={_case['n']},k={_case['k']},lag={_case['lag']}"
+    check_true(f"attribution: golden {_tag} returns a Fit", _f is not None)
+    if _f is None:
+        continue
+    check_true(f"attribution: golden {_tag} estimates match statsmodels",
+               max(abs(a - b) for a, b in zip(_f.estimates, _case["params"])) < 1e-8)
+    check_true(f"attribution: golden {_tag} HAC stderrs match (no small-sample correction)",
+               _f.stderr is not None
+               and max(abs(a - b) for a, b in zip(_f.stderr, _case["bse"])) < 1e-8)
+    check_true(f"attribution: golden {_tag} t-stats match",
+               _f.t is not None
+               and max(abs(a - b) for a, b in zip(_f.t, _case["tvalues"])) < 1e-8)
+
+# Opportunistic cross-check: pins the convention in BOTH directions against the
+# live library. Skips VISIBLY (statsmodels is in neither the lock nor pyproject).
+try:
+    import statsmodels.api as _sm  # noqa: E402
+except Exception:  # noqa: BLE001
+    skip("attribution: statsmodels cross-check",
+         "statsmodels not installed (not in requirements.lock.txt) - golden fixture still ran")
+else:
+    _c = _GOLD["cases"][0]
+    _yc, _Xc, _lc = _c["y"], _c["X"], _c["lag"]
+    _res = _sm.OLS(_yc, _Xc).fit(cov_type="HAC",
+                                 cov_kwds={"maxlags": _lc, "use_correction": False})
+    _mine = _attr.ols_hac(_yc, _Xc, lag=_lc)
+    check_true("attribution: matches statsmodels use_correction=False to 1e-8",
+               _mine is not None and _mine.stderr is not None
+               and max(abs(a - b) for a, b in zip(_mine.stderr, _res.bse)) < 1e-8)
+    _res_c = _sm.OLS(_yc, _Xc).fit(cov_type="HAC",
+                                   cov_kwds={"maxlags": _lc, "use_correction": True})
+    _n_c, _k_c = _c["n"], _c["k"]
+    _ratio = [b / a for a, b in zip(_res.bse, _res_c.bse)]
+    check_true("attribution: use_correction=True is exactly sqrt(n/(n-k)) larger (convention pinned both ways)",
+               max(abs(r - (_n_c / (_n_c - _k_c)) ** 0.5) for r in _ratio) < 1e-9)
+
+# Recovery of a known beta at a real sample size.
+_rng_a = __import__("numpy").random.default_rng(7)
+_np_a = __import__("numpy")
+_mkt = _rng_a.normal(scale=0.01, size=400)
+_port = 0.85 * _mkt + _rng_a.normal(scale=0.002, size=400)
+_fit_known = _attr.ols_hac(_port, _attr.with_intercept([[m] for m in _mkt]),
+                           names=["intercept", "beta"])
+check_true("attribution: recovers a known beta=0.85 at n=400",
+           _fit_known is not None and abs(_fit_known.estimates[1] - 0.85) < 0.02)
+check_true("attribution: reports inference when df floor is met",
+           _fit_known is not None and _fit_known.stderr is not None
+           and _fit_known.inference_withheld_reason == "")
+
+# Degenerate designs must REFUSE, not answer.
+check("attribution: singular design -> None",
+      _attr.ols_hac([1.0, 2.0, 3.0, 4.0] * 5, [[1.0, 1.0]] * 20), None)
+check("attribution: NaN in y -> None",
+      _attr.ols_hac([1.0, float("nan"), 3.0] * 7, _attr.with_intercept([[float(i)] for i in range(21)])), None)
+check("attribution: n <= k -> None",
+      _attr.ols_hac([1.0, 2.0], [[1.0, 0.0], [1.0, 1.0]]), None)
+check("attribution: empty input -> None", _attr.ols_hac([], []), None)
+
+# THE DF FLOOR. Estimates survive; every inference field is withheld.
+_small = _attr.ols_hac([0.01, -0.02, 0.005, -0.001],
+                       _attr.with_intercept([[0.002], [-0.003], [0.001], [0.0005]]),
+                       names=["intercept", "beta"])
+check_true("attribution: n=4,k=2 still returns point estimates", _small is not None and len(_small.estimates) == 2)
+check("attribution: n=4,k=2 withholds stderr", _small.stderr if _small else "x", None)
+check("attribution: n=4,k=2 withholds t", _small.t if _small else "x", None)
+check("attribution: n=4,k=2 withholds r2", _small.r2 if _small else "x", None)
+check_true("attribution: n=4,k=2 states why inference was withheld",
+           bool(_small and _small.inference_withheld_reason))
+check_true("attribution: as_dict() carries no verdict/threshold/p-value key",
+           _small is not None
+           and not ({"verdict", "significant", "p", "p_value", "t_crit", "threshold", "pass"}
+                    & set(_small.as_dict())))
+
+# n=8,k=7 on PURE NOISE is the case that would print seven |t| of 4-12.
+_rng_n = __import__("numpy").random.default_rng(11)
+_noise_y = _rng_n.normal(size=8)
+_noise_X = _attr.with_intercept(_rng_n.normal(size=(8, 6)).tolist())
+_nf = _attr.ols_hac(_noise_y, _noise_X)
+check_true("attribution: n=8,k=7 pure noise emits NO t-statistic", _nf is not None and _nf.t is None)
+
+# A 300-draw sweep below the floor must NEVER emit a numeric t.
+_rng_s = __import__("numpy").random.default_rng(3)
+_leaked = 0
+for _i in range(300):
+    _nn = 4 + (_i % 8)
+    _fs = _attr.ols_hac(_rng_s.normal(size=_nn),
+                        _attr.with_intercept(_rng_s.normal(size=(_nn, 1)).tolist()))
+    if _fs is not None and _fs.t is not None and _fs.n - _fs.k < _attr.RESIDUAL_DF_MIN:
+        _leaked += 1
+check("attribution: 300-draw sweep below the df floor leaks zero t-stats", _leaked, 0)
+
+# Lag rule + clamp.
+check("attribution: newey_west_lag(100) == 4", _attr.newey_west_lag(100), 4)
+check("attribution: newey_west_lag(252) == 4", _attr.newey_west_lag(252), 4)
+check("attribution: newey_west_lag clamps to n-k-1 at tiny n", _attr.newey_west_lag(5, 2), 2)
+check("attribution: newey_west_lag(3,2) clamps to 0", _attr.newey_west_lag(3, 2), 0)
+
+# --- equity-series hygiene (the filters that were provably inert before) -----
+_REAL_PTS = [("2026-05-30", 100.0), ("2026-06-01", 100.0), ("2026-06-02", 98.02884646),
+             ("2026-06-03", 245.980825135), ("2026-06-04", 245.37762008),
+             ("2026-06-05", 244.5615508), ("2026-06-08", 241.90108934),
+             ("2026-06-09", 51.398566535), ("2026-06-12", 242.9310406105),
+             ("2026-07-06", 219.94)]
+
+_kept, _drop = _attr.clean_equity_points(_REAL_PTS)
+check_true("attribution: the real 241.90/51.40/242.93 corrupt reading is dropped",
+           "2026-06-09" not in [d for d, _ in _kept])
+check("attribution: the drop is REPORTED with a date and a reason",
+      [(r["date"], r["reason"]) for r in _drop], [("2026-06-09", "spike_revert")])
+check("attribution: no other real point is dropped", len(_kept), 9)
+
+# A REAL 50% drawdown that does NOT retrace must be PRESERVED -- deleting it
+# would erase the single most important point in an account's history.
+_crash = [("d1", 200.0), ("d2", 100.0), ("d3", 98.0), ("d4", 101.0)]
+check("attribution: a real non-retracing drawdown is NOT dropped",
+      _attr.find_spike_reverts(_crash), [])
+
+# Capture-window filter: a Saturday stamp and a 21:20 stamp are real rows today.
+_win = {d: d not in ("2026-05-30", "2026-07-06") for d, _ in _REAL_PTS}
+_kept_w, _drop_w = _attr.clean_equity_points(_REAL_PTS, in_window=_win)
+check_true("attribution: out-of-window captures (Saturday, 21:20) are dropped",
+           {"2026-05-30", "2026-07-06"} <= {r["date"] for r in _drop_w})
+check_true("attribution: out-of-window drops carry the reason",
+           all(r["reason"] == "capture_outside_window"
+               for r in _drop_w if r["date"] in ("2026-05-30", "2026-07-06")))
+
+# interval_returns: gap boundary is exact, flows and unexplained jumps refuse.
+_span = {("a", "b"): 1, ("b", "c"): 2}
+_r_ok, _d_ok = _attr.interval_returns([("a", 100.0), ("b", 101.0), ("c", 102.0)],
+                                      trading_days=_span)
+check("attribution: interval of exactly MAX_INTERVAL_TRADING_DAYS is KEPT", sorted(_r_ok), ["b"])
+check("attribution: interval of MAX+1 is EXCLUDED",
+      [(r["date"], r["reason"]) for r in _d_ok], [("c", "interval_gap")])
+
+_r_f, _d_f = _attr.interval_returns([("a", 100.0), ("b", 101.0)], flows={"b": 50.0})
+check("attribution: an interval containing a recorded cash flow is dropped, not adjusted",
+      [(r["date"], r["reason"]) for r in _d_f], [("b", "recorded_cash_flow")])
+
+# The real unrecorded ~$148 deposit (98.03 -> 245.98, +150.9%) is a LEVEL SHIFT a
+# spike filter cannot catch, and at small n it single-handedly sets the slope.
+_r_j, _d_j = _attr.interval_returns([("2026-06-02", 98.02884646), ("2026-06-03", 245.980825135)])
+check("attribution: the unrecorded deposit-sized jump is REFUSED",
+      [(r["date"], r["reason"]) for r in _d_j], [("2026-06-03", "suspected_unrecorded_flow")])
+check("attribution: refusing it leaves no return for that interval", _r_j, {})
+
+# ...and there is NO order-activity escape hatch. An equity order converts cash
+# into stock at equal value, so it cannot move TOTAL equity; whitelisting on order
+# days let this very deposit through the guard built to catch it.
+check_true("attribution: interval_returns takes no order-activity whitelist",
+           "explained" not in __import__("inspect").signature(_attr.interval_returns).parameters)
+_r_o, _d_o = _attr.interval_returns(
+    [("2026-06-02", 98.02884646), ("2026-06-03", 245.980825135)])
+check("attribution: a deposit-sized jump is refused even on a heavy order day",
+      [(r["date"], r["reason"]) for r in _d_o], [("2026-06-03", "suspected_unrecorded_flow")])
+
+# CONVENTION CROSS-CHECK: compounding the per-interval returns must reproduce the
+# cumulative time-weighted return exactly. Pins the convention by arithmetic
+# rather than by prose, so the two can never drift apart.
+_clean_pts = [("2026-06-03", 245.980825135), ("2026-06-04", 245.37762008),
+              ("2026-06-05", 244.5615508), ("2026-06-08", 241.90108934)]
+_ri, _ = _attr.interval_returns(_clean_pts)
+_compounded = 1.0
+for _d in sorted(_ri):
+    _compounded *= (1.0 + _ri[_d])
+_twr = _goal_attr.time_weighted_return_pct(
+    _clean_pts[0][1], _clean_pts[0][0], _clean_pts[1:], [])
+check_true("attribution: prod(1+r_i)-1 equals goal.time_weighted_return_pct (convention pinned)",
+           _twr is not None and abs((_compounded - 1.0) * 100.0 - _twr) < 1e-12)
+
+# --- book_beta: the PRIMARY (bottom-up) exposure estimate -------------------
+_rng_b = __import__("numpy").random.default_rng(42)
+_mkt_b = _rng_b.normal(scale=0.01, size=500)
+_rets_b = {"AAA": 1.2 * _mkt_b + _rng_b.normal(scale=0.001, size=500),
+           "BBB": 0.4 * _mkt_b + _rng_b.normal(scale=0.001, size=500)}
+_bb = _attr.book_beta({"AAA": 60.0, "BBB": 40.0}, _rets_b, _mkt_b)
+_expect_b = (60.0 * _bb["per_name"]["AAA"]["beta"]
+             + 40.0 * _bb["per_name"]["BBB"]["beta"]) / _bb["weight_scale"]
+check_true("attribution: beta_book is the exact weighted sum of per-name betas",
+           abs(_bb["beta_book"] - _expect_b) < 1e-9)
+check_true("attribution: per-name betas recover 1.2 / 0.4",
+           abs(_bb["per_name"]["AAA"]["beta"] - 1.2) < 0.05
+           and abs(_bb["per_name"]["BBB"]["beta"] - 0.4) < 0.05)
+check_true("attribution: n>=500 per name means inference is NOT withheld",
+           _bb["per_name"]["AAA"]["stderr"] is not None)
+
+# An unpriced name must SURFACE, never be renormalized away.
+_bb2 = _attr.book_beta({"AAA": 60.0, "SPCX": 10.0}, {"AAA": _rets_b["AAA"]}, _mkt_b)
+check("attribution: an unpriced holding is reported as unpriced weight",
+      _bb2["unpriced_weight_pct"], 10.0)
+check_true("attribution: the unpriced name is named", "SPCX" in _bb2["unpriced"])
+check_true("attribution: unpriced weight is NOT renormalized away",
+           abs(_bb2["beta_book"]
+               - (60.0 / _bb2["weight_scale"]) * _bb2["per_name"]["AAA"]["beta"]) < 1e-9)
+check("attribution: total weight still reflects the real book", _bb2["total_weight_pct"], 70.0)
+
+# WEIGHT SCALE. A book quoted in percent (sums to 100) and one quoted in
+# fractions (sums to 1) must give the SAME beta. Getting this wrong multiplies the
+# answer by 100 -- a wrong number that still looks like a number. Found live: the
+# real book first reported beta_book = 149.76 instead of 1.4976.
+_w_pct = {"AAA": 60.0, "BBB": 40.0}
+_w_frac = {"AAA": 0.6, "BBB": 0.4}
+check("attribution: percent-quoted book detected as scale 100",
+      _attr.detect_weight_scale(_w_pct), 100.0)
+check("attribution: fraction-quoted book detected as scale 1",
+      _attr.detect_weight_scale(_w_frac), 1.0)
+_bb_pct = _attr.book_beta(_w_pct, _rets_b, _mkt_b)
+_bb_frac = _attr.book_beta(_w_frac, _rets_b, _mkt_b)
+check_true("attribution: percent and fraction books give the SAME beta_book",
+           abs(_bb_pct["beta_book"] - _bb_frac["beta_book"]) < 1e-9)
+check_true("attribution: a 60/40 book of beta-1.2 and beta-0.4 names lands near 0.88",
+           0.83 < _bb_pct["beta_book"] < 0.93)
+check("attribution: the applied weight scale is REPORTED, never silent",
+      _bb_pct["weight_scale"], 100.0)
+check_true("attribution: an explicit weight_scale overrides detection",
+           abs(_attr.book_beta(_w_pct, _rets_b, _mkt_b, weight_scale=1.0)["beta_book"]
+               - 100.0 * _bb_pct["beta_book"]) < 1e-6)
+
+# DATE ALIGNMENT. Pairing a holding's returns to the market BY POSITION silently
+# regresses a late-listing or gappy name against the wrong days. Found live: a
+# synthetic name with a TRUE beta of 2.0 trading only the first 30 of 100 market
+# days reported 0.028. book_beta must REFUSE a length mismatch, and the caller
+# must pass a date-aligned per-ticker market series.
+_rng_al = __import__("numpy").random.default_rng(1)
+_mkt_al = list(_rng_al.normal(scale=0.01, size=100))
+_early = [2.0 * _mkt_al[i] for i in range(30)]   # exact beta 2.0, first 30 days only
+_bb_bad = _attr.book_beta({"T": 100.0}, {"T": _early}, _mkt_al)
+check_true("attribution: a length-mismatched series is REFUSED, not tail-sliced",
+           "T" in _bb_bad["unpriced"] and _bb_bad["beta_book"] is None)
+check_true("attribution: the refusal states the mismatch",
+           "length mismatch" in _bb_bad["unpriced_reasons"].get("T", ""))
+_bb_good = _attr.book_beta({"T": 100.0}, {"T": _early}, _mkt_al,
+                           market_by_ticker={"T": _mkt_al[:30]})
+check_true("attribution: a DATE-aligned market series recovers the true beta 2.0",
+           abs(_bb_good["per_name"]["T"]["beta"] - 2.0) < 1e-6)
+check_true("attribution: every unpriced name carries a stated reason",
+           all(t in _bb_bad["unpriced_reasons"] for t in _bb_bad["unpriced"]))
+
+# --- ISOLATION: attribution must not be reachable from the trading path ------
+check_true("attribution: lib/attribution.py is inside the wall roster (zero grants)",
+           "lib/attribution.py" in _WALL_ROSTER)
+check("attribution: _WALL_GRANTS still has exactly 5 entries", len(_WALL_GRANTS), 5)
+check_true("attribution: reaches zero ungranted wall items",
+           not _wall_violations((_REPO / "lib" / "attribution.py").read_text(encoding="utf-8")))
+
+for _consumer in ("lib/signals.py", "lib/calibrate.py", "lib/allocate.py", "lib/memory.py",
+                  "lib/levers.py", "lib/risk.py", "lib/reflect_memory.py",
+                  "lib/strategy_context.py", "analyze.py"):
+    _csrc = (_REPO / _consumer).read_text(encoding="utf-8")
+    check_true(f"attribution: {_consumer} does not import lib.attribution (D2 / sizing isolation)",
+               "lib.attribution" not in _imported_modules(_csrc)
+               and "attribution" not in _csrc)
+
+
+print(f"\n{PASS} passed, {FAIL} failed, {SKIP} skipped")
 sys.exit(1 if FAIL else 0)

@@ -32,6 +32,7 @@ SUITES=(
   "e2e-catalyst|tests/test_e2e_catalyst.py"
   "e2e-ptj|tests/test_e2e_ptj.py"
   "e2e-wall-replay|tests/test_e2e_wall_replay.py"
+  "e2e-attribution|tests/test_e2e_attribution.py"
   # llm-judge runs offline here (its LLM `judge()` stages SELF-SKIP without QUIVER_LIVE_E2E;
   # only the offline pipeline + deterministic det() checks run). Under --live it is run WITH
   # QUIVER_LIVE_E2E=1 (see the loop below) so the real `claude` judging kicks in.
@@ -62,7 +63,11 @@ for entry in "${SUITES[@]}"; do
     "$PY" "$file" >"$log" 2>&1
     rc=$?
   fi
-  tail=$(grep -oE '[0-9]+ passed, [0-9]+ failed|[0-9]+ checks passed, [0-9]+ failed|PASS \(no-op\)' "/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" | tail -1)
+  # NOTE: grep -oE matches SUBSTRINGS, so the ", N skipped" alternative must come
+  # FIRST — otherwise the shorter "N passed, M failed" pattern wins and the skip
+  # count is silently truncated out of the summary (a skipped test would then be
+  # indistinguishable from a passing one).
+  tail=$(grep -oE '[0-9]+ passed, [0-9]+ failed, [0-9]+ skipped|[0-9]+ passed, [0-9]+ failed|[0-9]+ checks passed, [0-9]+ failed|PASS \(no-op\)' "/tmp/quiver_${name//[^a-zA-Z0-9]/_}.log" | tail -1)
   if [ "$rc" -eq 0 ]; then echo "OK    ${tail}"; else echo "FAIL  ${tail}  (see /tmp/quiver_${name//[^a-zA-Z0-9]/_}.log)"; FAILED+=("$name"); fi
 done
 

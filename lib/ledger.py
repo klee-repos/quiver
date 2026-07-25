@@ -813,6 +813,19 @@ class Ledger:
                 "SELECT DISTINCT ticker FROM decisions ORDER BY ticker"
             ).fetchall()]
 
+    def baseline_capture_times(self) -> dict:
+        """{trade_date: captured_at} for the equity curve. Read-only; diagnostic path.
+
+        Separate from baseline_equity_series so that curve's shape is untouched.
+        Callers need the timestamp because the curve is NOT uniformly captured near
+        the open -- live rows include one stamped on a Saturday and one 5.3 hours
+        after the close, which a return series must exclude rather than average in.
+        """
+        with self._conn() as c:
+            return {r["trade_date"]: r["captured_at"] for r in c.execute(
+                "SELECT trade_date, captured_at FROM day_baseline ORDER BY trade_date ASC"
+            ).fetchall()}
+
     def baseline_equity_series(self) -> list:
         """Daily baseline equity curve, date order. Used ONLY by the digest path
         (account-equity drawdown) — never by the analysis/memory path."""
