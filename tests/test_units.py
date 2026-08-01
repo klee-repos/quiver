@@ -4576,5 +4576,116 @@ for _consumer in ("lib/signals.py", "lib/calibrate.py", "lib/allocate.py", "lib/
                and "attribution" not in _csrc)
 
 
+# --- benchmark measurement: the calendar anchor rule (lib/benchmark) ----------
+# The defect being pinned: outcomes.benchmark_return was priced off a SPY series
+# that stopped at 2026-07-02 while the position leg used 2026-07-06, understating
+# the market leg 2.2x (0.007521 vs the true 0.016314573). Every case below uses the
+# REAL dates and the REAL closes from that incident.
+from lib import benchmark as _bm  # noqa: E402
+
+_BM_CLOSES = {"2026-05-29": 754.5, "2026-06-08": 739.219971,
+              "2026-07-02": 744.780029, "2026-07-06": 751.280029, "2026-07-09": 751.710022}
+# XNYS sessions across the window. 2026-05-30 is a Saturday and 2026-07-03 is the
+# observed July 4th holiday — both absent, which is exactly why a lag heuristic
+# cannot separate a legitimate gap from a truncated series.
+_BM_SESSIONS = ["2026-05-29", "2026-06-08", "2026-07-02", "2026-07-06", "2026-07-07",
+                "2026-07-08", "2026-07-09"]
+
+_bm_v, _bm_why = _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check_true("benchmark: T1 true window 06-08->07-06 == 0.016314573",
+           _bm_v is not None and abs(_bm_v - 0.016314572756584766) < 1e-9)
+
+# T2 — THE BUG. Series truncated before the end session: refuse, never substitute
+# the last close it happens to have (which would reproduce 0.007521 exactly).
+_bm_trunc = {k: v for k, v in _BM_CLOSES.items() if k <= "2026-07-02"}
+_bm_v, _bm_why = _bm.window_return(_bm_trunc, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check("benchmark: T2 truncated series refuses rather than using a stale close", _bm_v, None)
+check_true("benchmark: T2 refusal names the missing session", "2026-07-06" in _bm_why)
+
+# T2b — INTERIOR gap. A series that resumes AFTER the target still refuses; the
+# straddle/lag formulations both pass this one, which is why the rule is calendar-exact.
+_bm_gap = {"2026-06-08": 739.219971, "2026-07-02": 744.780029, "2026-07-09": 751.710022}
+_bm_v, _ = _bm.window_return(_bm_gap, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check("benchmark: T2b interior gap {07-02,07-09} refuses for 07-06", _bm_v, None)
+
+# T2c — alignment + degenerate inputs.
+_bm_v, _ = _bm.window_return(_BM_CLOSES, "2026-05-30", "2026-06-08", _BM_SESSIONS)
+check_true("benchmark: T2c Saturday trade_date 05-30 anchors back to Fri 05-29",
+           _bm_v is not None and abs(_bm_v - (739.219971 - 754.5) / 754.5) < 1e-12)
+check(("benchmark: T2c ISO timestamp end date is accepted"),
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06T21:25:17-04:00", _BM_SESSIONS)[0],
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _BM_SESSIONS)[0])
+check("benchmark: T2c same session == 0.0",
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-06-08", _BM_SESSIONS)[0], 0.0)
+check("benchmark: T2c end before start refuses",
+      _bm.window_return(_BM_CLOSES, "2026-07-06", "2026-06-08", _BM_SESSIONS)[0], None)
+check("benchmark: T2c empty series refuses",
+      _bm.window_return({}, "2026-06-08", "2026-07-06", _BM_SESSIONS)[0], None)
+check("benchmark: T2c no session on or before the target refuses",
+      _bm.window_return(_BM_CLOSES, "2020-01-01", "2026-07-06", _BM_SESSIONS)[0], None)
+# T2d — COVERAGE. A calendar that stops before the target must refuse, not fall back to
+# its own last session. Without this the anchor collapses onto the series' last close and
+# the tail guard dies — which is how the shipped producer (which bounded the calendar by
+# max(series)) silently reproduced the 0.007521 incident value end-to-end.
+_bm_short = [s for s in _BM_SESSIONS if s <= "2026-07-02"]
+_bm_v, _bm_why = _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _bm_short)
+check("benchmark: T2d a calendar ending before the target refuses on coverage", _bm_v, None)
+check_true("benchmark: T2d the coverage refusal names the calendar end",
+           "calendar ends" in _bm_why and "2026-07-02" in _bm_why)
+check("benchmark: T2d no session calendar at all refuses",
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", [])[0], None)
+check("benchmark: T2c non-positive close refuses",
+      _bm.window_return({**_BM_CLOSES, "2026-06-08": 0.0}, "2026-06-08", "2026-07-06",
+                        _BM_SESSIONS)[0], None)
+check("benchmark: T2c NaN close refuses",
+      _bm.window_return({**_BM_CLOSES, "2026-07-06": float("nan")}, "2026-06-08", "2026-07-06",
+                        _BM_SESSIONS)[0], None)
+
+# T3 — the narrow writer must NOT behave like record_outcome (INSERT OR REPLACE over
+# ten columns). Sentinels on the columns a naive backfill would silently blank.
+_bml = _tmp_ledger()
+_bmd = _bml.record_decision(trade_date="2026-06-08", ticker="SPYX", run_id="r", signal="Buy",
+                            intent="buy", decided_at="2026-06-08T10:00:00-04:00",
+                            decision_price=100.0)
+_bml.record_outcome(_bmd, resolved_at="2026-07-06T21:25:17-04:00", holding_days=28,
+                    directional_return=0.10, benchmark_return=0.007521, alpha=0.092479,
+                    realized_pnl=12.5, unrealized_pnl=3.5, scored_against="both",
+                    adherence="stop_violated")
+check("benchmark: T3 narrow update reports one row", _bml.update_outcome_benchmark(_bmd, 0.5, -0.4), 1)
+_bmr = [r for r in _bml.outcomes_for_backfill() if r["decision_id"] == _bmd][0]
+check("benchmark: T3 benchmark_return updated", _bmr["benchmark_return"], 0.5)
+check("benchmark: T3 alpha updated", _bmr["alpha"], -0.4)
+_bmraw = dict(_bml.decisions_with_outcomes("SPYX")[0])
+check("benchmark: T3 holding_days SURVIVES the narrow update", _bmraw["holding_days"], 28)
+check("benchmark: T3 scored_against SURVIVES", _bmraw["scored_against"], "both")
+check("benchmark: T3 adherence SURVIVES", _bmraw["adherence"], "stop_violated")
+check("benchmark: T3 realized_pnl SURVIVES", _bmraw["realized_pnl"], 12.5)
+check("benchmark: T3 directional_return SURVIVES", _bmraw["directional_return"], 0.10)
+check("benchmark: T3 resolved_at is byte-identical (proves UPDATE, not INSERT OR REPLACE)",
+      _bmr["resolved_at"], "2026-07-06T21:25:17-04:00")
+check("benchmark: T3 clearing to NULL works (a refusal must not preserve a bad value)",
+      (_bml.update_outcome_benchmark(_bmd, None, None),
+       [r for r in _bml.outcomes_for_backfill() if r["decision_id"] == _bmd][0]["benchmark_return"]),
+      (1, None))
+check("benchmark: T3 unknown decision_id updates nothing",
+      _bml.update_outcome_benchmark(999999, 0.1, 0.1), 0)
+
+# T19 — the untrusted CLI must not be able to reach the trust seam. If a future flag
+# exposed `trust_input_benchmark` on the reflect subparser, the orchestrator-supplied
+# benchmark path reopens silently and every other test here stays green.
+_tick_src = (_REPO / "tick.py").read_text(encoding="utf-8")
+# Match BOTH spellings: argparse maps "--trust-input-benchmark" to the dest
+# `trust_input_benchmark`, so scanning only the underscore form would miss the
+# idiomatic hyphenated flag and let the untrusted path reopen with the suite green.
+_trust_lines = [ln.strip() for ln in _tick_src.splitlines()
+                if "trust_input_benchmark" in ln or "trust-input-benchmark" in ln]
+check_true("benchmark: T19 (sanity) the trust seam exists in tick.py", bool(_trust_lines))
+check("benchmark: T19 no argparse flag registers the trust seam (the CLI cannot reach it)",
+      [ln for ln in _trust_lines if "add_argument" in ln], [])
+check("benchmark: T19 the seam is read only via getattr-with-default",
+      [ln for ln in _trust_lines
+       if "getattr" not in ln and "=" in ln and not ln.startswith("#")], [])
+
+
 print(f"\n{PASS} passed, {FAIL} failed, {SKIP} skipped")
 sys.exit(1 if FAIL else 0)

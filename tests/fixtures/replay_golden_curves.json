@@ -1,0 +1,59 @@
+{
+  "_note": "GOLDEN wall-replay curves. Regenerate with scripts/capture_replay_golden.py. Guards the byte-identical-default invariant; test_determinism does NOT (it loops in one process against one build).",
+  "_hashed_fields": [
+    "date",
+    "equity",
+    "cash",
+    "positions_mv",
+    "drop_pct",
+    "n_orders",
+    "n_filled",
+    "halt"
+  ],
+  "_provenance": {
+    "git_head": "212e041+dirty",
+    "git_diff_sha256_16": "19cbffaf128da441"
+  },
+  "scenarios": {
+    "sma_rebalance_on": {
+      "curve_sha256": "f55254e0e2c72c1c7eebd4f00a4e139bd9f7b0936087248f2a2a195da38d428d",
+      "n_ticks": 36,
+      "final_equity": 10047.529504,
+      "total_orders": 332,
+      "total_return_pct": 0.475,
+      "max_drawdown_pct": -1.684
+    },
+    "sma_rebalance_off": {
+      "curve_sha256": "5df0fa54738f8b719257842d6ca1405b89c66987360bb5d5e29230488a281c41",
+      "n_ticks": 36,
+      "final_equity": 8949.819419,
+      "total_orders": 37,
+      "total_return_pct": -10.502,
+      "max_drawdown_pct": -13.05
+    },
+    "buy_rebalance_on": {
+      "curve_sha256": "28b13607c5a519381eb66fa73573e14de963c2409be196d4ec88c9d18f4cd625",
+      "n_ticks": 36,
+      "final_equity": 10406.855362,
+      "total_orders": 340,
+      "total_return_pct": 4.069,
+      "max_drawdown_pct": -3.104
+    },
+    "hold_rebalance_on": {
+      "curve_sha256": "b394b1dda3c93f3f8d1437f5992353c9b3c95508c6acf8842991b531ba1a3559",
+      "n_ticks": 36,
+      "final_equity": 10000.0,
+      "total_orders": 324,
+      "total_return_pct": 0.0,
+      "max_drawdown_pct": 0.0
+    },
+    "buy_small_account": {
+      "curve_sha256": "2867251deaa49677238a9e3df4b6032b165fedc878c8a001a6bcc2bcbc41028f",
+      "n_ticks": 36,
+      "final_equity": 532.875341,
+      "total_orders": 342,
+      "total_return_pct": 6.575,
+      "max_drawdown_pct": -1.512
+    }
+  }
+}

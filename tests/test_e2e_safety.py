@@ -312,7 +312,11 @@ def main() -> int:
         rin = Path(d) / "reflect_input.json"
         rin.write_text(json.dumps({"resolutions": [
             {"decision_id": did, "price_now": 110.0, "benchmark_return": 0.04, "realized_pnl": 12.5}]}))
-        res = tick.cmd_reflect(types.SimpleNamespace(input=str(rin)))
+        # trust_input_benchmark: this is an IN-PROCESS Python caller supplying its own
+        # deterministic benchmark (like lib/wall_replay), which is what the flag exists
+        # for. The alpha arithmetic below is still the real thing. The UNtrusted path —
+        # the orchestrator's CLI, which cannot set this flag — is asserted right after.
+        res = tick.cmd_reflect(types.SimpleNamespace(input=str(rin), trust_input_benchmark=True))
         ok("T6 reflect resolves the outcome", res.get("resolved") == 1, res)
         row = led.decisions_with_outcomes("SMH")[0]
         ok("T6 directional_return computed (decision_price->price_now = +10%)",
@@ -324,6 +328,23 @@ def main() -> int:
         sc = memory.build_scorecard("SMH", led.decisions_with_outcomes("SMH"))
         ok("T6 scorecard now grades on skill (excess-vs-benchmark)", "excess-vs-benchmark" in sc, sc)
         ok("T6 scorecard surfaces realized P&L", "Realized P&L" in sc and "$+12.50" in sc, sc)
+
+        # T6b — the UNTRUSTED path (what the orchestrator actually runs) must IGNORE a
+        # supplied benchmark_return rather than trusting it. Same input, no flag: the
+        # market leg must come out NULL, and the ignore must be reported, not silent.
+        res2 = tick.cmd_reflect(types.SimpleNamespace(input=str(rin)))
+        ok("T6b untrusted reflect still resolves", res2.get("resolved") == 1, res2)
+        ok("T6b orchestrator-supplied benchmark_return is IGNORED (alpha NULL)",
+           led.decisions_with_outcomes("SMH")[0].get("alpha") is None,
+           led.decisions_with_outcomes("SMH")[0].get("alpha"))
+        ok("T6b the ignore is reported, not silent",
+           res2.get("ignored_benchmark_returns") == 1, res2.get("ignored_benchmark_returns"))
+        import sqlite3 as _sq3
+        _c = _sq3.connect(str(tdb))
+        _br = _c.execute("SELECT benchmark_return FROM outcomes WHERE decision_id=?",
+                         (did,)).fetchone()[0]
+        _c.close()
+        ok("T6b benchmark_return column itself is NULL on the untrusted path", _br is None, _br)
 
     print(f"\nE2E safety: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
