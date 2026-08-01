@@ -2407,6 +2407,265 @@ def _load_factors(day: str):
     return raw, ""
 
 
+# --- benchmark measurement (outcomes.benchmark_return / alpha) ------------------
+# The market leg of the decision-memory scorecard. It USED to be computed by the LLM
+# orchestrator per TICK.md STEP 6b, which is why it was NULL on 44 of 51 rows and,
+# where present, priced off a series that stopped four days short of the window it
+# was measuring. Python owns it now: a bounded producer writes the closes, and the
+# backfill below is the ONLY thing that writes the two columns.
+#
+# Split into fetch/apply on purpose. Nothing here runs inside cmd_reflect: reflect
+# executes inside the orchestrator's shared deadline, and a stalled yfinance socket
+# cannot be caught by try/except -- only bounded by a separate process.
+
+BENCHMARK_SIDECAR = "benchmark.json"
+DEFAULT_BENCHMARK = "SPY"
+
+
+def _benchmark_path():
+    """Sidecar location. Overridable so tests never touch the live scratch file."""
+    return Path(os.environ.get("QUIVER_BENCHMARK_PATH")
+                or (REPO / "state" / "tmp" / BENCHMARK_SIDECAR))
+
+
+def _load_benchmark():
+    """Read the benchmark sidecar. NOT day-stamp gated: a backfill is a historical
+    operation, and per-window completeness is enforced by the calendar rule in
+    lib.benchmark rather than by how fresh the file is."""
+    try:
+        raw = json.loads(_benchmark_path().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None, "no usable benchmark sidecar; run: tick.py benchmark-fetch"
+    if not isinstance(raw, dict):
+        return None, "benchmark sidecar is not an object"
+    if not isinstance(raw.get("series"), dict) or not raw["series"]:
+        return None, "benchmark sidecar carries no price series; run: tick.py benchmark-fetch"
+    if not isinstance(raw.get("sessions"), list) or not raw["sessions"]:
+        return None, "benchmark sidecar carries no session calendar; run: tick.py benchmark-fetch"
+    return raw, ""
+
+
+def _benchmark_sessions(series, day: str) -> list:
+    """The XNYS session calendar to ship alongside a benchmark series.
+
+    Extracted so a test can drive the REAL rule instead of re-implementing it. That is
+    not cosmetic: this function shipped once bounded by ``max(series)``, and because both
+    test fixtures hand-wrote a calendar the producer could never emit, nothing caught it.
+
+    It MUST extend PAST the series. lib.benchmark anchors a target to the last session on
+    or before it and refuses when that session is absent from the series; a calendar that
+    stops where the series stops can never contain such a session, so the refusal goes
+    structurally dead exactly at the tail -- and the tail is where the original defect
+    lived (a series ending 2026-07-02 pricing a window ending 2026-07-06, 2.2x low).
+    """
+    import pandas_market_calendars as mcal
+
+    end = (datetime.strptime(max(max(series), day or ""), "%Y-%m-%d")
+           + timedelta(days=45)).strftime("%Y-%m-%d")
+    sched = mcal.get_calendar("XNYS").schedule(start_date=min(series), end_date=end)
+    return sorted({d.strftime("%Y-%m-%d") for d in sched.index})
+
+
+def cmd_benchmark_fetch(args) -> dict:
+    """OPERATOR/RUNNER-RUN price fetcher for the benchmark measurement.
+
+    Own process with an outer timeout, and ALWAYS writes a sidecar (an empty series
+    on total failure), because a stalled socket can only be bounded by process death.
+
+    Uses auto_adjust=False and the raw Close ON PURPOSE, unlike factors-fetch: the
+    position leg of every outcome is a PRICE return between two broker quotes with no
+    dividend credit, so the market leg must be a price return too. A total-return
+    series would overstate the benchmark by its dividend yield and bias every alpha
+    negative. (Close is already split-adjusted, so this is not a split hazard.)
+    """
+    bench = str(getattr(args, "benchmark", "") or DEFAULT_BENCHMARK).upper()
+    day = str(getattr(args, "date", "") or market.trading_day_et())
+    payload = {"trading_day": day, "benchmark": bench, "series": {}, "sessions": [], "source": None}
+    try:
+        import socket
+        socket.setdefaulttimeout(15)
+        import yfinance as yf
+        import pandas_market_calendars as mcal
+
+        period = str(getattr(args, "period", "") or "2y")
+        hist = yf.Ticker(bench).history(period=period, auto_adjust=False)
+        series = {}
+        for idx, row in hist.iterrows():
+            try:
+                d, c = str(idx)[:10], float(row["Close"])
+            except Exception:  # noqa: BLE001
+                continue
+            if c > 0 and c == c and c != float("inf"):
+                series[d] = c
+        payload["series"] = series
+        if series:
+            payload["sessions"] = _benchmark_sessions(series, day)
+        payload["source"] = "yfinance(auto_adjust=False, Close)"
+    except Exception as e:  # noqa: BLE001 — a total failure still writes an empty sidecar
+        payload["error"] = str(e)[:200]
+    _write_json_sidecar(_benchmark_path(), payload)
+    return {"ok": bool(payload["series"]), "benchmark": bench, "trading_day": day,
+            "observations": len(payload["series"]),
+            "last_observation": max(payload["series"]) if payload["series"] else None,
+            "path": str(_benchmark_path())}
+
+
+def _benchmark_plan_rows(led, sidecar, fill_only: bool) -> list:
+    """Recompute the market leg for every resolved decision. Pure classification --
+    decides nothing and writes nothing."""
+    from lib import benchmark as benchmark_lib
+
+    series, sessions = sidecar["series"], sidecar["sessions"]
+    out = []
+    for row in led.outcomes_for_backfill():
+        cur_b, cur_a = row.get("benchmark_return"), row.get("alpha")
+        if fill_only and cur_b is not None:
+            continue
+        new_b, why = benchmark_lib.window_return(
+            series=series, start_date=row.get("trade_date"),
+            end_date=str(row.get("resolved_at") or "")[:10], sessions=sessions)
+        dret = row.get("directional_return")
+        # alpha ONLY where the position leg exists, so `alpha non-NULL` stays a subset
+        # of `directional_return non-NULL`. That subset relation is what keeps the
+        # graded sample size fixed, which is what keeps any name from crossing the
+        # calibration min_n cliff on a re-measurement.
+        new_a = (dret - new_b) if (new_b is not None and dret is not None) else None
+        same = ((cur_b is None and new_b is None)
+                or (cur_b is not None and new_b is not None and abs(cur_b - new_b) <= 1e-12))
+        if same:
+            kind = "unchanged"
+        elif new_b is None:
+            # A refusal on an already-populated row CLEARS it. Leaving a value that
+            # cannot be reproduced would let a bad measurement survive its own fix.
+            kind = "cleared"
+        elif cur_b is None:
+            kind = "fill"
+        else:
+            kind = "correct"
+        out.append({**row, "new_benchmark_return": new_b, "new_alpha": new_a,
+                    "kind": kind, "reason": why})
+    return out
+
+
+def _benchmark_scorecard(db_path, tickers, cfg) -> dict:
+    """{ticker: {multiplier, tier}} through the REAL consumers, so the printed diff
+    cannot drift from what the trading loop will actually compute."""
+    from lib import calibrate, reflect_memory
+
+    led = Ledger(str(db_path))
+    mult = calibrate.build_calibration(led, tickers,
+                                       min_n=int(cfg.strategy.learning.min_resolved_n))
+    out = {}
+    for t in tickers:
+        tier = None
+        try:
+            tier = reflect_memory.build_metric_bundle(led, t, cfg.memory)["ticker"]["guidance"].tier
+        except Exception:  # noqa: BLE001 — the tier is reporting only; never block the diff
+            tier = "unavailable"
+        out[t] = {"multiplier": mult.get(t, 1.0), "tier": tier}
+    return out
+
+
+def cmd_benchmark_backfill(args) -> dict:
+    """Recompute outcomes.benchmark_return/alpha from the sidecar. DRY-RUN unless --apply.
+
+    Prints the before/after conviction multiplier AND guidance tier for every affected
+    name, because this is a learning input that reaches order dollars -- not plumbing.
+    """
+    import shutil
+    import tempfile
+
+    apply = bool(getattr(args, "apply", False))
+    fill_only = bool(getattr(args, "fill_only", False))
+    try:
+        max_rows = int(getattr(args, "max_rows", 0) or 0)
+    except (TypeError, ValueError):
+        max_rows = 0
+
+    out = {"ok": False, "applied": False, "dry_run": not apply,
+           "fill_only": fill_only, "db": str(LEDGER_DB)}
+    sidecar, why = _load_benchmark()
+    if sidecar is None:
+        out["reason"] = why
+        return out
+    out["benchmark"] = sidecar.get("benchmark")
+    out["last_observation"] = max(sidecar["series"]) if sidecar["series"] else None
+
+    led = Ledger(LEDGER_DB)
+    cfg = load_config(CONFIG_PATH)
+    rows = _benchmark_plan_rows(led, sidecar, fill_only)
+    changes = [r for r in rows if r["kind"] != "unchanged"]
+    counts = {}
+    for r in rows:
+        counts[r["kind"]] = counts.get(r["kind"], 0) + 1
+    out["counts"] = counts
+    out["examined"] = len(rows)
+    out["changes"] = len(changes)
+    # Refusal reasons are the audit trail for anything left NULL -- surface them
+    # rather than reporting a silent "unchanged".
+    out["refusals"] = sorted({r["reason"] for r in rows
+                              if r["reason"] and r["kind"] in ("unchanged", "cleared")})[:5]
+
+    # Bound the UNATTENDED path by construction. Filling a NULL re-bases the scorecard
+    # from absolute return onto alpha, so a large backlog re-prices the book just as
+    # surely as correcting a wrong value does; only the row count separates routine
+    # measurement from a reviewable change.
+    if max_rows > 0 and len(changes) > max_rows:
+        out["reason"] = (f"backlog of {len(changes)} rows exceeds --max-rows {max_rows}; "
+                         "run a reviewed `tick.py benchmark-backfill` (dry-run), then --apply")
+        out["ok"] = True
+        return out
+
+    tickers = sorted({r["ticker"] for r in rows if r.get("ticker")}) or \
+        sorted({r["ticker"] for r in led.outcomes_for_backfill() if r.get("ticker")})
+    before = _benchmark_scorecard(LEDGER_DB, tickers, cfg)
+
+    # The "after" side is measured on a COPY, so a dry-run writes nothing anywhere.
+    tmpdir = tempfile.mkdtemp(prefix="quiver_benchmark_")
+    try:
+        shadow = Path(tmpdir) / "after.db"
+        shutil.copy(str(LEDGER_DB), str(shadow))
+        sled = Ledger(str(shadow))
+        for r in changes:
+            sled.update_outcome_benchmark(r["decision_id"], r["new_benchmark_return"], r["new_alpha"])
+        after = _benchmark_scorecard(shadow, tickers, cfg)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    diff = []
+    for t in tickers:
+        b, a = before[t], after[t]
+        if abs(b["multiplier"] - a["multiplier"]) > 1e-9 or b["tier"] != a["tier"]:
+            diff.append({"ticker": t,
+                         "multiplier_before": round(b["multiplier"], 4),
+                         "multiplier_after": round(a["multiplier"], 4),
+                         "tier_before": b["tier"], "tier_after": a["tier"]})
+    out["calibration_diff"] = diff
+
+    if apply and changes:
+        for r in changes:
+            led.update_outcome_benchmark(r["decision_id"], r["new_benchmark_return"], r["new_alpha"])
+        out["applied"] = True
+        goal = led.get_active_goal()
+        if goal:  # a NULL goal_id row is invisible to strategy_change_history
+            try:
+                led.record_strategy_change(
+                    goal_id=goal["id"], changed_at=market.now_et().isoformat(),
+                    change_type="measurement", trigger="benchmark-backfill",
+                    from_value=f"{counts.get('fill', 0)} unmeasured/"
+                               f"{counts.get('correct', 0)} mismeasured",
+                    to_value=f"{len(changes)} rows re-measured vs {out['benchmark']}",
+                    reason="benchmark_return/alpha recomputed from final closes over each "
+                           "decision's own holding window (Python-owned measurement)",
+                    proof_json=json.dumps({"counts": counts, "calibration_diff": diff,
+                                           "benchmark": out["benchmark"],
+                                           "fill_only": fill_only}))
+            except Exception:  # noqa: BLE001 — the change-log is observability; never blocks
+                pass
+    out["ok"] = True
+    return out
+
+
 def _daily_returns(rows: dict, field: str) -> dict:
     """{date: simple return} from {date: {open, close}} over consecutive dates."""
     ds = sorted(rows)
@@ -3101,8 +3360,22 @@ def cmd_protect(args) -> dict:
 #   {"resolutions": [
 #       {"decision_id": 12, "price_now": 196.4,
 #        "position_market_value": 48.0, "position_cost_basis": 50.0,   # optional
-#        "realized_pnl": 0.0, "benchmark_return": 0.004}               # optional
+#        "realized_pnl": 0.0}
 #   ]}
+#
+# benchmark_return is NOT accepted here. It used to be, and the orchestrator was told
+# to compute a SPY window return "or omit" — so it was omitted on 44 of 51 rows and,
+# where supplied, priced off a series ending four days before the window it measured.
+# Python owns that measurement now (`tick.py benchmark-backfill`), which also means it
+# is computed only from FINAL closes: at reflect time the resolve date's session is
+# still open, so the number simply does not exist yet. The row is written with a NULL
+# market leg and the backfill fills it on a later run; a NULL alpha degrades exactly as
+# before (the scorecard grades that row on its absolute return).
+#
+# trust_input_benchmark is the ONE exception, for IN-PROCESS Python callers that own a
+# deterministic benchmark series of their own — lib/wall_replay.py replaying history,
+# and the alpha-arithmetic e2e. The argparse CLI never sets it, so the orchestrator
+# path cannot reach it.
 
 def cmd_reflect(args) -> dict:
     led = Ledger(LEDGER_DB)
@@ -3110,6 +3383,8 @@ def cmd_reflect(args) -> dict:
     today = market.now_et().date()
     data = json.loads(Path(args.input).read_text(encoding="utf-8"))
     resolutions = data.get("resolutions", []) or []
+    trust_input_benchmark = bool(getattr(args, "trust_input_benchmark", False))
+    ignored_benchmarks = 0
 
     results = []
     affected: set = set()
@@ -3137,7 +3412,13 @@ def cmd_reflect(args) -> dict:
             holding_days = (today - td).days
         except Exception:  # noqa: BLE001
             holding_days = None
-        bench = _to_float(r.get("benchmark_return"))
+        supplied_bench = _to_float(r.get("benchmark_return"))
+        if trust_input_benchmark:
+            bench = supplied_bench
+        else:
+            bench = None
+            if supplied_bench is not None:
+                ignored_benchmarks += 1
         alpha = (dret - bench) if (dret is not None and bench is not None) else None
         scored = "both" if (unrealized is not None or realized is not None) else "directional"
         # F7/P7: grade whether the recorded stop/target plan held (PTJ "no curve" accountability).
@@ -3158,6 +3439,11 @@ def cmd_reflect(args) -> dict:
         "resolved": sum(1 for x in results if x["status"] == "resolved"),
         "results": results,
     }
+    if ignored_benchmarks:
+        # Say so out loud. A silently-dropped input is how the old measurement rotted.
+        out["ignored_benchmark_returns"] = ignored_benchmarks
+        out["benchmark_note"] = ("benchmark_return is computed by Python, not accepted here; "
+                                 "run: tick.py benchmark-fetch && tick.py benchmark-backfill")
     # Best-effort: refresh the reflective-memory metric blocks for the resolved
     # tickers + portfolio.md now that new outcomes landed. A memory error must NEVER
     # fail the tick (reflect is best-effort) — surface it in the output instead.
@@ -3730,6 +4016,15 @@ def main(argv) -> int:
     p_ff.add_argument("--date", default="")
     p_ff.add_argument("--tickers", default="")
     p_ff.add_argument("--period", default="2y")
+    p_bf = sub.add_parser("benchmark-fetch")
+    p_bf.add_argument("--benchmark", default=DEFAULT_BENCHMARK)
+    p_bf.add_argument("--date", default="")
+    p_bf.add_argument("--period", default="2y")
+    p_bb = sub.add_parser("benchmark-backfill")
+    # DRY-RUN by default: this rewrites a learning input that reaches order dollars.
+    p_bb.add_argument("--apply", action="store_true")
+    p_bb.add_argument("--fill-only", dest="fill_only", action="store_true")
+    p_bb.add_argument("--max-rows", dest="max_rows", default="0")
     p_sh = sub.add_parser("strategy-history")
     p_sh.add_argument("--limit", default="50")
     p_sh.add_argument("--type", default="")
@@ -3799,6 +4094,10 @@ def main(argv) -> int:
             out = cmd_decision_proof(args)
         elif args.cmd == "attribution":
             out = cmd_attribution(args)
+        elif args.cmd == "benchmark-fetch":
+            out = cmd_benchmark_fetch(args)
+        elif args.cmd == "benchmark-backfill":
+            out = cmd_benchmark_backfill(args)
         elif args.cmd == "factors-fetch":
             out = cmd_factors_fetch(args)
         elif args.cmd == "strategy-history":

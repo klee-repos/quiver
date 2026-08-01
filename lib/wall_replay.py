@@ -323,7 +323,10 @@ def _resolve_due_outcomes(led, date: str, price_at, benchmark_at, tmp: Path) -> 
     if not resolutions:
         return []
     _write_json(tmp, {"resolutions": resolutions})
-    out = tick.cmd_reflect(types.SimpleNamespace(input=str(tmp)))
+    # trust_input_benchmark: the replay owns a real benchmark series for the historical
+    # window it is replaying (benchmark_at above), so it is a Python authority in the
+    # same sense the live backfill is. The orchestrator CLI never sets this flag.
+    out = tick.cmd_reflect(types.SimpleNamespace(input=str(tmp), trust_input_benchmark=True))
     rows = []
     for r in out.get("results", []):
         if r.get("status") != "resolved":

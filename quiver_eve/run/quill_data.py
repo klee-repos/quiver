@@ -31,6 +31,13 @@ REPO = Path(__file__).resolve().parent.parent.parent  # the quiver root
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# MUST come after the sys.path insert above (this file runs as a script, is loaded by
+# importlib in tests, and is spawned by node — none of them put the repo on the path for us).
+# Deliberately NOT wrapped in try/except: a swallowed ImportError would leave this module
+# running with a silently different degraded-report rule, which is exactly the class of drift
+# this import exists to prevent. A hard failure here is loud, and loud is correct.
+from lib.data_sentinels import report_is_usable  # noqa: E402
+
 
 def _safe(fn) -> dict:
     try:
@@ -69,8 +76,15 @@ def _recent_window(date: str | None, days: int = 60) -> tuple[str, str]:
 
 
 # Sentinels that mean "this fetch returned an error/empty placeholder, not real data".
-# Used to derive an HONEST core_available per channel (mirrors analyze.py's gate), so a
-# thin/garbage channel is reported unavailable instead of dressed up as present data.
+# Used to derive an HONEST core_available per channel, so a thin/garbage channel is
+# reported unavailable instead of dressed up as present data.
+#
+# These score the RAW single-channel payload. analyze.py's tuple scores the MODEL'S
+# NARRATIVE about that payload, which is a different input domain — a healthy narrative
+# legitimately QUOTES "No news found for NVDA" — so the two tuples are deliberately NOT
+# merged (measured: merging flips 6 of 148 real recorded bodies to unavailable). The rule
+# they DO share is the anchored `UNAVAILABLE:` marker in lib/data_sentinels; a sentinel
+# added here is pinned by tests/test_units.py to be adopted there or recorded domain-only.
 _SENTINELS = (
     "error retrieving", "error fetching", "no data found", "no price data",
     "no fundamentals data", "no balance sheet data", "no news found",
@@ -80,12 +94,10 @@ _SENTINELS = (
 
 
 def _content_ok(text) -> bool:
-    """True only when `text` is real, usable data — non-trivial and free of any error
-    sentinel. The single source of truth for a channel's core_available flag."""
-    t = str(text or "").strip().lower()
-    if len(t) < 30:               # empty / near-empty -> unusable
-        return False
-    return not any(s in t for s in _SENTINELS)
+    """True only when `text` is real, usable data — non-trivial, not a whole-channel
+    `UNAVAILABLE: …` placeholder, and free of any error sentinel. The single source of
+    truth for a channel's core_available flag."""
+    return report_is_usable(text, min_chars=30, sentinels=_SENTINELS)
 
 
 def _tail_csv(csv_text: str, max_rows: int = 45) -> str:
@@ -110,12 +122,18 @@ def _latest_indicators(ticker: str, curr_date: str | None) -> dict:
     exact same-day row, which doesn't exist before today's close (the old
     fetch_market ALSO passed the start-date into the indicator slot, so indicators
     were always empty). Returns {"as_of": date, <ind>: value|None, ...}, or {} on any
-    failure (best-effort context; never fatal)."""
+    failure (best-effort context; never fatal).
+
+    Each value goes through ``indicator_at``, which returns NaN -> None when the frame is
+    shorter than the window that indicator needs. stockstats rolls with ``min_periods=1``,
+    so without that a young ticker (a fresh listing the screener rotated in) would report a
+    confident RSI/MACD/BOLL/ATR and a "200-day SMA" computed from a handful of bars. An
+    absent indicator is honest; a fabricated one silently answers a different question."""
     try:
         from datetime import datetime
         import pandas as pd
         from stockstats import wrap
-        from lib.dataflows.stockstats_utils import load_ohlcv
+        from lib.dataflows.stockstats_utils import load_ohlcv, indicator_at
         d = curr_date or datetime.now().strftime("%Y-%m-%d")
         data = load_ohlcv(ticker, d)
         if data is None or data.empty:
@@ -123,12 +141,9 @@ def _latest_indicators(ticker: str, curr_date: str | None) -> dict:
         df = wrap(data)
         names = ["rsi", "macd", "macds", "macdh", "boll", "boll_ub", "boll_lb",
                  "atr", "close_10_ema", "close_50_sma", "close_200_sma"]
+        out = {"as_of": pd.to_datetime(df.iloc[-1]["Date"]).strftime("%Y-%m-%d")}
         for n in names:
-            df[n]  # trigger stockstats to compute the column
-        last = df.iloc[-1]
-        out = {"as_of": pd.to_datetime(last["Date"]).strftime("%Y-%m-%d")}
-        for n in names:
-            v = last[n]
+            v = indicator_at(df, n)
             out[n] = round(float(v), 4) if pd.notna(v) else None
         return out
     except Exception:  # noqa: BLE001 — indicators are best-effort context, never fatal

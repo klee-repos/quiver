@@ -34,6 +34,7 @@ REASONDIR = REPO / "logs" / "reasoning"
 LEDGER_DB = Path(os.environ.get("QUIVER_LEDGER_DB") or (STATE / "ledger.db"))
 
 from lib.rating import parse_rating  # module-level: _validate_contract (F6) uses it too
+from lib.data_sentinels import report_is_usable  # the ONE degraded-report predicate
 
 
 def process_stderr(msg: str) -> None:
@@ -171,6 +172,13 @@ def parse_pm_field_float(decision_text: str, label: str):
 
 # Sentinels a degraded fetcher leaves in a report. A report that merely CONTAINS one of
 # these (or is near-empty) is NOT usable data — treating it as present is the fail-OPEN bug.
+#
+# These are scored against the MODEL'S NARRATIVE, which is a different input domain from the
+# raw payload quill_data._SENTINELS scores — a healthy narrative legitimately QUOTES phrases
+# like "No news found for NVDA". So this tuple is deliberately NOT the union of the two;
+# merging them was measured to flip 6 of 148 real recorded report bodies to unavailable.
+# What IS shared — and what the fail-open bug came from — is the anchored UNAVAILABLE marker,
+# which now lives once in lib/data_sentinels (see that module's docstring for the full RCA).
 _DATA_ERROR_SENTINELS = ("error retrieving", "no data found", "no price data",
                          "data unavailable", "dataunavailableerror", "could not retrieve",
                          "no data for")
@@ -178,11 +186,9 @@ _DATA_ERROR_SENTINELS = ("error retrieving", "no data found", "no price data",
 
 def _report_available(report) -> bool:
     """True only when a curated analyst report is real, usable data — not empty, not an
-    error sentinel. Used to decide data-quality + the fail-SAFE core-data ERROR override."""
-    t = str(report or "").strip().lower()
-    if len(t) < 40:                       # empty / near-empty -> unusable
-        return False
-    return not any(s in t for s in _DATA_ERROR_SENTINELS)
+    error sentinel, and not a whole-channel `UNAVAILABLE: …` failure placeholder. Used to
+    decide data-quality + the fail-SAFE core-data ERROR override."""
+    return report_is_usable(report, min_chars=40, sentinels=_DATA_ERROR_SENTINELS)
 
 
 def assess_data_quality(final_state: dict) -> dict:

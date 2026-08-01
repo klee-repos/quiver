@@ -524,6 +524,43 @@ def main() -> int:
                     except Exception as e:  # noqa: BLE001 — best-effort
                         _emit({"stage": "bills-review", "error": f"{type(e).__name__}: {e}"})
 
+                # --- benchmark measurement (outcomes.benchmark_return -> alpha) -------
+                # AFTER the orchestrator: nothing in the tick reads it, and reflect must not
+                # pay for it. Own subprocess with an outer timeout because a yfinance socket
+                # stall does not raise. Best-effort; never blocks a tick.
+                #
+                # --max-rows is the blast-radius bound, and it is doing real work: filling a
+                # NULL re-bases the scorecard from absolute return onto alpha, so a large
+                # BACKLOG re-prices the book just as surely as correcting a wrong value would
+                # (measured: filling 44 NULLs alone moved a name 0.75 -> 1.05). Only the row
+                # count separates routine measurement from a change a human should review, so
+                # a backlog is REFUSED here and left for `tick.py benchmark-backfill --apply`.
+                try:
+                    _budget = int(_deadline - time.monotonic())
+                    if _budget >= 30:
+                        _bf = _tick_json(["benchmark-fetch"], timeout=min(120, _budget))
+                        _emit({"stage": "benchmark-fetch", **{k: _bf[k] for k in (
+                            "observations", "last_observation", "error") if k in _bf}})
+                        _budget = int(_deadline - time.monotonic())
+                        # Only backfill against a sidecar this run actually produced. A
+                        # fetch killed by its outer timeout dies BEFORE writing, leaving the
+                        # previous run's file on disk, and the backfill does not day-gate it.
+                        # The calendar guard would refuse rather than write a stale close, but
+                        # not attempting it keeps the failure legible instead of silent.
+                        if _bf.get("error") or not _bf.get("observations"):
+                            _emit({"stage": "benchmark-backfill",
+                                   "skipped": "no fresh benchmark sidecar this run"})
+                        elif _budget >= 20:
+                            _bb = _tick_json(["benchmark-backfill", "--apply", "--fill-only",
+                                              "--max-rows", "12"], timeout=min(120, _budget))
+                            _emit({"stage": "benchmark-backfill", **{k: _bb[k] for k in (
+                                "applied", "changes", "reason", "error") if k in _bb}})
+                    else:
+                        _emit({"stage": "benchmark-fetch",
+                               "skipped": "insufficient wall-clock budget"})
+                except Exception as e:  # noqa: BLE001 — best-effort; never blocks a tick
+                    _emit({"stage": "benchmark", "error": f"{type(e).__name__}: {e}"})
+
                 # AUTH_ERROR is a hard-stop posture: exit non-zero so systemd + the
                 # documented drill see a failed run even if the orchestrator exited 0.
                 return 0 if (ok and not auth_error and not no_decisions) else 1

@@ -184,6 +184,18 @@ def test_replay_and_invariants():
     ok("reflect resolved >=1 decision with a directional_return",
        any(x.get("directional_return") is not None for x in res["decisions"]),
        len(res["decisions"]))
+    # The replay is a TRUSTED in-process caller: it owns a real benchmark series for the
+    # window it replays, so cmd_reflect must honor it (trust_input_benchmark=True). Read
+    # the columns RAW -- nothing in Ledger SELECTs benchmark_return, and cmd_reflect's
+    # output never exposes it, so without this the whole trust seam is untested and a
+    # typo'd kwarg would silently degrade every replayed alpha to NULL.
+    import sqlite3 as _sq3
+    _c = _sq3.connect(led.db_path)
+    _bm = _c.execute("SELECT COUNT(*) FROM outcomes WHERE benchmark_return IS NOT NULL").fetchone()[0]
+    _al = _c.execute("SELECT COUNT(*) FROM outcomes WHERE alpha IS NOT NULL").fetchone()[0]
+    _c.close()
+    ok("replay's trusted benchmark_return reaches the ledger (trust seam intact)", _bm > 0, _bm)
+    ok("replay's alpha is therefore computed, not NULL", _al > 0, _al)
 
 
 def test_dryrun_assert():

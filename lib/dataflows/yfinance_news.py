@@ -3,11 +3,16 @@
 from typing import Optional
 
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dateutil.relativedelta import relativedelta
 
 from .config import get_config
 from .stockstats_utils import yf_retry
+
+# curr_date is a TRADING date, i.e. an exchange-calendar date in ET (analyze.py derives it
+# from trading_day_et()). Never compare publish times against the OS timezone.
+_ET = ZoneInfo("America/New_York")
 
 
 def _extract_article_data(article: dict) -> dict:
@@ -41,13 +46,23 @@ def _extract_article_data(article: dict) -> dict:
             "pub_date": pub_date,
         }
     else:
-        # Fallback for flat structure
+        # Flat structure — this is what ``yf.Search(...).news`` actually returns (keys:
+        # title/publisher/link/providerPublishTime/...). Its timestamp is a Unix epoch int,
+        # NOT the ISO ``pubDate`` the nested shape carries. This used to hardcode
+        # ``pub_date: None``, which silently disabled every date filter downstream.
+        pub_date = None
+        ts = article.get("providerPublishTime")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
+            try:
+                pub_date = datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
+            except (OverflowError, OSError, ValueError):
+                pub_date = None
         return {
             "title": article.get("title", "No title"),
             "summary": article.get("summary", ""),
             "publisher": article.get("publisher", "Unknown"),
             "link": article.get("link", ""),
-            "pub_date": None,
+            "pub_date": pub_date,
         }
 
 
@@ -152,12 +167,12 @@ def get_global_news_yfinance(
             taken = 0
             if search.news:
                 for article in search.news:
-                    # Handle both flat and nested structures
-                    if "content" in article:
-                        data = _extract_article_data(article)
-                        title = data["title"]
-                    else:
-                        title = article.get("title", "")
+                    # _extract_article_data handles both the nested and flat shapes. Treat
+                    # its "No title" placeholder as untitled so a title-less article stays
+                    # skipped, exactly as the old flat branch's "" default did.
+                    title = _extract_article_data(article)["title"]
+                    if title == "No title":
+                        title = ""
 
                     # Deduplicate by title
                     if title and title not in seen_titles:
@@ -176,31 +191,41 @@ def get_global_news_yfinance(
         start_date = start_dt.strftime("%Y-%m-%d")
 
         news_str = ""
+        rendered = 0
+        # curr_date is an ET calendar date, so the cutoff is the end of curr_date IN ET.
+        # The original ``+1 day`` slack WAS the UTC->ET compensation for a naive compare;
+        # keeping it on top of the explicit ET conversion below would apply the correction
+        # twice and admit the ENTIRE next trading session (curr+1 open through close) as
+        # today's macro context.
+        cutoff = curr_dt.date()
         for article in all_news[:limit]:
-            # Handle both flat and nested structures
-            if "content" in article:
-                data = _extract_article_data(article)
-                # Skip articles published after curr_date (look-ahead guard)
-                if data.get("pub_date"):
-                    pub_naive = data["pub_date"].replace(tzinfo=None) if hasattr(data["pub_date"], "replace") else data["pub_date"]
-                    if pub_naive > curr_dt + relativedelta(days=1):
-                        continue
-                title = data["title"]
-                publisher = data["publisher"]
-                link = data["link"]
-                summary = data["summary"]
-            else:
-                title = article.get("title", "No title")
-                publisher = article.get("publisher", "Unknown")
-                link = article.get("link", "")
-                summary = ""
-
-            news_str += f"### {title} (source: {publisher})\n"
-            if summary:
-                news_str += f"{summary}\n"
-            if link:
-                news_str += f"Link: {link}\n"
+            # One extraction path for both shapes. This guard used to sit inside an
+            # ``if "content" in article:`` branch, but yf.Search returns the FLAT shape, so
+            # it never ran and future-dated headlines were rendered as current macro.
+            data = _extract_article_data(article)
+            pub = data.get("pub_date")
+            if pub is not None:
+                # Both shapes' timestamps are UTC (the flat epoch is converted to naive UTC
+                # in _extract_article_data; the nested ISO one carries its own offset), so a
+                # naive value is assumed UTC. Compare CALENDAR DATES in ET: a datetime
+                # compare against a naive local midnight puts the boundary at ~20:00 ET and
+                # silently drops same-day evening headlines.
+                aware = pub if pub.tzinfo else pub.replace(tzinfo=timezone.utc)
+                if aware.astimezone(_ET).date() > cutoff:
+                    continue
+            news_str += f"### {data['title']} (source: {data['publisher']})\n"
+            if data["summary"]:
+                news_str += f"{data['summary']}\n"
+            if data["link"]:
+                news_str += f"Link: {data['link']}\n"
             news_str += "\n"
+            rendered += 1
+
+        if not rendered:
+            # Every article was filtered out. Returning the bare header here would hand back
+            # a >30-char string that quill_data._content_ok scores as REAL DATA, so an empty
+            # macro feed would report itself as available. Return the recognized sentinel.
+            return f"No global news found for {curr_date}"
 
         return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
 

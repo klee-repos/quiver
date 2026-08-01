@@ -44,8 +44,7 @@ def get_YFin_data_online(
 
     # Add header information
     header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(data)}\n"
-    header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    header += f"# Total records: {len(data)}\n\n"
 
     return header + csv_string
 
@@ -313,8 +312,7 @@ def get_fundamentals(
             else:
                 lines.append(f"{label}: {value}")
 
-        header = f"# Company Fundamentals for {ticker.upper()}\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header = f"# Company Fundamentals for {ticker.upper()}\n\n"
 
         return header + "\n".join(lines)
 
@@ -345,8 +343,7 @@ def get_balance_sheet(
         csv_string = data.to_csv()
         
         # Add header information
-        header = f"# Balance Sheet data for {ticker.upper()} ({freq})\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header = f"# Balance Sheet data for {ticker.upper()} ({freq})\n\n"
         
         return header + csv_string
         
@@ -377,8 +374,7 @@ def get_cashflow(
         csv_string = data.to_csv()
         
         # Add header information
-        header = f"# Cash Flow data for {ticker.upper()} ({freq})\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header = f"# Cash Flow data for {ticker.upper()} ({freq})\n\n"
         
         return header + csv_string
         
@@ -409,8 +405,7 @@ def get_income_statement(
         csv_string = data.to_csv()
         
         # Add header information
-        header = f"# Income Statement data for {ticker.upper()} ({freq})\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header = f"# Income Statement data for {ticker.upper()} ({freq})\n\n"
         
         return header + csv_string
         
@@ -433,8 +428,7 @@ def get_insider_transactions(
         csv_string = data.to_csv()
         
         # Add header information
-        header = f"# Insider Transactions data for {ticker.upper()}\n"
-        header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        header = f"# Insider Transactions data for {ticker.upper()}\n\n"
         
         return header + csv_string
         

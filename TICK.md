@@ -310,17 +310,17 @@ have its `ticker` and its `trade_date`; gather the current data you fetched in S
   ticker is currently held (else omit — directional-only scoring).
 - `realized_pnl` = the broker's realized P&L for the name IF the position was CLOSED/reduced
   since the decision (else omit). This closes the "did it actually make money" leg.
-- `benchmark_return` = the **market benchmark's** fractional return over the SAME window as
-  the decision (decision `trade_date` → now). Fetch `get_equity_historicals("SPY", ...)`
-  ONCE this wake, then for each resolution compute `(spy_now - spy_on_trade_date)/spy_on_trade_date`.
-  Passing this makes the memory loop score **alpha (skill), not market beta** — a long that
-  merely rode a rising tape is no longer counted as a "win." Omit only if SPY history is
-  unavailable (then it scores on absolute return, as before).
+- Do **NOT** pass `benchmark_return`. Python owns that measurement now (`tick.py
+  benchmark-backfill`, run by the supervisor) and `reflect` IGNORES the field if you send it.
+  It used to be your job — "compute a SPY window return or omit" — and the result was that it
+  was omitted on 44 of 51 rows and, where supplied, priced off a series ending four days before
+  the window it was measuring. It is also not computable at this point in the day: the resolve
+  date's session is still open, so its close does not exist yet.
 
 Write `state/tmp/reflect_input.json`:
 ```json
 {"resolutions": [
-  {"decision_id": <id>, "price_now": <quote>, "benchmark_return": <SPY window return or omit>,
+  {"decision_id": <id>, "price_now": <quote>,
    "position_market_value": <or omit>, "position_cost_basis": <or omit>,
    "realized_pnl": <or omit>}
 ]}

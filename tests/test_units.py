@@ -3759,6 +3759,352 @@ finally:
 check_true("macro: empty -> core False (honest)", _mcore2 is False)
 
 
+# === Fetcher data-integrity fixes (2026-08-01) ====================================
+# Four ANALYSIS-side defects in lib/dataflows/, each pinned by the assertion that was RED
+# before the fix:
+#  F1 load_ohlcv anchored its OHLCV window to TODAY instead of curr_date, so a dated run got a
+#     SHORT frame — and stockstats rolls with min_periods=1, so that short mean came back
+#     labelled `close_200_sma`. Real AAPL @2022-03-01: 147 bars, "200 SMA" 154.72. On
+#     2021-09-15 the price-vs-200d READ INVERTED (reported 145.85 -> BELOW, true 200d
+#     130.21 -> ABOVE). The cache key omitted curr_date, so the answer also depended on the
+#     day you asked.
+#  F2 the look-ahead guard sat inside `if "content" in article:`, but yf.Search returns the
+#     FLAT shape (providerPublishTime, a Unix epoch int) — so the guard was unreachable and
+#     future-dated macro headlines were never filtered.
+#  F3 an all-filtered global-news body still returned a >30-char header, which
+#     quill_data._content_ok scores as real data. (macro is NOT core — analyze.py:207 gates on
+#     market only — so this never blocked a trade; it lied to the model and wrote a false
+#     `macro: available` into the persisted data_quality row.)
+#  F4 `# Data retrieved on: <wall clock>` leaked into the model-facing market report.
+import shutil as _fsh  # noqa: E402
+import datetime as _fdt  # noqa: E402
+import numpy as _fnp  # noqa: E402
+import pandas as _fpd  # noqa: E402
+import lib.dataflows.stockstats_utils as _ssu  # noqa: E402
+import lib.dataflows.config as _dfcfg  # noqa: E402
+from stockstats import wrap as _fwrap  # noqa: E402
+from lib.dataflows.errors import DataUnavailableError as _fDUE  # noqa: E402
+
+# --- F1c: min_periods_for — a literal table over the CLOSED live indicator set.
+# (quill_data.py:124-125 enumerates exactly these 11; measured, a 5-bar frame returns a
+# confident number for ALL 11, so a name-parsing heuristic would have masked only 3.)
+for _fname, _fwant in [("close_200_sma", 200), ("close_50_sma", 50), ("close_10_ema", 10),
+                       ("rsi", 14), ("atr", 14), ("boll", 20), ("boll_ub", 20),
+                       ("boll_lb", 20), ("macd", 26), ("macds", 34), ("macdh", 34)]:
+    check(f"fetch: min_periods_for({_fname})", _ssu.min_periods_for(_fname), _fwant)
+# numeric-suffix fallback for names outside the table
+check("fetch: min_periods_for(rsi_14) fallback", _ssu.min_periods_for("rsi_14"), 14)
+check("fetch: min_periods_for(close_20_sma) fallback", _ssu.min_periods_for("close_20_sma"), 20)
+# genuinely unknown, no window in the name -> None (never mask on a guess)
+for _fname in ("vwap", "close", "supertrend"):
+    check(f"fetch: min_periods_for({_fname}) is None", _ssu.min_periods_for(_fname), None)
+
+
+def _fsynth(n, start_price=100.0, drift=0.5):
+    """n business-day bars on a steady uptrend (deterministic, no network)."""
+    _d = _fpd.bdate_range("2024-01-02", periods=n)
+    _c = start_price + drift * _fnp.arange(n)
+    return _fpd.DataFrame({"Date": _d, "Open": _c, "High": _c * 1.01, "Low": _c * 0.99,
+                           "Close": _c, "Volume": 1_000_000})
+
+
+# --- F1c: a frame SHORTER than the indicator's window yields NaN, not a short mean.
+# RED BEFORE FIX: stockstats returned 139.0 — the 157-bar mean — as the "200-day SMA".
+_fshort = _fwrap(_fsynth(157).copy())
+check_true("fetch: close_200_sma NaN on a 157-bar frame",
+           _fpd.isna(_ssu.indicator_at(_fshort, "close_200_sma")))
+check_true("fetch: close_50_sma still real on 157 bars (157 >= 50)",
+           not _fpd.isna(_ssu.indicator_at(_fshort, "close_50_sma")))
+# Pin the VALUE on a long frame, so masking can't be faked by returning NaN unconditionally.
+_flong = _fwrap(_fsynth(400).copy())
+check("fetch: close_200_sma value on 400 bars",
+      round(float(_ssu.indicator_at(_flong, "close_200_sma")), 4),
+      round(float(_fsynth(400)["Close"].tail(200).mean()), 4))
+
+# --- F1a/F1b: the download window + cache key anchor to curr_date, not to today.
+# The temp-dir swap is MANDATORY: data_cache_dir is the relative "state/cache" and
+# run_e2e.sh cds to the repo root, so an unisolated call writes into the real repo.
+_fcache = tempfile.mkdtemp(prefix="quiver-test-cache-")
+_forig_cache = _dfcfg.get_config()["data_cache_dir"]
+_forig_dl = _ssu.yf.download
+_fdl = []
+
+
+def _ffake_download(symbol, start=None, end=None, **kw):
+    _fdl.append({"symbol": symbol, "start": start, "end": end})
+    _f = _fsynth(1400)
+    _f["Date"] = _fpd.bdate_range(end=_fpd.to_datetime(end) - _fpd.Timedelta(days=1), periods=1400)
+    return _f.set_index("Date")
+
+
+def _flast_dl():
+    """Last recorded download, or a blank record. A missing call is itself a FAILURE mode
+    (a stale cache key serving the wrong window), so it must fail a check — never abort the
+    file with an IndexError and take every later check down with it."""
+    return _fdl[-1] if _fdl else {"symbol": None, "start": None, "end": None}
+
+
+_dfcfg.set_config({"data_cache_dir": _fcache})
+_ssu.yf.download = _ffake_download
+try:
+    _ftoday = _fpd.Timestamp.today().normalize()
+    _ftoday_s = _ftoday.strftime("%Y-%m-%d")
+    # (a) LIVE INVARIANCE (a PIN, green either way by construction): when
+    # to_datetime(curr_date).normalize() == Timestamp.today().normalize(), the requested
+    # window must be byte-identical to the old today-anchored one.
+    _fdl.clear()
+    _ssu.load_ohlcv("TESTX", _ftoday_s)
+    check("fetch: live download called once", len(_fdl), 1)
+    check("fetch: live start == old today-anchored start", _flast_dl()["start"],
+          (_fpd.Timestamp.today() - _fpd.DateOffset(years=5)).strftime("%Y-%m-%d"))
+    check("fetch: live end == old today-anchored end", _flast_dl()["end"], _ftoday_s)
+
+    # (b) RED-FIRST: a HISTORICAL curr_date anchors the window to curr_date.
+    _fdl.clear()
+    _fhist = _ssu.load_ohlcv("TESTX", "2022-03-01")
+    check("fetch: historical download called once", len(_fdl), 1)
+    check("fetch: historical start is curr_date - 5y", _flast_dl()["start"], "2017-03-01")
+    check("fetch: historical end includes curr_date (+1d; yfinance end is exclusive)",
+          _flast_dl()["end"], "2022-03-02")
+    check("fetch: historical frame ends at curr_date",
+          str(_fhist["Date"].max().date()), "2022-03-01")
+    # The headline defect: today this frame is 147 bars, far short of the 200 the SMA claims.
+    check_true("fetch: historical frame has a FULL window (>=1000 bars, was 147)",
+               len(_fhist) >= 1000)
+
+    # (c) RED-FIRST: the cache key differs per curr_date, so the historical run cannot be
+    # served the live run's file (that is the month-to-month reproducibility defect).
+    check("fetch: two curr_dates -> two distinct cache files", len(os.listdir(_fcache)), 2)
+
+    # (d) curr_date one day back: the start shifts by a day (asserted, not discovered).
+    # The live caller passes an ET date while Timestamp.today() is the process-local clock,
+    # so after 20:00 ET they disagree by one day — this pins that consequence.
+    # NOTE the distinct symbol. On a LEAP DAY, pd.DateOffset(years=5) clamps both 02-29 and
+    # 02-28 to the same 02-28, and `end` clamps to today for both — so under one symbol this
+    # probe's cache filename would equal (a)'s, hit the cache, never call the stub, and the
+    # suite would go red every Feb 29 for a reason unrelated to that day's change.
+    _fdl.clear()
+    _fyest = (_ftoday - _fpd.Timedelta(days=1))
+    _ssu.load_ohlcv("TESTY", _fyest.strftime("%Y-%m-%d"))
+    check("fetch: yesterday start is yesterday - 5y", _flast_dl()["start"],
+          (_fyest - _fpd.DateOffset(years=5)).strftime("%Y-%m-%d"))
+    check("fetch: yesterday end clamps to today (never the future)", _flast_dl()["end"], _ftoday_s)
+
+    # (e) an empty curr_date must RAISE, not rot into a NaT strftime accident.
+    check_raises("fetch: load_ohlcv(None) raises", lambda: _ssu.load_ohlcv("TESTX", None),
+                 ValueError)
+
+    # (f) AN EMPTY DOWNLOAD MUST NEVER BE CACHED.
+    # yfinance swallows ANY per-ticker network error into an empty frame (multi.py: the
+    # except branch stores utils.empty_df()), so a blip returns 0 rows rather than raising,
+    # and yf_retry only covers YFRateLimitError. Persisting that empty frame used to be
+    # survivable because the cache key rolled with the wall clock and self-healed the next
+    # day — but a curr_date-anchored key for a PAST date never rolls, so a single blip would
+    # poison that (symbol, curr_date) permanently. Validate before publishing.
+    _fdl.clear()
+    _fempty_calls = []
+
+    def _fblip(symbol, start=None, end=None, **kw):
+        _fempty_calls.append(symbol)
+        return _fpd.DataFrame(columns=["Adj Close", "Close", "High", "Low", "Open", "Volume"])
+
+    def _fblip_dated(symbol, start=None, end=None, **kw):
+        # The SILENT variant: an empty frame that still carries a Date column, so cleaning
+        # does NOT raise — it just yields 0 bars. Caught by the `.empty` half of the guard.
+        _fempty_calls.append(symbol)
+        return _fpd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
+
+    for _flabel, _fstub in (("no Date col", _fblip), ("with Date col (silent)", _fblip_dated)):
+        _ssu.yf.download = _fstub
+        try:
+            check_raises(f"fetch: empty download RAISES [{_flabel}]",
+                         lambda: _ssu.load_ohlcv("BLIPX", "2022-03-01"), _fDUE)
+            check(f"fetch: empty download writes NO cache file [{_flabel}]",
+                  [f for f in os.listdir(_fcache) if f.startswith("BLIPX")], [])
+        finally:
+            _ssu.yf.download = _ffake_download
+    # ...and the very next healthy call must succeed, i.e. the blip left nothing behind.
+    _fheal = _ssu.load_ohlcv("BLIPX", "2022-03-01")
+    check_true("fetch: a healthy retry after a blip self-heals", len(_fheal) >= 1000)
+finally:
+    _ssu.yf.download = _forig_dl
+    _dfcfg.set_config({"data_cache_dir": _forig_cache})
+    _fsh.rmtree(_fcache, ignore_errors=True)
+check("fetch: cache dir restored", _dfcfg.get_config()["data_cache_dir"], _forig_cache)
+
+# --- F1c LIVE SEAM: _latest_indicators is the ONE indicator path the bot actually runs.
+# (route_to_vendor has no callers repo-wide, so StockstatsUtils.get_stock_stats and
+# _get_stock_stats_bulk are dead code; this is the assertion that proves LIVE is fixed.)
+# RED BEFORE FIX: close_200_sma came back as 139.0 on a 157-bar frame.
+_forig_load = _ssu.load_ohlcv
+_fload_calls = []
+
+
+def _ffake_load(t, d):
+    _fload_calls.append((t, d))
+    return _fsynth(157)
+
+
+_ssu.load_ohlcv = _ffake_load
+try:
+    _finds = _qd._latest_indicators("TESTX", "2024-08-01")
+finally:
+    _ssu.load_ohlcv = _forig_load
+# Guard the seam itself: if the stub were never reached, the dict would be real data (or {})
+# and the assertions below would be meaningless.
+check("fetch: live-seam stub actually reached", len(_fload_calls), 1)
+check_true("fetch: live indicators produced (not swallowed to {})", bool(_finds))
+check("fetch: LIVE close_200_sma is None on 157 bars", _finds.get("close_200_sma"), None)
+# Everything whose window 157 DOES satisfy must still come through — masking is targeted,
+# not a blanket "short frame -> drop everything".
+for _fname in ("close_50_sma", "close_10_ema", "rsi", "atr", "boll", "macd", "macds"):
+    check_true(f"fetch: LIVE {_fname} still present on 157 bars",
+               _finds.get(_fname) is not None)
+# ...and on a frame too short for ANY of them, every one is honestly absent.
+_ssu.load_ohlcv = lambda t, d: _fsynth(5)
+try:
+    _finds5 = _qd._latest_indicators("TESTX", "2024-08-01")
+finally:
+    _ssu.load_ohlcv = _forig_load
+for _fname in ("rsi", "macd", "macds", "macdh", "boll", "boll_ub", "boll_lb", "atr",
+               "close_10_ema", "close_50_sma", "close_200_sma"):
+    check(f"fetch: LIVE {_fname} is None on a 5-bar frame", _finds5.get(_fname), None)
+
+# --- F2: the flat (yf.Search) shape carries providerPublishTime, a Unix epoch int.
+_fepoch = 1785418357
+check("fetch: flat pub_date parsed from epoch",
+      _ynm._extract_article_data({"title": "T", "providerPublishTime": _fepoch})["pub_date"],
+      _fdt.datetime.fromtimestamp(_fepoch, _fdt.timezone.utc).replace(tzinfo=None))
+for _fbad in ({}, {"providerPublishTime": None}, {"providerPublishTime": 0},
+              {"providerPublishTime": "nope"}, {"providerPublishTime": float("nan")}):
+    check(f"fetch: flat pub_date None on {_fbad}",
+          _ynm._extract_article_data(_fbad)["pub_date"], None)
+# The NESTED shape is what yf.Ticker.get_news() really returns — must be untouched by F2.
+check("fetch: nested pub_date still parsed from pubDate ISO",
+      _ynm._extract_article_data({"content": {"title": "N", "pubDate": "2026-07-10T12:00:00Z"}})["pub_date"],
+      _fdt.datetime(2026, 7, 10, 12, 0, tzinfo=_fdt.timezone.utc))
+
+
+def _fsearch(articles):
+    class _FakeSearch:
+        def __init__(self, *a, **k):
+            self.news = list(articles)
+    return _FakeSearch
+
+
+def _fts(y, m, d, h=12):
+    return int(_fdt.datetime(y, m, d, h, tzinfo=_fdt.timezone.utc).timestamp())
+
+
+_FCURR = "2026-07-13"
+_forig_search = _ynm.yf.Search
+
+# --- F2 RED-FIRST: the look-ahead guard now actually fires on the FLAT shape.
+_ynm.yf.Search = _fsearch([
+    {"title": "PAST HEADLINE", "publisher": "AP", "link": "l1",
+     "providerPublishTime": _fts(2026, 7, 10)},
+    {"title": "FUTURE HEADLINE", "publisher": "AP", "link": "l2",
+     "providerPublishTime": _fts(2026, 9, 1)},
+])
+try:
+    _fgn = _ynm.get_global_news_yfinance(_FCURR)
+finally:
+    _ynm.yf.Search = _forig_search
+check_true("fetch: past headline kept", "PAST HEADLINE" in _fgn)
+check_true("fetch: FUTURE headline filtered (the guard was dead code)",
+           "FUTURE HEADLINE" not in _fgn)
+
+# F2: a same-day EVENING headline (21:00 ET = 01:00 UTC next day) must NOT be misread as
+# future. Comparing full datetimes collapses the +1d slack into a hard ~20:00 ET cutoff;
+# comparing DATES keeps the headline while still dropping genuinely future ones.
+_ynm.yf.Search = _fsearch([
+    {"title": "EVENING HEADLINE", "publisher": "AP", "link": "l",
+     "providerPublishTime": _fts(2026, 7, 14, 1)},
+])
+try:
+    _fev = _ynm.get_global_news_yfinance(_FCURR)
+finally:
+    _ynm.yf.Search = _forig_search
+check_true("fetch: same-day evening headline kept (no 20:00 ET cutoff)",
+           "EVENING HEADLINE" in _fev)
+
+# ...and the boundary must sit at the END OF curr_date IN ET. The original code's `+1 day`
+# slack WAS the UTC->ET compensation; applying it on top of an explicit ET conversion would
+# admit the whole NEXT trading session (curr+1 open through close) as "today's" macro — a
+# look-ahead leak on any dated/replay run. Pin every hour that matters.
+for _flabel, _fargs, _fkeep in [
+    ("curr 12:00 ET",             (2026, 7, 13, 16), True),
+    ("curr 21:00 ET evening",     (2026, 7, 14, 1),  True),
+    ("curr+1 09:30 ET NEXT-OPEN", (2026, 7, 14, 13), False),
+    ("curr+1 16:00 ET NEXT-CLOSE", (2026, 7, 14, 20), False),
+    ("curr+1 19:00 ET",           (2026, 7, 14, 23), False),
+    ("curr+2 09:30 ET",           (2026, 7, 15, 13), False),
+]:
+    _ynm.yf.Search = _fsearch([{"title": "BOUNDARY", "publisher": "AP", "link": "l",
+                                "providerPublishTime": _fts(*_fargs)}])
+    try:
+        _fb = _ynm.get_global_news_yfinance(_FCURR)
+    finally:
+        _ynm.yf.Search = _forig_search
+    check(f"fetch: guard boundary [{_flabel}] kept={_fkeep}", "BOUNDARY" in _fb, _fkeep)
+
+# A title-less FLAT article stays SKIPPED (today's dedup behavior); F2 changes the date
+# guard only, never WHICH articles are collected.
+_ynm.yf.Search = _fsearch([{"publisher": "AP", "link": "l",
+                            "providerPublishTime": _fts(2026, 7, 10)}])
+try:
+    _fnotitle = _ynm.get_global_news_yfinance(_FCURR)
+finally:
+    _ynm.yf.Search = _forig_search
+check_true("fetch: title-less flat article still skipped", "No global news found" in _fnotitle)
+
+# --- F3 RED-FIRST: an all-filtered body returns the UNAVAILABLE sentinel, not a bare header.
+# Asserted through the REAL _content_ok AND the REAL fetch_macro — the property that matters.
+# Both the exact sentinel AND the boolean are asserted, so a fetcher that merely blew up
+# (blanket except -> "Error fetching global news") cannot masquerade as a pass.
+_ynm.yf.Search = _fsearch([{"title": "FUTURE ONLY", "publisher": "AP", "link": "l",
+                            "providerPublishTime": _fts(2026, 9, 1)}])
+try:
+    _fempty = _ynm.get_global_news_yfinance(_FCURR)
+    _fmrep, _fmcore = _qd.fetch_macro(_FCURR)
+finally:
+    _ynm.yf.Search = _forig_search
+check_true("fetch: all-filtered body -> the sentinel string", "No global news found" in _fempty)
+check("fetch: all-filtered body -> _content_ok False", _qd._content_ok(_fempty), False)
+check("fetch: all-filtered body -> fetch_macro core False", _fmcore, False)
+
+# The per-ticker path was ALREADY fail-safe; pin it so the "leave it alone" scope call can't
+# silently rot. Assert the exact sentinel too, not just the boolean (a crashed fetcher also
+# yields _content_ok False, which would make a boolean-only check a tautology).
+_forig_tkr = _ynm.yf.Ticker
+
+
+class _FEmptyNewsTicker:
+    def __init__(self, *a, **k):
+        pass
+
+    def get_news(self, count=None):
+        return []
+
+
+_ynm.yf.Ticker = _FEmptyNewsTicker
+try:
+    _ftn = _ynm.get_news_yfinance("TESTX", "2026-07-06", _FCURR)
+finally:
+    _ynm.yf.Ticker = _forig_tkr
+check_true("fetch: per-ticker empty news -> 'No news found' sentinel", "No news found" in _ftn)
+check("fetch: per-ticker empty news still _content_ok False", _qd._content_ok(_ftn), False)
+
+# --- F4 RED-FIRST: no wall-clock timestamp in the report builders (6 sites today).
+_fyf_src = (_REPO / "lib" / "dataflows" / "y_finance.py").read_text(encoding="utf-8")
+check("fetch: no 'Data retrieved on' wall-clock header remains",
+      _fyf_src.count("Data retrieved on"), 0)
+check("fetch: no datetime.now() left in y_finance", _fyf_src.count("datetime.now()"), 0)
+# The ADJACENT header coupling must survive: quill_data.py:154 keys on "Total records:",
+# and _tail_csv (quill_data.py:98) hoists '#' lines into the model-facing block.
+check_true("fetch: '# Total records:' header preserved", "# Total records:" in _fyf_src)
+
+
 # ===================== LEGISLATIVE CATALYST (lib/legislative, congress, learn) =====================
 import lib.legislative as _L  # noqa: E402
 import lib.dataflows.congress as _CG  # noqa: E402
@@ -4574,6 +4920,347 @@ for _consumer in ("lib/signals.py", "lib/calibrate.py", "lib/allocate.py", "lib/
     check_true(f"attribution: {_consumer} does not import lib.attribution (D2 / sizing isolation)",
                "lib.attribution" not in _imported_modules(_csrc)
                and "attribution" not in _csrc)
+
+
+# --- benchmark measurement: the calendar anchor rule (lib/benchmark) ----------
+# The defect being pinned: outcomes.benchmark_return was priced off a SPY series
+# that stopped at 2026-07-02 while the position leg used 2026-07-06, understating
+# the market leg 2.2x (0.007521 vs the true 0.016314573). Every case below uses the
+# REAL dates and the REAL closes from that incident.
+from lib import benchmark as _bm  # noqa: E402
+
+_BM_CLOSES = {"2026-05-29": 754.5, "2026-06-08": 739.219971,
+              "2026-07-02": 744.780029, "2026-07-06": 751.280029, "2026-07-09": 751.710022}
+# XNYS sessions across the window. 2026-05-30 is a Saturday and 2026-07-03 is the
+# observed July 4th holiday — both absent, which is exactly why a lag heuristic
+# cannot separate a legitimate gap from a truncated series.
+_BM_SESSIONS = ["2026-05-29", "2026-06-08", "2026-07-02", "2026-07-06", "2026-07-07",
+                "2026-07-08", "2026-07-09"]
+
+_bm_v, _bm_why = _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check_true("benchmark: T1 true window 06-08->07-06 == 0.016314573",
+           _bm_v is not None and abs(_bm_v - 0.016314572756584766) < 1e-9)
+
+# T2 — THE BUG. Series truncated before the end session: refuse, never substitute
+# the last close it happens to have (which would reproduce 0.007521 exactly).
+_bm_trunc = {k: v for k, v in _BM_CLOSES.items() if k <= "2026-07-02"}
+_bm_v, _bm_why = _bm.window_return(_bm_trunc, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check("benchmark: T2 truncated series refuses rather than using a stale close", _bm_v, None)
+check_true("benchmark: T2 refusal names the missing session", "2026-07-06" in _bm_why)
+
+# T2b — INTERIOR gap. A series that resumes AFTER the target still refuses; the
+# straddle/lag formulations both pass this one, which is why the rule is calendar-exact.
+_bm_gap = {"2026-06-08": 739.219971, "2026-07-02": 744.780029, "2026-07-09": 751.710022}
+_bm_v, _ = _bm.window_return(_bm_gap, "2026-06-08", "2026-07-06", _BM_SESSIONS)
+check("benchmark: T2b interior gap {07-02,07-09} refuses for 07-06", _bm_v, None)
+
+# T2c — alignment + degenerate inputs.
+_bm_v, _ = _bm.window_return(_BM_CLOSES, "2026-05-30", "2026-06-08", _BM_SESSIONS)
+check_true("benchmark: T2c Saturday trade_date 05-30 anchors back to Fri 05-29",
+           _bm_v is not None and abs(_bm_v - (739.219971 - 754.5) / 754.5) < 1e-12)
+check(("benchmark: T2c ISO timestamp end date is accepted"),
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06T21:25:17-04:00", _BM_SESSIONS)[0],
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _BM_SESSIONS)[0])
+check("benchmark: T2c same session == 0.0",
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-06-08", _BM_SESSIONS)[0], 0.0)
+check("benchmark: T2c end before start refuses",
+      _bm.window_return(_BM_CLOSES, "2026-07-06", "2026-06-08", _BM_SESSIONS)[0], None)
+check("benchmark: T2c empty series refuses",
+      _bm.window_return({}, "2026-06-08", "2026-07-06", _BM_SESSIONS)[0], None)
+check("benchmark: T2c no session on or before the target refuses",
+      _bm.window_return(_BM_CLOSES, "2020-01-01", "2026-07-06", _BM_SESSIONS)[0], None)
+# T2d — COVERAGE. A calendar that stops before the target must refuse, not fall back to
+# its own last session. Without this the anchor collapses onto the series' last close and
+# the tail guard dies — which is how the shipped producer (which bounded the calendar by
+# max(series)) silently reproduced the 0.007521 incident value end-to-end.
+_bm_short = [s for s in _BM_SESSIONS if s <= "2026-07-02"]
+_bm_v, _bm_why = _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", _bm_short)
+check("benchmark: T2d a calendar ending before the target refuses on coverage", _bm_v, None)
+check_true("benchmark: T2d the coverage refusal names the calendar end",
+           "calendar ends" in _bm_why and "2026-07-02" in _bm_why)
+check("benchmark: T2d no session calendar at all refuses",
+      _bm.window_return(_BM_CLOSES, "2026-06-08", "2026-07-06", [])[0], None)
+check("benchmark: T2c non-positive close refuses",
+      _bm.window_return({**_BM_CLOSES, "2026-06-08": 0.0}, "2026-06-08", "2026-07-06",
+                        _BM_SESSIONS)[0], None)
+check("benchmark: T2c NaN close refuses",
+      _bm.window_return({**_BM_CLOSES, "2026-07-06": float("nan")}, "2026-06-08", "2026-07-06",
+                        _BM_SESSIONS)[0], None)
+
+# T3 — the narrow writer must NOT behave like record_outcome (INSERT OR REPLACE over
+# ten columns). Sentinels on the columns a naive backfill would silently blank.
+_bml = _tmp_ledger()
+_bmd = _bml.record_decision(trade_date="2026-06-08", ticker="SPYX", run_id="r", signal="Buy",
+                            intent="buy", decided_at="2026-06-08T10:00:00-04:00",
+                            decision_price=100.0)
+_bml.record_outcome(_bmd, resolved_at="2026-07-06T21:25:17-04:00", holding_days=28,
+                    directional_return=0.10, benchmark_return=0.007521, alpha=0.092479,
+                    realized_pnl=12.5, unrealized_pnl=3.5, scored_against="both",
+                    adherence="stop_violated")
+check("benchmark: T3 narrow update reports one row", _bml.update_outcome_benchmark(_bmd, 0.5, -0.4), 1)
+_bmr = [r for r in _bml.outcomes_for_backfill() if r["decision_id"] == _bmd][0]
+check("benchmark: T3 benchmark_return updated", _bmr["benchmark_return"], 0.5)
+check("benchmark: T3 alpha updated", _bmr["alpha"], -0.4)
+_bmraw = dict(_bml.decisions_with_outcomes("SPYX")[0])
+check("benchmark: T3 holding_days SURVIVES the narrow update", _bmraw["holding_days"], 28)
+check("benchmark: T3 scored_against SURVIVES", _bmraw["scored_against"], "both")
+check("benchmark: T3 adherence SURVIVES", _bmraw["adherence"], "stop_violated")
+check("benchmark: T3 realized_pnl SURVIVES", _bmraw["realized_pnl"], 12.5)
+check("benchmark: T3 directional_return SURVIVES", _bmraw["directional_return"], 0.10)
+check("benchmark: T3 resolved_at is byte-identical (proves UPDATE, not INSERT OR REPLACE)",
+      _bmr["resolved_at"], "2026-07-06T21:25:17-04:00")
+check("benchmark: T3 clearing to NULL works (a refusal must not preserve a bad value)",
+      (_bml.update_outcome_benchmark(_bmd, None, None),
+       [r for r in _bml.outcomes_for_backfill() if r["decision_id"] == _bmd][0]["benchmark_return"]),
+      (1, None))
+check("benchmark: T3 unknown decision_id updates nothing",
+      _bml.update_outcome_benchmark(999999, 0.1, 0.1), 0)
+
+# T19 — the untrusted CLI must not be able to reach the trust seam. If a future flag
+# exposed `trust_input_benchmark` on the reflect subparser, the orchestrator-supplied
+# benchmark path reopens silently and every other test here stays green.
+_tick_src = (_REPO / "tick.py").read_text(encoding="utf-8")
+# Match BOTH spellings: argparse maps "--trust-input-benchmark" to the dest
+# `trust_input_benchmark`, so scanning only the underscore form would miss the
+# idiomatic hyphenated flag and let the untrusted path reopen with the suite green.
+_trust_lines = [ln.strip() for ln in _tick_src.splitlines()
+                if "trust_input_benchmark" in ln or "trust-input-benchmark" in ln]
+check_true("benchmark: T19 (sanity) the trust seam exists in tick.py", bool(_trust_lines))
+check("benchmark: T19 no argparse flag registers the trust seam (the CLI cannot reach it)",
+      [ln for ln in _trust_lines if "add_argument" in ln], [])
+check("benchmark: T19 the seam is read only via getattr-with-default",
+      [ln for ln in _trust_lines
+       if "getattr" not in ln and "=" in ln and not ln.startswith("#")], [])
+
+
+# === DS: the fail-OPEN core-data sentinel hole =============================
+# RCA: every data tool reports a failure by OPENING its report with "UNAVAILABLE: <reason>"
+# (quill_data.py:40/169/172/232/237/271, quill_data.mjs:52/59/62), and the gather prompt tells
+# the model to copy that marker verbatim (decide.mjs:204-205). quill_data._SENTINELS listed
+# "unavailable:"; analyze._DATA_ERROR_SENTINELS did NOT. A long failure message (mjs:52 appends
+# up to 200 chars of stderr) therefore cleared analyze's 40-char floor, matched none of its
+# sentinels, and scored as REAL DATA -> core_available True -> the fail-SAFE ERROR override
+# never fired -> a tradable Buy survived a crashed price fetch, with the audit trail recording
+# the data as fully healthy. The shared marker now lives once in lib/data_sentinels.
+from lib import data_sentinels as _ds  # noqa: E402
+
+# --- DS1 the reported bug (RED at HEAD: _report_available returned True) -----
+_DS_REPRO = ("UNAVAILABLE: quill_data exit 1: Traceback most recent call last File yfinance "
+             "rate limited retry exhausted after 3 attempts giving up now")
+# Meta-guard FIRST: if the body were under the floor, the floor -- not the marker -- would be
+# doing the work and every row below would be green for the wrong reason.
+check_true("DS1: repro clears the 40-char floor (so the MARKER must do the rejecting)",
+           len(_DS_REPRO.strip()) >= 40)
+check("DS1: the reported UNAVAILABLE report is NOT usable data", _az._report_available(_DS_REPRO), False)
+
+# The realistic producer shape: quill_data.mjs:52 wraps a crashed helper's stderr (200 chars).
+_DS_MJS52 = ("UNAVAILABLE: quill_data exit 1: Traceback (most recent call last):\n"
+             '  File "/opt/quiver/quiver_eve/run/quill_data.py", line 152, in fetch_market\n'
+             "    sd = _retry(lambda: get_YFin_data_online(ticker, start, end))\n"
+             "YFRateLimitError: Too Many Requests. Rate limited. Try after a while.")
+check_true("DS1: mjs:52 envelope clears the floor", len(_DS_MJS52.strip()) >= 40)
+check("DS1: a crashed-helper envelope is NOT usable data", _az._report_available(_DS_MJS52), False)
+
+# --- DS2 end-to-end through the REAL contract fixture (RED at HEAD: signal was Buy) ---
+_DS_BAD = _EVE_FIXTURE.replace("## market_report\nPrice closed 195.1, volume up 12%, RSI 62.\n",
+                               f"## market_report\n{_DS_MJS52}\n")
+_ds_split = _az._split_eve_markdown(_DS_BAD)
+check_true("DS2: the degraded market_report survives the splitter at full length",
+           len(_ds_split["market_report"]) >= 40)
+_ds_dq = _az.assess_data_quality(_ds_split)
+check("DS2: core_available is false for a crashed price fetch", _ds_dq["core_available"], False)
+check_true("DS2: the audit trail names market as unavailable (it recorded [] before)",
+           "market" in _ds_dq["sources_unavailable"])
+_ds_fields = _az.extract_fields(_ds_split, _rating.parse_rating(_ds_split["final_trade_decision"]), "AAPL")
+check("DS2: a tradable Buy is downgraded to ERROR (the fail-open)", _ds_fields["signal"], "ERROR")
+check_true("DS2: the ERROR carries the reason", "core data unavailable" in (_ds_fields["error"] or ""))
+# Anti-tautology: the SAME fixture with a healthy market_report must still be tradable, else
+# DS2 would pass even if extract_fields returned ERROR unconditionally.
+_ds_ok_fields = _az.extract_fields(_az._split_eve_markdown(_EVE_FIXTURE),
+                                   _rating.parse_rating(_ds_split["final_trade_decision"]), "AAPL")
+check("DS2: (control) the healthy fixture is still tradable", _ds_ok_fields["signal"], "Buy")
+
+# --- DS3 every emit-site shape the marker must catch -------------------------
+for _label, _body in [
+        ("bare", "UNAVAILABLE: YFRateLimitError: Too Many Requests. Rate limited, retries exhausted."),
+        ("bulleted", "- UNAVAILABLE: the market_data tool errored and no price series was retrieved."),
+        ("bold", "**UNAVAILABLE**: market_data errored and no price series could be retrieved today."),
+        ("leading blank lines", "\n\nUNAVAILABLE: quill_data exit 1: rate limited, no price series for sizing."),
+        ("blockquote", "> UNAVAILABLE: quill_data exit 1: rate limited, no price series available here."),
+        # The model routinely TITLES its section before copying the tool's failure text, so the
+        # marker lands on line 2 or 3. Anchoring to line 1 alone left the fail-open wide open.
+        ("titled", "**Market Data — AAPL**\nUNAVAILABLE: quill_data exit 1: rate limited, no price series."),
+        ("heading + subtitle",
+         "### market_report\n\n**AAPL**\nUNAVAILABLE: quill_data exit 1: rate limited, no price series."),
+        # instructions.md:82/:93 describe a colon-less marker; a marker alone on its line counts.
+        ("bare, no colon",
+         "**UNAVAILABLE**\nThe market_data tool returned an error and no price series was retrieved."),
+]:
+    check(f"DS3: marker shape '{_label}' is rejected", _az._report_available(_body), False)
+    check_true(f"DS3: marker shape '{_label}' clears the floor (marker, not length, rejects)",
+               len(_body.strip()) >= 40)
+# The window must stay NARROW in the other direction, and the colon-less form must not swallow
+# ordinary prose — without these two rows, "scan the whole body" and "drop the colon" both pass.
+check("DS3: a marker DEEP in the body does not reject (that is the inline-caveat case)",
+      _az._report_available("Price/Volume (OHLCV):\n- Ticker: AAPL\n- close 213.55\n- 23 bars\n"
+                            "- UNAVAILABLE: indicators were not returned by the tool."), True)
+check("DS3: prose merely STARTING with the word 'unavailable' is not a marker",
+      _az._report_available("Unavailable indicators were excluded from this analysis. "
+                            "Price/Volume OHLCV 2026-07-03 close 213.55 across 23 daily bars."), True)
+check("DS3: 'unavailability' is a different word and must not match",
+      _az._report_available("Unavailability of indicators is noted; the full 42-bar price series "
+                            "is present with close 308.33 on 2026-07-03."), True)
+# Separator + decoration variants. decide.mjs:204 mandates a colon, but decide.mjs:146 emits an
+# em dash and instructions.md:82/:93 omit the separator entirely, so the gate must not depend on
+# which of the three the model happened to follow.
+for _label, _body in [
+        ("em dash", "UNAVAILABLE — model returned no output after retries for this data channel."),
+        ("hyphen", "UNAVAILABLE - the market_data tool errored and returned nothing at all today."),
+        ("numbered list", "1. UNAVAILABLE: the market_data tool errored and returned no series."),
+        ("parenthesised", "(UNAVAILABLE: market_data returned an error, no price series today.)"),
+]:
+    check(f"DS3: separator/decoration variant '{_label}' is rejected",
+          _az._report_available(_body), False)
+    check_true(f"DS3: variant '{_label}' clears the floor", len(_body.strip()) >= 40)
+
+# --- DS4 ANTI-FALSE-POSITIVE: real recorded producer output must SURVIVE ------
+# Verbatim lines 0, 1 and 29 of state/analyze_logs/2026-07-03_AAPL.json's market_report: a
+# fully-priced report that merely ANNOTATES inline that indicators were missing. A naive
+# substring rule ERRORs this healthy, tradable name -- and since _latest_indicators returns {}
+# on any exception and is deliberately not retried, that state is ROUTINE. This row is what
+# fails if anyone ever "simplifies" the anchored marker back into a substring search.
+_DS_AAPL = ("Price/Volume (OHLCV):\n- Ticker: AAPL\n"
+            "- Period: 2026-05-04 to 2026-07-03 (42 records)\n"
+            "- Close price on 2026-07-03: 308.33\n- Sample values:\n"
+            "- UNAVAILABLE: Short-term technical indicators (RSI, MACD, Bollinger Bands, etc.) "
+            "— the market_data tool did not return these fields.")
+check_true("DS4: fixture still carries the INLINE caveat (else the row is a tautology)",
+           "\n- UNAVAILABLE:" in _DS_AAPL)
+check_true("DS4: the caveat is NOT on the first non-empty line (else the row is permanently red)",
+           _DS_AAPL.lstrip().lower().startswith("price/volume"))
+# Trimming this fixture is how it silently stops testing anything. In the real recorded body
+# the caveat sits at non-empty line 29 of 33, so it must stay BELOW the marker scan window —
+# an earlier 3-line trim put it at line 2, inside the window, and turned this row permanently
+# red for a reason that has nothing to do with the code under test.
+check_true("DS4: the caveat stays below the marker scan window (faithful to the real body)",
+           len([_l for _l in _DS_AAPL.splitlines()[:-1] if _l.strip()]) >= _ds._MARKER_SCAN_LINES)
+check_true("DS4: the fixture leads with REAL data, as the recorded body does",
+           "42 records" in _DS_AAPL and "308.33" in _DS_AAPL)
+check_true("DS4: a naive substring rule WOULD have rejected it (the row can fail)",
+           "unavailable:" in _DS_AAPL.lower())
+check("DS4: a priced report with an inline caveat is still usable data",
+      _az._report_available(_DS_AAPL), True)
+# The genuine whole-report degrade from the same corpus (2026-07-07_BOT news_report) -> rejected.
+_DS_BOT = ("UNAVAILABLE: No news items were found for BOT between 2026-06-30 and 2026-07-07, "
+           "creating a news silence period.")
+check("DS4: a genuine whole-report degrade IS rejected", _az._report_available(_DS_BOT), False)
+
+# --- DS5 the two gates share ONE predicate (drift is impossible by construction) ---
+check_true("DS5: analyze resolves the canonical predicate", _az.report_is_usable is _ds.report_is_usable)
+check_true("DS5: quill_data resolves the canonical predicate", _qd.report_is_usable is _ds.report_is_usable)
+# Identity is NOT enough on its own: rewriting _content_ok's body inline while KEEPING the
+# import leaves both rows above green while the marker silently stops applying at that layer.
+# (Measured: under exactly that sabotage, zero DS rows went red before these were added.)
+# So assert the BEHAVIOUR through each gate's own public function.
+for _label, _body in [
+        ("bare", "UNAVAILABLE: quill_data exit 1: rate limited, retries exhausted, no series."),
+        ("bold", "**UNAVAILABLE**: market_data errored and no price series could be retrieved."),
+        ("titled", "**Market Data — AAPL**\nUNAVAILABLE: quill_data exit 1: rate limited, no series."),
+]:
+    check(f"DS5/quill: marker shape '{_label}' is rejected by _content_ok",
+          _qd._content_ok(_body), False)
+    check_true(f"DS5/quill: marker shape '{_label}' clears quill's 30-char floor",
+               len(_body.strip()) >= 30)
+check("DS5/quill: (control) a real payload is still usable, so the rows above can fail",
+      _qd._content_ok("Price/Volume (OHLCV): 2026-07-03 close 213.55 volume 34955800; 23 bars."), True)
+
+# --- DS6 BEHAVIOURAL drift guard: every sentinel actually rejects, per side ---
+# Padded with sentinel-free PROSE, never whitespace: whitespace is .strip()ed before the floor
+# check, so a whitespace-padded body is rejected by the FLOOR and the guard stays green even
+# with an emptied sentinel tuple. The negative control below is what proves the loop can fail.
+_DS_PAD = ("Price/Volume (OHLCV): 2026-07-03 open 212.15 high 214.65 low 211.81 close 213.55 "
+           "volume 34955800; 23 daily bars present.")
+check("DS6: (negative control) the pad ALONE is usable by both gates",
+      (_az._report_available(_DS_PAD), _qd._content_ok(_DS_PAD)), (True, True))
+# The loops below iterate the tuples UNDER TEST, so DELETING a sentinel would shrink the loop
+# instead of failing it. Pin both sets against inline historical literals so a deletion is a
+# failure, not a silently smaller test.
+check("DS6: analyze's sentinel set has not silently SHRUNK",
+      sorted(_az._DATA_ERROR_SENTINELS),
+      sorted(("error retrieving", "no data found", "no price data", "data unavailable",
+              "dataunavailableerror", "could not retrieve", "no data for")))
+check("DS6: quill_data's sentinel set has not silently SHRUNK",
+      sorted(_qd._SENTINELS),
+      sorted(("error retrieving", "error fetching", "no data found", "no price data",
+              "no fundamentals data", "no balance sheet data", "no news found",
+              "no global news found", "no cash flow", "no income", "data unavailable",
+              "could not retrieve", "unavailable:", "<stocktwits unavailable",
+              "<no stocktwits messages")))
+for _s in _az._DATA_ERROR_SENTINELS:
+    check_true(f"DS6/analyze: '{_s}' rejects a real-length body",
+               not _az._report_available(_DS_PAD + " " + _s))
+for _s in _qd._SENTINELS:
+    check_true(f"DS6/quill: '{_s}' rejects a real-length body",
+               not _qd._content_ok(_DS_PAD + " " + _s))
+
+# --- DS7 the SECOND drift surface: the length floors, observed behaviourally ---
+# The floors are call-site kwargs, so a constants comparison would assert nothing. 'q'*n
+# contains no sentinel from either tuple, so these probe the real effective floor.
+check("DS7: analyze's floor is exactly 40",
+      (_az._report_available("q" * 39), _az._report_available("q" * 40)), (False, True))
+check("DS7: quill_data's floor is exactly 30",
+      (_qd._content_ok("q" * 29), _qd._content_ok("q" * 30)), (False, True))
+_ds_floor = lambda fn: next(n for n in range(1, 80) if fn("q" * n))  # noqa: E731
+check_true("DS7: the BINDING gate is the stricter one",
+           _ds_floor(_az._report_available) >= _ds_floor(_qd._content_ok))
+
+# --- DS8 the substring tuples are domain-specific ON PURPOSE, and cannot drift SILENTLY ---
+# They score different inputs: quill_data sees the RAW payload, analyze sees the MODEL'S
+# NARRATIVE quoting it. Merging them was measured to flip 6 of 148 real recorded bodies
+# (e.g. a healthy sentiment report quoting "No news found for NVDA", a healthy fundamentals
+# report saying "no income cushion during downturns"). A sentinel added to quill_data must
+# therefore be either adopted by analyze or listed here as a deliberate domain-only choice.
+_DS_QUILL_ONLY = {
+    "unavailable:",            # superseded at analyze's layer by the ANCHORED marker
+    "error fetching", "no fundamentals data", "no balance sheet data",
+    "no news found", "no global news found", "no cash flow", "no income",
+    "<stocktwits unavailable", "<no stocktwits messages",
+}
+check("DS8: every quill_data sentinel is adopted by analyze or recorded as domain-only",
+      sorted(set(_qd._SENTINELS) - set(_az._DATA_ERROR_SENTINELS) - _DS_QUILL_ONLY), [])
+check("DS8: the domain-only list has no dead entries (each is really a quill_data sentinel)",
+      sorted(_DS_QUILL_ONLY - set(_qd._SENTINELS)), [])
+
+# --- DS9 cross-layer: quill_data's REWRITE is rejected by analyze's gate ------
+# _content_ok also gates REPLACING the sentiment body (quill_data.py:171-172); the replacement
+# opens with the marker, so both layers agree end-to-end.
+_ds_rewritten = f"UNAVAILABLE: {'sentiment feed returned no data for this ticker today. ' * 2}"
+check("DS9: quill_data's UNAVAILABLE rewrite is rejected by analyze's gate",
+      _az._report_available(_ds_rewritten), False)
+check_true("DS9: that rewrite clears the floor (marker, not length, rejects)",
+           len(_ds_rewritten.strip()) >= 40)
+
+# --- DS10 quill_data resolves the canonical predicate from a FOREIGN cwd ------
+# quill_data.py runs as a script, is importlib-loaded here, and is spawned by node -- none of
+# them put the repo on sys.path, so its own sys.path insert must carry the new import. An
+# exit-code/JSON check would NOT catch a swallowed import (a defensive try/except fallback
+# still exits 0 with parseable JSON); an IDENTITY probe does.
+import subprocess as _ds_sp  # noqa: E402
+
+_DS_PROBE = (
+    "import importlib.util as u,sys;"
+    f"s=u.spec_from_file_location('qd_probe', {str(_REPO / 'quiver_eve' / 'run' / 'quill_data.py')!r});"
+    "m=u.module_from_spec(s);s.loader.exec_module(m);"
+    "import lib.data_sentinels as d;print(m.report_is_usable is d.report_is_usable)")
+# Fails LOUD, never into skip(): this probe is fully offline and deterministic, so the only
+# reasons it can throw are the ones it exists to catch.
+try:
+    _ds_r = _ds_sp.run([sys.executable, "-c", _DS_PROBE], cwd=tempfile.gettempdir(),
+                       capture_output=True, text=True, timeout=90)
+    _ds_got = (_ds_r.returncode, _ds_r.stdout.strip())
+except Exception as _e:  # noqa: BLE001
+    _ds_got = ("probe raised", repr(_e))
+check("DS10: quill_data resolves the CANONICAL predicate from a foreign cwd", _ds_got, (0, "True"))
 
 
 print(f"\n{PASS} passed, {FAIL} failed, {SKIP} skipped")

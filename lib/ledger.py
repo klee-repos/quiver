@@ -258,8 +258,8 @@ CREATE TABLE IF NOT EXISTS strategy_change_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     goal_id     INTEGER,
     changed_at  TEXT NOT NULL,
-    change_type TEXT NOT NULL,                            -- regime|book|weight|status|basis
-    ticker      TEXT,                                     -- NULL for goal-level (regime|book)
+    change_type TEXT NOT NULL,               -- regime|book|weight|status|basis|measurement
+    ticker      TEXT,                        -- NULL for goal-level (regime|book|measurement)
     from_value  TEXT,
     to_value    TEXT,
     trigger     TEXT,                                     -- what caused it (macro_reading, strategy-set, ...)
@@ -680,6 +680,37 @@ class Ledger:
                 (decision_id, resolved_at, holding_days, directional_return, benchmark_return,
                  alpha, realized_pnl, unrealized_pnl, scored_against, adherence),
             )
+
+    # --- benchmark measurement (the `benchmark-backfill` seam) --------------------
+    # Deliberately NARROW, and deliberately NOT record_outcome: that one is INSERT OR
+    # REPLACE across all ten columns, so re-measuring the market leg through it would
+    # blank resolved_at/holding_days/scored_against/adherence/realized_pnl -- the very
+    # fields the scorecard grades on. These two touch only the two columns the
+    # measurement owns, and read back the two nothing else SELECTs.
+
+    def update_outcome_benchmark(self, decision_id: int, benchmark_return: Optional[float],
+                                 alpha: Optional[float]) -> int:
+        """Set (or clear) ONLY the market leg + its excess. Returns rows updated."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE outcomes SET benchmark_return=?, alpha=? WHERE decision_id=?",
+                (benchmark_return, alpha, decision_id),
+            )
+            return int(cur.rowcount or 0)
+
+    def outcomes_for_backfill(self) -> list:
+        """Every resolved decision with the fields the benchmark measurement needs.
+
+        Carries ``benchmark_return`` -- which no other query selects -- so a backfill
+        can tell a fill from a correction, and so a re-run can prove it is idempotent.
+        """
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT d.id AS decision_id, d.ticker, d.trade_date, o.resolved_at, "
+                "o.directional_return, o.benchmark_return, o.alpha "
+                "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
+                "ORDER BY d.id ASC"
+            ).fetchall()]
 
     def decisions_with_outcomes(self, ticker: str, limit: int = 8) -> list:
         """Recent decisions for a ticker joined to their outcomes, newest first."""
