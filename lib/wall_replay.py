@@ -71,11 +71,21 @@ class SimBroker:
     cost basis. Values positions at each tick's close (carrying the last mark when a
     tick has no price, never producing NaN). NOT a market simulator — see module docs."""
 
-    def __init__(self, cash: float):
+    def __init__(self, cash: float, *, cost_model=None):
         self.cash = float(cash)
         self.positions: dict[str, float] = {}
         self.cost_basis: dict[str, float] = {}   # total $ cost per held name
         self._last_mark: dict[str, float] = {}
+        # DEFAULT None == frictionless, byte-identical to the pre-cost-model behaviour. A cost
+        # model is opt-in; see bench/costs.py for why free trading is the dangerous default.
+        self.cost_model = cost_model
+        self.total_costs = 0.0                   # cumulative slippage + fees actually charged
+
+    def _exec_px(self, side: str, ticker: str, ref: float) -> float:
+        return self.cost_model.exec_price(side, ticker, ref) if self.cost_model else ref
+
+    def _fee(self, side: str, dollars: float, shares: float) -> float:
+        return self.cost_model.fee(side, dollars, shares) if self.cost_model else 0.0
 
     def snapshot(self, prices: dict) -> dict:
         """Broker-shaped snapshot. NOTE equity is TOTAL account value (cash + MV), not
@@ -125,6 +135,14 @@ class SimBroker:
                 continue
             exec_px = float(exec_px)
 
+            # Apply the cost model's execution price (adverse by construction: a buy fills
+            # above the reference, a sell below). With no cost model this is `exec_px` unchanged,
+            # which is what keeps the default path byte-identical.
+            ref_px = exec_px
+            exec_px = self._exec_px(side, tk, ref_px)
+            if not _valid_px(exec_px):
+                exec_px = ref_px
+
             if side == "buy":
                 if o.get("dollar_amount") is not None:
                     dollars = min(float(o["dollar_amount"]), self.cash)
@@ -141,9 +159,12 @@ class SimBroker:
                     fills.append({"ticker": tk, "side": side, "filled": False, "note": "insufficient_cash"})
                     continue
                 self.cash -= dollars
+                self.total_costs += abs(exec_px - ref_px) * shares   # slippage paid on entry
                 self.positions[tk] = self.positions.get(tk, 0.0) + shares
                 self.cost_basis[tk] = self.cost_basis.get(tk, 0.0) + dollars
-                self._last_mark[tk] = exec_px
+                # Mark at the REFERENCE close, not the execution price: marking at your own
+                # adverse fill would hide the slippage you just paid inside the position value.
+                self._last_mark[tk] = ref_px
                 fills.append({"ticker": tk, "side": "buy", "filled": True, "shares": shares,
                               "price": exec_px, "dollars": round(dollars, 6), "realized_pnl": 0.0})
 
@@ -154,8 +175,11 @@ class SimBroker:
                     fills.append({"ticker": tk, "side": side, "filled": False, "note": "no_shares"})
                     continue
                 proceeds = qty * exec_px
+                sell_fee = self._fee("sell", proceeds, qty)      # SEC + TAF are sell-side only
+                proceeds -= sell_fee
+                self.total_costs += sell_fee + abs(ref_px - exec_px) * qty
                 avg = (self.cost_basis.get(tk, 0.0) / held) if held > 0 else 0.0
-                realized = (exec_px - avg) * qty
+                realized = (exec_px - avg) * qty - sell_fee
                 self.cash += proceeds
                 self.cost_basis[tk] = max(0.0, self.cost_basis.get(tk, 0.0) - avg * qty)
                 self.positions[tk] = held - qty
@@ -224,10 +248,30 @@ def jsonl_signal_source(path: str):
         if not line:
             continue
         row = json.loads(line)
+        # A row with no `date` would key under the literal string "None" and then never match
+        # any real date, so the whole recorded stream would silently yield ZERO signals and the
+        # replay would read as a clean all-Hold run. Fail loudly instead. (`analyze.py` does not
+        # emit a `date` — the producer side is `scripts/run_analyses.py --tee-signals`.)
+        if not str(row.get("date") or "").strip():
+            raise ValueError(
+                f"{path}: recorded signal row has no 'date' key: {str(row)[:120]!r}. "
+                "Produce the stream with `run_analyses.py --tee-signals` (it stamps the date).")
         idx.setdefault(str(row.get("date")), []).append(row)
 
     def src(date, tickers, snap):
-        return list(idx.get(date, []))
+        # LAST-WINS per ticker + filter to the requested universe. `append_tee` is append-only by
+        # design (a crash can lose the tail but never corrupt the archive), so re-running a day
+        # legitimately leaves TWO rows for the same (date, ticker). Passing both through would
+        # hand `_run_plan` a duplicate analysis for one name, and feeding a ticker outside
+        # `tickers` would size a name the replay never priced.
+        want = {str(t).upper() for t in (tickers or [])}
+        fold: dict = {}
+        for row in idx.get(date, []):
+            tk = str(row.get("ticker") or "").upper()
+            if not tk or (want and tk not in want):
+                continue
+            fold[tk] = row              # later line wins = the most recent re-run
+        return list(fold.values())
 
     return src
 
@@ -351,7 +395,7 @@ def _max_drawdown_pct(curve: list) -> float:
 
 def run_backtest(cfg, led, *, dates, tickers, signal_source, price_at, benchmark_at,
                  starting_cash: float, run_construct: bool = True, macro_reading=None,
-                 config_path: str | None = None) -> dict:
+                 config_path: str | None = None, cost_model=None) -> dict:
     """Chronological forward-only replay. One tick per date (v1). Returns
     {equity_curve, decisions, summary}. See module docstring for fidelity limits.
 
@@ -366,13 +410,20 @@ def run_backtest(cfg, led, *, dates, tickers, signal_source, price_at, benchmark
     reflect_tmp = tmpdir / "reflect.json"
 
     prev_ldb, prev_cfg = tick.LEDGER_DB, tick.CONFIG_PATH
+    # Save the caller's clock pin so the `finally` can RESTORE it rather than blanking it.
+    # `market.set_clock(None)` would clobber an enclosing `frozen_clock`, which is exactly what a
+    # walk-forward driver (bench/sweep.py) does when it nests runs inside one pinned window.
+    prev_clock = market._now_override
     tick.LEDGER_DB = Path(led.db_path)
     if config_path:
         tick.CONFIG_PATH = Path(config_path)
 
-    broker = SimBroker(starting_cash)
+    broker = SimBroker(starting_cash, cost_model=cost_model)
     equity_curve: list = []
     per_decision: list = []
+    blotter: list = []                 # every simulated fill, with its date/signal/intent
+    target_series: list = []           # the allocator's target weights per tick
+    skip_reasons: dict = {}            # skip-reason family -> count (gate-suppression fuel)
     halted = False
 
     try:
@@ -412,12 +463,29 @@ def run_backtest(cfg, led, *, dates, tickers, signal_source, price_at, benchmark
                 for o, f in zip(orders, fills):
                     _commit_order(o, f, plan.get("run_id"), commit_tmp)
 
+                # --- instrumentation (ADDITIVE; never feeds back into the simulation) -------
+                # The blotter. SimBroker already computed shares/price/dollars/proceeds/
+                # realized_pnl per fill and then threw them away, so per-name holding period,
+                # turnover, and cost drag were all uncomputable. Zip is safe: apply_fills
+                # appends exactly one row per order, in order.
+                for o, f in zip(orders, fills):
+                    blotter.append({**f, "date": date, "signal": o.get("signal"),
+                                    "intent": o.get("intent"), "order_type": o.get("type")})
+                target_series.append({"date": date, "weights": dict(target_weights or {})})
+                for row in (plan.get("decisions") or plan.get("results") or []):
+                    if str(row.get("status") or "") == "skipped":
+                        fam = str(row.get("detail") or "").split(":")[0].strip() or "(blank)"
+                        skip_reasons[fam] = skip_reasons.get(fam, 0) + 1
+                gross = sum(abs(float(f.get("dollars") or f.get("proceeds") or 0.0))
+                            for f in fills if f.get("filled"))
+
                 after = broker.snapshot(prices)
                 equity_curve.append({
                     "date": date, "equity": after["equity"], "cash": round(broker.cash, 6),
                     "positions_mv": round(after["equity"] - broker.cash, 6),
                     "drop_pct": plan.get("drop_pct"), "n_orders": len(orders),
                     "n_filled": sum(1 for f in fills if f.get("filled")), "halt": halted,
+                    "gross_notional": round(gross, 6),
                 })
 
                 per_decision += _resolve_due_outcomes(led, date, price_at, benchmark_at, reflect_tmp)
@@ -425,11 +493,13 @@ def run_backtest(cfg, led, *, dates, tickers, signal_source, price_at, benchmark
             if halted:
                 break
     finally:
-        market.set_clock(None)
+        market.set_clock(prev_clock)          # RESTORE, never blank — see prev_clock above
         tick.LEDGER_DB, tick.CONFIG_PATH = prev_ldb, prev_cfg
 
     start_eq = equity_curve[0]["equity"] if equity_curve else float(starting_cash)
     final_eq = equity_curve[-1]["equity"] if equity_curve else float(starting_cash)
+    turnover = sum(pt.get("gross_notional") or 0.0 for pt in equity_curve)
+    mean_eq = (sum(pt["equity"] for pt in equity_curve) / len(equity_curve)) if equity_curve else 0.0
     summary = {
         "n_ticks": len(equity_curve),
         "start_equity": start_eq,
@@ -439,5 +509,13 @@ def run_backtest(cfg, led, *, dates, tickers, signal_source, price_at, benchmark
         "total_orders": sum(pt["n_orders"] for pt in equity_curve),
         "decisions_resolved": len(per_decision),
         "halted": halted,
+        # --- ADDITIVE instrumentation ---
+        "n_fills": sum(1 for f in blotter if f.get("filled")),
+        "turnover_usd": round(turnover, 6),
+        "turnover_ratio": round(turnover / mean_eq, 6) if mean_eq else 0.0,
+        "skip_reasons": dict(sorted(skip_reasons.items())),
+        "total_costs_usd": round(broker.total_costs, 6),
+        "cost_drag_pct": (round(-broker.total_costs / start_eq * 100.0, 6) if start_eq else 0.0),
     }
-    return {"equity_curve": equity_curve, "decisions": per_decision, "summary": summary}
+    return {"equity_curve": equity_curve, "decisions": per_decision,
+            "fills": blotter, "targets": target_series, "summary": summary}

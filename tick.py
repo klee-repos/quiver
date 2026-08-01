@@ -1341,7 +1341,15 @@ def _run_construct(cfg, led, data) -> dict:
                 protected = {t for t in eng_weights
                              if str((alloc.detail.get(t) or {}).get("reason") or "").startswith("hold_prior")
                              or hold_floors.get(t, 0.0) > 0.0}
-                protected_sum = sum(eng_weights[t] for t in protected)
+                # sorted(): `protected` is a SET, so this summed floats in set-iteration order,
+                # which for str keys varies with PYTHONHASHSEED — a cross-process determinism
+                # hazard for the process-parallel benchmark sweep. HONEST CAVEAT: this is
+                # hygiene, not a proven-live bug. On this interpreter (CPython 3.12, compensated
+                # summation) the `round(..., 4)` below absorbs the residue — 0 of 200000
+                # perturbation trials changed the output — so no test can currently make it go
+                # red. It is applied because the ordering guarantee is free and the property is
+                # relied upon, not because a failure was observed.
+                protected_sum = sum(eng_weights[t] for t in sorted(protected))
                 scalable = [t for t in eng_weights if t not in protected]
                 scalable_sum = sum(eng_weights[t] for t in scalable)
                 target_scalable = max(0.0, deploy_target - protected_sum)

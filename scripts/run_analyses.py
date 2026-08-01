@@ -130,10 +130,57 @@ def run(tickers, *, concurrency: int | None = None, timeout: int | None = None) 
     return results
 
 
+def append_tee(path, rows, trade_date: str) -> int:
+    """Append each analysis row to a durable JSONL archive, stamped with `trade_date`.
+
+    WHY THIS EXISTS. `state/tmp/analyses.json` is OVERWRITTEN every tick
+    (`deploy/runner/run_tick.py`), and `analyze.py` emits no `date` field, so quiver keeps NO
+    durable record of what its brain actually said on any past day. Without an archive there is
+    nothing to replay a real signal stream from, and `lib.wall_replay.jsonl_signal_source` — the
+    seam built to consume exactly that — has never had a producer.
+
+    Returns the number of rows appended. NEVER RAISES: this runs on the live trading path, and
+    a full disk or a read-only mount must not be able to abort a tick. Failures return 0.
+
+    Append-only, one JSON object per line, opened in "a" mode per call so a crash mid-write can
+    at worst lose the tail rather than corrupt the archive.
+    """
+    try:
+        rows = [r for r in (rows or []) if isinstance(r, dict)]
+        if not rows or not str(trade_date or "").strip():
+            return 0
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        n = 0
+        with p.open("a", encoding="utf-8") as fh:
+            for r in rows:
+                # `date` FIRST and always present — its absence is what made every recorded
+                # stream silently key under "None" and yield zero signals on replay.
+                fh.write(json.dumps({"date": str(trade_date), **r}, default=str) + "\n")
+                n += 1
+        return n
+    except Exception as e:  # noqa: BLE001 — deliberately total: observability must never trade
+        sys.stderr.write(f"[run_analyses] tee-signals failed (ignored): {e}\n")
+        return 0
+
+
 def main(argv) -> int:
+    argv = list(argv)
+    tee_path = None
+    tee_date = None
+    if "--tee-signals" in argv:
+        i = argv.index("--tee-signals")
+        tee_path = argv[i + 1] if i + 1 < len(argv) else None
+        del argv[i:i + 2]
+    if "--date" in argv:
+        i = argv.index("--date")
+        tee_date = argv[i + 1] if i + 1 < len(argv) else None
+        del argv[i:i + 2]
+
     tickers = [a.strip().upper() for a in argv if a.strip()]
     if not tickers:
-        sys.stderr.write("usage: run_analyses.py TICKER [TICKER ...]\n")
+        sys.stderr.write("usage: run_analyses.py [--tee-signals PATH] [--date YYYY-MM-DD] "
+                         "TICKER [TICKER ...]\n")
         print("[]")
         return 0
     sys.stderr.write(
@@ -141,6 +188,10 @@ def main(argv) -> int:
         f"(concurrency={_int_env('QUIVER_ANALYZE_CONCURRENCY', 2)}, "
         f"timeout={_int_env('QUIVER_ANALYZE_TIMEOUT', 3600)}s): {', '.join(tickers)}\n")
     results = run(tickers)
+    if tee_path:
+        from lib import market as _market
+        n = append_tee(tee_path, results, tee_date or _market.trading_day_et())
+        sys.stderr.write(f"[run_analyses] teed {n} signal rows -> {tee_path}\n")
     print(json.dumps(results))
     return 0
 

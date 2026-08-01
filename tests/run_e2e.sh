@@ -34,6 +34,18 @@ SUITES=(
   "e2e-wall-replay|tests/test_e2e_wall_replay.py"
   "e2e-attribution|tests/test_e2e_attribution.py"
   "e2e-benchmark|tests/test_e2e_benchmark.py"
+  # bench/ — the offline benchmark harness. All deterministic: no network, no broker, no LLM.
+  "bench-diagnostics|tests/test_bench_diagnostics.py"
+  "bench-replay|tests/test_bench_replay.py"
+  "bench-ladder|tests/test_bench_ladder.py"
+  "bench-costs|tests/test_bench_costs.py"
+  "bench-sweep|tests/test_bench_sweep.py"
+  # bench-brain: the OFFLINE half (fixture discovery, the fail-safe contract gate, scorecard
+  # wiring) is real and deterministic. Its LIVE replay self-skips unless QUIVER_LIVE_E2E=1,
+  # because QUIVER_REPLAY_REPORTS stubs only the gather turn — deepTurn/quickTurn still bill
+  # tokens. It prints a sanctioned "N passed, M failed, K skipped" tail, so a skip can never be
+  # mistaken for a pass by the grep at the bottom of this file.
+  "bench-brain|tests/test_bench_brain.py"
   # llm-judge runs offline here (its LLM `judge()` stages SELF-SKIP without QUIVER_LIVE_E2E;
   # only the offline pipeline + deterministic det() checks run). Under --live it is run WITH
   # QUIVER_LIVE_E2E=1 (see the loop below) so the real `claude` judging kicks in.

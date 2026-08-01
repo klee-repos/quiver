@@ -351,6 +351,18 @@ def main() -> int:
                              event_detail=f"could not write state/tmp/analyses.json: {e}")
                 return 1
 
+            # Durable signal archive (benchmark input). state/tmp/analyses.json above is
+            # OVERWRITTEN every tick, so without this quiver keeps no record of what its brain
+            # said on any past day. STRICTLY BEST-EFFORT and OUTSIDE the try/return-1 above:
+            # `append_tee` never raises, and this block adds no branch that can end a tick.
+            try:
+                _teed = run_analyses.append_tee(
+                    _REPO / "state" / "signals" / f"{str(day)[:7]}.jsonl", analyses, day)
+                if _teed:
+                    _emit({"stage": "analyze", "teed_signals": _teed})
+            except Exception as e:  # noqa: BLE001 — belt AND braces; observability never trades
+                _emit({"stage": "analyze", "tee_error": str(e)})
+
             # --- PTJ event-risk producer (F8/F9): write state/tmp/event_risk.json BEFORE the
             # orchestrator so plan can consume it. Runs as its OWN subprocess with an outer timeout
             # — a yfinance socket stall does NOT raise, so a try/except cannot bound it; only the
