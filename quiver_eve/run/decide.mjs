@@ -8,9 +8,13 @@
 // The prior decide.mjs collapsed that into one
 // shot. This version runs each phase as its own model call, threading the
 // report text + the read-only past_context forward, and assembles the FINAL
-// markdown to carry EXACTLY the 8 `## section` blocks + 12 labels analyze.py
-// parses (the contract is byte-identical to before; lib.rating.parse_rating +
-// extract_fields + the F6 Python validator are untouched).
+// markdown (via ./contract.mjs) to carry the 9 model-authored `## section`
+// blocks + 12 labels analyze.py parses, plus a 10th `## data_availability`
+// section. That last one is PRODUCER-EMITTED, never model-authored, and always
+// LAST: it carries the deterministic per-channel `core_available` the fetchers
+// computed, so Python's trade gate can stop scoring the model's prose about the
+// data. (lib.rating.parse_rating + extract_fields + the F6 Python validator are
+// untouched; unknown sections were already ignored by the splitter.)
 //
 // WHY sequential generateText turns (not EVE defineAgent subagents): EVE's HTTP
 // stream proxy stalls on long generations (the /eve/v1/session/:id/stream
@@ -29,6 +33,7 @@ import { generateText, tool, isStepCount } from "ai";
 import { z } from "zod";
 import { runPythonDataTool } from "./quill_data.mjs";
 import { withRetry } from "./retry.mjs";
+import { assembleContract, recordAvailability } from "./contract.mjs";
 import { readFileSync } from "node:fs";
 
 const TICKER = process.argv[2] || "AAPL";
@@ -177,10 +182,28 @@ ${PAST_CONTEXT || "(no prior decisions on this ticker)"}`;
 // subhead must NOT fail gather -> ERROR (only market_report gates a trade). It's still
 // prompted for + assembled below via grabSub (falls back to "UNAVAILABLE: not produced").
 const GATHER_NAMES = ["market_report", "trend_report", "fundamentals_report", "news_report", "sentiment_report"];
+
+// The DETERMINISTIC per-channel `core_available` the FETCHER computed, accumulated off the tool
+// envelopes as they resolve and emitted below as `## data_availability`. Before this, the envelope
+// went to the model and the boolean was dropped here — so a failed market fetch that the model
+// narrated into a plausible priced report reached the trade gate as healthy data
+// (state/analyze_logs/2026-07-06_AAPL.json). See contract.mjs for the full RCA.
+// The Map deliberately OUTLIVES the gather retry (sticky-OR): a channel that succeeded on either
+// attempt really did reach the model.
+const dataAvailability = new Map();
 const dataTool = (kind, description) => tool({
   description,
   inputSchema: z.object({ ticker: z.string().min(1) }),
-  execute: async ({ ticker }) => runPythonDataTool(kind, { ticker, date: DATE }),
+  execute: async ({ ticker }) => {
+    const envelope = await runPythonDataTool(kind, { ticker, date: DATE });
+    // recordAvailability is TOTAL (never throws), but this path could not throw at all before, so
+    // belt-and-braces: an observability shim must never turn into a tool error that burns the
+    // tries:2 gather budget and ERRORs the ticker.
+    try {
+      recordAvailability(dataAvailability, kind, envelope, { ticker, expectedTicker: TICKER });
+    } catch { /* unreachable by construction; never let accounting break a fetch */ }
+    return envelope;   // unchanged: the model still sees the whole {report, core_available}
+  },
 });
 
 async function runGather() {
@@ -350,14 +373,14 @@ const leverBlock = /(- \[(data_source|analysis_angle|sentiment_weight|other)\][^
   ? decision.match(/- \[(data_source|analysis_angle|sentiment_weight|other)\][^\n]+/gi)?.join("\n") || "none"
   : "none";
 
-// --- ASSEMBLE the final markdown (Gate-A + Gate-B: sanitize + prepend headers once) ---
-// Each turn body may contain stray `## ` lines that would make analyze.py's
-// _split_eve_markdown mis-key (it keys on `^##\s+<word>$`). Downgrade any `## `
-// line in a turn body to `### ` so the splitter only sees the 8 canonical
-// headers we prepend below. Then prepend exactly one canonical header per section.
-function sanitize(body) {
-  return (body || "").split("\n").map(l => l.startsWith("## ") ? "### " + l.slice(3) : l).join("\n").trim();
-}
+// --- ASSEMBLE the final markdown ---
+// The assembly + sanitization now live in ./contract.mjs (`assembleContract`), extracted so the
+// EMIT BOUNDARY is behaviourally testable — inline, a one-token slip here could ship an all-green
+// suite with the whole feature dead. sanitize() downgrades any line starting `##` that is not
+// `###`, splitting on EVERY boundary Python's str.splitlines() recognizes: both rules are
+// deliberately BROADER than analyze.py's `^##\s+` splitter, because matching JS's classes to
+// Python's by hand leaves measured gaps (JS `\s` misses U+001C-001F/U+0085; JS `split("\n")` misses
+// CR/VT/FF/NEL/LS/PS) and each gap let a model-authored body OVERWRITE the gated market_report.
 
 // Extract the 5 analyst sub-reports from the gather turn (### subheadings).
 function grabSub(body, name) {
@@ -389,35 +412,23 @@ function extractLabels(text, labels) {
 const traderBlock = extractLabels(proposal, TRADER_LABELS);
 const pmBlock = extractLabels(decision, PM_LABELS);
 
-const final = [
-  "## market_report",
-  sanitize(marketBody),
-  "",
-  "## trend_report",
-  sanitize(trendBody),
-  "",
-  "## sentiment_report",
-  sanitize(sentBody),
-  "",
-  "## news_report",
-  sanitize(newsBody),
-  "",
-  "## macro_report",
-  sanitize(macroBody),
-  "",
-  "## fundamentals_report",
-  sanitize(fundBody),
-  "",
-  "## trader_investment_plan",
-  sanitize(traderBlock),
-  "",
-  "## final_trade_decision",
-  sanitize(pmBlock),
-  "",
-  "## lever_proposals",
-  sanitize(leverBlock),
-  "",
-].join("\n");
+// assembleContract sanitizes each body, prepends exactly one canonical header per section, and
+// appends `## data_availability` STRICTLY LAST. Last is load-bearing: analyze.py's splitter lets a
+// LATER duplicate header win, so emitting the genuine section after every model-authored body means
+// a forged copy can never override it.
+// `measured: false` under the replay seam (QUIVER_REPLAY_REPORTS) — no tool runs there, so every
+// channel renders `unknown`, which analyze.py treats exactly like an absent section (prose-only).
+const final = assembleContract([
+  ["market_report", marketBody],
+  ["trend_report", trendBody],
+  ["sentiment_report", sentBody],
+  ["news_report", newsBody],
+  ["macro_report", macroBody],
+  ["fundamentals_report", fundBody],
+  ["trader_investment_plan", traderBlock],
+  ["final_trade_decision", pmBlock],
+  ["lever_proposals", leverBlock],
+], dataAvailability, { measured: !process.env.QUIVER_REPLAY_REPORTS });
 
 process.stdout.write(final);
 

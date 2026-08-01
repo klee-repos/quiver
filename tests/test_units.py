@@ -5263,5 +5263,327 @@ except Exception as _e:  # noqa: BLE001
 check("DS10: quill_data resolves the CANONICAL predicate from a foreign cwd", _ds_got, (0, "True"))
 
 
+# === DA: the DETERMINISTIC half of the core-data gate =======================
+# The DS block above closed a fail-OPEN in the PROSE rule. This block closes the residual that rule
+# explicitly could not (lib/data_sentinels.py): the gate scored the model's NARRATIVE about the
+# data, so a market fetch that failed while the model wrote a plausible priced report anyway sailed
+# through. MEASURED over state/analyze_logs/: 34 of 35 recorded market reports score as usable, 21
+# of them quote no date at all, and 2026-07-06_AAPL.json derives a price from market cap / share
+# count with a 34-day-stale window — scoring core_available TRUE. Its own PM text says
+# "the `core_available` flag returned false": the honest boolean reached the MODEL and the wall
+# never saw it. quiver_eve/run/contract.mjs now emits it as `## data_availability`.
+import glob as _da_glob  # noqa: E402
+import json as _da_json  # noqa: E402
+import re as _da_re  # noqa: E402
+import subprocess as _da_sp  # noqa: E402
+
+_DA_CONTRACT_MJS = _REPO / "quiver_eve" / "run" / "contract.mjs"
+_DA_GOOD_MARKET = ("Price/Volume (most-recent bars, CSV):\nDate,Open,High,Low,Close,Volume\n"
+                   "2026-07-03,306.1,309.4,305.2,308.33,34955800\nLatest indicators (as of "
+                   "2026-07-03): {\"rsi\": 61.2, \"close_200_sma\": 270.69}")
+
+
+def _da_doc(market=_DA_GOOD_MARKET, section=None, extra=""):
+    """An EVE contract document, with the `## data_availability` section optionally present."""
+    d = (f"## market_report\n{market}\n\n{extra}"
+         "## trader_investment_plan\n**Action**: Buy\n**Entry Price**: 195.1\n**Stop Loss**: 182.5\n"
+         "**Position Sizing**: ~4.5% of capital\n**Position Pct**: 4.5\n"
+         "**Strategy Basis**: momentum_breakout\n**Catalyst**: none\n**Target Price**: 210\n\n"
+         "## final_trade_decision\n**Rating**: Buy\n**Next Review Hours**: 24\n"
+         "**Conviction**: 72\n**Uncertainty**: 30\n")
+    if section is not None:
+        d += f"\n## data_availability\n{section}\n"
+    return d
+
+
+def _da_fields(**kw):
+    split = _az._split_eve_markdown(_da_doc(**kw))
+    return _az.extract_fields(split, _rating.parse_rating(split["final_trade_decision"]), "AAPL")
+
+
+# --- DA0 sanity meta-guards: a deleted feature must not leave this block green ---
+check_true("DA0: the section is registered with the splitter",
+           "data_availability" in _az._EVE_SECTIONS)
+check_true("DA0: the splitter actually captures the section",
+           "market" in _az._split_eve_markdown(_da_doc(section="- market: true")).get(
+               "data_availability", ""))
+check_true("DA0: contract.mjs exists (the producer this block drives)", _DA_CONTRACT_MJS.is_file())
+
+# --- DA1 THE RESIDUAL, on the REAL recorded body (RED at HEAD: signal was tradable) ---
+# Verbatim lines from state/analyze_logs/2026-07-06_AAPL.json's market_report: a fabricated price
+# with a stale window. No sentinel and no marker rule can reject it — that is the whole point, and
+# the two rows below prove the prose gate genuinely still accepts it (so DA1 cannot pass for the
+# wrong reason, and Constraint 4 is visibly untouched).
+_DA_FABRICATED = (
+    "**Price & Technical Structure (partial data — core indicators UNAVAILABLE)**\n\n"
+    "Available OHLCV data spans 2026-05-07 through 2026-06-02 (truncated; June 3 - July 6 daily "
+    "bars missing). The indicators block returned empty, so RSI, MACD, Bollinger, and ATR cannot "
+    "be computed from the market_data feed.\n\n"
+    "| Estimated current price | ~$313 (Market Cap $4.592T / ~14.668B shares) |")
+check_true("DA1: the fabricated report clears the 40-char floor", len(_DA_FABRICATED.strip()) >= 40)
+check("DA1: the PROSE rule still accepts it (the residual is real, and untouched by this change)",
+      _az._report_available(_DA_FABRICATED), True)
+check("DA1: with NO section it is still tradable (the RED antecedent — today's behaviour)",
+      _da_fields(market=_DA_FABRICATED)["signal"], "Buy")
+check("DA1: with the deterministic market:false it is downgraded to ERROR",
+      _da_fields(market=_DA_FABRICATED, section="- market: false")["signal"], "ERROR")
+
+# --- DA2 composition: only an explicit FALSE has teeth; a TRUE never licenses bad prose ---
+check("DA2: market:false vetoes a healthy-looking report",
+      _da_fields(section="- market: false")["signal"], "ERROR")
+check("DA2: (control) market:true on the same document is tradable",
+      _da_fields(section="- market: true")["signal"], "Buy")
+# The no-fail-open row: the flag cannot rescue a report the PROSE rule rejects.
+_DA_UNAVAIL = "UNAVAILABLE: quill_data exit 1: rate limited, retries exhausted, no price series."
+check("DA2: market:TRUE does NOT override an anchored UNAVAILABLE marker (no fail-open)",
+      _da_fields(market=_DA_UNAVAIL, section="- market: true")["signal"], "ERROR")
+check("DA2: (control) that same body with NO section is also ERROR (prose rule, unchanged)",
+      _da_fields(market=_DA_UNAVAIL)["signal"], "ERROR")
+# Non-core channels are recorded but gate nothing.
+check("DA2: a non-core channel's false does NOT gate",
+      _da_fields(section="- news: false\n- market: true")["signal"], "Buy")
+
+# --- DA3 the four provenance states are DISTINCT (a garbled section must not look like absent) ---
+_da_src = lambda **kw: _az.assess_data_quality(_az._split_eve_markdown(_da_doc(**kw)))  # noqa: E731
+check("DA3: no section -> absent", _da_src()["tool_flags_source"], "absent")
+check("DA3: a real measurement -> parsed",
+      _da_src(section="- market: true")["tool_flags_source"], "parsed")
+check("DA3: replay (all unknown) -> unknown",
+      _da_src(section="\n".join(f"- {c}: unknown" for c in _az._AVAILABILITY_CHANNELS)
+              )["tool_flags_source"], "unknown")
+check("DA3: header present but the market line garbled -> malformed",
+      _da_src(section="- market: yes\n- news: true")["tool_flags_source"], "malformed")
+# The load-bearing part: unknown/malformed must DEGRADE to the prose verdict, never fail closed —
+# a replayed corpus or an older brain must keep trading exactly as today.
+for _lbl, _sec in [("replay unknown", "\n".join(f"- {c}: unknown" for c in _az._AVAILABILITY_CHANNELS)),
+                   ("malformed", "- market: yes"), ("junk", "the model wrote prose here")]:
+    check(f"DA3: '{_lbl}' degrades to the PROSE verdict (never fails closed)",
+          _da_fields(section=_sec)["signal"], "Buy")
+
+# --- DA4 parser rules: allow-list, FALSE-WINS duplicates, unknown omitted ---
+_da_parse = _az.parse_data_availability
+check("DA4: the producer dialect parses", _da_parse("- market: true\n- trend: false")[0],
+      {"market": True, "trend": False})
+check("DA4: an UNKNOWN identifier is dropped (never persisted into data_quality)",
+      _da_parse("- profitability: false\n- market: true")[0], {"market": True})
+check("DA4: duplicates resolve FALSE-WINS, not last-wins (a forged true cannot flip the veto)",
+      _da_parse("- market: false\n- market: true")[0], {"market": False})
+check("DA4: FALSE-WINS in either order", _da_parse("- market: true\n- market: false")[0],
+      {"market": False})
+check("DA4: 'unknown' is omitted from flags but kept in raw",
+      (_da_parse("- market: unknown")[0], _da_parse("- market: unknown")[1]),
+      ({}, {"market": "unknown"}))
+check("DA4: (control) junk parses to nothing", _da_parse("the model wrote prose here")[0], {})
+
+# --- DA5 the ERROR string is the ONLY durable record of a flag veto -----------
+# A flag-vetoed row never reaches ledger.record_decision: tick.py takes the
+# `signal not in VALID_SIGNALS` branch into record_action, which has no data_quality column. So the
+# provenance has to ride on out_error, which tick.py persists verbatim into ticker_action.detail.
+_da_prose_err = _da_fields(market=_DA_UNAVAIL)["error"]
+_da_flag_err = _da_fields(section="- market: false")["error"]
+check_true("DA5: a flag-derived ERROR names the deterministic source",
+           "tool_flags market=false source=parsed" in (_da_flag_err or ""))
+check_true("DA5: a prose-derived ERROR and a flag-derived ERROR are DISTINGUISHABLE",
+           _da_prose_err != _da_flag_err)
+check("DA5: (CONTROL) the prose-only ERROR string is byte-identical to before this change",
+      _da_prose_err, "core data unavailable: missing fundamentals,macro,market,news,sentiment")
+
+# --- DA6 the dq dict shape is additive: sources_unavailable is NOT touched ----
+# tests/test_bench_diagnostics.py equality-asserts sources_unavailable against this real producer,
+# so the new keys must live OUTSIDE `avail`.
+_da_dq = _da_src(section="- market: true\n- trend: true")
+check("DA6: the new keys are top-level, not channels in avail",
+      sorted(set(_da_dq) - {"market", "sentiment", "news", "fundamentals", "macro",
+                            "core_available", "sources_unavailable"}),
+      ["tool_flags", "tool_flags_source"])
+check("DA6: 'trend' never becomes an avail channel (it would change sources_unavailable)",
+      "trend" in _da_dq, False)
+check("DA6: core_available is still the MARKET channel only",
+      (_da_dq["core_available"], _da_dq["market"]), (True, True))
+
+# --- DA7 PRODUCER-DERIVED: the fixture is emitted by the REAL contract.mjs ----
+# A hand-written fixture the producer cannot emit has already shipped a defect through a green suite
+# here, so the dialect, the header bytes and the section's LAST-ness are all derived by CALLING the
+# producer through node. Fails LOUD, never into skip(): node is already an unconditional dependency
+# of the gate (tests/run_e2e.sh runs the brain-node suite with plain `node`), so the only reasons
+# this can throw are the ones it exists to catch. The specifier is an absolute file URI because DS10
+# deliberately runs from a foreign cwd — a relative import there is ERR_MODULE_NOT_FOUND with EMPTY
+# stdout, which would degrade into `absent` and certify the very fallback path it meant to test.
+_DA_URI = _DA_CONTRACT_MJS.as_uri()
+
+
+def _da_node(script: str):
+    """Run `script` against the REAL contract.mjs; -> (returncode, stdout). Never raises."""
+    src = f'import * as C from {_DA_URI!r};\n{script}'
+    try:
+        r = _da_sp.run(["node", "--input-type=module", "-e", src], cwd=tempfile.gettempdir(),
+                       capture_output=True, text=True, timeout=90)
+        return (r.returncode, r.stdout)
+    except Exception as _e:  # noqa: BLE001 — a broken probe must be RED, never silently skipped
+        return ("probe raised", repr(_e))
+
+
+# The full document the producer really emits for a dead market channel, driven end-to-end into the
+# consumer. This is the row that catches a dialect drift on either side of the language boundary.
+_da_rc, _da_out = _da_node(
+    'const m = new Map();'
+    'C.recordAvailability(m, "market", {report: "UNAVAILABLE: x", core_available: false},'
+    '                     {ticker: "AAPL", expectedTicker: "AAPL"});'
+    'C.recordAvailability(m, "news", {report: "News …", core_available: true},'
+    '                     {ticker: "AAPL", expectedTicker: "AAPL"});'
+    'process.stdout.write(C.assembleContract('
+    '  [["market_report", "Price/Volume real bars close 308.33 across 42 records, volume ok."],'
+    '   ["final_trade_decision", "**Rating**: Buy"]], m, {measured: true}));')
+check("DA7: the producer probe ran (rc, non-empty stdout)",
+      (_da_rc, bool(_da_out.strip()) if isinstance(_da_out, str) else False), (0, True))
+_da_prod_split = _az._split_eve_markdown(_da_out if isinstance(_da_out, str) else "")
+check_true("DA7: the REAL producer emits a section the REAL splitter captures",
+           "data_availability" in _da_prod_split)
+_da_prod_dq = _az.assess_data_quality(_da_prod_split)
+check("DA7: the producer's dead-market document vetoes end-to-end",
+      (_da_prod_dq["core_available"], _da_prod_dq["tool_flags_source"]), (False, "parsed"))
+check("DA7: the producer's flags round-trip through the Python parser",
+      (_da_prod_dq["tool_flags"].get("market"), _da_prod_dq["tool_flags"].get("news")),
+      (False, True))
+# The ENVELOPE boundary, derived from the REAL quill_data producer rather than a literal: if
+# _safe's shape ever changes (a rename, a nesting), `core_available === true` would silently read
+# undefined and EVERY channel would record false on every live run.
+_da_env_ok = _da_json.dumps(_qd._safe(lambda: ("Price/Volume (OHLCV): 42 records, close 308.33.", True)))
+_da_env_bad = _da_json.dumps(_qd._safe(lambda: (_ for _ in ()).throw(RuntimeError("yfinance down"))))
+_da_rc2, _da_out2 = _da_node(
+    f'const ok = {_da_env_ok}, bad = {_da_env_bad};'
+    'const t = {ticker: "AAPL", expectedTicker: "AAPL"};'
+    'const a = C.recordAvailability(new Map(), "market", ok, t).get("market");'
+    'const b = C.recordAvailability(new Map(), "market", bad, t).get("market");'
+    'process.stdout.write(JSON.stringify([a, b]));')
+check("DA7: a REAL quill_data envelope credits true, a REAL failure envelope records false",
+      (_da_rc2, _da_out2), (0, "[true,false]"))
+check_true("DA7: (control) the derived healthy envelope really carries core_available true",
+           _da_json.loads(_da_env_ok)["core_available"] is True)
+
+# --- DA8 the forgery the deterministic gate would otherwise be built on top of ---
+# _split_eve_markdown lets a LATER duplicate header win, and the model-authored trader/PM/lever
+# bodies are emitted AFTER market_report. Both the header class and the LINE-BOUNDARY class had
+# measured gaps (JS `\s` misses U+001C-001F/U+0085; JS split("\n") misses CR/VT/FF/NEL/LS/PS), so a
+# body could overwrite the gated market_report. Driven through the REAL producer, per separator.
+_DA_SEPS = {"CR": "\r", "VT": "\v", "FF": "\f", "FS": "\x1c", "GS": "\x1d", "RS": "\x1e",
+            "NEL": "\x85", "LS": " ", "PS": " ", "TAB-header": "\n\t", "NBSP-header": "\n\xa0"}
+for _da_lbl, _da_sep in _DA_SEPS.items():
+    _da_forged = ("**Action**: Buy" + _da_sep + "## market_report" + _da_sep
+                  + "FABRICATED: price 999, RSI 55, all systems nominal.")
+    _rc3, _out3 = _da_node(
+        f'process.stdout.write(C.assembleContract([["market_report", {_DA_UNAVAIL!r}],'
+        f' ["trader_investment_plan", {_da_forged!r}]], new Map(), {{measured: true}}));')
+    _got = _az._split_eve_markdown(_out3 if isinstance(_out3, str) else "").get("market_report", "")
+    check(f"DA8: a forged header after <{_da_lbl}> cannot overwrite market_report",
+          (_rc3, "FABRICATED" in _got), (0, False))
+check_true("DA8: (control) the genuine UNAVAILABLE body is what survives, so the gate still vetoes",
+           _az._report_available(_got) is False)
+
+# --- DA9 Constraint 4: the anchored marker rule is BEHAVIOURALLY unweakened ---
+# A constants comparison would assert nothing (DS7's own ruling), so probe the effective window: the
+# same marker body just inside the scan window is rejected, just outside it is accepted.
+_DA_MARKER = "UNAVAILABLE: quill_data exit 1: rate limited, no price series available at all."
+_da_pad = "Price/Volume (OHLCV): close 308.33 across 42 daily bars, volume 34955800 present."
+_da_inside = "\n".join([_da_pad] * (_ds._MARKER_SCAN_LINES - 1) + [_DA_MARKER])
+_da_outside = "\n".join([_da_pad] * _ds._MARKER_SCAN_LINES + [_DA_MARKER])
+check("DA9: the marker window is unchanged (inside rejected, outside accepted)",
+      (_az._report_available(_da_inside), _az._report_available(_da_outside)), (False, True))
+check("DA9: the DS4 healthy-report verdict is unchanged", _az._report_available(_DS_AAPL), True)
+check("DA9: the DS4 genuine-degrade verdict is unchanged", _az._report_available(_DS_BOT), False)
+
+# --- DA10 registration: a new node test that is never RUN is permanently fake-green ---
+# run_e2e.sh's brain-node branch is a HARDCODED list, so a file added to quiver_eve/test/ without
+# editing it never executes. Membership-compared on basenames (an ordered compare against a sorted
+# glob is RED at baseline for a pure ordering reason), plus two shape guards.
+_da_sh = (_REPO / "tests" / "run_e2e.sh").read_text(encoding="utf-8")
+_da_m = _da_re.search(r"^\s*for t in (.+); do$", _da_sh, _da_re.M)
+check_true("DA10: the brain-node loop line is locatable in run_e2e.sh", _da_m is not None)
+_da_toks = _da_m.group(1).split() if _da_m else []
+check("DA10: every registered node test exists, is path-qualified and unique",
+      (sorted(Path(t).name for t in _da_toks),
+       all(t.startswith("quiver_eve/test/") for t in _da_toks),
+       len(_da_toks) == len(set(_da_toks))),
+      (sorted(Path(p).name for p in _da_glob.glob(str(_REPO / "quiver_eve" / "test" / "*.test.mjs"))),
+       True, True))
+
+# --- DA11 the producer's channel list matches the tools it actually exposes ---
+# A 7th dataTool added later without extending AVAILABILITY_CHANNELS would never be recorded and
+# nothing would notice.
+_da_decide = (_REPO / "quiver_eve" / "run" / "decide.mjs").read_text(encoding="utf-8")
+_da_kinds = sorted(set(_da_re.findall(r'dataTool\(\s*"([a-z_]+)"', _da_decide)))
+_rc4, _out4 = _da_node('process.stdout.write(JSON.stringify(C.AVAILABILITY_CHANNELS.slice().sort()));')
+# Compare PARSED values, not the JSON text: JS JSON.stringify emits no space after commas while
+# Python's json.dumps does, so a string compare would fail on formatting rather than on content.
+check("DA11: AVAILABILITY_CHANNELS == the dataTool kinds decide.mjs exposes",
+      (_rc4, _da_json.loads(_out4) if _rc4 == 0 else _out4), (0, _da_kinds))
+check_true("DA11: (control) the kind scan actually found tools", len(_da_kinds) >= 6)
+
+# --- DA12 the wiring source pins (SUPPLEMENT to the behavioural rows above) ---
+check_true("DA12: decide.mjs imports the real helpers",
+           "from \"./contract.mjs\"" in _da_decide)
+check_true("DA12: decide.mjs records availability inside the tool execute path",
+           "recordAvailability(dataAvailability" in _da_decide)
+check_true("DA12: decide.mjs no longer defines its own sanitize",
+           "function sanitize(" not in _da_decide)
+check_true("DA12: the assembly goes through assembleContract",
+           "assembleContract(" in _da_decide)
+
+# --- DA13 the new import EDGE must resolve, or the live brain dies on the box ---
+# decide.mjs is the brain's only entry point and deploy/runner/healthcheck.py never executes it
+# (it checks node_modules presence), so a broken relative import ships to a live tick with a GREEN
+# healthcheck. This resolves every relative specifier decide.mjs declares, without running it
+# (running it would read stdin and call the provider).
+_da_imports = _da_re.findall(r'^import\s+[^;]*?from\s+"(\./[^"]+)";', _da_decide, _da_re.M)
+check_true("DA13: (control) decide.mjs really declares relative imports", len(_da_imports) >= 3)
+check("DA13: every relative import in decide.mjs resolves on disk",
+      sorted(s for s in _da_imports if not (_REPO / "quiver_eve" / "run" / s[2:]).is_file()), [])
+# And the module graph must actually LOAD — a syntax error inside contract.mjs (e.g. a raw U+2028
+# in a regex literal, which IS a JS line terminator) is invisible to a source scan.
+_rc5, _out5 = _da_node('process.stdout.write(typeof C.assembleContract);')
+check("DA13: contract.mjs loads and exports assembleContract", (_rc5, _out5), (0, "function"))
+
+# --- DA14 END-TO-END: a FULL contract from the REAL producer through the REAL consumer ---
+# The rows above prove pieces. This one drives the whole document the brain actually writes — all
+# ten sections, assembled by contract.mjs — through the real chain analyze.py runs on live output:
+# _split_eve_markdown -> _validate_contract (the F6 12-label gate) -> extract_fields. Both the
+# tradable path and the veto path, so neither can pass for the other's reason.
+_DA_E2E_BODIES = (
+    '[["market_report", {market!r}],'
+    ' ["trend_report", "ADX 28, regime UPTREND, Sharpe 1.1, max DD -14%."],'
+    ' ["sentiment_report", "StockTwits (24 msgs): mildly bullish."],'
+    ' ["news_report", "Earnings beat; guidance raised."],'
+    ' ["macro_report", "Fed on hold; oil steady."],'
+    ' ["fundamentals_report", "PE 28, P/B 6.1, market cap 3.0e11."],'
+    ' ["trader_investment_plan", "**Action**: Buy\\n**Entry Price**: 195.1\\n**Stop Loss**: 182.5\\n'
+    '**Position Sizing**: ~4.5% of capital\\n**Position Pct**: 4.5\\n'
+    '**Strategy Basis**: momentum_breakout\\n**Catalyst**: none\\n**Target Price**: 210"],'
+    ' ["final_trade_decision", "**Rating**: Buy\\n**Next Review Hours**: 24\\n'
+    '**Conviction**: 72\\n**Uncertainty**: 30\\nMomentum intact."],'
+    ' ["lever_proposals", "- [data_source] options_flow: add odd-lot flow"]]')
+
+for _lbl, _core, _want_signal in [("healthy fetch", "true", "Buy"), ("dead market channel", "false", "ERROR")]:
+    _rc6, _doc = _da_node(
+        f'const m = new Map();'
+        f'C.recordAvailability(m, "market", {{core_available: {_core}}},'
+        f'                     {{ticker: "AAPL", expectedTicker: "AAPL"}});'
+        f'process.stdout.write(C.assembleContract({_DA_E2E_BODIES.format(market=_DA_GOOD_MARKET)},'
+        f'                                        m, {{measured: true}}));')
+    _e2e = _az._split_eve_markdown(_doc if isinstance(_doc, str) else "")
+    # The F6 contract validator must still accept the producer's document — a new section must not
+    # break the 12-label gate that stands between a half-formed brain output and a tradable signal.
+    _e2e_valid = True
+    try:
+        _az._validate_contract(_e2e)
+    except Exception:  # noqa: BLE001
+        _e2e_valid = False
+    check(f"DA14 [{_lbl}]: the producer's FULL contract passes the F6 label validator",
+          (_rc6, _e2e_valid), (0, True))
+    check(f"DA14 [{_lbl}]: all ten sections survive the splitter",
+          len([k for k in _az._EVE_SECTIONS if k in _e2e]), 10)
+    _e2e_fields = _az.extract_fields(_e2e, _rating.parse_rating(_e2e["final_trade_decision"]), "AAPL")
+    check(f"DA14 [{_lbl}]: end-to-end signal", _e2e_fields["signal"], _want_signal)
+
+
 print(f"\n{PASS} passed, {FAIL} failed, {SKIP} skipped")
 sys.exit(1 if FAIL else 0)

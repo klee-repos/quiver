@@ -39,12 +39,41 @@ its OWN tuple, and ``tests/test_units.py`` pins that a sentinel one side gains i
 either adopted by the other or recorded as domain-only — so they can never
 diverge SILENTLY again.
 
-RESIDUAL, stated rather than papered over: this gate reads LLM prose
-(decide.mjs:229 -> grabSub :363-368), so a FABRICATED or paraphrased market
-report is not closed by any sentinel rule. The deterministic per-channel
-``core_available`` produced at quill_data.mjs:52 is currently DISCARDED at
-decide.mjs:183; threading it through the brain is the real fix for that, and is a
-separate change.
+THE RESIDUAL THIS RULE CANNOT CLOSE — and what now does. Everything above scores
+LLM PROSE (decide.mjs runGather -> grabSub -> analyze.py:_split_eve_markdown), so a
+FABRICATED or paraphrased market report is closed by no sentinel rule. Measured, not
+theoretical: ``state/analyze_logs/2026-07-06_AAPL.json`` supplies
+``Estimated current price ~$313 (Market Cap $4.592T / ~14.668B shares)`` while its
+price window is 34 days stale and "The indicators block returned empty" — and it
+scores as usable data. That run's own PM text even says "the ``core_available`` flag
+returned false": the honest boolean reached the MODEL and the Python wall never saw
+it. Only the model choosing to write Hold stopped a trade, which is prompt luck.
+
+That boolean is no longer discarded. ``quiver_eve/run/contract.mjs`` accumulates the
+per-channel ``core_available`` off every tool envelope and emits it as a
+``## data_availability`` section — producer-written, never model-authored, always
+LAST — and ``analyze.py:assess_data_quality`` ANDs the MARKET channel into
+``core_available``. The two halves compose asymmetrically ON PURPOSE: only an
+explicit ``false`` has teeth, and a deterministic ``true`` NEVER overrides this
+module's verdict. The flag asserts "a price series arrived", not "the model's report
+is faithful to it", so a channel that cannot see the narrative may add a veto but
+must not grant a licence — and a false FALSE only costs an ERROR (the allocator holds
+the prior weight) while a false TRUE is a real-money trade on garbage.
+
+The NARROWED residual, stated rather than papered over:
+  * only MARKET is deterministically gated; the other five channels remain
+    prose-only (they gate nothing, by design).
+  * a deterministic ``true`` still cannot detect prose that MISREPRESENTS data the
+    fetcher really did return. What keeps that surface honest is ``sanitize`` in
+    contract.mjs, which must stay BROADER than analyze.py's ``^##\\s+`` splitter in
+    both its header class and its line-boundary class: JS ``\\s`` misses
+    U+001C-001F/U+0085 and ``split("\\n")`` misses CR/VT/FF/NEL/LS/PS, and each gap
+    was measured to let a model-authored body OVERWRITE the gated market_report via
+    the splitter's last-duplicate-wins rule.
+  * sticky-OR accumulation is bounded to the gather-retry window: attempt 1 true,
+    attempt 1's text rejected, attempt 2 UNAVAILABLE but paraphrased confidently,
+    still reads ``true``. AND-accumulation was rejected because it resurrects the
+    transient-miss ERRORs quill_data.py:_retry exists to kill.
 
 Analysis-side and stdlib-pure: no broker, no trading limits, no config.
 """

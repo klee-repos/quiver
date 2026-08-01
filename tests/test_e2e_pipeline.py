@@ -13,6 +13,7 @@ Plain asserts (no pytest); exits non-zero on any failure.
 """
 
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -313,10 +314,21 @@ because ADX 31 and 200d slope positive
 **Uncertainty**: 28
 The trend is persistent; ride it."""
 
-    # Replicate decide.mjs's sanitize + extract + prepend-headers-once:
+    # Replicate decide.mjs's sanitize + extract + prepend-headers-once.
+    #
+    # NB this is a SIMULATION of the producer, not the producer: the real one is
+    # quiver_eve/run/contract.mjs:sanitize. Keep it in step or this suite silently keeps modelling
+    # an old brain. It is deliberately NOT the proof of sanitize's behaviour — that lives in
+    # quiver_eve/test/contract_helpers.test.mjs (which imports the REAL function) and in the
+    # producer-derived DA rows in tests/test_units.py (which drive it through `node`).
+    #
+    # Mirrors the hardened rule: downgrade any line starting `##` that is not `###`, splitting on
+    # EVERY boundary str.splitlines() recognizes. Both are broader than analyze.py's `^##\s+`
+    # splitter on purpose — matching the classes by hand left measured gaps that let a model-authored
+    # body overwrite the gated market_report.
     def _sanitize(body):
-        return "\n".join(("### " + l[3:]) if l.startswith("## ") else l
-                         for l in (body or "").split("\n")).strip()
+        return "\n".join(("###" + l[2:]) if re.match(r"^##(?!#)", l) else l
+                         for l in str(body or "").splitlines()).strip()
 
     def _extract(text, labels):
         lines = (text or "").split("\n")
