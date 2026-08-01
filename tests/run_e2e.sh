@@ -18,6 +18,11 @@ LIVE=0
 
 # name|file pairs. The live one is appended only when requested.
 SUITES=(
+  # FIRST, because it is the cheapest and it gates a failure the rest of this suite cannot see:
+  # a tracked file referencing a file git does not carry still passes every test here — the file
+  # is on YOUR disk — and only breaks once the box pulls the commit without it.
+  "tracked-refs|tests/check_tracked_refs.py"
+  "guard-tracked-refs|tests/test_tracked_refs.py"
   "unit|tests/test_units.py"
   "chat-guard|tests/test_chat_guard.py"
   "chat-history|tests/test_chat_history.py"
