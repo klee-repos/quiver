@@ -69,7 +69,7 @@ for entry in "${SUITES[@]}"; do
     # rest of the suite is Python-only, so without this branch these never run in the gate.
     : >"$log"
     rc=0
-    for t in quiver_eve/test/retry.test.mjs quiver_eve/test/contract.test.mjs; do
+    for t in quiver_eve/test/retry.test.mjs quiver_eve/test/contract.test.mjs quiver_eve/test/contract_helpers.test.mjs; do
       node "$t" >>"$log" 2>&1 || rc=1
     done
   elif [ "$name" = "e2e-live(GLM)" ] || { [ "$name" = "llm-judge" ] && [ "$LIVE" = "1" ]; }; then

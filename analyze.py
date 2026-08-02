@@ -191,14 +191,91 @@ def _report_available(report) -> bool:
     return report_is_usable(report, min_chars=40, sentinels=_DATA_ERROR_SENTINELS)
 
 
+# --- the DETERMINISTIC half of the core-data gate ----------------------------
+# The gate above scores the MODEL'S PROSE, which is why a fabricated market report survives it
+# (state/analyze_logs/2026-07-06_AAPL.json derives a price from market cap / share count while its
+# window is 34 days stale, and scores as usable data). The brain now also emits the per-channel
+# `core_available` the FETCHER computed, as a `## data_availability` section — see
+# quiver_eve/run/contract.mjs. This block parses it; assess_data_quality ANDs it in.
+#
+# Channel ALLOW-LIST: only these six are recorded. Without it any body line of the form
+# `- profitability: false` would be parsed as a channel and persisted into the ledger's
+# data_quality JSON. These are the brain's tool `kind`s, deliberately NOT `avail`'s five keys.
+_AVAILABILITY_CHANNELS = ("market", "trend", "fundamentals", "news", "sentiment", "macro")
+_AVAILABILITY_LINE_RX = re.compile(
+    r"^[\s\-*•]*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(true|false|unknown)\s*$", re.I)
+
+
+def parse_data_availability(section):
+    """Parse the brain's ``## data_availability`` section -> ``(flags, raw)``.
+
+    ``flags`` maps channel -> bool for the channels that reported ``true``/``false``;
+    ``raw`` maps channel -> the literal token seen (``true``/``false``/``unknown``).
+
+    Both are returned because the THIRD state is load-bearing and a bool map destroys it: under the
+    replay seam every channel renders ``unknown``, and a garbled section parses to nothing — without
+    ``raw`` those two are byte-identical to the caller, so "not measured" and "the producer broke"
+    would be indistinguishable. That is exactly the silent divergence this module's sibling RCA
+    (lib/data_sentinels) exists to prevent.
+
+    Duplicates resolve FALSE-WINS, never last-wins: a forged ``- market: true`` appended after a
+    genuine ``- market: false`` must not flip the veto off. Unknown identifiers are dropped.
+    An unparseable section yields ``({}, {})`` -> the caller falls back to the prose rule.
+    """
+    raw: dict = {}
+    for line in str(section or "").splitlines():
+        m = _AVAILABILITY_LINE_RX.match(line)
+        if not m:
+            continue
+        channel = m.group(1).lower()
+        if channel not in _AVAILABILITY_CHANNELS:
+            continue
+        token = m.group(2).lower()
+        prev = raw.get(channel)
+        if prev == "false":
+            continue                       # false wins; nothing can override it
+        if prev is None or token == "false":
+            raw[channel] = token
+    flags = {c: (t == "true") for c, t in raw.items() if t in ("true", "false")}
+    return flags, raw
+
+
+def _availability_source(final_state: dict, raw: dict) -> str:
+    """Provenance of the deterministic signal, for the audit trail: which of the four states the
+    ``## data_availability`` section was in. ``absent`` = an older brain (or any recorded/replayed
+    corpus) with no section at all; ``unknown`` = the replay seam, where no tool ran; ``parsed`` =
+    a real measurement; ``malformed`` = the section arrived but its ``market`` line did not parse,
+    which must NOT look identical to ``absent`` or a producer regression degrades the gate back to
+    prose in silence."""
+    if "data_availability" not in final_state:
+        return "absent"
+    token = raw.get("market")
+    if token == "unknown":
+        return "unknown"
+    if token in ("true", "false"):
+        return "parsed"
+    return "malformed"
+
+
 def assess_data_quality(final_state: dict) -> dict:
     """Per-decision data-completeness, sentinel-aware. CORE = market_report (prices +
     indicators): without it you cannot even size, so a missing/errored market report
     fails the analysis SAFE (signal:ERROR -> the allocator holds the prior weight, never
     trades on garbage). Fundamentals/news/sentiment missing is recorded (the calibration
     can later down-weight thin-data calls) but is NOT on its own a trade-blocker — many
-    book names are ETFs with intentionally sparse fundamentals."""
-    market = _report_available(final_state.get("market_report"))
+    book names are ETFs with intentionally sparse fundamentals.
+
+    The CORE channel is scored by BOTH halves, ANDed: the prose rule above and the deterministic
+    fetcher flag. Only an explicit ``false`` has teeth — a deterministic ``true`` NEVER overrides a
+    prose UNAVAILABLE. That asymmetry is deliberate: the flag asserts "a price series arrived", not
+    "the model's report is faithful to it", so a channel that cannot see the narrative may add a
+    veto but must not grant a licence. And the error costs are asymmetric — a false FALSE yields
+    ERROR and the allocator holds the prior weight, while a false TRUE is a real-money trade on
+    garbage. An absent or ``unknown`` section leaves the prose verdict untouched, so an older brain
+    and the replay seam both degrade to exactly today's behaviour rather than failing closed."""
+    tool_flags, tool_raw = parse_data_availability(final_state.get("data_availability"))
+    market = (_report_available(final_state.get("market_report"))
+              and tool_flags.get("market") is not False)
     sentiment = _report_available(final_state.get("sentiment_report"))
     news = _report_available(final_state.get("news_report"))
     fundamentals = _report_available(final_state.get("fundamentals_report"))
@@ -212,6 +289,12 @@ def assess_data_quality(final_state: dict) -> dict:
         **avail,
         "core_available": market,
         "sources_unavailable": sorted(k for k, ok in avail.items() if not ok),
+        # TOP-LEVEL, deliberately NOT inside `avail`: sources_unavailable is derived by iterating
+        # avail, and tests/test_bench_diagnostics.py equality-asserts that list against this real
+        # producer. Extra top-level keys are inert for every consumer (the ledger stores the whole
+        # dict as one opaque TEXT column).
+        "tool_flags": tool_flags,
+        "tool_flags_source": _availability_source(final_state, tool_raw),
     }
 
 
@@ -228,7 +311,17 @@ def extract_fields(final_state: dict, signal: str, ticker: str) -> dict:
     out_signal, out_error = signal, None
     if not dq["core_available"]:
         out_signal = "ERROR"
-        out_error = f"core data unavailable: missing {','.join(dq['sources_unavailable']) or 'market'}"
+        # PROVENANCE, appended only when the DETERMINISTIC flag is what vetoed. An ERROR row never
+        # reaches ledger.record_decision — tick.py takes the `signal not in VALID_SIGNALS` branch
+        # into record_action, which has no data_quality column — so this string is the ONLY durable
+        # record of why. Without it, "the residual firing correctly" and "the credit rule is too
+        # strict" are byte-identical in the ledger, i.e. exactly the rows this feature creates are
+        # the rows with no evidence. A prose-only ERROR keeps today's string byte-for-byte.
+        provenance = ""
+        if dq.get("tool_flags", {}).get("market") is False:
+            provenance = f" [tool_flags market=false source={dq.get('tool_flags_source')}]"
+        out_error = (f"core data unavailable: missing "
+                     f"{','.join(dq['sources_unavailable']) or 'market'}{provenance}")
     fields = {
         "ticker": ticker,
         "signal": out_signal,  # deterministic: Buy/Overweight/Hold/Underweight/Sell (or ERROR on bad data)
@@ -291,10 +384,15 @@ def _dump_full_state(final_state: dict, ticker: str, date: str) -> None:
 # The separable `## section` headers EVE emits (F1 contract) -> final_state keys.
 # F3: trend_report added (optional long-horizon guidepost block; missing -> the
 # splitter just won't have it, never an ERROR — only core market data gates).
+# data_availability is the one PRODUCER-EMITTED section (quiver_eve/run/contract.mjs assembles it
+# last, after every model-authored body) — it carries the deterministic per-channel core_available
+# the fetchers computed. Registering it here is what lets _split_eve_markdown capture it; an older
+# brain simply omits it and the splitter's allow-list drops nothing, so the gate falls back to the
+# prose rule.
 _EVE_SECTIONS = (
     "market_report", "sentiment_report", "news_report", "fundamentals_report",
     "trend_report", "macro_report", "trader_investment_plan", "final_trade_decision",
-    "lever_proposals",
+    "lever_proposals", "data_availability",
 )
 
 # F6: the 12 contract labels. The Python-side gate is BINDING (the TS validator
@@ -390,7 +488,7 @@ def _communicate_with_stderr_tee(proc, input_bytes, timeout, on_stderr_line):
     Why this exists instead of communicate(): communicate() reads proc.stderr itself, so
     running it alongside a drain thread puts TWO readers on ONE pipe, and each sees only the
     chunks the other lost. Measured on a 200-line burst: the thread got 99-200 lines and
-    communicate() got the rest. decide.mjs:424 emits its SINGLE ``REASONING_TOKENS: N`` line
+    communicate() got the rest. decide.mjs:435 emits its SINGLE ``REASONING_TOKENS: N`` line
     LAST, so that split made ``reasoning_content_len`` binary rather than merely low — 14 of
     60 runs reported 0 on a run that had reasoned fine, i.e. a false thinking-OFF regression.
 
@@ -403,7 +501,7 @@ def _communicate_with_stderr_tee(proc, input_bytes, timeout, on_stderr_line):
     communicate() raises, which _classify_failure buckets as "timeout" — after killing and
     reaping the child, so a timed-out ticker does not leave node burning tokens next to the
     F2 fallback re-run (reachable whenever there is no --deadline, e.g. `python analyze.py
-    TICKER`, because then the FLOOR guard at :658 is inert and the re-run proceeds).
+    TICKER`, because then the FLOOR guard at :756 is inert and the re-run proceeds).
     """
     import subprocess
     import threading
@@ -414,7 +512,7 @@ def _communicate_with_stderr_tee(proc, input_bytes, timeout, on_stderr_line):
     def _guarded(fn):
         """Run fn in a thread, parking any exception for the CALLING thread to re-raise.
         Without this a dead stdout reader is invisible: the helper would return b"" with
-        returncode 0, and :574 would call that "no markdown" (a MODEL verdict) instead of
+        returncode 0, and :672 would call that "no markdown" (a MODEL verdict) instead of
         the reader failure it actually is."""
         def _run():
             try:
@@ -424,8 +522,8 @@ def _communicate_with_stderr_tee(proc, input_bytes, timeout, on_stderr_line):
         return _run
 
     def _write_stdin():
-        # NEVER guard this on truthiness. past_context="" is reachable (analyze.py:583's own
-        # default), and decide.mjs:36 awaits readStdin() at TOP LEVEL, whose
+        # NEVER guard this on truthiness. past_context="" is reachable (analyze.py:681's own
+        # default), and decide.mjs:41 awaits readStdin() at TOP LEVEL, whose
         # `for await (const chunk of process.stdin)` returns only on EOF. An unclosed stdin
         # therefore hangs the brain before its first turn, for the whole timeout. communicate()
         # closes stdin unconditionally; so do we, in a finally.
@@ -555,8 +653,8 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
     reasoning_tokens = [0]
 
     def _on_stderr_line(line: str) -> None:
-        # Accumulate BEFORE writing the tee, never after. decide.mjs:424 emits exactly ONE
-        # REASONING_TOKENS line (:126 — the count is promoted from the successful attempt,
+        # Accumulate BEFORE writing the tee, never after. decide.mjs:435 emits exactly ONE
+        # REASONING_TOKENS line (:131 — the count is promoted from the successful attempt,
         # not summed across turns), so if a sink write were to raise first — e.g. a straggler
         # arriving after _run_eve_analysis's finally closed the reasoning log — that single
         # line would be lost and reasoning_content_len would read 0 on a run that reasoned.
