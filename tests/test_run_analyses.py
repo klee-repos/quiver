@@ -377,6 +377,26 @@ def main() -> int:
         check("swept live process group" in seen and "path=ok" in seen,
               f"PGSWEEP logs the success-path sweep — its most diagnostic event "
               f"(stderr={seen[:300]!r})")
+        check(seen.count("swept live process group") == 1,
+              f"exactly ONE sweep line per reclaimed group, not one per sweep call "
+              f"(got {seen.count('swept live process group')})")
+
+    def _arm_no_duplicate_sweep_log():
+        # The timeout path sweeps explicitly and then again in `finally`. killpg(pgid,0)
+        # succeeds for a ZOMBIE, so without suppression the second probe re-fires and an
+        # operator counting leak events sees two per timeout. Pin it at one.
+        pidfile = tmp / "leak_dup.pid"
+        os.environ["QUIVER_TEST_PIDFILE"] = str(pidfile)
+        ra.ANALYZE_SCRIPT = str(leak_stub)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            res = ra.run(["LEAKHANG"], concurrency=1, timeout=2)
+        seen = buf.getvalue()
+        _SPAWNED.append(int(pidfile.read_text()))
+        check(res[0].get("signal") == "ERROR", "duplicate-log arm took the timeout path")
+        check(seen.count("swept live process group") == 1,
+              f"timeout path logs the sweep exactly ONCE (got "
+              f"{seen.count('swept live process group')}): {seen[:300]!r}")
 
     def _arm_interrupt_sweep():
         # The Ctrl-C path. start_new_session moves children OUT of the terminal's foreground
@@ -404,6 +424,7 @@ def main() -> int:
         _arm("timeout-path", _arm_timeout_path)
         _arm("success-path", _arm_success_path)
         _arm("observability", _arm_observability)
+        _arm("no-duplicate-sweep-log", _arm_no_duplicate_sweep_log)
         _arm("self-kill-guard", _arm_self_kill_guard)
         _arm("spawn-failure", _arm_spawn_failure)
         _arm("sweep-failure-swallowed", _arm_sweep_failure_swallowed)

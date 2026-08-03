@@ -234,6 +234,7 @@ def analyze_one(ticker: str, *, timeout: int) -> dict:
     proc = None
     pgid = None
     path = "ok"
+    swept = [False]   # list so the finally can see the timeout branch's assignment
     try:
         try:
             proc = subprocess.Popen(
@@ -259,6 +260,12 @@ def analyze_one(ticker: str, *, timeout: int) -> dict:
             path = "timeout"
             # Kill the GROUP before draining, so the drain is not waiting on live writers.
             _sweep_process_group(pgid, ticker, path)
+            # Suppress the finally-sweep's duplicate. SIGKILL is uncatchable, so nothing in
+            # the group can still be RUNNING — but the grandchild spends ~6-30ms as a zombie
+            # awaiting reparent-to-init reaping, and killpg(pgid, 0) succeeds for a zombie.
+            # Without this the finally probe re-fires and logs a SECOND "swept" line for the
+            # same pgid, so an operator counting leak events would see two per timeout.
+            swept[0] = True
             # BOUNDED. An unbounded second communicate() waits for EOF on both pipes, which
             # any descendant that escaped the group can hold open forever -> the fan-out
             # never returns -> run_tick.py:328 hangs -> the run_lock TTL expires and the next
@@ -284,8 +291,10 @@ def analyze_one(ticker: str, *, timeout: int) -> dict:
                                   f"stderr tail: {tail}")
         return _parse_analysis_line(ticker, lines[-1])
     finally:
-        # Sweep on EVERY exit path, success included — see the module header.
-        _sweep_process_group(pgid, ticker, path)
+        # Sweep on EVERY exit path, success included — see the module header. Skipped only
+        # when the timeout branch already swept this exact group moments ago.
+        if not swept[0]:
+            _sweep_process_group(pgid, ticker, path)
         if pgid:
             with _LIVE_LOCK:
                 _LIVE_PGIDS.discard(pgid)
