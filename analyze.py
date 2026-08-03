@@ -469,6 +469,141 @@ def _split_eve_markdown(md: str) -> dict:
     return out
 
 
+# The provider-reported thinking-ON marker decide.mjs writes to stderr. Module-level so the
+# regression test sums with the PRODUCTION pattern instead of a copy of it that can drift.
+_REASONING_TOKENS_RE = re.compile(r"REASONING_TOKENS:\s*(\d+)")
+
+# How long the reader threads get AFTER the child has been reaped. Once proc.wait() returns,
+# nothing holds the write end of our pipes — decide.mjs spawns its data helper with node's
+# default stdio:'pipe' (quiver_eve/run/quill_data.mjs), so no grandchild inherits them — and
+# EOF is immediate. This bound exists only so that a future stdio:'inherit' grandchild fails
+# LOUD below instead of silently hanging a tick.
+_DRAIN_GRACE_S = 30.0
+
+
+def _communicate_with_stderr_tee(proc, input_bytes, timeout, on_stderr_line):
+    """``proc.communicate(input=…, timeout=…)`` with a LIVE stderr tee — and with exactly
+    ONE reader of ``proc.stderr``.
+
+    Why this exists instead of communicate(): communicate() reads proc.stderr itself, so
+    running it alongside a drain thread puts TWO readers on ONE pipe, and each sees only the
+    chunks the other lost. Measured on a 200-line burst: the thread got 99-200 lines and
+    communicate() got the rest. decide.mjs:435 emits its SINGLE ``REASONING_TOKENS: N`` line
+    LAST, so that split made ``reasoning_content_len`` binary rather than merely low — 14 of
+    60 runs reported 0 on a run that had reasoned fine, i.e. a false thinking-OFF regression.
+
+    Dropping the drain thread and parsing communicate()'s stderr would fix the count but
+    buffer the whole stream until exit, so logs/reasoning/<date>_<TICKER>.log would land in
+    one lump at the end and `tail -f` would show nothing — the very thing the tee exists for.
+    So the thread stays and OWNS the pipe, and this function does communicate()'s other jobs.
+
+    Returns stdout as BYTES. Raises subprocess.TimeoutExpired — the same type and message
+    communicate() raises, which _classify_failure buckets as "timeout" — after killing and
+    reaping the child, so a timed-out ticker does not leave node burning tokens next to the
+    F2 fallback re-run (reachable whenever there is no --deadline, e.g. `python analyze.py
+    TICKER`, because then the FLOOR guard at :756 is inert and the re-run proceeds).
+    """
+    import subprocess
+    import threading
+
+    stdout_chunks: list = []
+    worker_err: list = [None]
+
+    def _guarded(fn):
+        """Run fn in a thread, parking any exception for the CALLING thread to re-raise.
+        Without this a dead stdout reader is invisible: the helper would return b"" with
+        returncode 0, and :672 would call that "no markdown" (a MODEL verdict) instead of
+        the reader failure it actually is."""
+        def _run():
+            try:
+                fn()
+            except BaseException as e:  # noqa: BLE001 — re-raised in the caller's thread
+                worker_err[0] = e
+        return _run
+
+    def _write_stdin():
+        # NEVER guard this on truthiness. past_context="" is reachable (analyze.py:681's own
+        # default), and decide.mjs:41 awaits readStdin() at TOP LEVEL, whose
+        # `for await (const chunk of process.stdin)` returns only on EOF. An unclosed stdin
+        # therefore hangs the brain before its first turn, for the whole timeout. communicate()
+        # closes stdin unconditionally; so do we, in a finally.
+        try:
+            if proc.stdin is not None and input_bytes is not None:
+                proc.stdin.write(input_bytes)
+        except (BrokenPipeError, OSError):
+            pass  # child exited before reading — exactly what communicate() swallows
+        finally:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _read_stdout():
+        try:
+            stdout_chunks.append(proc.stdout.read())
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _read_stderr():
+        try:
+            for raw in proc.stderr:
+                line = raw.decode("utf-8", errors="replace")
+                try:
+                    on_stderr_line(line)
+                except Exception:  # noqa: BLE001 — one bad line must not stop the drain:
+                    pass           # a stalled drain fills the pipe and blocks the child.
+        finally:
+            try:
+                proc.stderr.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # One dedicated thread per pipe, so no pipe can fill without a reader. daemon=True
+    # preserves the property the HEAD drain thread had: a straggler can never wedge
+    # interpreter exit after analyze.py has already printed its JSON line.
+    stdin_t, stdout_t, stderr_t = (
+        threading.Thread(target=_guarded(fn), daemon=True)
+        for fn in (_write_stdin, _read_stdout, _read_stderr))
+    for t in (stdin_t, stdout_t, stderr_t):
+        t.start()
+
+    try:
+        # Pass `timeout` STRAIGHT through, never `timeout or None`: communicate(timeout=0)
+        # raises TimeoutExpired immediately, and coercing 0 to None would invert that into an
+        # unbounded wait. Only None means "block forever", exactly as before.
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        # Let the tee fall quiet BEFORE the caller's finally closes the reasoning log and the
+        # F2 re-run truncates and reopens it, or run-1's straggler braids into run-2's log.
+        for t in (stdin_t, stdout_t, stderr_t):
+            t.join(timeout=_DRAIN_GRACE_S)
+        raise
+
+    # The child is reaped, so both pipes are at EOF and these joins return at once. They are
+    # bounded by their OWN grace, never by the shared deadline: a deadline that has nearly
+    # run out must not turn into a silently truncated stderr — that is the very loss being
+    # fixed, re-entering through the back door.
+    _grace_end = time.monotonic() + _DRAIN_GRACE_S
+    for t in (stdin_t, stdout_t, stderr_t):
+        t.join(timeout=max(0.0, _grace_end - time.monotonic()))
+    if worker_err[0] is not None:
+        raise worker_err[0]
+    still_alive = [n for n, t in (("stdin", stdin_t), ("stdout", stdout_t),
+                                  ("stderr", stderr_t)) if t.is_alive()]
+    if still_alive:
+        # Fail LOUD. Returning here would hand back a complete-looking result built on a
+        # half-drained pipe — indistinguishable from success.
+        raise RuntimeError(
+            f"EVE brain reader thread(s) did not finish after child exit: {still_alive}")
+    return b"".join(c for c in stdout_chunks if c)
+
+
 def _run_eve(ticker: str, date: str, cfg, past_context: str,
              past_context_compact: str, sink) -> dict:
     """Drive the EVE brain (a standalone Node script) and return a pseudo-final_state.
@@ -487,7 +622,6 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
     the caller maps to an ERROR signal (fail-safe).
     """
     import subprocess
-    import threading
 
     eve_dir = REPO / (getattr(cfg, "eve_dir", "quiver_eve") or "quiver_eve")
     script = eve_dir / "run" / "decide.mjs"
@@ -511,28 +645,26 @@ def _run_eve(ticker: str, date: str, cfg, past_context: str,
     except FileNotFoundError as e:
         raise RuntimeError(f"node not found (is Node 24+ installed?): {e}")
 
-    # Stream stderr into the tee so the reasoning log is live (tail -f), and
-    # capture the REASONING_TOKENS: marker decide.mjs emits (the provider-reported
-    # thinking-ON count — survivor #4 gate).
+    # Stream stderr into the tee so the reasoning log is live (tail -f), and capture the
+    # REASONING_TOKENS: marker decide.mjs emits (the provider-reported thinking-ON count —
+    # survivor #4 gate). _communicate_with_stderr_tee gives this callback SOLE ownership of
+    # proc.stderr; a second reader (as communicate() used to be) splits the stream and drops
+    # whichever chunks it wins.
     reasoning_tokens = [0]
-    def _drain_stderr():
-        try:
-            for raw in proc.stderr:
-                line = raw.decode("utf-8", errors="replace")
-                sink.write(line)
-                m = re.search(r"REASONING_TOKENS:\s*(\d+)", line)
-                if m:
-                    # F4 (Gate-B): SUM across deep turns (not last-write-wins) so a
-                    # Step-6 throw after a Step-3 count still leaves a nonzero total
-                    # (honest thinking-ON proof). decide.mjs emits per deep turn in a
-                    # finally so a crash still surfaces its count.
-                    reasoning_tokens[0] += int(m.group(1))
-        except Exception:  # noqa: BLE001 — the log is best-effort
-            pass
-    t = threading.Thread(target=_drain_stderr, daemon=True)
-    t.start()
-    md, _ = proc.communicate(input=ctx_stdin, timeout=getattr(cfg, "analyze_timeout_sec", 3600))
-    t.join(timeout=5)
+
+    def _on_stderr_line(line: str) -> None:
+        # Accumulate BEFORE writing the tee, never after. decide.mjs:435 emits exactly ONE
+        # REASONING_TOKENS line (:131 — the count is promoted from the successful attempt,
+        # not summed across turns), so if a sink write were to raise first — e.g. a straggler
+        # arriving after _run_eve_analysis's finally closed the reasoning log — that single
+        # line would be lost and reasoning_content_len would read 0 on a run that reasoned.
+        m = _REASONING_TOKENS_RE.search(line)
+        if m:
+            reasoning_tokens[0] += int(m.group(1))
+        sink.write(line)
+
+    md = _communicate_with_stderr_tee(
+        proc, ctx_stdin, getattr(cfg, "analyze_timeout_sec", 3600), _on_stderr_line)
     if proc.returncode != 0:
         raise RuntimeError(f"EVE brain (decide.mjs) exited {proc.returncode}")
     md = md.decode("utf-8", errors="replace")

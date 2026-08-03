@@ -5584,6 +5584,183 @@ for _lbl, _core, _want_signal in [("healthy fetch", "true", "Buy"), ("dead marke
     _e2e_fields = _az.extract_fields(_e2e, _rating.parse_rating(_e2e["final_trade_decision"]), "AAPL")
     check(f"DA14 [{_lbl}]: end-to-end signal", _e2e_fields["signal"], _want_signal)
 
+# --- SR: _run_eve owns proc.stderr with EXACTLY ONE reader ------------------
+# HEAD ran a drain thread over proc.stderr AND proc.communicate() (which reads stderr too),
+# so two readers split one pipe and each dropped whatever the other won. Measured on the HEAD
+# pattern: 99-200 of 200 lines reached the thread, 0/150 runs were lossless. Consequences:
+# logs/reasoning/<date>_<TICKER>.log was truncated at that rate, and because decide.mjs:435
+# emits its SINGLE `REASONING_TOKENS: N` line LAST, reasoning_content_len went BINARY --
+# 14/60 runs on the production shape reported 0 on a run that had reasoned fine.
+#
+# These checks bind the CALL SITE, not just the helper: a version of _run_eve that still
+# called communicate() would pass a helper-only test while production stayed byte-identical
+# to HEAD. The child emits N padded lines (>64KB total) because that is the shape measured to
+# lose lines 150/150 times -- a bare burst got lucky 4/30 and would be a flaky red.
+# Driven through a subprocess with timeout=90 (DS10 idiom, tests/test_units.py:5258) so a
+# deadlock in the new concurrency code is a COUNTED FAIL, not an infinite run_e2e.sh hang.
+import inspect as _inspect  # noqa: E402
+import subprocess as _sr_sp  # noqa: E402
+
+_SR_N = 200
+_SR_DRIVER = r'''
+import json, re, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+
+REPO, TMP, N = sys.argv[1], sys.argv[2], int(sys.argv[3])
+sys.path.insert(0, REPO)
+import analyze
+
+# A stand-in for decide.mjs. It mirrors the real brain's contract: read stdin to EOF
+# (decide.mjs:41 awaits readStdin() at TOP LEVEL), emit reasoning chatter on stderr, print the
+# contract markdown on stdout. `analyze.py` hardcodes `node <script> <ticker> <date>`, so the
+# stub has to be a real .mjs -- node is already a hard dependency of this gate.
+STUB = r"""
+import fs from "node:fs";
+let stdin = "";
+for await (const chunk of process.stdin) stdin += chunk;   // EOF-terminated, like decide.mjs:440
+const md = fs.readFileSync(new URL("../contract.md", import.meta.url), "utf8");
+const PAD = "x".repeat(1024);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// LIVENESS HANDSHAKE. Completeness alone cannot tell a live tee from a post-exit replay: both
+// leave the same bytes in the sink by the time _run_eve returns. So the CHILD checks, while it
+// is still running, whether the parent's sink has already seen its first line. A batched
+// implementation (communicate() then replay the stderr it captured) physically cannot create
+// this flag before exit -- which is the design analyze.py rejects to keep `tail -f` alive.
+process.stderr.write(`REASONING_TOKENS: 1 line=0 ${PAD}\n`);
+const flag = new URL("../live.flag", import.meta.url);
+let sawFlag = false;
+for (let w = 0; w < 1000 && !sawFlag; w++) {        // 10s ceiling; live latency is ~1ms
+  sawFlag = fs.existsSync(flag);
+  if (!sawFlag) await sleep(10);
+}
+fs.writeFileSync(new URL("../child_saw_flag", import.meta.url), sawFlag ? "1" : "0");
+
+for (let i = 1; i < N_LINES; i++)
+  process.stderr.write(`REASONING_TOKENS: 1 line=${i} ${PAD}\n`);
+process.stdout.write(md);
+"""
+Path(TMP, "run").mkdir(parents=True, exist_ok=True)
+Path(TMP, "run", "decide.mjs").write_text(STUB.replace("N_LINES", str(N)), encoding="utf-8")
+
+out = {}
+
+# (1) THE call-site check. past_context="" on purpose: ctx_stdin is then b"", and a writer
+# guarded on truthiness instead of `is not None` would never close stdin, hanging the stub
+# (and the real brain) for the whole timeout.
+buf = []
+class _Sink:
+    def write(self, s):
+        buf.append(s)
+        if len(buf) == 1:
+            Path(TMP, "live.flag").touch()   # the child's half of the liveness handshake
+    def flush(self): pass
+cfg = SimpleNamespace(eve_dir=TMP, research_rounds=1, analyze_timeout_sec=60)
+pseudo = analyze._run_eve("SRTEST", "2026-08-01", cfg, "", "", _Sink())
+# NOT sorted: one thread iterates proc.stderr and calls the callback in sequence, so order is
+# deterministic. Sorting would let a complete-but-scrambled log pass a check whose whole point
+# is that the log is readable.
+ids = [int(m) for m in re.findall(r"line=(\d+)", "".join(buf))]
+out["tee_line_ids_complete"] = (ids == list(range(N)))   # no drop, no dup, right order
+out["tee_line_count"] = len(ids)
+out["reasoning_tokens"] = pseudo.get("_reasoning_tokens")
+out["contract_parsed"] = bool(pseudo.get("final_trade_decision"))
+out["child_saw_live_tee"] = Path(TMP, "child_saw_flag").read_text().strip()
+
+# (1b) Hostile sink: analyze.py's _read_stderr swallows callback exceptions (so one bad line
+# cannot stall the drain and block the child). That makes ORDER inside the callback load-bearing
+# -- accumulate-then-write keeps the count; write-then-accumulate loses the marker entirely and
+# reasoning_content_len reads 0 on a run that reasoned.
+class _RaisingSink:
+    def write(self, s): raise IOError("reasoning log already closed by the caller's finally")
+    def flush(self): pass
+try:
+    out["tokens_when_sink_raises"] = analyze._run_eve(
+        "SRTEST", "2026-08-01", cfg, "", "", _RaisingSink()).get("_reasoning_tokens")
+except Exception as e:
+    out["tokens_when_sink_raises"] = f"raised {e!r}"
+
+# (2) Timeout parity: same exception type communicate() raised, same _classify_failure bucket,
+# and the child is actually killed+reaped rather than left burning tokens.
+p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    analyze._communicate_with_stderr_tee(p, b"", 1.0, lambda s: None)
+    out["timeout_exc"] = "NONE-RAISED"
+except subprocess.TimeoutExpired as e:
+    out["timeout_exc"] = type(e).__name__
+    out["timeout_bucket"] = analyze._classify_failure(e)
+    out["timeout_child_reaped"] = p.poll() is not None
+finally:
+    try: p.kill()
+    except Exception: pass
+
+# (3) stdout/returncode parity against a child that blocks until stdin EOF.
+p2 = subprocess.Popen(
+    [sys.executable, "-c",
+     "import sys; sys.stdin.buffer.read(); sys.stdout.write('HELLO'); sys.stderr.write('e\\n')"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+seen = []
+out["stdout_bytes"] = analyze._communicate_with_stderr_tee(p2, b"", 30, seen.append).decode()
+out["returncode"] = p2.returncode
+out["stderr_seen"] = "".join(seen).strip()
+
+print(json.dumps(out))
+'''
+
+_sr_tmp = tempfile.mkdtemp(prefix="quiver_sr_")
+try:
+    # The stdout fixture is built by the repo's OWN producer (_contract_md, already proven
+    # against _split_eve_markdown/_validate_contract above) -- never hand-written, so it
+    # cannot drift into a shape the real parser would reject.
+    Path(_sr_tmp, "contract.md").write_text(_contract_md(), encoding="utf-8")
+    Path(_sr_tmp, "drive.py").write_text(_SR_DRIVER, encoding="utf-8")
+    _sr_r = _sr_sp.run([sys.executable, str(Path(_sr_tmp, "drive.py")),
+                        str(_REPO), _sr_tmp, str(_SR_N)],
+                       capture_output=True, text=True, timeout=90)
+    _sr = _json.loads(_sr_r.stdout.strip().splitlines()[-1])
+except Exception as _e:  # noqa: BLE001 — fails LOUD as a counted FAIL, never a silent abort
+    _sr = {"driver": f"raised {_e!r}", "stderr": (locals().get("_sr_r").stderr[-400:]
+                                                  if locals().get("_sr_r") else "")}
+
+check("SR1: every stderr line reaches the tee, exactly once (live tail -f + no dup/drop)",
+      _sr.get("tee_line_ids_complete"), True)
+check(f"SR2: all {_SR_N} lines captured (HEAD split them between two readers)",
+      _sr.get("tee_line_count"), _SR_N)
+check("SR3: REASONING_TOKENS sums complete (the thinking-ON / Gate-B proof)",
+      _sr.get("reasoning_tokens"), _SR_N)
+check("SR4: the brain's markdown still parses through the same path", _sr.get("contract_parsed"), True)
+check("SR5: timeout still raises TimeoutExpired", _sr.get("timeout_exc"), "TimeoutExpired")
+check("SR6: ...and still classifies as 'timeout'", _sr.get("timeout_bucket"), "timeout")
+check("SR7: ...and the timed-out child is killed, not left running", _sr.get("timeout_child_reaped"), True)
+check("SR8: stdout is returned whole (parity with communicate)", _sr.get("stdout_bytes"), "HELLO")
+check("SR9: returncode is set before returning", _sr.get("returncode"), 0)
+check("SR10: stderr is still tee'd on the plain path", _sr.get("stderr_seen"), "e")
+# The user's hard constraint. Completeness (SR1/SR2) cannot distinguish a live tee from a
+# post-exit replay -- both leave identical bytes in the sink. Only the child, asking mid-run
+# whether the parent had already seen its first line, can tell them apart.
+check("SR11: the tee is LIVE mid-run, not replayed after exit (tail -f is the point)",
+      _sr.get("child_saw_live_tee"), "1")
+check("SR12: a RAISING sink cannot zero the token count (accumulate before tee write)",
+      _sr.get("tokens_when_sink_raises"), _SR_N)
+
+# Merge tripwire: the structural checks that earn their keep. They cannot prove the tee is wired
+# (SR1/SR11 do that behaviourally) but they are the cheapest possible guard against a merge that
+# restores the second reader verbatim. Scoped to BOTH functions: the caller AND the helper that
+# would actually hold the restored call. AST, not substring (precedent: _imported_modules at
+# tests/test_units.py:1359) — a substring scan counts the helper's own docstring, which quotes
+# `proc.communicate(...)` to explain why it is not used.
+def _sr_calls(fn, name):
+    return sum(1 for n in _ast.walk(_ast.parse(_inspect.getsource(fn)))
+               if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Attribute)
+               and n.func.attr == name)
+
+check("SR13: neither _run_eve nor the helper CALLS communicate() (two readers, one pipe)",
+      _sr_calls(_az._run_eve, "communicate") + _sr_calls(_az._communicate_with_stderr_tee, "communicate"), 0)
+check("SR14: _run_eve starts no second stderr reader thread",
+      _inspect.getsource(_az._run_eve).count("threading.Thread"), 0)
+
 
 print(f"\n{PASS} passed, {FAIL} failed, {SKIP} skipped")
 sys.exit(1 if FAIL else 0)
