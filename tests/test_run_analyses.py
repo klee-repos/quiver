@@ -7,10 +7,15 @@ Plain asserts, prints "<n> checks passed, <m> failed", exits non-zero on any fai
 (matches tests/run_e2e.sh's summary grep)."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -34,8 +39,65 @@ if t == "SLOW":       # sleeps longer than a tiny timeout
 print(json.dumps({"signal": "Buy", "position_pct": 0.1}))
 '''
 
+# A second stub for the PGSWEEP arms: it spawns a real GRANDCHILD (mirroring analyze.py:506,
+# which spawns `node decide.mjs`) and then either hangs (so the OUTER timeout fires) or exits 0
+# leaving the grandchild behind (the case a kill-only-on-timeout fix would miss entirely).
+_LEAK_STUB = '''\
+import json, os, subprocess, sys, time
+t = sys.argv[1]
+# The grandchild must PROVABLY NEVER WRITE. A writing grandchild dies of EPIPE/SIGPIPE by
+# itself when this stub is killed, and both arms below would then pass with the fix removed.
+# Explicit DEVNULL on all three fds also stops it holding the outer capture pipe open, which
+# would silently convert the SUCCESS arm into a timeout arm.
+g = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(45)"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
+open(os.environ["QUIVER_TEST_PIDFILE"], "w").write(str(g.pid))
+if t == "LEAKOK":
+    # SUCCESS path: valid analysis, exit 0 — deliberately orphaning the grandchild.
+    print(json.dumps({"signal": "Buy", "pgid": os.getpgid(0), "argv": sys.argv}))
+    sys.exit(0)
+time.sleep(45)   # LEAKHANG: block so the OUTER timeout fires
+'''
+
 _PASS = 0
 _FAIL = 0
+_SPAWNED = []          # every pid this file created, killed unconditionally at exit
+
+
+def _alive(pid):
+    """Does `pid` exist? NOTE: also True for a ZOMBIE (dead but not yet reaped) — which is
+    exactly why callers POLL rather than sleeping a fixed interval. PermissionError is NOT
+    'gone': it means the pid was recycled onto another uid, so the verdict is unusable and
+    must go red loudly rather than pass quietly."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _wait_gone(pid, timeout=5.0):
+    """Poll until `pid` leaves the process table. Measured sweep latency is ~6-30ms while a
+    LEAKED grandchild sleeps 45s, so the two populations are three orders of magnitude apart
+    and this is deterministic — unlike a fixed sleep, which is a flake generator against an
+    unbounded quantity (SIGKILL delivery + reap + reparent-to-init reap) on a loaded box."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if not _alive(pid):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _arm(name, fn):
+    """Run one process-level arm. An exception becomes a FAILED check instead of an uncaught
+    raise, which would kill the '<n> checks passed' summary line that tests/run_e2e.sh greps
+    and silently skip every check after it."""
+    try:
+        fn()
+    except Exception as e:  # noqa: BLE001 — that is the entire point of this wrapper
+        check(False, f"{name}: raised {type(e).__name__}: {e}")
 
 
 def check(cond, msg):
@@ -160,9 +222,255 @@ def main() -> int:
     check(rt._orchestrator_reason("") is None, "empty stdout -> None")
     check(rt._orchestrator_reason("not json\n{oops\n") is None, "garbage stdout -> None (never raises)")
 
+    # ================= PGSWEEP: the orphaned-grandchild token leak =================
+    # Placed AFTER the 30 checks above so that even a catastrophic failure here cannot skip
+    # them. Every arm goes through _arm() and asserts against REAL kernel process state.
+    check(hasattr(os, "killpg") and hasattr(os, "getpgid"),
+          "POSIX process-group API present (both target platforms are POSIX)")
+
+    leak_stub = tmp / "leak_stub.py"
+    leak_stub.write_text(_LEAK_STUB)
+    # Swap the analyzer by REBINDING THE MODULE ATTRIBUTE. Re-setting QUIVER_ANALYZE_SCRIPT
+    # here would be a silent no-op: run_analyses.py:52 binds ANALYZE_SCRIPT at IMPORT time,
+    # so the arm would quietly re-run the original _STUB, spawn no grandchild, and pass
+    # having tested nothing. analyze_one resolves the global at call time, so this works.
+    _orig_script = ra.ANALYZE_SCRIPT
+
+    def _arm_timeout_path():
+        pidfile = tmp / "leak_hang.pid"
+        os.environ["QUIVER_TEST_PIDFILE"] = str(pidfile)
+        ra.ANALYZE_SCRIPT = str(leak_stub)
+        # CONTROL: an identical grandchild that never goes near run_analyses. If the control
+        # dies too, something in the environment is killing these processes for unrelated
+        # reasons and the main verdict below would be a false green — so the control failing
+        # must itself be a FAIL. This is the durable stand-in for a one-shot red/green ritual.
+        ctrl = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(45)"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        _SPAWNED.append(ctrl.pid)
+        res = ra.run(["LEAKHANG"], concurrency=1, timeout=2)
+        check(pidfile.exists(), "timeout arm: the stub really did spawn a grandchild")
+        gpid = int(pidfile.read_text())
+        _SPAWNED.append(gpid)
+        check(res[0].get("signal") == "ERROR" and "timed out" in res[0].get("error", ""),
+              f"timeout arm: still yields the ERROR datum (got {res[0]})")
+        check(_wait_gone(gpid),
+              f"OUTER TIMEOUT: grandchild {gpid} swept from the process table (the leak)")
+        check(_alive(ctrl.pid),
+              "control grandchild still alive — the environment is not killing these for us")
+
+    def _arm_success_path():
+        # THE ARM WITH TEETH. A fix that only kills on timeout passes the arm above and fails
+        # this one: analyze.py's own INNER timeout can orphan node and then exit 0-ish, in
+        # which case the outer SIGKILL never fires at all.
+        pidfile = tmp / "leak_ok.pid"
+        os.environ["QUIVER_TEST_PIDFILE"] = str(pidfile)
+        ra.ANALYZE_SCRIPT = str(leak_stub)
+        t0 = time.monotonic()
+        res = ra.run(["LEAKOK"], concurrency=1, timeout=20)
+        elapsed = time.monotonic() - t0
+        check(res[0].get("signal") == "Buy", f"success arm: took the SUCCESS path (got {res[0]})")
+        # Pins that this really was the success path, independent of the stub's internals:
+        # had the grandchild held the capture pipe open, this would have taken the full 20s.
+        check(elapsed < 10, f"success arm: returned promptly, not via the timeout branch ({elapsed:.1f}s)")
+        gpid = int(pidfile.read_text())
+        _SPAWNED.append(gpid)
+        check(_wait_gone(gpid),
+              f"SUCCESS PATH: orphan {gpid} swept too (a kill-on-timeout-only fix leaks here)")
+        # Same arm proves the child got its OWN process group, and that --deadline survived
+        # the subprocess.run -> Popen rewrite (nothing else in this file inspects argv).
+        check(res[0].get("pgid") not in (None, os.getpgid(0)),
+              f"child ran in its OWN process group, not ours (got {res[0].get('pgid')})")
+        argv = res[0].get("argv") or []
+        check("--deadline" in argv, f"--deadline argv preserved through the rewrite (got {argv})")
+
+    def _arm_self_kill_guard():
+        # NEVER execute a real killpg against our own group to test this: if the guard is
+        # broken — the ONLY case this check exists for — it would SIGKILL run_e2e.sh itself
+        # (foreground, shared pgid), so the gate would vanish rather than fail. A recorder is
+        # the right seam here precisely because the two arms above already supply the
+        # un-mocked kernel verdict; this check is only about the branch decision.
+        calls = []
+        real = os.killpg
+        os.killpg = lambda pgid, sig: calls.append((pgid, sig))
+        try:
+            for bad, label in ((os.getpgid(0), "own pgid"), (0, "0 = caller's group"),
+                               (None, "None (spawn failure)"), (1, "init/launchd")):
+                ra._sweep_process_group(bad, "GUARD", "unit")
+                check(calls == [], f"self-kill guard held for {label} (got {calls})")
+        finally:
+            os.killpg = real
+
+    def _arm_spawn_failure():
+        # An unguarded `finally:` sweep would raise NameError on this path (proc/pgid unbound)
+        # and convert an ERROR datum into a process failure — violating "a failed ticker is
+        # data, never a process failure" (run_analyses.py header).
+        old = ra.PYTHON
+        ra.PYTHON = "/nonexistent/python/binary"
+        try:
+            res = ra.run(["SPAWNFAIL"], concurrency=1, timeout=5)
+        finally:
+            ra.PYTHON = old
+        check(res[0].get("signal") == "ERROR",
+              f"spawn failure -> ERROR datum, not a crash (got {res[0]})")
+        check(len(res) == 1, "spawn failure still returns one result per input ticker")
+        # signal=="ERROR" alone CANNOT tell a handled spawn failure from a crash inside the
+        # finally-sweep: run()'s own except clause rewrites both to an ERROR datum. Pin the
+        # message so an unbound-name crash in the sweep goes red instead of masquerading.
+        err = res[0].get("error", "")
+        check("FileNotFoundError" in err or "No such file" in err,
+              f"the ERROR names the SPAWN failure (got {err!r})")
+        check("NameError" not in err and "UnboundLocalError" not in err,
+              f"the finally-sweep did not crash on unbound proc/pgid (got {err!r})")
+
+    def _arm_sweep_failure_swallowed():
+        ra.ANALYZE_SCRIPT = _orig_script
+        real = os.killpg
+
+        sigs = []
+
+        def boom(_pgid, sig):  # noqa: ARG001 — signature must match os.killpg
+            sigs.append(sig)
+            # Raise ONLY for the real SIGKILL, not for the sig=0 liveness probe. Raising on
+            # the probe too would make this arm die at the probe and never reach the guard it
+            # exists to test — it would pass while the SIGKILL path stayed unprotected.
+            if sig != 0:
+                raise PermissionError("simulated: not permitted to signal that group")
+        os.killpg = boom
+        try:
+            res = ra.run(["AAPL"], concurrency=1, timeout=30)
+        finally:
+            os.killpg = real
+        check(res[0].get("signal") == "Buy",
+              f"a raising killpg is swallowed; the analysis result survives (got {res[0]})")
+        check(0 in sigs and any(s != 0 for s in sigs),
+              f"the arm reached the real SIGKILL, not just the probe (sigs={sigs})")
+
+    def _arm_non_posix():
+        ra.ANALYZE_SCRIPT = _orig_script
+        real = os.killpg
+        del os.killpg
+        try:
+            res = ra.run(["AAPL"], concurrency=1, timeout=30)
+        finally:
+            os.killpg = real
+        check(res[0].get("signal") == "Buy",
+              f"no os.killpg (non-POSIX) -> degrades to a no-op, result intact (got {res[0]})")
+
+    def _arm_observability():
+        # F2's ONLY shipped behavior is the invariant line, and PGSWEEP's only visible signal
+        # is the sweep line. Both were uncovered. A silent regression in either would leave
+        # the original bug's defining property — total invisibility — fully intact.
+        pidfile = tmp / "leak_log.pid"
+        os.environ["QUIVER_TEST_PIDFILE"] = str(pidfile)
+        ra.ANALYZE_SCRIPT = str(leak_stub)
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            res = ra.run(["LEAKOK"], concurrency=1, timeout=20)
+        seen = buf.getvalue()
+        _SPAWNED.append(int(pidfile.read_text()))
+        check(res[0].get("signal") == "Buy", "observability arm took the success path")
+        check("timeout invariant" in seen,
+              f"TIMEOUT-INVARIANT line emitted (stderr={seen[:200]!r})")
+        check(any(v in seen for v in ("outer_first", "inner_first", "race", "unknown")),
+              "the invariant line carries a real verdict, not just a label")
+        check("swept live process group" in seen and "path=ok" in seen,
+              f"PGSWEEP logs the success-path sweep — its most diagnostic event "
+              f"(stderr={seen[:300]!r})")
+
+    def _arm_interrupt_sweep():
+        # The Ctrl-C path. start_new_session moves children OUT of the terminal's foreground
+        # process group, so an interrupt no longer reaches them the way it did before PGSWEEP.
+        # If this regressed, the operator's only out is `kill -9` on the fan-out — uncatchable,
+        # so the per-ticker finally-sweep never runs and PGSWEEP would have turned a fast
+        # teardown into a GUARANTEED leak. Assert on the kill SIGNAL, not just liveness:
+        # os.kill(pid,0) still succeeds for an unreaped zombie.
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(45)"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        _SPAWNED.append(p.pid)
+        with ra._LIVE_LOCK:
+            ra._LIVE_PGIDS.add(p.pid)
+        try:
+            ra._sweep_all_live("test-interrupt")
+            check(p.wait(timeout=5) == -signal.SIGKILL,
+                  f"interrupt sweep SIGKILLed the registered tree (rc={p.returncode})")
+        finally:
+            with ra._LIVE_LOCK:
+                ra._LIVE_PGIDS.discard(p.pid)
+
+    try:
+        _arm("interrupt-sweep", _arm_interrupt_sweep)
+        _arm("timeout-path", _arm_timeout_path)
+        _arm("success-path", _arm_success_path)
+        _arm("observability", _arm_observability)
+        _arm("self-kill-guard", _arm_self_kill_guard)
+        _arm("spawn-failure", _arm_spawn_failure)
+        _arm("sweep-failure-swallowed", _arm_sweep_failure_swallowed)
+        _arm("non-posix", _arm_non_posix)
+    finally:
+        ra.ANALYZE_SCRIPT = _orig_script
+        os.environ.pop("QUIVER_TEST_PIDFILE", None)
+
+    # ============ TIMEOUT-INVARIANT: pure, so no process is spawned ============
+    def _arm_timeout_invariant():
+        check(ra._timeout_invariant(3600, 3600)[0] == "race",
+              "outer == inner -> race (what run_tick.py:326 produces TODAY)")
+        check(ra._timeout_invariant(3660, 3600)[0] == "inner_first",
+              "outer > inner -> inner fires first (the good case)")
+        check(ra._timeout_invariant(300, 3600)[0] == "outer_first",
+              "outer < inner -> the OUTER SIGKILL wins, no error_mode")
+        check(ra._timeout_invariant(3600, None)[0] == "unknown",
+              "inner unknown -> 'unknown', never a bogus verdict")
+        check(ra._timeout_invariant(0, 3600)[0] == "unknown", "outer falsy -> unknown")
+        check("3600" in ra._timeout_invariant(3600, 3600)[1]
+              and "race" in ra._timeout_invariant(3600, 3600)[1].lower(),
+              "the note carries the real numbers and names the consequence")
+        # The inner really is discoverable here, and matches config.yaml's analyze_timeout_sec.
+        check(ra._discover_inner_timeout() == 3600,
+              f"inner discovered from config.yaml (got {ra._discover_inner_timeout()})")
+
+    def _arm_operator_value_honored():
+        # The operator's value must be HONORED verbatim — never silently raised. Clamping it
+        # up would remove the only cap on token burn AND lengthen the very leak PGSWEEP
+        # closes, while still not delivering "inner first" (the fallback's admission floor is
+        # anchored to the same deadline the outer enforces, so the two cancel).
+        ra.ANALYZE_SCRIPT = _orig_script
+        seen = ra.run(["AAPL"], concurrency=1, timeout=30)
+        check(seen[0].get("signal") == "Buy",
+              "a caller timeout far below the config inner is honored, not clamped away")
+
+    _arm("timeout-invariant", _arm_timeout_invariant)
+    _arm("operator-value-honored", _arm_operator_value_honored)
+
+    # The registry must not leak entries across ticks, or a later interrupt would sweep a pgid
+    # that has since been recycled onto an unrelated process group.
+    _arm("live-pgid-registry", lambda: check(
+        len(ra._LIVE_PGIDS) == 0,
+        f"live-pgid registry drained after every fan-out (left {ra._LIVE_PGIDS})"))
+
+    # A vanished arm is invisible to run_e2e.sh (it greps only for '0 failed'), so pin a floor.
+    check(_PASS + _FAIL >= 64, f"arm count did not shrink (ran {_PASS + _FAIL})")
+
     print(f"{_PASS} checks passed, {_FAIL} failed")
     return 1 if _FAIL else 0
 
 
+def _cleanup_spawned():
+    """Kill every process this file created. A CORRECTLY-RED run leaks a 45s sleeper, and
+    tests/run_e2e.sh runs 18 more suites after this one inside a cgroup capped at
+    MemoryMax=2500M — so a red must not also poison the suites behind it."""
+    for pid in _SPAWNED:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    rc = 1
+    try:
+        rc = main()
+    finally:
+        _cleanup_spawned()
+    raise SystemExit(rc)

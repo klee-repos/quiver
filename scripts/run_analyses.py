@@ -29,11 +29,39 @@ Env:
                               after profiling real analyze.py RSS shows headroom. The 4h
                               tick budget means even sequential (cap 1) finishes in time,
                               so memory safety wins over speed here).
-  QUIVER_ANALYZE_TIMEOUT      per-ticker wall-clock seconds. Precedence: this env
-                              var (if set) OVERRIDES the caller-passed value; else
-                              the supervisor passes config loop.analyze_timeout_sec;
-                              else a 3600s default. Set very high so a normal
-                              high-reasoning GLM run never hits it.
+  QUIVER_ANALYZE_TIMEOUT      per-ticker wall-clock seconds for the OUTER guard (this
+                              file's SIGKILL). Precedence: this env var (if set)
+                              OVERRIDES the caller-passed value; else the supervisor
+                              passes config loop.analyze_timeout_sec; else a 3600s
+                              default. Set very high so a normal high-reasoning GLM run
+                              never hits it. This value is HONORED verbatim — never
+                              silently raised — because it is the operator's only cap on
+                              token burn (analyze.py has no knob for total child wall
+                              time). See TIMEOUT-INVARIANT below for what we do instead.
+
+TWO timeouts, and which one fires first matters:
+  OUTER = this file's SIGKILL (above).  INNER = analyze.py:534's per-brain-run
+  communicate(timeout=cfg.analyze_timeout_sec). The INNER is the better one to win: it
+  yields an ERROR datum carrying error_mode via analyze._classify_failure, while the OUTER
+  yields only the bare _error() string below, with no error_mode at all. We LOG the
+  relationship once per fan-out (TIMEOUT-INVARIANT) rather than enforcing it, because every
+  way of enforcing it is worse than the disease: clamping the outer UP removes the operator's
+  burn cap and *lengthens* the window a leaked node keeps billing; a hard assert fails CLOSED
+  (a no-trades tick is a P0 outage); and "inner always first" is unreachable anyway — the
+  fallback's admission floor (analyze.py:611-626) is anchored to the SAME deadline the outer
+  enforces, so raising the outer raises the floor identically and cancels out. Leaving it
+  un-enforced is SAFE only because PGSWEEP (below) makes an outer SIGKILL non-leaking: losing
+  the race now costs error_mode fidelity, not money.
+
+PGSWEEP — each analyze.py child gets its OWN process group (start_new_session=True) and that
+group is SIGKILLed on EVERY exit path. analyze.py:506 spawns `node decide.mjs` with no process
+group of its own, so before this, SIGKILLing analyze.py orphaned node and it kept billing
+OpenRouter to completion — silently: node holds no fd back to this process, so the outer call
+returned promptly with a clean ERROR datum and nothing ever logged. Sweeping on success too
+(not just on timeout) is what makes the guarantee hold by construction: analyze.py's own inner
+timeout can orphan node and then exit 0-ish, in which case the outer SIGKILL never fires at all.
+NOTE for on-box cleanup: children now live in their own process groups, so
+`kill -TERM -<run_analyses pgid>` no longer reaches them — use `pkill -f analyze.py`.
   QUIVER_ANALYZE_SCRIPT       path to the analyzer (default <repo>/analyze.py);
                               overridable so the harness is testable offline.
   QUIVER_PYTHON               interpreter for analyze.py (default: this interpreter).
@@ -42,12 +70,20 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
+
+# Process groups with a live analyze.py tree in them, so an interrupt can reclaim ALL of them
+# (see the Ctrl-C note in the header). Mutated from worker threads -> guarded.
+_LIVE_PGIDS: set = set()
+_LIVE_LOCK = threading.Lock()
 
 ANALYZE_SCRIPT = os.environ.get("QUIVER_ANALYZE_SCRIPT", str(_REPO / "analyze.py"))
 PYTHON = os.environ.get("QUIVER_PYTHON", sys.executable)
@@ -64,6 +100,121 @@ def _error(ticker: str, msg: str) -> dict:
     return {"ticker": ticker, "signal": "ERROR", "error": str(msg)[:500], "schema": 1}
 
 
+def _sweep_process_group(pgid, ticker: str, path: str) -> None:
+    """PGSWEEP: SIGKILL anything still alive in one analyze.py child's process group.
+
+    Runs on EVERY exit path of analyze_one — timeout, spawn failure, crash, AND success.
+    A hit on path=ok is the most diagnostic event this file can produce: it means something
+    outlived a *successful* analysis, i.e. a process still billing OpenRouter with nobody
+    waiting on it.
+
+    TOTAL, never raises: this sits on the live trading path and a sweep failure must never
+    turn an analysis result into a process failure ("a failed ticker is data", see header).
+
+    The guard is deliberately four conditions, not one equality. `pgid` is None on the
+    spawn-failure path, and 0 is POSIX for "the CALLER's process group" — os.killpg(0,
+    SIGKILL) would SIGKILL run_analyses AND the run_tick.py supervisor that calls run()
+    IN-PROCESS (run_tick.py:328), un-catchably, with the run_lock held and not one ERROR
+    datum written. `pgid <= 1` additionally rejects the init/launchd group.
+    """
+    if not hasattr(os, "killpg") or not hasattr(os, "getpgid"):
+        return  # non-POSIX; both target platforms (darwin dev, linux box) are POSIX
+    try:
+        own = os.getpgid(0)
+    except OSError:
+        return
+    if not pgid or pgid <= 1 or pgid == own:
+        return
+    try:
+        os.killpg(pgid, 0)  # probe: is anything still alive in the group?
+    except ProcessLookupError:
+        return  # genuinely empty group — the normal, quiet case; say nothing
+    except OSError:
+        # EPERM and friends mean the group EXISTS but we may not signal it (e.g. it contains
+        # only a process we no longer own). A bare `except OSError` here would score that as
+        # "empty" and skip BOTH the log and the kill — silently, which is the exact property
+        # that made the original leak invisible. Fall through: log it, then try anyway.
+        pass
+    except Exception:  # noqa: BLE001 — TOTAL: a monkeypatched/odd killpg must not escape
+        return
+    # Something OUTLIVED the analysis. GT-1's defining property was that this was SILENT,
+    # so closing the leak without a signal would reproduce exactly that property.
+    try:
+        sys.stderr.write(f"[run_analyses] swept live process group {pgid} "
+                         f"for {ticker} (path={path})\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — logging must never break the result path
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001 — TOTAL, per this function's contract
+        pass
+
+
+def _sweep_all_live(reason: str) -> None:
+    """Reclaim EVERY live analyze.py tree. The interrupt path: start_new_session moves the
+    children out of the terminal's foreground process group, so a Ctrl-C on the documented
+    manual CLI no longer reaches them the way it did before PGSWEEP. Without this, the
+    operator's only recourse is `kill -9` on the fan-out — which is uncatchable, so the
+    per-ticker `finally:` sweep never runs and PGSWEEP would have turned a fast teardown
+    into a GUARANTEED leak. Sweeping here also unblocks shutdown(wait=True): the workers'
+    communicate() returns as soon as their children die."""
+    with _LIVE_LOCK:
+        pgids = list(_LIVE_PGIDS)
+    for p in pgids:
+        _sweep_process_group(p, "*", reason)
+
+
+def _discover_inner_timeout():
+    """analyze.py's INNER per-brain-run timeout, or None when it cannot be known.
+
+    Mirrors analyze.py:534's expression INCLUDING its 3600 fallback. That fallback is load
+    bearing and must stay in sync: lib/config.py:791 defaults the same key to 900, so reading
+    only the loader's default here would report an inner of 900 for a child that will actually
+    use 3600 — an inverted invariant reported with a false sense of safety.
+
+    Injectable seam: tests rebind this module attribute to force the unknown-inner branch.
+    """
+    try:
+        # The documented manual CLI (`run_analyses.py AAPL`, see the header) puts scripts/ on
+        # sys.path, NOT the repo root — so without this `lib.config` is unimportable and the
+        # invariant line degrades to "unknown" on exactly the box where an operator would run
+        # it by hand. In the supervisor process run_tick.py:25-26 has already done this.
+        if str(_REPO) not in sys.path:
+            sys.path.insert(0, str(_REPO))
+        from lib.config import load_config
+        # The SAME file analyze.py:716 loads, so we report the value the child will really use.
+        return int(getattr(load_config(_REPO / "config.yaml"), "analyze_timeout_sec", 3600))
+    except Exception:  # noqa: BLE001 — a broken config must not break the fan-out
+        return None
+
+
+def _timeout_invariant(outer, inner):
+    """TIMEOUT-INVARIANT: classify OUTER vs INNER. PURE — no I/O, so it is unit-testable
+    without spawning anything. Returns (verdict, note).
+
+    verdict: "unknown" | "inner_first" | "race" | "outer_first".
+    We report rather than enforce — see the module header for why every enforcement option
+    is worse than the disease.
+    """
+    if not outer or not inner:
+        # Name WHICH side is missing; "inner=unknown" when the outer was the falsy one sends
+        # a reader to look at config.yaml for a problem that is not there.
+        missing = "outer" if not outer else "inner"
+        return "unknown", (f"outer={outer}s inner={inner}s — {missing} unknown, cannot "
+                           f"determine which timeout fires first")
+    if outer > inner:
+        return "inner_first", (f"outer={outer}s > inner={inner}s — the INNER fires first "
+                               f"(good: the ERROR datum carries error_mode)")
+    if outer == inner:
+        # What deploy/runner/run_tick.py:326 produces TODAY: it passes cfg.analyze_timeout_sec
+        # as the OUTER while analyze.py:534 reads the SAME key as the INNER.
+        return "race", (f"outer={outer}s == inner={inner}s — RACE: which timeout fires first "
+                        f"is nondeterministic, so error_mode may or may not be recorded")
+    return "outer_first", (f"outer={outer}s < inner={inner}s — the OUTER SIGKILL fires first; "
+                           f"the ERROR datum will carry NO error_mode")
+
+
 def analyze_one(ticker: str, *, timeout: int) -> dict:
     """Run analyze.py for one ticker; return its parsed JSON dict, or an ERROR dict.
 
@@ -73,29 +224,81 @@ def analyze_one(ticker: str, *, timeout: int) -> dict:
     F2: pass a per-ticker --deadline (epoch s) = now + timeout, so analyze.py's
     fallback re-run can skip itself if < 600s remain (anchored to the SAME clock
     as this subprocess's SIGKILL, not the tick-wide deadline).
+
+    PGSWEEP: this is subprocess.run() unrolled, because subprocess.run NEVER exposes the
+    Popen — and without proc.pid there is no process group to reclaim. Everything else about
+    the call is deliberately byte-identical to it (same argv, cwd, PIPEs, text, inherited
+    stdin, same _error strings).
     """
-    import time
     deadline = time.monotonic() + timeout
+    proc = None
+    pgid = None
+    path = "ok"
     try:
-        p = subprocess.run(
-            [PYTHON, ANALYZE_SCRIPT, ticker, "--deadline", f"{deadline}"],
-            cwd=str(_REPO), capture_output=True, text=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return _error(ticker, f"analyze.py timed out after {timeout}s")
-    except Exception as e:  # noqa: BLE001 — a spawn failure is just an ERROR datum
-        return _error(ticker, f"{type(e).__name__}: {e}")
-    lines = [ln for ln in (p.stdout or "").splitlines() if ln.strip()]
-    if not lines:
-        tail = (p.stderr or "").strip()[-300:]
-        return _error(ticker, f"analyze.py produced no stdout (rc={p.returncode}); "
-                              f"stderr tail: {tail}")
+        try:
+            proc = subprocess.Popen(
+                [PYTHON, ANALYZE_SCRIPT, ticker, "--deadline", f"{deadline}"],
+                cwd=str(_REPO), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+        except Exception as e:  # noqa: BLE001 — a spawn failure is just an ERROR datum
+            path = "spawn_failed"
+            return _error(ticker, f"{type(e).__name__}: {e}")
+        # setsid() makes the child the leader of a NEW session and group whose pgid == its
+        # pid, so proc.pid IS the group. Captured HERE, at spawn — os.getpgid(proc.pid)
+        # raises once the child is reaped, which would silently skip the sweep in exactly
+        # the case where a grandchild survived. (While the group is NON-EMPTY the kernel
+        # keeps that pid reserved as its pgid, so the leak case cannot hit a recycled pid;
+        # once it is empty the probe below finds nothing and the sweep is a no-op.)
+        pgid = proc.pid
+        with _LIVE_LOCK:
+            _LIVE_PGIDS.add(pgid)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            path = "timeout"
+            # Kill the GROUP before draining, so the drain is not waiting on live writers.
+            _sweep_process_group(pgid, ticker, path)
+            # BOUNDED. An unbounded second communicate() waits for EOF on both pipes, which
+            # any descendant that escaped the group can hold open forever -> the fan-out
+            # never returns -> run_tick.py:328 hangs -> the run_lock TTL expires and the next
+            # hourly fire steals it -> two concurrent ticks on one ledger. The recovery path
+            # must never be less bounded than the path it replaced.
+            try:
+                proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001 — best-effort reap; the sweep already killed it
+                pass
+            return _error(ticker, f"analyze.py timed out after {timeout}s")
+        except Exception as e:  # noqa: BLE001 — any other I/O failure is still just a datum
+            path = "error"
+            return _error(ticker, f"{type(e).__name__}: {e}")
+        rc = proc.returncode
+        # Label the sweep path honestly: a non-zero exit is not "ok", and mislabelling it
+        # would make the one genuinely alarming log line (path=ok, i.e. something outlived a
+        # SUCCESSFUL analysis) indistinguishable from a routine crash.
+        path = "ok" if rc == 0 else f"exit{rc}"
+        lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+        if not lines:
+            tail = (err or "").strip()[-300:]
+            return _error(ticker, f"analyze.py produced no stdout (rc={rc}); "
+                                  f"stderr tail: {tail}")
+        return _parse_analysis_line(ticker, lines[-1])
+    finally:
+        # Sweep on EVERY exit path, success included — see the module header.
+        _sweep_process_group(pgid, ticker, path)
+        if pgid:
+            with _LIVE_LOCK:
+                _LIVE_PGIDS.discard(pgid)
+
+
+def _parse_analysis_line(ticker: str, line: str) -> dict:
+    """The last stdout line -> the analysis dict, or an ERROR datum."""
     try:
-        obj = json.loads(lines[-1])
+        obj = json.loads(line)
     except ValueError:
-        return _error(ticker, f"analyze.py last stdout line was not JSON: {lines[-1][:200]}")
+        return _error(ticker, f"analyze.py last stdout line was not JSON: {line[:200]}")
     if not isinstance(obj, dict):
-        return _error(ticker, f"analyze.py JSON was not an object: {lines[-1][:200]}")
+        return _error(ticker, f"analyze.py JSON was not an object: {line[:200]}")
     obj.setdefault("ticker", ticker)
     return obj
 
@@ -111,9 +314,24 @@ def run(tickers, *, concurrency: int | None = None, timeout: int | None = None) 
         timeout = _int_env("QUIVER_ANALYZE_TIMEOUT", 3600)
     elif timeout is None:
         timeout = 3600
+    # TIMEOUT-INVARIANT: state the outer-vs-inner relationship ONCE per fan-out (not per
+    # ticker — in production it is the same for all of them and a line that always prints is
+    # a line nobody reads). Report only; the operator's value is honored verbatim.
+    try:
+        _verdict, _note = _timeout_invariant(timeout, _discover_inner_timeout())
+        sys.stderr.write(f"[run_analyses] timeout invariant [{_verdict}]: {_note}\n")
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 — observability must never block the fan-out
+        pass
     results: list = [None] * len(tickers)
     workers = min(concurrency, len(tickers))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    # NOT `with ThreadPoolExecutor(...)`: __exit__ runs shutdown(wait=True) BEFORE any except
+    # clause here, so a Ctrl-C would block until every in-flight analyze.py hit its full
+    # timeout (3600s by default) while its children — now in their own sessions — kept
+    # billing. Managing the executor by hand lets the interrupt reclaim the trees FIRST,
+    # which then lets the join finish in milliseconds.
+    ex = ThreadPoolExecutor(max_workers=workers)
+    try:
         fut_to_i = {ex.submit(analyze_one, t, timeout=timeout): i
                     for i, t in enumerate(tickers)}
         done = 0
@@ -127,6 +345,11 @@ def run(tickers, *, concurrency: int | None = None, timeout: int | None = None) 
             sys.stderr.write(f"[run_analyses] {done}/{len(tickers)} {tickers[i]} -> "
                              f"{results[i].get('signal')}\n")
             sys.stderr.flush()
+    except BaseException:  # noqa: BLE001 — KeyboardInterrupt/SystemExit included ON PURPOSE
+        _sweep_all_live("interrupt")
+        raise
+    finally:
+        ex.shutdown(wait=True)
     return results
 
 
