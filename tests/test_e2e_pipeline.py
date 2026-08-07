@@ -150,8 +150,10 @@ def main() -> int:
     _an_uw = [{"ticker": t, "signal": "Underweight", "conviction": 40, "uncertainty": 30}
               for t in _engines]
     with tempfile.TemporaryDirectory() as d1:
+        # F3 must be opted into EXPLICITLY now: conviction_deploy_min_factor defaults to 1.0
+        # (neutral) since the 0.70 default froze live trading — see lib/allocate._DEFAULTS.
         cfg_on, led_on = _mk(Path(d1), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
-                             holdings=_bear_holds)
+                             holdings=_bear_holds, dep_min_factor=0.70)
         out_on = tick._run_construct(cfg_on, led_on, {**base, "analyses": _an_uw})
         tw_on = out_on["target_weights"]
         cash_on = tw_on["SGOV"]["target_weight"]
@@ -174,7 +176,7 @@ def main() -> int:
     # a materially overweight book is what makes F3's cash-raise reach the broker.
     with tempfile.TemporaryDirectory() as d3:
         cfg_p, led_p = _mk(Path(d3), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
-                           holdings=_bear_holds)
+                           holdings=_bear_holds, dep_min_factor=0.70)  # explicit opt-in (see above)
         snap = {"equity": 1000.0, "buying_power": 200.0,
                 "positions": {t: {"quantity": 3.0, "market_value": 300.0} for t in _engines},
                 "quotes": {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0, "DDD": 100.0, "SGOV": 1.0},
@@ -185,6 +187,26 @@ def main() -> int:
         _trims = [o for o in plan["orders"] if o.get("order_kind") == "rebalance_trim"]
         ok("F3 e2e: bearish book emits rebalance_trim orders (raises cash to the broker)",
            len(_trims) > 0, [o.get("order_kind") for o in plan["orders"]])
+
+    # --- REGRESSION (live incident 2026-07-31..08-07): a MIXED-BULLISH book must not self-freeze.
+    # Production ran 7 Overweight / 4 Underweight / 1 Hold. Mean raw conviction 0.4136 vs the 0.45
+    # reference gave F3 factor 0.903, which shrank every engine target ~10% and lifted the cash
+    # sleeve 18% -> 25.47%. That was enough to pull every underweight name back INSIDE its drift
+    # band, so all 12 came back intent=hold and the bot placed ZERO orders for 6 straight sessions
+    # while 45.6% of the account sat in cash. With the default floor now neutral, a book that is
+    # net BULLISH must never end up targeting MORE cash than the static book says.
+    with tempfile.TemporaryDirectory() as d4:
+        cfg_r, led_r = _mk(Path(d4), rh=_bear_rh, cash_floor=5, smoothing_alpha=0.4,
+                           holdings=_bear_holds)          # shipped defaults, no opt-in
+        _an_mixed = ([{"ticker": t, "signal": "Overweight", "conviction": 68, "uncertainty": 40}
+                      for t in ("AAA", "BBB", "CCC")]
+                     + [{"ticker": "DDD", "signal": "Underweight", "conviction": 52,
+                         "uncertainty": 60}])
+        _tw_r = tick._run_construct(cfg_r, led_r, {**base, "analyses": _an_mixed})["target_weights"]
+        _cash_r = _tw_r["SGOV"]["target_weight"]
+        _static_cash = 20.0            # _bear_holds' SGOV weight
+        ok("F3 regression: net-bullish book does NOT get cash inflated above the static book",
+           _cash_r <= _static_cash + 0.5, (_cash_r, _static_cash))
 
     # --- Q3: screener ADD -> human-approve -> apply_add conserves -> in universe ---
     _sleeves = ('sleeves:\n  "US large cap": {screen: {sector: Technology, '

@@ -40,7 +40,19 @@ _DEFAULTS = {
     "min_weight_floor_pct": 0.5,   # a smoothed weight below this rounds to 0 (avoid dust)
     # F3 (conviction-driven deployment): a broadly-BEARISH book deploys less -> raises cash.
     "conviction_full_deploy_at": 0.45,   # mean fresh conviction (0..1) that earns FULL deployment
-    "conviction_deploy_min_factor": 0.70, # most a weak-conviction book can cut deployment (raise cash)
+    # NEUTRAL BY DEFAULT (1.0 == F3 off; see conviction_deploy_factor's docstring). It was 0.70,
+    # which DOUBLE-COUNTED conviction: the per-name allocator already under-weights a bearish
+    # name, then this scaled the WHOLE book down again and parked the remainder in the cash
+    # sleeve. Because tick.py applies it AFTER apply_target_hysteresis it also bypassed the
+    # anti-churn damping entirely, and it can only ever move money TO cash, never out of it.
+    # Live proof (box, 2026-08-06, a BULLISH book of 7 Overweight / 4 Underweight): mean fresh
+    # conviction 0.4136 / 0.45 -> factor 0.903, which shrank every engine target ~10% (SMH
+    # 15->13.55, CEG 9->8.13) and lifted the SGOV cash sleeve 18% -> 25.47%. That was enough to
+    # pull CEG/GEV/BSOL from OUTSIDE their drift band to INSIDE it, so all 12 names came back
+    # intent=hold and the tick placed ZERO orders -- every session from 07-31 to 08-07 while
+    # $919 (45.6% of the account) sat idle. Conviction still sizes each name; it no longer gets
+    # a second, undamped shot at the whole book. The 20% daily-loss halt + KILL are unchanged.
+    "conviction_deploy_min_factor": 1.0,
     "default_conviction": {        # used only when the model omits a numeric conviction
         "Buy": 70.0, "Overweight": 55.0, "Underweight": 35.0,
     },

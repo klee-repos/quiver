@@ -3109,12 +3109,23 @@ check_true("item4: a Buy still grows above prior (reduce-only doesn't touch adds
 
 # --- F3: conviction_deploy_factor (book-conviction deployment scalar; reallocation teeth) -----
 # A broadly-BEARISH book deploys less -> raises cash; a bullish book deploys full. Takes RAW
-# effective_conviction (0..1) so curve_k/calibration stay deployment-neutral. Defaults: full
-# deploy at mean 0.45, floor 0.70.
+# effective_conviction (0..1) so curve_k/calibration stay deployment-neutral. Ref default: full
+# deploy at mean 0.45. The FLOOR now defaults to 1.0 (F3 NEUTRAL) — it shipped at 0.70 and froze
+# live trading: on 2026-08-06 a BULLISH box book (7 Overweight / 4 Underweight) scored mean
+# 0.4136 -> factor 0.903, which shrank every engine target ~10%, lifted the SGOV cash sleeve
+# 18% -> 25.47%, and pulled every name inside its drift band -> ZERO orders for 6 sessions while
+# 45.6% of the account sat in cash. The math below is unchanged and still covered by passing an
+# EXPLICIT floor; only the default moved.
 _cdf = _alloc.conviction_deploy_factor
-check("F3 dep: bullish book (Buy 0.70) -> full deploy 1.0", _cdf([0.70, 0.70, 0.70]), 1.0)
-check("F3 dep: all-bearish book (Underweight ~0.175) -> floor 0.70", _cdf([0.175, 0.175, 0.175]), 0.70)
-_mixf = _cdf([0.50, 0.30])  # mean 0.40 -> 0.40/0.45 = 0.888...
+_F3ON = {"conviction_deploy_min_factor": 0.70}   # opt back in to exercise the curve
+check("F3 dep: DEFAULT is neutral (1.0) — a weak book no longer self-freezes",
+      _alloc._DEFAULTS["conviction_deploy_min_factor"], 1.0)
+check("F3 dep: default floor makes an all-bearish book still fully deploy",
+      _cdf([0.175, 0.175, 0.175]), 1.0)
+check("F3 dep: bullish book (Buy 0.70) -> full deploy 1.0", _cdf([0.70, 0.70, 0.70], _F3ON), 1.0)
+check("F3 dep: all-bearish book (Underweight ~0.175) -> floor 0.70",
+      _cdf([0.175, 0.175, 0.175], _F3ON), 0.70)
+_mixf = _cdf([0.50, 0.30], _F3ON)  # mean 0.40 -> 0.40/0.45 = 0.888...
 check_true("F3 dep: mixed book strictly between floor and 1.0", 0.70 < _mixf < 1.0)
 check("F3 dep: mixed value == mean/ref", round(_mixf, 4), round((0.40 / 0.45), 4))
 check("F3 dep: empty (no fresh conviction) -> 1.0", _cdf([]), 1.0)

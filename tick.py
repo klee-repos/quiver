@@ -179,6 +179,15 @@ def _run_preflight(cfg, led) -> dict:
             "buy_type": cfg.buy_type,
             "time_in_force": cfg.time_in_force,
             "market_hours": cfg.market_hours,
+            # TICK.md STEP 5e gates the protective stop on `order.protective_stop.enabled`.
+            # Omitting it here made that condition read a missing key -> permanently false, so
+            # `tick.py protect` was NEVER invoked and every entry since 2026-07-19 filled naked
+            # (verified: 161 broker orders, 0 with a stop_price). Echo the real config.
+            "protective_stop": {
+                "enabled": cfg.protective_stop_enabled,
+                "stop_pct": cfg.protective_stop_pct,
+                "time_in_force": cfg.protective_stop_tif,
+            },
         },
     }
 
@@ -1010,9 +1019,15 @@ def _run_plan(cfg, led, data) -> dict:
             # to the min(). Both no-op when the knobs are OFF -> name_budget BYTE-IDENTICAL.
             _room = signals.room_under_target(td, held_mv)
             _risk_cap_r, _exposure_r = (_ptj_buy_clamps(a_rr, ticker) if a_rr is not None else (None, None))
-            if _exposure_r is not None:
-                _room *= _exposure_r
             _clamps_r = [_room, remaining_daily_cap, avail_cash]
+            if _exposure_r is not None:
+                # Cap THIS ORDER, do not shrink the room. Multiplying `_room` itself made the
+                # exposure scalar a permanent ceiling rather than a rate limiter: the name landed
+                # short of target but INSIDE its drift band, so needs_rebalance() read "on target"
+                # on the next tick and the deploy never completed. Capping the order instead
+                # leaves the untouched residual visible, so a high-vol name walks to its target
+                # over several ticks (still <= room x scalar per tick) instead of parking below it.
+                _clamps_r.append(_room * _exposure_r)
             if _risk_cap_r is not None:
                 _clamps_r.append(_risk_cap_r)
             name_budget = round(min(_clamps_r), 2)
