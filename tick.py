@@ -3372,15 +3372,83 @@ def cmd_protect(args) -> dict:
     # stop expires at the close, so it protects the SESSION and is re-armed by the next tick's
     # protect call — real intraday protection, but NOT an overnight-gap guard. That is the
     # ceiling of what Robinhood supports on fractional shares, not a choice.
-    _whole = float(fill_qty).is_integer()
-    _tif = cfg.protective_stop_tif if _whole else "gfd"
+    _tif = signals.stop_time_in_force(fill_qty, cfg.protective_stop_tif)
     return {"ok": True, "stop": {
         "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
         "quantity": fill_qty, "stop_price": stop_price,
         "time_in_force": _tif, "market_hours": "regular_hours",
-        "tif_downgraded": (not _whole and cfg.protective_stop_tif != "gfd"),
+        "tif_downgraded": (_tif != str(cfg.protective_stop_tif or "").lower()),
         "order_kind": "protective_stop", "parent_ref_id": d.get("ref_id"),
     }}
+
+
+# --- protective-stop RE-ARM ---------------------------------------------------
+# STEP 2b. `protect` only fires immediately after a BUY fills, so a position whose stop
+# was rejected, expired, or never placed stays naked indefinitely — exactly what happened
+# on 2026-08-07 (11 buys filled, every stop rejected, nothing re-tried them). A gfd stop
+# ALSO dies at every close by construction, so the book needs a stop re-armed once per
+# trading day regardless. This runs EARLY in the tick (right after the broker snapshot,
+# before the slow analysis) so it cannot be starved by anything downstream.
+#
+# Python decides, the orchestrator executes: it passes the live broker snapshot (positions,
+# quotes, and the CURRENTLY RESTING stop orders) and gets back the exact stops to place.
+# The anchor is the LIVE QUOTE, not the original fill: a sell stop must sit below the
+# market to be legal, and re-anchoring each day makes the stop ratchet UP with the position
+# instead of decaying into a stale level far from price.
+
+def cmd_rearm_stops(args) -> dict:
+    cfg, led = _cfg_and_ledger()
+    day = market.trading_day_et()
+    now_iso = market.now_et().isoformat()
+    d = json.loads(Path(args.input).read_text(encoding="utf-8"))
+
+    if not cfg.protective_stop_enabled:
+        return {"ok": True, "stops": [], "reason": "protective_stop_disabled"}
+
+    positions = d.get("positions", {}) or {}
+    quotes = {str(k).upper(): _to_float(v) for k, v in (d.get("quotes") or {}).items()}
+    cash_tk = str(getattr(cfg.risk, "cash_sleeve_ticker", "") or "").upper()
+    # Symbols that ALREADY have a stop resting at the broker. Broker truth, not ledger
+    # belief: a stop the ledger thinks it placed but the broker rejected must still be
+    # re-armed (that is the exact 2026-08-07 failure).
+    covered = {str((s or {}).get("symbol", "")).upper()
+               for s in (d.get("open_stops") or [])
+               if str((s or {}).get("symbol", "")).strip()}
+
+    stops, skipped = [], []
+    for raw_tk, pos in sorted(positions.items()):
+        ticker = str(raw_tk).upper()
+        qty = _to_float((pos or {}).get("shares_available_for_sells"))
+        if qty is None:
+            qty = _to_float((pos or {}).get("quantity")) or 0.0
+        if ticker == cash_tk or qty <= 0:
+            continue
+        if ticker in covered:
+            skipped.append({"ticker": ticker, "reason": "already_protected"})
+            continue
+        anchor = quotes.get(ticker)
+        if not anchor:
+            mv = _to_float((pos or {}).get("market_value"))
+            anchor = (mv / qty) if (mv and qty) else None
+        stop_price = signals.resolve_stop_price(anchor, None, cfg.protective_stop_pct)
+        if stop_price is None:
+            skipped.append({"ticker": ticker, "reason": "no_usable_price"})
+            continue
+        ref_id = None
+        if not cfg.dry_run:
+            ref_id = led.new_ref_id()
+            led.reserve_order(ref_id, day, ticker, side="sell", type="stop_market",
+                              dollar_amount=None, quantity=qty, now_iso=now_iso,
+                              order_kind="protective_stop", stop_price=stop_price,
+                              parent_ref_id=None, state="reserved")
+        stops.append({
+            "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
+            "quantity": qty, "stop_price": stop_price,
+            "time_in_force": signals.stop_time_in_force(qty, cfg.protective_stop_tif),
+            "market_hours": "regular_hours", "order_kind": "protective_stop",
+        })
+    return {"ok": True, "stops": stops, "skipped": skipped,
+            "n_positions": len(positions), "n_already_protected": len(covered)}
 
 
 # --- decision-memory outcome resolution --------------------------------------
@@ -4000,6 +4068,8 @@ def main(argv) -> int:
     p_reflect.add_argument("--input", required=True)
     p_protect = sub.add_parser("protect")
     p_protect.add_argument("--input", required=True)
+    p_rearm = sub.add_parser("rearm-stops")
+    p_rearm.add_argument("--input", required=True)
     p_ss = sub.add_parser("strategy-set")
     p_ss.add_argument("--input", required=False)
     p_con = sub.add_parser("construct")
@@ -4094,6 +4164,8 @@ def main(argv) -> int:
             out = cmd_protect(args)
         elif args.cmd == "strategy-set":
             out = cmd_strategy_set(args)
+        elif args.cmd == "rearm-stops":
+            out = cmd_rearm_stops(args)
         elif args.cmd == "construct":
             out = cmd_construct(args)
         elif args.cmd == "goal-track":

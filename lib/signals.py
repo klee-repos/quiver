@@ -431,6 +431,26 @@ def whole_shares_for_dollars(dollars: float, limit_price: Optional[float]) -> in
     return int(dollars // limit_price)
 
 
+def stop_time_in_force(quantity, configured_tif: str) -> str:
+    """Broker-legal time_in_force for a protective stop of ``quantity`` shares.
+
+    Robinhood rejects a FRACTIONAL stop with time_in_force=gtc ("Invalid time in force for
+    fractional order" — it killed all 11 stops on 2026-08-07). GTC needs a WHOLE-share
+    quantity; a fractional quantity only accepts gfd. Pure + total: honour the configured
+    TIF when the quantity is whole, otherwise degrade to the only value the broker takes.
+
+    A gfd stop expires at the close, so it protects the SESSION and must be re-armed each
+    trading day (see tick.py rearm-stops). That is the ceiling of what the broker supports
+    on fractional shares, not a policy choice.
+    """
+    tif = str(configured_tif or "gfd").strip().lower()
+    try:
+        whole = float(quantity).is_integer()
+    except (TypeError, ValueError):
+        return "gfd"
+    return tif if whole else "gfd"
+
+
 def resolve_stop_price(fill_price, model_stop_loss, stop_pct) -> Optional[float]:
     """Protective stop price below ``fill_price``.
 

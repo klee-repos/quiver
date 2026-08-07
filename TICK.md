@@ -109,6 +109,36 @@ Call the Robinhood MCP with the `account_number` from preflight:
    of positions that are no longer in the book (a full exit still sells without a
    quote, but include them so a trim is priced correctly).
 
+## STEP 2b — Re-arm protective stops (only if `order.protective_stop.enabled`)
+
+Runs HERE, before the slow analysis, so it can never be starved by anything downstream.
+STEP 5e only places a stop right after a BUY fills, so a position whose stop was rejected,
+expired, or never placed would otherwise stay naked forever — and a `gfd` stop (the only
+kind Robinhood accepts on FRACTIONAL shares) expires at every close, so the book needs one
+re-armed each trading day regardless.
+
+1. `get_equity_orders(account_number, state:"confirmed")` → the stops RESTING at the broker
+   right now. Keep `{symbol, stop_price}` for each `stop_market` sell. Broker truth is what
+   counts here: a stop the ledger believes it placed but the broker rejected must still be
+   re-armed.
+2. Write `state/tmp/rearm_input.json`:
+   ```json
+   {"positions": {"AAPL": {"quantity": 0.5, "shares_available_for_sells": 0.5}},
+    "quotes": {"AAPL": 190.12},
+    "open_stops": [{"symbol": "MSFT", "stop_price": 380.0}]}
+   ```
+   (`positions` and `quotes` are the STEP 2 snapshot, unchanged.)
+3. `~/dev/quiver/.venv/bin/python tick.py rearm-stops --input state/tmp/rearm_input.json`
+4. Place each entry in the returned `stops` exactly as given — `place_equity_order` with its
+   `ticker/side/type/quantity/stop_price/time_in_force/market_hours`. Python already chose
+   the price (8% below the LIVE quote, clamped) and the broker-legal `time_in_force`; do not
+   substitute your own. In `dry_run` review but never place.
+5. Then `tick.py commit` each placed stop exactly like any other order so the ledger tracks
+   it (`order_kind:"protective_stop"`), and a later sell can cancel it.
+
+A failure here is logged and the tick CONTINUES — an unplaceable stop must never block
+trading. `stops: []` (everything already protected) is the normal steady state.
+
 ## STEP 3 — Read the pre-computed analyses (already done by Python)
 
 The per-ticker analysis (GLM, slow) has ALREADY been run for you by Python
