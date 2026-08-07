@@ -3364,10 +3364,21 @@ def cmd_protect(args) -> dict:
                           dollar_amount=None, quantity=fill_qty, now_iso=now_iso,
                           order_kind="protective_stop", stop_price=stop_price,
                           parent_ref_id=d.get("ref_id"), state="reserved")
+    # Robinhood rejects a FRACTIONAL stop with time_in_force=gtc — "Invalid time in force for
+    # fractional order" killed all 11 stops on 2026-08-07, the first tick that ever reached this
+    # code. GTC requires a whole-share quantity; a fractional quantity only takes gfd. This book
+    # is almost entirely fractional (most positions are < 1 share), so honour the broker: keep
+    # the configured TIF when the quantity is a whole number, otherwise degrade to gfd. A gfd
+    # stop expires at the close, so it protects the SESSION and is re-armed by the next tick's
+    # protect call — real intraday protection, but NOT an overnight-gap guard. That is the
+    # ceiling of what Robinhood supports on fractional shares, not a choice.
+    _whole = float(fill_qty).is_integer()
+    _tif = cfg.protective_stop_tif if _whole else "gfd"
     return {"ok": True, "stop": {
         "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
         "quantity": fill_qty, "stop_price": stop_price,
-        "time_in_force": cfg.protective_stop_tif, "market_hours": "regular_hours",
+        "time_in_force": _tif, "market_hours": "regular_hours",
+        "tif_downgraded": (not _whole and cfg.protective_stop_tif != "gfd"),
         "order_kind": "protective_stop", "parent_ref_id": d.get("ref_id"),
     }}
 

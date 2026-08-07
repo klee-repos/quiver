@@ -1016,6 +1016,16 @@ check("protective stop parsed",
 check_raises("stop_pct out of (0,100) raises",
              lambda: make_order_config({"protective_stop": {"enabled": True, "stop_pct": 150}}), ConfigError)
 
+# Broker capability: Robinhood rejects a FRACTIONAL stop with time_in_force=gtc ("Invalid time
+# in force for fractional order" — it killed all 11 stops on 2026-08-07, the first tick that ever
+# reached the protect path). GTC needs a whole-share quantity; fractional only takes gfd. This
+# book is almost entirely fractional, so cmd_protect degrades the TIF per-quantity.
+_tif_for = lambda q, cfg_tif="gtc": (cfg_tif if float(q).is_integer() else "gfd")
+check("fractional stop degrades gtc -> gfd (broker rejects gtc on fractional)", _tif_for(0.160177), "gfd")
+check("whole-share stop keeps the configured gtc", _tif_for(5), "gtc")
+check("whole-share float (5.0) is still whole", _tif_for(5.0), "gtc")
+check("a gfd-configured stop is unchanged by the downgrade", _tif_for(0.5, "gfd"), "gfd")
+
 # --- ledger: order-lifecycle columns + protective-stop tracking ---
 _oled = _tmp_ledger()
 ODAY = "2026-05-30"

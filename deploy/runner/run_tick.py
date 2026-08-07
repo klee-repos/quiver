@@ -391,7 +391,15 @@ def main() -> int:
                 # dropping strict mode adds no stray servers.
                 "--mcp-config", MCP_CONFIG,
                 "--settings", SETTINGS, "--add-dir", str(_REPO),
-                "--max-turns", "80", "--append-system-prompt", SYSTEM_PROMPT,
+                # Turn budget. 80 was far too low and failed CLOSED in the worst possible place:
+                # on 2026-08-07 the first unfrozen tick placed all 11 rebalance buys and then hit
+                # the cap mid-way through the protective-stop pass, so the run exited 1 with the
+                # book bought and unprotected. Each ORDER costs ~4-5 turns (review -> place ->
+                # commit -> protect), so a full 12-name deploy needs ~60 for orders alone, before
+                # preflight, the broker snapshot, construct, plan, reflect and report. 400 leaves
+                # a wide margin at every realistic book size; the real bounds on a runaway are the
+                # 4h tick deadline and the deterministic order list plan already fixed.
+                "--max-turns", "400", "--append-system-prompt", SYSTEM_PROMPT,
                 "--dangerously-skip-permissions",  # unattended; the order guard is the real gate
                 "Follow ./TICK.md exactly for today's tick.",
             ]
