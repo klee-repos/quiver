@@ -33,10 +33,11 @@ guard** denies any order whose `ref_id` the Python `plan` did not reserve.
 ```bash
 ./deploy/gcp/bootstrap-gcp.sh      # pushes .env + strategy.yaml -> quiver-<KEY> secrets
 ```
-Creates `quiver-GLM_API_KEY`, `quiver-DEEPSEEK_API_KEY`, `quiver-RH_ACCOUNT_NUMBER`,
-`quiver-RESEND_API_KEY`, `quiver-NOTIFY_TO`, `quiver-RESEND_FROM`, `quiver-STRATEGY_YAML`
-(+ optional `quiver-NOTIFY_ALERTS_TO` / `quiver-CLAUDE_CODE_OAUTH_TOKEN` if set in `.env`). Claude auth
-is OPTIONAL — the on-box `claude login` (step 4) covers it.
+Creates `quiver-OPENROUTER_API_KEY` (the live brain key), `quiver-RH_ACCOUNT_NUMBER`,
+`quiver-STRATEGY_YAML`, the Telegram secrets (`quiver-TELEGRAM_BOT_TOKEN` /
+`quiver-TELEGRAM_ALLOWED_CHAT_IDS` — optional, see docs/CHAT.md), plus the rollback-only
+`quiver-GLM_API_KEY` / `quiver-DEEPSEEK_API_KEY` / `quiver-RESEND_API_KEY` / `quiver-NOTIFY_TO`
+if set in `.env`. Claude auth is OPTIONAL — the on-box `claude login` (step 4) covers it.
 
 ## 2. Provision with Terraform
 ```bash

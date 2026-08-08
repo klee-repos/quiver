@@ -364,9 +364,6 @@ class Guidance:
     tier: str
     text: str   # the full, auditable proof line
 
-    def render(self) -> str:
-        return self.text
-
 
 _DISCLAIMER = "context for your reasoning ONLY — it does NOT change position sizing"
 

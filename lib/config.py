@@ -17,10 +17,10 @@ import yaml
 _PLACEHOLDER_ACCOUNT = "XXXXXXXX"
 
 # Supported LLM providers for the per-role chat_provider/reasoner_provider keys.
-# Mirror of tradingagents.llm_clients.factory._OPENAI_COMPATIBLE, kept LOCAL on
-# purpose: config.py is a light leaf, and importing the framework here would run
-# tradingagents/__init__.py's load_dotenv() as a side effect mid-load — clobbering
-# the os.environ of env-isolated callers (tests, the notify-recipient resolution).
+# These keys are LEGACY back-compat: the live EVE brain (quiver_eve/run/decide.mjs)
+# does not read them — it reads OPENROUTER_API_KEY + QUIVER_*_MODEL env slugs.
+# config.py parses + validates the legacy glm:/deepseek: block so an old config
+# still loads (fail-safe), but nothing on the live trading path consumes it.
 _SUPPORTED_LLM_PROVIDERS = (
     "openai", "xai", "deepseek", "qwen", "qwen-cn",
     "glm", "glm-cn", "minimax", "minimax-cn", "ollama", "openrouter",
@@ -83,13 +83,13 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class NotifyConfig:
-    """Email-digest delivery settings. Observability only — never trading.
+    """Alert-delivery settings (Telegram). Observability only — never trading.
 
     Fails SAFE: stays disabled unless ``notify.enabled`` is exactly ``true``.
-    No secrets here — the RESEND_API_KEY and sender live in the operator's Resend
-    MCP registration (``claude mcp add``), same as the Robinhood MCP, NOT in this
-    repo. ``from_addr`` is optional; blank means the MCP's own sender is used. A
-    bad/missing key degrades to a logged send failure, never a config crash.
+    No secrets here — the Telegram creds (TELEGRAM_BOT_TOKEN / *_CHAT_IDS) live in
+    .env, NOT in this repo. ``to`` / ``from_addr`` are the dormant email-renderer
+    fields (lib/notify renders both HTML and text); the live sender (lib.telegram)
+    does not read them. A bad/missing key degrades to a logged send, never a crash.
     """
     enabled: bool
     to: List[str]
@@ -236,22 +236,18 @@ class Config:
     legislative: LegislativeConfig
     intel: IntelConfig
     raw: dict
-    # Per-role LLM providers (mixed-provider support). Default to "glm" so an
-    # absent block/key keeps today's single-provider GLM behavior byte-identical.
-    # The quick/chat role (analysts' tool-calling) and the deep/reasoner role
-    # (debates/judgment) can name different providers (e.g. deepseek + glm).
+    # Per-role LLM providers (legacy back-compat). The live EVE brain does NOT read
+    # these — it reads OPENROUTER_API_KEY + QUIVER_*_MODEL env slugs. Kept so an old
+    # config.yaml with a glm:/deepseek: block still loads (fail-safe parsing only).
     chat_provider: str = "glm"
     reasoner_provider: str = "glm"
     # --- Brain engine (EVE migration) ------------------------------------
-    # brain_engine selects the analysis backend. "tradingagents" (default) = the
-    # legacy in-tree LangGraph framework (kept live as the rollback path until F8
-    # deletes tradingagents/). "eve" = the Node/EVE deep-research agent. The
-    # dispatch lives in analyze.py:run_analysis(); the legacy import is deferred
-    # into the else-branch so the EVE path never loads tradingagents/. Flip to
-    # "eve" only after the live e2e is green on the EVE brain.
+    # brain_engine selects the analysis backend. "eve" = the Node/EVE deep-research
+    # agent (quiver_eve/run/decide.mjs), the only live brain. The legacy
+    # "tradingagents" engine was F8-deleted (2026-07-06); analyze.py:run_analysis()
+    # raises LOUD on any non-eve value. A missing/garbled block resolves to "eve".
     brain_engine: str = "eve"
     eve_dir: str = "quiver_eve"
-    eve_url: str = "http://127.0.0.1:2244"  # the EVE server (eve dev / eve start) HTTP endpoint
     research_rounds: int = 1  # F4: bull/bear + risk-debate rounds (default 1; spec max 2)
     # --- Self-learning tail (lib/levers) --------------------------------
     # auto_apply_levers=false (default) = a discovered lever needs human
@@ -321,9 +317,10 @@ def load_config(path) -> Config:
     d = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
     # Per-user/secret values are NOT committed: they come from .env (gitignored),
-    # alongside GLM_API_KEY. Load it here so every entrypoint (tick.py,
-    # analyze.py) sees the same values via load_config. Missing python-dotenv or
-    # a missing .env is fine — the vars may already be set in the real environment.
+    # e.g. OPENROUTER_API_KEY, RH_ACCOUNT_NUMBER, TELEGRAM_*_CHAT_IDS. Load .env
+    # here so every entrypoint (tick.py, analyze.py) sees the same values via
+    # load_config. Missing python-dotenv or a missing .env is fine — the vars may
+    # already be set in the real environment.
     try:
         from dotenv import load_dotenv
 
@@ -421,10 +418,10 @@ def load_config(path) -> Config:
             "config.yaml: model IDs are still placeholders — verify the current "
             "IDs in the provider's model list and set them."
         )
-    # Per-role providers. The block-default provider (which block matched) is the
-    # fallback for any role that doesn't name its own, so absent keys keep today's
-    # behavior: a `glm:` block => both roles glm; a legacy `deepseek:` block => both
-    # deepseek. The live mixed setup names each role explicitly (deepseek + glm).
+    # Per-role providers (legacy back-compat parsing only — the EVE brain does not
+    # read them). The block-default provider (which block matched) is the fallback
+    # for any role that doesn't name its own: a `glm:` block => both roles glm; a
+    # legacy `deepseek:` block => both deepseek.
     block_default = "glm" if glm_block else ("deepseek" if d.get("deepseek") else "glm")
     chat_provider = str(models.get("chat_provider", block_default) or block_default).strip().lower()
     reasoner_provider = str(models.get("reasoner_provider", block_default) or block_default).strip().lower()
@@ -633,8 +630,6 @@ def load_config(path) -> Config:
     if brain_engine not in ("tradingagents", "eve"):
         brain_engine = "eve"
     eve_dir = str(brain.get("eve_dir", "quiver_eve") or "quiver_eve").strip()
-    eve_url = str(brain.get("eve_url", os.environ.get("QUIVER_EVE_URL", "http://127.0.0.1:2244"))
-                  or "http://127.0.0.1:2244").strip()
     # F4: research_rounds bounds the bull/bear + risk-debate turns (each round =
     # +2 quick-model turns). Default 1 (~8 turns/ticker worst case) preserves the
     # v1 cost ceiling; the spec's max is 2. Raise only with data to justify it.
@@ -774,7 +769,6 @@ def load_config(path) -> Config:
         reasoner_provider=reasoner_provider,
         brain_engine=brain_engine,
         eve_dir=eve_dir,
-        eve_url=eve_url,
         research_rounds=research_rounds,
         auto_apply_levers=auto_apply_levers,
         lever_min_decisions=lever_min_decisions,

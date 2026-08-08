@@ -350,7 +350,6 @@ def ma_stats(prices: Sequence[float]) -> MAStats:
 
 
 # Regime thresholds (explicit, deterministic, single source of truth here).
-ADX_TRENDING = 25.0      # ADX >= this = a real trend, not chop
 ADX_VERY_STRONG = 35.0
 REGIME_RANGE_ADX = 20.0  # below this = range/no trend
 MIN_ANNUALIZED_ROWS = 60  # min daily returns before annualized ratios are meaningful (~3mo)

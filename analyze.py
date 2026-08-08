@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-import logging
 import os
 import re
 import sys
@@ -86,44 +85,6 @@ def _open_reasoning_log(ticker: str, date: str):
         return open(REASONDIR / f"{date}_{ticker}.log", "w", encoding="utf-8")
     except Exception:  # noqa: BLE001 — best-effort; fall back to stderr-only
         return None
-
-
-# HTTP/SDK libraries log a line per request; at INFO they drown out the agent
-# reasoning we actually want to see. Pin them to WARNING for the run.
-_NOISY_LOGGERS = ("httpx", "httpcore", "urllib3", "openai", "langsmith", "langchain")
-
-
-def _install_run_logging(stream) -> logging.Handler | None:
-    """Mirror all framework log records (INFO+) into ``stream`` (the reasoning tee).
-
-    Returns the attached handler (pass it to :func:`_remove_run_logging`) or None
-    if anything went wrong — logging must never break the analysis.
-    """
-    try:
-        handler = logging.StreamHandler(stream)
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(levelname)s %(name)s: %(message)s", "%H:%M:%S"))
-        root = logging.getLogger()
-        root.addHandler(handler)
-        if root.level > logging.INFO or root.level == logging.NOTSET:
-            root.setLevel(logging.INFO)
-        for name in _NOISY_LOGGERS:
-            logging.getLogger(name).setLevel(logging.WARNING)
-        return handler
-    except Exception:  # noqa: BLE001 — logging must never break analysis
-        return None
-
-
-def _remove_run_logging(handler: logging.Handler | None) -> None:
-    """Detach the run handler installed by :func:`_install_run_logging`."""
-    if handler is None:
-        return
-    try:
-        logging.getLogger().removeHandler(handler)
-        handler.close()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def parse_trader_plan(plan_text: str) -> dict:

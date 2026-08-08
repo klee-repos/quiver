@@ -3,8 +3,9 @@
 
 On each scheduled wake (systemd timer): acquire the single-run lock, run
 `tick.py preflight`, and — ONLY if it says proceed — drive exactly one tick by
-running the `claude` CLI in headless `-p` mode over TICK.md, with the Robinhood +
-Resend MCPs attached and the PreToolUse order-guard denying any unauthorized order.
+running the `claude` CLI in headless `-p` mode over TICK.md, with the Robinhood
+MCP attached and the PreToolUse order-guard denying any unauthorized order.
+(Alerting is Telegram via lib.telegram; there is no Resend MCP — see mcp.json.example.)
 
 Execution-only: ZERO trading logic lives here. Mirrors BRAX's `spawnClaude` shape
 (`claude -p --append-system-prompt <rules> --mcp-config mcp.json --settings <hooks>
@@ -386,8 +387,8 @@ def main() -> int:
                 "--model", MODEL, "--effort", EFFORT,
                 # NO --strict-mcp-config: the Robinhood MCP is registered at USER scope and
                 # carries its OAuth (done once in the on-box browser); strict mode would
-                # ignore user-scope servers + their stored OAuth. --mcp-config still layers
-                # in resend (static key). The box's quiver user has no other MCP servers, so
+                # ignore user-scope servers + their stored OAuth. There is no Resend MCP
+                # (alerting is Telegram); the box's quiver user has no other MCP servers, so
                 # dropping strict mode adds no stray servers.
                 "--mcp-config", MCP_CONFIG,
                 "--settings", SETTINGS, "--add-dir", str(_REPO),
@@ -431,7 +432,7 @@ def main() -> int:
                 # in TICK.md prose (the orchestrator Reads the runbook into stdout) and would
                 # false-positive on EVERY healthy tick. Match instead on the UNIQUE sentinel
                 # the orchestrator emits ONLY by running `tick.py auth-stop` on a real 401. OR
-                # with the ledger marker so a 401 whose (best-effort) in-tick email FAILED to
+                # with the ledger marker so a 401 whose (best-effort) in-tick alert FAILED to
                 # send — leaving no notifications row — is still caught (no silent miss). The
                 # ledger read is wrapped: a DB hiccup must never crash the supervisor.
                 try:
@@ -447,7 +448,7 @@ def main() -> int:
                 if auth_error:
                     _emit({"stage": "tick", "event": "AUTH_ERROR",
                            "detail": "Robinhood MCP auth failed — placed nothing, hard-stop"})
-                    # Dedups against the orchestrator's own in-tick auth_error email
+                    # Dedups against the orchestrator's own in-tick auth_error alert
                     # (TICK.md STEP 2.1) via the shared (date, kind, stage) row.
                     _maybe_alert(led, kind="auth_error", stage=notify.AUTH_STAGE, day=day,
                                  now_iso=now_iso,
@@ -460,7 +461,7 @@ def main() -> int:
                                  now_iso=now_iso,
                                  event_detail="Daily-loss halt fired this tick; KILL written.")
                 # A non-zero/failed orchestrator that is NEITHER auth nor halt is a crash
-                # the orchestrator couldn't email about (max-turns, MCP wedge, exception).
+                # the orchestrator couldn't page about (max-turns, MCP wedge, exception).
                 # But if the in-tick path ALREADY paged a hard-stop error this day
                 # (preflight/plan/commit), suppress this generic page — its stage differs
                 # ("orchestrator") so it would NOT dedup against that row and would
@@ -587,7 +588,7 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 _emit({"stage": "tick", "ok": False, "error": "tick exceeded the timeout"})
                 # The subprocess wedged past the wall-clock — it certainly never reached
-                # its own email step; last-resort page.
+                # its own report-send step; last-resort page.
                 _maybe_alert(led, kind="error", stage="orchestrator", day=day,
                              now_iso=now_iso,
                              event_detail=f"tick exceeded its {int(_orch_timeout)}s orchestrator "

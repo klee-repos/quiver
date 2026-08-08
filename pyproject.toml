@@ -4,11 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 # Quiver — the autonomous trading desk this repo builds. The distribution is
-# named "quiver"; the bundled multi-agent framework keeps its own import path
-# (the `tradingagents/` directory — directory name, not distribution name, is
-# what `import tradingagents` resolves), so renaming this field touches no
-# imports. That framework is an owned, vendored fork — provenance in README.md
-# and tradingagents/UPSTREAM.md, not here.
+# named "quiver". The analysis brain lives in quiver_eve/ (Node runtime), not
+# under this distribution; the Python package only ships lib/ + the CLI
+# entrypoints (tick.py / analyze.py). The tradingagents/ framework was deleted
+# in the EVE migration (2026-07-06) — do not re-add it.
 name = "quiver"
 version = "0.2.5"
 description = "Quiver — an autonomous trading desk that executes a multi-agent LLM signal on Robinhood's agentic trading platform"

@@ -15,8 +15,8 @@ EnvironmentFile=/etc/quiver/quiver.env
 Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
 # CLAUDE_CONFIG_DIR comes from quiver.env (=/opt/quiver/state/claude-config) — a writable
 # ReadWritePath, so claude/MCP OAuth state is readable+refreshable even under ProtectHome.
-# Keep npx's cache (the resend MCP runs `npx -y resend-mcp`) off the read-only HOME too,
-# else the in-tick digest send silently fails.
+# Keep npx's cache (used by the EVE brain / claude tooling) off the read-only HOME,
+# else the in-tick run silently fails on cache writes.
 Environment=npm_config_cache=/opt/quiver/state/.npm-cache
 ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_tick.py
 # Outer guard only. STEP 3 now BLOCKS on the full-book analysis (~11 GLM runs; a slow,

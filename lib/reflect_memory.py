@@ -32,8 +32,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from lib import fsutil, memory, risk
 
-DEFAULT_MEMORY_DIR = Path(__file__).resolve().parent.parent / "state" / "memory" / "reflect"
-
 # Order metrics appear in the rendered table (stable, scannable).
 _METRIC_ORDER = ["mean_return", "hit_rate", "volatility", "sharpe", "sortino",
                  "max_drawdown", "profit_factor"]

@@ -11,8 +11,8 @@ email, or change any file**. It runs on the box as `deploy/quiver-chat.service`.
 ## Why Telegram (not SMS)
 
 The box has **no public inbound** (IAP-only firewall). Telegram's bot API is *long-polled* —
-the box reaches OUT to Telegram over HTTPS (the same egress that already talks to the model and
-Resend), so **no public endpoint, no phone number, and no A2P registration** are needed. SMS
+the box reaches OUT to Telegram over HTTPS (the same egress that already talks to the model via
+OpenRouter), so **no public endpoint, no phone number, and no A2P registration** are needed. SMS
 would require a public webhook + Twilio + carrier registration; Telegram needs none of that.
 
 ## The security model — five independent walls

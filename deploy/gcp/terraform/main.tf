@@ -42,8 +42,9 @@ locals {
   #     --member=serviceAccount:<box-sa-email> --role=roles/secretmanager.secretAccessor
   # then refresh /etc/quiver/quiver.env on the box — see docs/CHAT.md.)
   secrets = [
-    "GLM_API_KEY", "DEEPSEEK_API_KEY", "RH_ACCOUNT_NUMBER", "RESEND_API_KEY",
-    "NOTIFY_TO", "RESEND_FROM", "STRATEGY_YAML",
+    "OPENROUTER_API_KEY", "RH_ACCOUNT_NUMBER", "STRATEGY_YAML",
+    # Rollback-only (kept so a rollback path can still read them):
+    "GLM_API_KEY", "DEEPSEEK_API_KEY", "RESEND_API_KEY", "NOTIFY_TO", "RESEND_FROM",
   ]
 }
 

@@ -2964,8 +2964,9 @@ check("config reads glm: block", make_config().chat_model, "glm-5.2")
 
 # (F8) build_glm_config/build_agents_config + the GLMChatOpenAI/MiniMax/factory/
 # capabilities/extra_body checks removed — they tested tradingagents.llm_clients,
-# which is deleted. The EVE brain wires GLM+DeepSeek via @ai-sdk/openai in
-# quiver_eve/agent/agent.ts; its provider options are exercised by the live e2e.
+# which is deleted. The EVE brain wires GLM (only) via @ai-sdk/openai against
+# OpenRouter in quiver_eve/run/decide.mjs; its provider options are exercised by
+# the live e2e.
 
 _legacy_d = {
     "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
@@ -2976,7 +2977,8 @@ _legacy_d = {
 check("config back-compat: legacy deepseek: block still loads",
       load_config(_write_config(_legacy_d)).chat_model, "deepseek-v4-flash")
 
-# Per-role providers parse from config + survive validation (the live mixed setup).
+# Per-role providers parse from config + survive validation (legacy back-compat;
+# the EVE brain does not read them — see the provider-wiring comment above).
 _mix_d = {
     "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/bw_kill_test",
     "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,

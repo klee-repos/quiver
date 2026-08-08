@@ -1,7 +1,7 @@
 schema: 1
 
-# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, GLM_API_KEY,
-# NOTIFY_TO and the Resend key all live in .env / the MCP registration, never here.
+# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, OPENROUTER_API_KEY and
+# the Telegram keys all live in .env / the MCP registration, never here.
 # What the bot TRADES is derived from strategy.yaml's book, not this file.
 
 # --- Mode ------------------------------------------------------------------
@@ -58,16 +58,13 @@ order:
     stop_pct: 8.0                      # target distance below fill; clamped to a safe band
     time_in_force: "gtc"
 
-# --- Models (mixed providers) ----------------------------------------------
-# Per-role provider + model. The quick/chat role (the analysts' tool-calling, i.e.
-# "managing the agents") runs DeepSeek V4 Flash; the deep/reasoner role (debates/
-# judgment) runs GLM 5.2 with thinking at HIGH reasoning effort (one step below
-# GLM's MAX — see the glm-5.2 row in tradingagents/llm_clients/capabilities.py).
-# Both are OpenAI-compatible thinking models with full tool calling; each resolves
-# its own endpoint + API key (DEEPSEEK_API_KEY / GLM_API_KEY). The block name `glm:`
-# is historical (kept for back-compat); providers are per-role. To put a role back
-# on a single provider, just match its chat_provider/reasoner_provider. Verify IDs
-# at the provider's model list if a call rejects them.
+# --- Models (LEGACY config, not read by the EVE brain) ----------------------
+# This block is parsed by lib/config.py (back-compat + the "verify" fail-safe) and
+# pinned by tests, but the live EVE brain does NOT read it. The EVE brain
+# (quiver_eve/run/decide.mjs) reads its models from env: OPENROUTER_API_KEY +
+# QUIVER_REASONER_MODEL / QUIVER_CHAT_MODEL (defaults z-ai/glm-5.2 / z-ai/glm-4.7-flash).
+# Do not use GLM_API_KEY / DEEPSEEK_API_KEY here — they are rollback-only and the
+# EVE brain ignores them. Values below stay valid for the legacy config loader.
 glm:
   chat_model: "deepseek-v4-flash"
   chat_provider: "deepseek"
@@ -75,11 +72,11 @@ glm:
   reasoner_provider: "glm"
 
 # --- Brain engine (EVE migration) ------------------------------------------
-# brain.engine selects the analysis backend. "tradingagents" (default) = the legacy
-# in-tree LangGraph framework (the validated once-a-day path, kept live as the
-# rollback). "eve" = the Node/EVE deep-research agent (quiver_eve/). Flip to "eve"
-# ONLY after the live e2e is green on the EVE brain. FAIL-SAFE: a missing/garbled
-# block stays on the legacy brain — never silently flips the live brain.
+# brain.engine selects the analysis backend. "eve" (live) = the Node/EVE
+# deep-research agent (quiver_eve/run/decide.mjs). The legacy "tradingagents"
+# engine was DELETED in the EVE migration (2026-07-06); lib/config.py fails LOUD
+# if it is ever set — there is no legacy brain to roll back to. FAIL-SAFE: a
+# missing/garbled block stays on "eve", never silently swaps the brain.
 brain:
   engine: "eve"
   eve_dir: "quiver_eve"
@@ -107,12 +104,15 @@ loop:
   review_ceiling_open_min: 120         # while market OPEN, never wait longer than this
   review_ceiling_min: 1440             # after close, may wait up to this (next session)
 
-# --- Notifications (email digest + alerts) ---------------------------------
-# Python builds the email; the orchestrator sends it via the Resend MCP. Recipients
-# come from NOTIFY_TO in .env. Fails SAFE: OFF unless enabled is exactly `true`.
+# --- Notifications (Telegram digest + alerts) -------------------------------
+# The daily digest + halt/auth/error alerts go to Telegram (lib.telegram; sent by
+# `tick.py report-send` and run_tick.py's last-resort pager). Recipients come from
+# TELEGRAM_ALERT_CHAT_IDS / TELEGRAM_ALLOWED_CHAT_IDS in .env. Fails SAFE: OFF
+# unless enabled is exactly `true`. (`from:` here is the dormant email-renderer
+# field — not used by the Telegram sender.)
 notify:
   enabled: true
-  from: ""                             # blank -> the Resend MCP's own sender is used
+  from: ""                             # dormant email-renderer field; Telegram ignores it
   subject_prefix: "[Quiver]"
   loud_digest: true                    # daily digest pings LOUD (heartbeat) even on 0-order days; false = silent
 

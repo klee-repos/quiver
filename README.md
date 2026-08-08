@@ -66,8 +66,9 @@ trigger. Quiver splits that into three separate jobs, and puts a wall between th
    It just does exactly what the rule-keeper said.
 ```
 
-- **The thinker** is a team of AI analysts (running on a model called GLM 5.2). They argue
-  it out — a bull case, a bear case, a final call — and produce one opinion per stock.
+- **The thinker** is the EVE brain — a team of AI analysts (running on GLM 5.2 via
+  OpenRouter, one key). They argue it out — a bull case, a bear case, a risk check, a
+  final call — and produce one opinion per stock.
 - **The rule-keeper** is plain code. It takes that opinion and works out the real order, while
   obeying every limit you set (how much per trade, per day, per stock). The AI never gets to
   override these. If the math says "spend nothing," it spends nothing.
@@ -258,9 +259,9 @@ longer used by the live alert path.)
 ## Good to know
 
 - **What data does it use?** Stock prices, charts, company numbers, and news all come from a
-  free source — **no paid data key needed**. The keys you must have are the two AI keys: one
-  for GLM 5.2 (the deep reasoning/debate role) and one for DeepSeek (the quick analyst
-  tool-calling role) — the live setup runs a mixed-provider stack.
+  free source — **no paid data key needed**. The only AI key you must have is `OPENROUTER_API_KEY`
+  (the brain runs GLM 5.2 through OpenRouter — the deep reasoning/debate role is `glm-5.2`, the
+  quick analyst/tool-calling role is `glm-4.7-flash`; both use the same single key).
 - **What does it cost to run?** The AI is cheap — a full run is a few cents, roughly
   **$5–20 a month** if you watch three stocks a day.
 - **One small gap:** it can't read Reddit (the site blocks it), so it just skips that and uses
@@ -274,13 +275,13 @@ longer used by the live alert path.)
 |---|---|
 | `analyze.py` | The thinker. Give it a stock, it prints back one opinion. |
 | `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
-| `lib/` | The building blocks: market hours, the logbook, the safety rules, email, memory. |
+| `lib/` | The building blocks: market hours, the logbook, the safety rules, alerts, memory. |
 | `TICK.md` | The exact step-by-step the helper follows on every run. |
 | `config.yaml` | Your settings (the table above). Committed — carries no secrets (those live in `.env`). |
 | `strategy.yaml` | Your portfolio book = the stocks it trades. Private — gitignored. |
 | `strategy.yaml.example` | The committed template you copy to make `strategy.yaml`. Safe defaults. |
 | `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
-| `tradingagents/` | The AI analyst team that powers the thinking. |
+| `quiver_eve/` | The EVE brain — the AI analyst team that powers the thinking (Node/TypeScript). |
 | `.env` | Your private keys and account number. Never shared, never committed. |
 
 ---
@@ -289,6 +290,6 @@ longer used by the live alert path.)
 
 *The code decides. The AI advises. The agent only ever pulls the trigger.*
 
-<sub>The analyst team in `tradingagents/` is an open-source framework used under the Apache-2.0 license — see `tradingagents/LICENSE` and `tradingagents/UPSTREAM.md`.</sub>
+<sub>The EVE brain (`quiver_eve/`) runs on the open-source `eve` agent framework + the AI SDK (Apache-2.0) — installed under `quiver_eve/node_modules/`.</sub>
 
 </div>

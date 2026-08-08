@@ -2,8 +2,8 @@
 # Run the full Quiver test + e2e suite. One command, clean summary, non-zero on any failure.
 #
 #   tests/run_e2e.sh           # unit + all DETERMINISTIC e2e (fast, free, no network/LLM)
-#   tests/run_e2e.sh --live    # ALSO the REAL GLM e2e (test_e2e_live.py) — costs tokens,
-#                              #   needs GLM_API_KEY, takes a few minutes
+#   tests/run_e2e.sh --live    # ALSO the REAL e2e (test_e2e_live.py) — costs tokens,
+#                              #   needs OPENROUTER_API_KEY, takes a few minutes
 #
 # The live suite is gated behind QUIVER_LIVE_E2E=1; without --live it self-skips (PASS), so
 # this script is safe to run constantly / on a schedule. Everything runs against temp ledgers —
