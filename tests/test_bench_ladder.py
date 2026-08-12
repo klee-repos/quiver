@@ -76,9 +76,27 @@ DS, PRICE_AT, BENCH_AT = wr.make_in_memory_price_fns(PM, BM)
 CASH = 5000.0
 
 
-def run(name, src, **kw):
+def run(name, src, strategy=None, **kw):
     return L.run_arm(name, src, dates=DS, tickers=TICKERS, price_at=PRICE_AT,
-                     benchmark_at=BENCH_AT, strategy_path=STRATEGY, starting_cash=CASH, **kw)
+                     benchmark_at=BENCH_AT, strategy_path=(strategy or STRATEGY),
+                     starting_cash=CASH, **kw)
+
+
+def _strategy_with_rr_gate(floor: float = 3.0):
+    """A strategy file that ARMS the R:R gate, for the VOID guard only.
+
+    The VOID guard proves that a gate which zeroes a run does not read as "no edge".
+    It needs an armed gate to do that. It used to borrow the operator's live
+    strategy.yaml, so removing `min_reward_risk` from that file silently DISARMED
+    the guard while every assertion still ran. The fixture now supplies the gate,
+    so the guard tests the machinery and never the operator's data.
+    """
+    import yaml as _yaml
+    d = _yaml.safe_load(STRATEGY.read_text(encoding="utf-8")) or {}
+    d.setdefault("risk_policy", {})["min_reward_risk"] = floor
+    out = Path(tempfile.mkdtemp(prefix="ladder_rr_")) / "strategy.yaml"
+    out.write_text(_yaml.safe_dump(d, sort_keys=False), encoding="utf-8")
+    return out
 
 
 # ---------------------------------------------------------------- the VOID guard
@@ -88,9 +106,10 @@ def test_rr_gate_below_floor_is_VOID_not_zero_edge():
     ok("real strategy.yaml exists", STRATEGY.exists(), str(STRATEGY))
     ok("book universe is non-empty", len(TICKERS) >= 3, TICKERS)
 
-    # R:R 1.88 — plausible, and BELOW the real 3.0 floor.
+    # R:R 1.88 — plausible, and BELOW the 3.0 floor this fixture arms.
+    _rr_strategy = _strategy_with_rr_gate(3.0)
     below = B.oracle(PM, horizon=5, rr=B.RRSpec.graded_at(1.875))
-    r_below = run("oracle_rr1.88", below)
+    r_below = run("oracle_rr1.88", below, strategy=_rr_strategy)
     # NOTE: the initial book deploy can still place a handful of rebalance orders; what makes
     # the run void is that the gate refused the overwhelming majority of WOULD-BE entries.
     ok("below-floor arm placed few orders", r_below.summary["total_orders"] <= 20, r_below.summary)
@@ -116,7 +135,10 @@ def test_rr_gate_below_floor_is_VOID_not_zero_edge():
 def test_compare_refuses_to_rank_a_void_arm():
     print("\n[compare() must not rank a VOID arm]")
     hold = run("hold", B.hold_book())
-    below = run("void_arm", B.oracle(PM, horizon=5, rr=B.RRSpec.graded_at(1.875)))
+    # Same armed-gate fixture as the VOID guard: compare() can only refuse to rank a
+    # void arm if an arm is actually void, and only an armed gate makes one void.
+    below = run("void_arm", B.oracle(PM, horizon=5, rr=B.RRSpec.graded_at(1.875)),
+                strategy=_strategy_with_rr_gate(3.0))
     cmp_ = L.compare([hold, below], baseline="hold")
     ok("comparison flags any_void", cmp_["any_void"] is True, cmp_)
     void_row = [r for r in cmp_["rows"] if r["arm"] == "void_arm"][0]
