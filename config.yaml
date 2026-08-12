@@ -53,8 +53,11 @@ order:
   sell_mode: "close_position"
   time_in_force: "gfd"
   market_hours: "regular_hours"        # fractional/dollar orders only fill in RTH
-  protective_stop:                     # GTC stop placed AFTER an entry fills; price Python-clamped. ENABLED 2026-07-19 (PTJ defense).
-    enabled: true
+  protective_stop:                     # DEAD PATH — Robinhood accepts no stop order on a
+                                       # fractional quantity, and every position here is
+                                       # fractional. 62 such orders were reserved, 0 filled.
+                                       # cmd_protect / cmd_rearm_stops are no-ops. Keep false.
+    enabled: false
     stop_pct: 8.0                      # target distance below fill; clamped to a safe band
     time_in_force: "gtc"
 
