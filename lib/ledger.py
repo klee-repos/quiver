@@ -996,10 +996,21 @@ class Ledger:
             )
 
     def unfinalized_orders(self, trade_date: str):
-        """Orders reserved but never finalized — reconcile these on restart."""
+        """Orders reserved but never finalized — reconcile these on restart.
+
+        Excludes ``protective_stop``. Robinhood rejects that order on a fractional
+        quantity, so the row can never become a real position change. Leaving it in
+        kept preflight awake AND removed its own ticker from ``pending``, which
+        blocked analysis of a held name (2026-08-11).
+
+        ``protective_exit`` STAYS in the set. That order moves shares, so a crash
+        between ``reserve_order`` and the broker call must reconcile the EXISTING
+        ``ref_id`` instead of minting a second one.
+        """
         with self._conn() as c:
             return [dict(r) for r in c.execute(
-                "SELECT * FROM orders WHERE trade_date=? AND finalized=0", (trade_date,)
+                "SELECT * FROM orders WHERE trade_date=? AND finalized=0 "
+                "AND COALESCE(order_kind,'') != 'protective_stop'", (trade_date,)
             ).fetchall()]
 
     # --- email-digest dedup ---------------------------------------------------

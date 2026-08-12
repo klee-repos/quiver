@@ -3012,11 +3012,18 @@ def cmd_commit(args) -> dict:
             st = "stop_placed"
         led.set_order_state(ref_id, st)
     ticker = str(d["ticker"]).upper()
-    led.record_action(
-        day, ticker,
-        signal=d.get("signal", ""), intent=d.get("intent", ""),
-        status=d["status"], detail=str(d.get("detail", "")), now_iso=now_iso,
-    )
+    # `ticker_action` is INSERT OR REPLACE on (trade_date, ticker) — a snapshot, not
+    # a log. A FAILED protective stop moves no shares, so writing it erased why the
+    # name traded or skipped: on 2026-08-11 all 12 rows were overwritten by
+    # "Invalid trigger for fractional order". Skip that one dead case only.
+    _skip_action = (str(d.get("order_kind") or "") == "protective_stop"
+                    and d["status"] in ("error", "blocked_guardrail"))
+    if not _skip_action:
+        led.record_action(
+            day, ticker,
+            signal=d.get("signal", ""), intent=d.get("intent", ""),
+            status=d["status"], detail=str(d.get("detail", "")), now_iso=now_iso,
+        )
     # Append to the action event log (cooldown / action-cap / on-change history).
     # The gates count only completed trades (intent buy|sell, status placed|dry_run);
     # blocked/error attempts are logged but don't start a cooldown or burn the cap.
@@ -3341,45 +3348,17 @@ def cmd_auth_stop(_args) -> dict:
 # later sell. Returns {"stop": null} when stops are disabled or inputs are unusable.
 
 def cmd_protect(args) -> dict:
-    cfg, led = _cfg_and_ledger()
-    day = market.trading_day_et()
-    now_iso = market.now_et().isoformat()
-    d = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    """No-op. Robinhood accepts NO stop order on a fractional quantity.
 
-    if not cfg.protective_stop_enabled:
-        return {"ok": True, "stop": None, "reason": "protective_stop_disabled"}
-
-    ticker = str(d.get("ticker", "")).upper()
-    fill_price = _to_float(d.get("fill_price"))
-    fill_qty = _to_float(d.get("fill_qty"))
-    stop_price = signals.resolve_stop_price(
-        fill_price, _to_float(d.get("model_stop_loss")), cfg.protective_stop_pct)
-    if not ticker or not fill_qty or fill_qty <= 0 or stop_price is None:
-        return {"ok": True, "stop": None, "reason": "no_stop (need ticker, fill qty, valid price)"}
-
-    ref_id = None
-    if not cfg.dry_run:
-        ref_id = led.new_ref_id()
-        led.reserve_order(ref_id, day, ticker, side="sell", type="stop_market",
-                          dollar_amount=None, quantity=fill_qty, now_iso=now_iso,
-                          order_kind="protective_stop", stop_price=stop_price,
-                          parent_ref_id=d.get("ref_id"), state="reserved")
-    # Robinhood rejects a FRACTIONAL stop with time_in_force=gtc — "Invalid time in force for
-    # fractional order" killed all 11 stops on 2026-08-07, the first tick that ever reached this
-    # code. GTC requires a whole-share quantity; a fractional quantity only takes gfd. This book
-    # is almost entirely fractional (most positions are < 1 share), so honour the broker: keep
-    # the configured TIF when the quantity is a whole number, otherwise degrade to gfd. A gfd
-    # stop expires at the close, so it protects the SESSION and is re-armed by the next tick's
-    # protect call — real intraday protection, but NOT an overnight-gap guard. That is the
-    # ceiling of what Robinhood supports on fractional shares, not a choice.
-    _tif = signals.stop_time_in_force(fill_qty, cfg.protective_stop_tif)
-    return {"ok": True, "stop": {
-        "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
-        "quantity": fill_qty, "stop_price": stop_price,
-        "time_in_force": _tif, "market_hours": "regular_hours",
-        "tif_downgraded": (_tif != str(cfg.protective_stop_tif or "").lower()),
-        "order_kind": "protective_stop", "parent_ref_id": d.get("ref_id"),
-    }}
+    Both time_in_force values were rejected live: gtc -> "Invalid time in force
+    for fractional order" (2026-08-07), gfd -> "Invalid trigger for fractional
+    order" (2026-08-10, 2026-08-11). 62 such orders were reserved and 0 ever
+    filled. Every position in this book is fractional, so this path could never
+    protect anything. The daily analysis decides when to sell.
+    """
+    _cfg_and_ledger()
+    return {"ok": True, "stop": None,
+            "reason": "protective_stops_unsupported_on_fractional_shares"}
 
 
 # --- protective-stop RE-ARM ---------------------------------------------------
@@ -3397,58 +3376,14 @@ def cmd_protect(args) -> dict:
 # instead of decaying into a stale level far from price.
 
 def cmd_rearm_stops(args) -> dict:
-    cfg, led = _cfg_and_ledger()
-    day = market.trading_day_et()
-    now_iso = market.now_et().isoformat()
-    d = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    """No-op. See ``cmd_protect``: the broker holds no fractional stop.
 
-    if not cfg.protective_stop_enabled:
-        return {"ok": True, "stops": [], "reason": "protective_stop_disabled"}
-
-    positions = d.get("positions", {}) or {}
-    quotes = {str(k).upper(): _to_float(v) for k, v in (d.get("quotes") or {}).items()}
-    cash_tk = str(getattr(cfg.risk, "cash_sleeve_ticker", "") or "").upper()
-    # Symbols that ALREADY have a stop resting at the broker. Broker truth, not ledger
-    # belief: a stop the ledger thinks it placed but the broker rejected must still be
-    # re-armed (that is the exact 2026-08-07 failure).
-    covered = {str((s or {}).get("symbol", "")).upper()
-               for s in (d.get("open_stops") or [])
-               if str((s or {}).get("symbol", "")).strip()}
-
-    stops, skipped = [], []
-    for raw_tk, pos in sorted(positions.items()):
-        ticker = str(raw_tk).upper()
-        qty = _to_float((pos or {}).get("shares_available_for_sells"))
-        if qty is None:
-            qty = _to_float((pos or {}).get("quantity")) or 0.0
-        if ticker == cash_tk or qty <= 0:
-            continue
-        if ticker in covered:
-            skipped.append({"ticker": ticker, "reason": "already_protected"})
-            continue
-        anchor = quotes.get(ticker)
-        if not anchor:
-            mv = _to_float((pos or {}).get("market_value"))
-            anchor = (mv / qty) if (mv and qty) else None
-        stop_price = signals.resolve_stop_price(anchor, None, cfg.protective_stop_pct)
-        if stop_price is None:
-            skipped.append({"ticker": ticker, "reason": "no_usable_price"})
-            continue
-        ref_id = None
-        if not cfg.dry_run:
-            ref_id = led.new_ref_id()
-            led.reserve_order(ref_id, day, ticker, side="sell", type="stop_market",
-                              dollar_amount=None, quantity=qty, now_iso=now_iso,
-                              order_kind="protective_stop", stop_price=stop_price,
-                              parent_ref_id=None, state="reserved")
-        stops.append({
-            "ticker": ticker, "ref_id": ref_id, "side": "sell", "type": "stop_market",
-            "quantity": qty, "stop_price": stop_price,
-            "time_in_force": signals.stop_time_in_force(qty, cfg.protective_stop_tif),
-            "market_hours": "regular_hours", "order_kind": "protective_stop",
-        })
-    return {"ok": True, "stops": stops, "skipped": skipped,
-            "n_positions": len(positions), "n_already_protected": len(covered)}
+    This command placed 24 rejected orders on 2026-08-11 alone, and its error
+    rows overwrote the day's real trading rows.
+    """
+    _cfg_and_ledger()
+    return {"ok": True, "stops": [], "skipped": [],
+            "reason": "protective_stops_unsupported_on_fractional_shares"}
 
 
 # --- decision-memory outcome resolution --------------------------------------

@@ -132,11 +132,35 @@ _mn = signals.resolve_sell_quantity_min_notional
 # trim already clears $1 -> unchanged
 check("trim clears floor", _mn(2.0, 1.0, 140.0), (1.0, "trim"))
 # trim under $1 but whole position >= $1 -> bumped to 1/quote, clamped to held
-check("bumped to $1", _mn(0.02, 0.005, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+
+
+
+def _bump_ok(held, raw, quote, min_notional=1.0):
+    """Assert the INVARIANT a bumped sell must hold, not a magic quantity.
+
+    The old cases pinned ``round(1.0/140.0, 6)``. That constant only clears the
+    floor because quote=140 happens to round UP. `round()` truncates downward at
+    other prices: 7 of the 12 live names produced a sub-$1 order and Robinhood
+    rejected every one. A test that pins one lucky quote cannot see that. Assert
+    what the broker actually requires.
+    """
+    qty, reason = _mn(held, raw, quote, min_notional=min_notional)
+    return (reason == "bumped_to_min"
+            and qty * quote >= min_notional      # clears the broker floor
+            and qty <= held + 1e-12)             # long-only: never oversell
+
+
+check("bumped to $1", _bump_ok(0.02, 0.005, 140.0), True)
+# REGRESSION (2026-08-11): sweep the REAL live quotes. Under the old `round()`
+# form ANET/BSOL/CEG/GEV/SMH/SPCX/VRT all landed under $1 and were rejected.
+_live_quotes = [197.85, 30.98, 10.33, 278.36, 190.81, 1011.88,
+                718.45, 572.93, 534.20, 133.29, 45.17, 281.81]
+check("no live quote yields a sub-floor sell",
+      all(_bump_ok(100.0, 0.000001, q) for q in _live_quotes), True)
 # bumped qty never exceeds held (long-only invariant): a $1 bump would need more
 # than held -> capped at held. Here held=0.008 (=$1.12, whole >= $1) but the
 # cheapest qty clearing $1 is 1/140=0.007143 (< held), so we bump to 0.007143.
-check("bump clamped to held", _mn(0.008, 0.004, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+check("bump clamped to held", _bump_ok(0.008, 0.004, 140.0), True)
 # whole position under $1 (dust) -> skip_dust, no error
 check("dust whole pos <$1", _mn(0.004, 0.002, 140.0), (0.0, "skip_dust"))  # 0.004*140=$0.56
 # no usable quote -> defensive skip (never synthesize a price to force a sell)
@@ -146,12 +170,10 @@ check("zero quote -> skip", _mn(2.0, 1.0, 0.0), (0.0, "skip_no_quote"))
 check("nothing held", _mn(0.0, 1.0, 140.0), (0.0, "skip_nothing"))
 check("nothing to trim", _mn(2.0, 0.0, 140.0), (0.0, "skip_nothing"))
 # custom floor ($2) respected
-check("custom $2 floor", _mn(0.02, 0.005, 140.0, min_notional=2.0),
-      (round(2.0 / 140.0, 6), "bumped_to_min"))
+check("custom $2 floor", _bump_ok(0.02, 0.005, 140.0, min_notional=2.0), True)
 # held just over the floor: whole pos >= $1 so not dust; bump to the cheapest qty
 # clearing $1 (1/140=0.007143), which is < held (0.0072) -> a sliver stays.
-check("bump leaves sliver", _mn(0.0072, 0.003, 140.0),
-      (round(1.0 / 140.0, 6), "bumped_to_min"))  # 0.007143*140=$1.00; 0.0072-0.007143 dust stays
+check("bump leaves sliver", _bump_ok(0.0072, 0.003, 140.0), True)
 
 # --- F2: bump_to_min flag (TRIM=skip vs EXIT=bump) + raised economic floor ---
 # TRIM semantics (bump_to_min=False): a sub-floor trim (raw < $5) whose WHOLE position clears
@@ -168,11 +190,10 @@ check("F2 dust precedes skip_below_min",
       _mn(0.004, 0.002, 140.0, min_notional=5.0, bump_to_min=False), (0.0, "skip_dust"))
 # EXIT semantics (bump_to_min=True, $1 floor): a sub-$1 sliver still BUMPS so wind-downs finish.
 check("F2 exit still bumps at the $1 floor",
-      _mn(0.02, 0.005, 140.0, min_notional=1.0, bump_to_min=True),
-      (round(1.0 / 140.0, 6), "bumped_to_min"))
+      _bump_ok(0.02, 0.005, 140.0, min_notional=1.0), True)
 # default (bump_to_min omitted) is the pre-F2 bump behavior (back-compat).
 check("F2 default bump_to_min=True (back-compat)",
-      _mn(0.02, 0.005, 140.0), (round(1.0 / 140.0, 6), "bumped_to_min"))
+      _bump_ok(0.02, 0.005, 140.0), True)
 
 
 
@@ -1016,16 +1037,13 @@ check("protective stop parsed",
 check_raises("stop_pct out of (0,100) raises",
              lambda: make_order_config({"protective_stop": {"enabled": True, "stop_pct": 150}}), ConfigError)
 
-# Broker capability: Robinhood rejects a FRACTIONAL stop with time_in_force=gtc ("Invalid time
-# in force for fractional order" — it killed all 11 stops on 2026-08-07, the first tick that ever
-# reached the protect path). GTC needs a whole-share quantity; fractional only takes gfd. This
-# book is almost entirely fractional, so cmd_protect degrades the TIF per-quantity.
-_tif_for = signals.stop_time_in_force
-check("fractional stop degrades gtc -> gfd (broker rejects gtc on fractional)", _tif_for(0.160177, "gtc"), "gfd")
-check("whole-share stop keeps the configured gtc", _tif_for(5, "gtc"), "gtc")
-check("whole-share float (5.0) is still whole", _tif_for(5.0, "gtc"), "gtc")
-check("a gfd-configured stop is unchanged by the downgrade", _tif_for(0.5, "gfd"), "gfd")
-check("unusable quantity fails safe to gfd", _tif_for(None, "gtc"), "gfd")
+# Robinhood accepts NO stop order on a fractional quantity. Both TIF values were
+# rejected live: gtc -> "Invalid time in force for fractional order" (2026-08-07),
+# gfd -> "Invalid trigger for fractional order" (2026-08-10, 2026-08-11). 62 such
+# orders were reserved and 0 ever filled. `stop_time_in_force` encoded the false
+# claim that gfd works, so it is deleted. Python holds the level instead.
+check("stop_time_in_force is gone (it encoded a false broker claim)",
+      hasattr(signals, "stop_time_in_force"), False)
 
 # Re-arm anchors on the LIVE quote, not the original fill: a sell stop must sit below the
 # market to be legal, and re-anchoring daily ratchets the stop UP with the position.

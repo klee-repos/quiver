@@ -11,6 +11,7 @@ A Sell/Underweight with no existing position is a no-op (never opens a short).
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Optional, Tuple
@@ -143,6 +144,11 @@ def resolve_sell_quantity(held_qty: float, sell_fraction: float) -> float:
 # `rebalance_buy_below_min` / `whole_shares_for_dollars < 1` guards.
 MIN_SELL_NOTIONAL_USD = 1.0
 
+# Headroom above the broker floor for a bumped-up sell. The quantity is rounded
+# UP to 6 decimal places, so the order clears the floor by construction; this
+# factor also absorbs a quote move between the plan and the fill.
+MIN_NOTIONAL_HEADROOM = 1.02
+
 
 def resolve_sell_quantity_min_notional(
     held_qty: float, raw_qty: float, quote: Optional[float],
@@ -194,8 +200,14 @@ def resolve_sell_quantity_min_notional(
     if not bump_to_min:
         # TRIM semantics (F2): a sub-floor trim is churn — skip it, don't bump it up.
         return (0.0, "skip_below_min")
-    bumped = min(held_qty, min_notional / quote)
-    bumped = round(bumped, 6)
+    # Round the quantity UP to the 6 decimal places the broker accepts, and add
+    # headroom above the floor. `round()` here truncated the last place downward
+    # and put the order UNDER the floor: 7 of the 12 live names produced a
+    # sub-$1 order, and Robinhood rejected each one with "Fractional orders must
+    # be at least $1". The headroom also absorbs a quote move between the plan
+    # and the fill. Never exceed the held quantity (long-only).
+    need = (min_notional * MIN_NOTIONAL_HEADROOM) / quote
+    bumped = min(held_qty, math.ceil(need * 1_000_000) / 1_000_000)
     if bumped <= 0:
         return (0.0, "skip_dust")
     return (bumped, "bumped_to_min")
@@ -429,26 +441,6 @@ def whole_shares_for_dollars(dollars: float, limit_price: Optional[float]) -> in
     if not limit_price or limit_price <= 0 or dollars <= 0:
         return 0
     return int(dollars // limit_price)
-
-
-def stop_time_in_force(quantity, configured_tif: str) -> str:
-    """Broker-legal time_in_force for a protective stop of ``quantity`` shares.
-
-    Robinhood rejects a FRACTIONAL stop with time_in_force=gtc ("Invalid time in force for
-    fractional order" — it killed all 11 stops on 2026-08-07). GTC needs a WHOLE-share
-    quantity; a fractional quantity only accepts gfd. Pure + total: honour the configured
-    TIF when the quantity is whole, otherwise degrade to the only value the broker takes.
-
-    A gfd stop expires at the close, so it protects the SESSION and must be re-armed each
-    trading day (see tick.py rearm-stops). That is the ceiling of what the broker supports
-    on fractional shares, not a policy choice.
-    """
-    tif = str(configured_tif or "gfd").strip().lower()
-    try:
-        whole = float(quantity).is_integer()
-    except (TypeError, ValueError):
-        return "gfd"
-    return tif if whole else "gfd"
 
 
 def resolve_stop_price(fill_price, model_stop_loss, stop_pct) -> Optional[float]:
