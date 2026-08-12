@@ -326,6 +326,18 @@ def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False)
     recent = 3 if compact else 6
     limit = 3 if compact else 8
     parts: List[str] = []
+    # The OPEN POSITION comes first. The model judges the stock but has never seen
+    # the call it already made on it. The window is wider than the scorecard's,
+    # because an open run can start well before those few rows. Same width in
+    # compact and full: a bounded read must never make a held book look flat.
+    # Its own try/except, so a hiccup can never shrink the proven scorecard below.
+    try:
+        pos = memory.build_position_block(
+            ticker, led.decisions_with_outcomes(ticker, limit=memory.POSITION_WINDOW))
+        if pos:
+            parts.append(pos)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         rows = led.decisions_with_outcomes(ticker, limit=limit)
         sc = memory.build_scorecard(ticker, rows, recent=recent)

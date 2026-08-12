@@ -36,6 +36,7 @@ SUITES=(
   "e2e-sellmin|tests/test_e2e_sellmin.py"
   "e2e-catalyst|tests/test_e2e_catalyst.py"
   "e2e-ptj|tests/test_e2e_ptj.py"
+  "e2e-position-memory|tests/test_e2e_position_memory.py"
   "e2e-wall-replay|tests/test_e2e_wall_replay.py"
   "e2e-attribution|tests/test_e2e_attribution.py"
   "e2e-benchmark|tests/test_e2e_benchmark.py"

@@ -315,7 +315,9 @@ CURRENT trend now CONTRADICTS is itself an inconsistency. If the setup has turne
 broken), say so and name the structural change; do not cling to a prior call the trend has outrun.
 
 PLAN:
-${plan}`, { tries: 3, validate: (t) => hasRequiredLabels(t, TRADER_LABELS) });
+${plan}
+
+${PAST}`, { tries: 3, validate: (t) => hasRequiredLabels(t, TRADER_LABELS) });
 
 // --- Step 5: risk debate (quick model, aggressive + conservative) ---
 const riskAgg = await quickTurnRetry("risk_agg", HORIZON, `As a RISK-ON UPSIDE reviewer for ${TICKER}, argue the

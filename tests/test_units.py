@@ -1388,6 +1388,13 @@ _WALL_GRANTS = {
     # (reflect_memory's side of the wall) and NOTHING else. Narrow on purpose —
     # a blanket exemption would drop its never-imports-lib.signals guarantee.
     "lib/learn.py":       {"lib.risk"},
+    # Owns the eval-lever tables. `from lib import levers` was invisible to the
+    # scanner until it recorded the module.name form. Schema ownership only:
+    # ledger never imports lib.signals or lib.config.
+    "lib/ledger.py":      {"lib.levers"},
+    # The scorecard/guidance builder sits on reflect_memory's side of the wall and
+    # reads risk's pure guidance helpers. Same narrow grant as lib/learn.py.
+    "lib/reflect_memory.py": {"lib.risk"},
 }
 
 
@@ -1398,6 +1405,10 @@ def _imported_modules(src: str) -> set:
             mods.update(a.name for a in _node.names)
         elif isinstance(_node, _ast.ImportFrom) and _node.module:
             mods.add(_node.module)
+            # `from lib import risk` binds lib.risk, but the node module is only
+            # "lib". Record module.name too, or that whole import form crosses the
+            # wall unseen. Two live imports were invisible until this line existed.
+            mods.update(f"{_node.module}.{a.name}" for a in _node.names)
     return mods
 
 
@@ -1455,6 +1466,17 @@ if _decide_src.exists():
     _dsrc = _decide_src.read_text(encoding="utf-8")
     check_true("D7: decide.mjs reads past_context from stdin into the prompt",
                "readStdin" in _dsrc and "PAST_CONTEXT" in _dsrc)
+    # The TRADER turn must see the memory. The Trader authors Stop Loss, Position
+    # Pct, Strategy Basis and Catalyst, and tick.py binds all four. Its prompt also
+    # demands "a reversal of your prior stance needs a named catalyst" — which it
+    # cannot obey while blind to its prior stance. `${PAST}` reached 5 turns and
+    # skipped this one, so the deciding agent never saw the scorecard.
+    _trader_turn = _dsrc[_dsrc.index("TRADER_LABELS") - 4000:_dsrc.index("TRADER_LABELS")] \
+        if "TRADER_LABELS" in _dsrc else ""
+    check_true("D7: the TRADER turn injects ${PAST} (the deciding agent sees memory)",
+               "${PAST}" in _trader_turn)
+    check("D7: decide.mjs injects ${PAST} at every turn that reads it",
+          _dsrc.count("${PAST}"), 6)
 else:
     check_true("D7: decide.mjs present", False)  # fail loudly if the brain is missing
 
@@ -4957,7 +4979,7 @@ check_true("attribution: every unpriced name carries a stated reason",
 # --- ISOLATION: attribution must not be reachable from the trading path ------
 check_true("attribution: lib/attribution.py is inside the wall roster (zero grants)",
            "lib/attribution.py" in _WALL_ROSTER)
-check("attribution: _WALL_GRANTS still has exactly 5 entries", len(_WALL_GRANTS), 5)
+check("attribution: _WALL_GRANTS still has exactly 7 entries", len(_WALL_GRANTS), 7)
 check_true("attribution: reaches zero ungranted wall items",
            not _wall_violations((_REPO / "lib" / "attribution.py").read_text(encoding="utf-8")))
 

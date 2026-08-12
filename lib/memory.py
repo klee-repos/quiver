@@ -23,6 +23,10 @@ from typing import List, Optional
 # build memory steadily, long enough to be a meaningful directional read.
 HOLDING_DAYS = 5
 
+# How many decision rows the POSITION block reads back over. A query window, not a
+# rule: an open run can start well before the scorecard's own short window.
+POSITION_WINDOW = 60
+
 _BULLISH = {"buy", "overweight"}
 _BEARISH = {"sell", "underweight"}
 
@@ -159,6 +163,63 @@ def build_scorecard(ticker: str, rows: List[dict], recent: int = 6) -> str:
     return "\n".join(lines)
 
 
+def build_position_block(ticker: str, rows: List[dict]) -> str:
+    """Render the CURRENT open run of decisions on ``ticker`` (newest first).
+
+    The model judges the stock but never sees the position, so it cannot weigh a
+    call it already made. This block gives it that, from the ledger only.
+
+    What the ledger does NOT hold, and this never claims:
+      * a fill price. ``orders`` records no fill, and a market buy stores
+        ``quantity`` as NULL. ``decisions.entry_price`` is the model's own SEED,
+        never a paid price.
+      * a share count, so there is no cost basis and no average.
+    So print each dated decision quote separately. Never average them, and never
+    write "you paid" or "entry".
+
+    The run stops at the last row that closed the position, so an older, already
+    exited run never renders as if the bot still holds it.
+
+    PURE over already-fetched rows. Returns '' when no open run exists.
+    """
+    if not rows:
+        return ""
+    run = []
+    for r in rows:                       # newest first
+        intent = str(r.get("intent") or "").strip().lower()
+        if intent in ("sell", "exit"):   # the position closed here; stop
+            break
+        run.append(r)
+    opens = [r for r in run if str(r.get("intent") or "").strip().lower() == "buy"]
+    if not opens:
+        return ""
+
+    oldest = opens[-1]
+    lines = [f"Your CURRENT position in {ticker} (ledger record of your own past "
+             f"decisions — NOT limits, NOT a position snapshot):"]
+    since = str(oldest.get("trade_date") or "").strip()
+    if since:
+        lines.append(f"- Held since your first recorded buy decision on {since}.")
+    bases = [str(r.get("basis") or "").strip() for r in opens if (r.get("basis") or "").strip()]
+    if bases:
+        lines.append(f"- The thesis you bought on: {bases[-1]}.")
+    for r in opens:
+        dp = r.get("decision_price")
+        px = f"{float(dp):.2f}" if dp is not None else "unrecorded"
+        sr = score_return(r)
+        move = f", moved {_fmt_pct(sr)} since" if sr is not None else ""
+        lines.append(f"- {r.get('trade_date')}: quote at decision time {px}"
+                     f" (the fill price is not recorded){move}.")
+    pnl = {r["unrealized_pnl"] for r in run if r.get("unrealized_pnl") is not None}
+    if pnl:
+        lines.append(f"- Open P&L at the position level: ${sum(pnl):+.2f}.")
+    lines.append("These are facts, not an instruction. A decision-time quote is a sunk "
+                 "fact: it does not make the name cheap or expensive today. Judge whether "
+                 "the thesis still holds. A position that has gone your way deserves the "
+                 "same re-examination as one that has not.")
+    return "\n".join(lines)
+
+
 def build_sliced_scorecard(rows: List[dict], key: str, label: str, *, min_n: int = 3) -> str:
     """Cross-sectional 'what KIND of call wins' scorecard: group resolved, position-taking
     decisions by ``row[key]`` (e.g. 'basis' or 'sleeve') and show per-group hit-rate +
@@ -199,4 +260,10 @@ def scorecard(led, ticker: str, limit: int = 8) -> str:
     *memory* the analysis path is allowed to see.
     """
     rows = led.decisions_with_outcomes(ticker, limit=limit)
-    return build_scorecard(ticker, rows)
+    card = build_scorecard(ticker, rows)
+    # The open run can be older than the scorecard window, so read a WIDER window
+    # for it. This is a query window, never a rule: it bounds how far back the
+    # position block looks, and it decides nothing.
+    pos = build_position_block(ticker,
+                               led.decisions_with_outcomes(ticker, limit=POSITION_WINDOW))
+    return "\n\n".join([s for s in (pos, card) if s])
