@@ -168,5 +168,30 @@ ok("an order INSIDE the window and truly absent IS retired",
 ok("the old order stays pending for a later, wider fetch",
    any(r["ref_id"] == "r_old" for r in led.fills_pending()), led.fills_pending())
 
+# --- the window preflight computes must COVER the oldest pending order ---------
+# TICK.md tells the orchestrator to pass `fills_created_at_gte from STEP 1`. If
+# preflight does not emit it, the orchestrator invents one — the exact mistake that
+# retired 139 real orders.
+led = _led()
+_order(led, "r_a", "PLTR", "A")
+_order(led, "r_b", "ANET", "B")
+with led._conn() as _c:
+    _c.execute("UPDATE orders SET submitted_at=? WHERE ref_id=?",
+               ("2026-06-16T10:04:00-04:00", "r_a"))
+    _c.execute("UPDATE orders SET submitted_at=? WHERE ref_id=?",
+               ("2026-08-10T10:00:00-04:00", "r_b"))
+w = tick._fills_window(led)
+ok("the window covers the OLDEST pending order", w <= "2026-06-16", w)
+ok("the window carries a day of margin", w == "2026-06-15", w)
+ok("no pending orders -> today, not a crash", tick._fills_window(_led()) is not None)
+
+from lib.config import load_config as _lc                       # noqa: E402
+_cfg = _lc(str(Path(__file__).resolve().parent.parent / "config.yaml"))
+_pf = tick._run_preflight(_cfg, led)
+ok("preflight EMITS fills_created_at_gte", "fills_created_at_gte" in _pf, sorted(_pf))
+ok("preflight emits the pending count", _pf.get("fills_pending") == 2, _pf.get("fills_pending"))
+ok("the emitted window covers the oldest order",
+   _pf["fills_created_at_gte"] <= "2026-06-16", _pf["fills_created_at_gte"])
+
 print("%d passed, %d failed" % (PASS, len(FAILED)))
 sys.exit(1 if FAILED else 0)

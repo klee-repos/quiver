@@ -371,8 +371,11 @@ yourself: hand-assembled fill data drifted into 15 different shapes over 159 ord
 and stored a price 1.3% off the real fill. Dump the broker answer VERBATIM and let
 Python parse it.
 
+SKIP this whole step when STEP 1 returned `fills_pending: 0` — there is nothing to
+capture. Otherwise use the window STEP 1 computed, VERBATIM. Never invent one.
+
 ```
-get_equity_orders(account_number, created_at_gte: "<fills_created_at_gte from STEP 1>")
+get_equity_orders(account_number, created_at_gte: "<preflight.fills_created_at_gte>")
 ```
 Write the response EXACTLY as returned to `state/tmp/fills.json`, and add the SAME
 `created_at_gte` you passed to the broker as a top-level key in that file:
@@ -391,7 +394,9 @@ Do NOT pass a `state` filter. The field takes ONE value, so `state:"filled"` can
 return a `partially_filled`-then-`cancelled` order, which is still a real fill.
 Fetch the window and let Python classify.
 
-Best-effort: on any error log `FILLS_SKIPPED <error>` and continue. A pending fill
+Best-effort, ALWAYS. This step never fails a tick: on ANY error — a broker error,
+a missing file, a non-zero exit — log `FILLS_SKIPPED <error>` and go straight to
+STEP 7. It records history; it never places, cancels or changes an order. A pending fill
 is captured on the next tick — Python holds the row open until the broker reports a
 terminal state, so a partial fill never stores a wrong share count.
 

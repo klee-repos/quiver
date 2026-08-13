@@ -145,6 +145,30 @@ def cmd_preflight(_args) -> dict:
     return _run_preflight(cfg, led)
 
 
+def _fills_window(led) -> str:
+    """The `created_at_gte` that covers EVERY order still missing its real fill.
+
+    Derived from the OLDEST pending order, never guessed. A window narrower than
+    the pending set makes the broker answer silent for orders it was never asked
+    about, and a live run then retired 139 real orders as `not_found`.
+
+    `submitted_at` carries an ET offset and the broker reads a naive value as UTC,
+    so convert rather than pass the raw string. Returns a date (YYYY-MM-DD); one
+    extra day of margin costs nothing and a short window loses fills.
+    """
+    pending = led.fills_pending()
+    if not pending:
+        return market.trading_day_et()
+    oldest = min(str(r.get("submitted_at") or "") for r in pending if r.get("submitted_at"))
+    try:
+        dt = datetime.fromisoformat(oldest)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return (dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        return market.trading_day_et()
+
+
 def _run_preflight(cfg, led) -> dict:
     day = market.trading_day_et()
     now = market.now_et().isoformat()
@@ -169,6 +193,11 @@ def _run_preflight(cfg, led) -> dict:
         "pending": [],
         "pending_outcomes": pending_outcomes,
         "unfinalized": led.unfinalized_orders(day),
+        # STEP 6c: how many orders still need their REAL fill, and the window that
+        # covers all of them. Python computes the window; the orchestrator passes it
+        # through verbatim and never invents one.
+        "fills_pending": len(led.fills_pending()),
+        "fills_created_at_gte": _fills_window(led),
         "risk": {
             # No fixed per-trade / daily-deploy dollar cap: both are CALCULATED live at plan time
             # (per_name_max_pct% of deployable equity / deployable equity) — nothing to echo here.
