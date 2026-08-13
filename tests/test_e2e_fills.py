@@ -130,5 +130,43 @@ led.record_fill("r_aud", avg_price=1.0, quantity=2.0, fees=0.0,
                 fill_state="filled", now_iso="t")
 ok("result_json survives the capture", led.get_order("r_aud")["result_json"] == "{}")
 
+# --- REGRESSION (live run, 2026-08-13): a narrow window must not retire old orders
+# The first live run passed a window starting 2026-08-05 against a pending set
+# reaching back to 2026-06-16. Every older order was absent from the response and
+# was marked `not_found`, which is TERMINAL — 139 real orders were retired forever.
+import json as _json
+led = _led()
+_order(led, "r_old", "PLTR", "OLD1")
+_order(led, "r_new", "ANET", "NEW1")
+with led._conn() as _c:
+    _c.execute("UPDATE orders SET submitted_at=? WHERE ref_id=?",
+               ("2026-06-16T10:00:00-04:00", "r_old"))
+    _c.execute("UPDATE orders SET submitted_at=? WHERE ref_id=?",
+               ("2026-08-10T10:00:00-04:00", "r_new"))
+
+_inp = Path(tempfile.mkdtemp()) / "fills.json"
+_inp.write_text(_json.dumps({"created_at_gte": "2026-08-05", "orders": []}), encoding="utf-8")
+
+
+class _A:
+    input = str(_inp)
+
+
+import lib.config as _cfgmod                                    # noqa: E402
+_orig = tick._cfg_and_ledger
+tick._cfg_and_ledger = lambda: (_orig()[0], led)
+try:
+    out = tick.cmd_fills(_A())
+finally:
+    tick._cfg_and_ledger = _orig
+
+ok("an order OLDER than the window is not retired",
+   led.get_order("r_old")["fill_state"] is None, led.get_order("r_old")["fill_state"])
+ok("it is reported as outside_window", out.get("outside_window") == 1, out)
+ok("an order INSIDE the window and truly absent IS retired",
+   led.get_order("r_new")["fill_state"] == "not_found", led.get_order("r_new")["fill_state"])
+ok("the old order stays pending for a later, wider fetch",
+   any(r["ref_id"] == "r_old" for r in led.fills_pending()), led.fills_pending())
+
 print("%d passed, %d failed" % (PASS, len(FAILED)))
 sys.exit(1 if FAILED else 0)

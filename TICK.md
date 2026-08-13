@@ -374,7 +374,16 @@ Python parse it.
 ```
 get_equity_orders(account_number, created_at_gte: "<fills_created_at_gte from STEP 1>")
 ```
-Write the response EXACTLY as returned to `state/tmp/fills.json`, then run:
+Write the response EXACTLY as returned to `state/tmp/fills.json`, and add the SAME
+`created_at_gte` you passed to the broker as a top-level key in that file:
+```json
+{"created_at_gte": "<the value you used>", "orders": [ ...verbatim... ]}
+```
+Python needs the window to tell "the broker has no such order" from "I did not ask for
+that order". Without it, every order older than the window is retired as `not_found`
+and never captured — a live run did that to 139 real orders.
+
+Then run:
 ```
 ~/dev/quiver/.venv/bin/python tick.py fills --input state/tmp/fills.json
 ```

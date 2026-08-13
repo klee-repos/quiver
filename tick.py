@@ -3604,13 +3604,23 @@ def cmd_fills(args) -> dict:
     d = _load_input(args)
     orders_in = d.get("orders") or []
     by_id = {str(o.get("id") or ""): o for o in orders_in if o.get("id")}
+    # The window the orchestrator actually asked the broker for. An order older
+    # than this window is ABSENT because it was not requested, not because the
+    # broker forgot it. Marking that `not_found` retires it forever — a live run
+    # did exactly that to 139 real orders. Only names INSIDE the window may be
+    # marked missing; an older one stays pending for a later, wider fetch.
+    window = str(d.get("created_at_gte") or "").strip()
 
     pending = led.fills_pending()
-    captured, still_open, missing = [], [], []
+    captured, still_open, missing, outside = [], [], [], []
     for row in pending:
         bid = str(row.get("broker_order_id") or "")
         o = by_id.get(bid)
         if o is None:
+            submitted = str(row.get("submitted_at") or "")
+            if window and submitted and submitted[:10] < window[:10]:
+                outside.append(row["ticker"])
+                continue
             led.record_fill(row["ref_id"], avg_price=None, quantity=None, fees=None,
                             fill_state="not_found", now_iso=now_iso)
             missing.append(row["ticker"])
@@ -3624,7 +3634,8 @@ def cmd_fills(args) -> dict:
         else:
             still_open.append({"ticker": row["ticker"], "state": f["fill_state"]})
     return {"ok": True, "pending_in": len(pending), "captured": captured,
-            "still_open": still_open, "not_found": missing}
+            "still_open": still_open, "not_found": missing,
+            "outside_window": len(outside)}
 
 
 def cmd_prune(_args) -> dict:
