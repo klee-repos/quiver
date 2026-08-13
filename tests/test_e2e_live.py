@@ -94,6 +94,17 @@ def main() -> int:
        and "NAMED new catalyst" in ctx.full)
     ok("memory: scorecard injected (prior calls + hit-rate)",
        f"prior calls on {ticker}" in ctx.full and "hit-rate" in ctx.full)
+    # The OPEN POSITION block. The brain judged the stock and never saw the position
+    # it already held, so it could not weigh a call it had already made. The seed
+    # above is two BUYs with no closing sell, so the block MUST render.
+    ok("memory: open-position block is injected",
+       f"CURRENT position in {ticker}" in ctx.full)
+    ok("memory: it carries the decision-time quotes, each dated",
+       "120.00" in ctx.full and "127.00" in ctx.full and "2026-06-05" in ctx.full)
+    ok("memory: it never claims a paid price the ledger does not hold",
+       not any(w in ctx.full.lower() for w in ("you paid", "cost basis", "average price")))
+    ok("memory: the framing stays symmetric (no disposition-effect nudge)",
+       "same re-examination" in ctx.full and "not an instruction" in ctx.full)
 
     # --- (ii) REAL analyze.py: a live GLM 5.2 multi-agent run on the seeded memory ---
     print(f"\n[running REAL analyze.py {ticker} — a few minutes; reading the seeded memory]")
