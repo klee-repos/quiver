@@ -364,6 +364,28 @@ This grounds the memory scorecard in real outcomes. It never affects trading.
 tickers + `portfolio.md` (the JSON carries `memory_update`, or `memory_update_error`
 if a refresh hiccuped — either way the tick continues).
 
+## STEP 6c — Capture the REAL fill (best-effort)
+
+The ledger must record what the bot actually PAID. Do not transcribe any number
+yourself: hand-assembled fill data drifted into 15 different shapes over 159 orders
+and stored a price 1.3% off the real fill. Dump the broker answer VERBATIM and let
+Python parse it.
+
+```
+get_equity_orders(account_number, created_at_gte: "<fills_created_at_gte from STEP 1>")
+```
+Write the response EXACTLY as returned to `state/tmp/fills.json`, then run:
+```
+~/dev/quiver/.venv/bin/python tick.py fills --input state/tmp/fills.json
+```
+Do NOT pass a `state` filter. The field takes ONE value, so `state:"filled"` cannot
+return a `partially_filled`-then-`cancelled` order, which is still a real fill.
+Fetch the window and let Python classify.
+
+Best-effort: on any error log `FILLS_SKIPPED <error>` and continue. A pending fill
+is captured on the next tick — Python holds the row open until the broker reports a
+terminal state, so a partial fill never stores a wrong share count.
+
 ## STEP 7 — Close out
 
 7a. Append a one-line summary to `logs/orchestrator.log`:

@@ -58,7 +58,17 @@ CREATE TABLE IF NOT EXISTS orders (
     limit_price     REAL,
     stop_price      REAL,
     parent_ref_id   TEXT,                        -- links a protective stop to its entry
-    state           TEXT DEFAULT 'reserved'      -- reserved|filled|partial|unfilled|cancelled|stop_placed|triggered
+    state           TEXT DEFAULT 'reserved',     -- reserved|filled|partial|unfilled|cancelled|stop_placed|triggered
+    -- The REAL fill, read back from the broker by broker_order_id. `result_json` is
+    -- assembled by the orchestrator at PLACE time, so it is inconsistent (15 distinct
+    -- key shapes over 159 orders) and wrong as a price: BOT 6a79ec24 stored 27.59
+    -- against an actual average_price of 27.9499. Python parses the broker answer here.
+    -- `fill_quantity` is the ONLY place a dollar-based market buy's share count exists.
+    fill_avg_price  REAL,
+    fill_quantity   REAL,
+    fill_fees       REAL,
+    fill_state      TEXT,                        -- the BROKER's state, never our lifecycle `state`
+    fill_captured_at TEXT
 );
 CREATE TABLE IF NOT EXISTS notifications (
     trade_date   TEXT NOT NULL,
@@ -402,6 +412,11 @@ class Ledger:
             "stop_price": "REAL",
             "parent_ref_id": "TEXT",
             "state": "TEXT DEFAULT 'reserved'",
+            "fill_avg_price": "REAL",
+            "fill_quantity": "REAL",
+            "fill_fees": "REAL",
+            "fill_state": "TEXT",
+            "fill_captured_at": "TEXT",
         }
         for col, decl in additions.items():
             if col not in existing:
@@ -1012,6 +1027,38 @@ class Ledger:
                 "SELECT * FROM orders WHERE trade_date=? AND finalized=0 "
                 "AND COALESCE(order_kind,'') != 'protective_stop'", (trade_date,)
             ).fetchall()]
+
+    # --- real fills, read back from the broker -------------------------------
+    # A fill is retired on the broker's STATE, never on a price. A partially_filled
+    # order carries a REAL partial average_price, so a price key retires the row
+    # mid-fill and freezes the share count. Live proof: BSOL order
+    # 6a75fa00-9d7d-40d3-84af-8620e0943cc2 has two executions summing 1.697570; a
+    # capture after the first stores 1.000000, which is 59% of the truth.
+    TERMINAL_FILL_STATES = ("filled", "cancelled", "rejected", "failed",
+                            "voided", "not_found")
+
+    def fills_pending(self, limit: int = 500):
+        """Orders whose real fill is not captured yet, oldest first."""
+        marks = ",".join("?" for _ in self.TERMINAL_FILL_STATES)
+        with self._conn() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM orders WHERE broker_order_id IS NOT NULL "
+                f"AND (fill_state IS NULL OR fill_state NOT IN ({marks})) "
+                "ORDER BY submitted_at LIMIT ?",
+                (*self.TERMINAL_FILL_STATES, limit)).fetchall()]
+
+    def record_fill(self, ref_id: str, *, avg_price, quantity, fees,
+                    fill_state: str, now_iso: str) -> None:
+        """Write the broker's answer for one order.
+
+        Always writes ``fill_state`` and ``fill_captured_at``, even when the broker
+        returned no numbers. A row with no state would be re-fetched forever.
+        """
+        with self._conn() as c:
+            c.execute(
+                "UPDATE orders SET fill_avg_price=?, fill_quantity=?, fill_fees=?, "
+                "fill_state=?, fill_captured_at=? WHERE ref_id=?",
+                (avg_price, quantity, fees, str(fill_state or ""), now_iso, ref_id))
 
     # --- email-digest dedup ---------------------------------------------------
     # Email is best-effort: we mark a digest as sent AFTER the orchestrator

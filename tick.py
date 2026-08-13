@@ -3568,6 +3568,65 @@ def _write_event_risk(payload: dict) -> None:
         pass
 
 
+def _parse_broker_fill(o: dict) -> dict:
+    """Pull the REAL fill out of one broker order object. Pure.
+
+    A zero price is not a fill, so it becomes None rather than 0.0 — the same
+    convention lib/memory.py uses. Fees keep 0.0, which is a real value.
+    """
+    avg = _to_float(o.get("average_price"))
+    qty = _to_float(o.get("cumulative_quantity"))
+    if qty is None:
+        qty = _to_float(o.get("quantity"))
+    fees = _to_float(o.get("fees"))
+    return {
+        "avg_price": avg if (avg and avg > 0) else None,
+        "quantity": qty if (qty and qty > 0) else None,
+        "fees": fees if fees is not None else 0.0,
+        "fill_state": str(o.get("state") or ""),
+    }
+
+
+def cmd_fills(args) -> dict:
+    """Capture the REAL fill for every pending order (STEP 6c).
+
+    The orchestrator dumps `get_equity_orders` VERBATIM; Python matches on
+    `broker_order_id` and parses. The orchestrator transcribes no number — that
+    is what produced 15 different `result_json` shapes and a price 1.3% off.
+
+    Best-effort: an order the broker no longer returns is marked `not_found` so it
+    leaves the pending set instead of being re-fetched forever. A non-terminal
+    state (unconfirmed, partially_filled) holds the row open and self-heals on the
+    next tick, so a partial fill never freezes a wrong share count.
+    """
+    cfg, led = _cfg_and_ledger()
+    now_iso = market.now_et().isoformat()
+    d = _load_input(args)
+    orders_in = d.get("orders") or []
+    by_id = {str(o.get("id") or ""): o for o in orders_in if o.get("id")}
+
+    pending = led.fills_pending()
+    captured, still_open, missing = [], [], []
+    for row in pending:
+        bid = str(row.get("broker_order_id") or "")
+        o = by_id.get(bid)
+        if o is None:
+            led.record_fill(row["ref_id"], avg_price=None, quantity=None, fees=None,
+                            fill_state="not_found", now_iso=now_iso)
+            missing.append(row["ticker"])
+            continue
+        f = _parse_broker_fill(o)
+        led.record_fill(row["ref_id"], avg_price=f["avg_price"], quantity=f["quantity"],
+                        fees=f["fees"], fill_state=f["fill_state"], now_iso=now_iso)
+        if f["fill_state"] in led.TERMINAL_FILL_STATES:
+            captured.append({"ticker": row["ticker"], "state": f["fill_state"],
+                             "avg_price": f["avg_price"], "quantity": f["quantity"]})
+        else:
+            still_open.append({"ticker": row["ticker"], "state": f["fill_state"]})
+    return {"ok": True, "pending_in": len(pending), "captured": captured,
+            "still_open": still_open, "not_found": missing}
+
+
 def cmd_prune(_args) -> dict:
     cfg = load_config(CONFIG_PATH)
     arch = storage.get_archiver(cfg.storage)
@@ -4041,6 +4100,8 @@ def main(argv) -> int:
     p_ua.add_argument("--id", required=True)
     p_ua.add_argument("--approve", action="store_true")
     sub.add_parser("event-risk")
+    p_fills = sub.add_parser("fills")
+    p_fills.add_argument("--input", required=True)
     sub.add_parser("prune")
     sub.add_parser("auth-stop")
     p_ms = sub.add_parser("memory-show")
@@ -4123,6 +4184,8 @@ def main(argv) -> int:
             out = cmd_universe_apply(args)
         elif args.cmd == "event-risk":
             out = cmd_event_risk(args)
+        elif args.cmd == "fills":
+            out = cmd_fills(args)
         elif args.cmd == "prune":
             out = cmd_prune(args)
         elif args.cmd == "auth-stop":
