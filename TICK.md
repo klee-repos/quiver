@@ -100,7 +100,11 @@ Call the Robinhood MCP with the `account_number` from preflight:
      to re-authenticate Robinhood in the on-box browser — trading auto-resumes next wake
      (see docs/DEPLOY.md). Robinhood's OAuth expires ~every 3.8 days, no headless refresh.
 2. `get_equity_positions(account_number)` → for each held ticker record
-   `{quantity, market_value}`.
+   `{quantity, market_value, average_buy_price}`. Copy `average_buy_price` VERBATIM
+   (a string, e.g. `"182.730000"`); omit the key when the broker omits it. Python
+   snapshots it into the ledger so the brain can be told what it actually PAID. The
+   ledger cannot derive that figure — averaging our own buy fills ignores sells and
+   drifts (SPCX by 7.7%).
 3. `get_equity_quotes(account_number, [<pending tickers> + <pending_outcomes tickers>
    + <every currently-held position ticker>])`
    → record each ticker's latest price as `{TICKER: last_price}`. This is the single
@@ -222,7 +226,7 @@ Write a file `state/tmp/plan_input.json` containing:
   "equity": <from get_portfolio>,
   "buying_power": <from get_portfolio>,
   "now_iso": "<preflight now_iso>",
-  "positions": { "AAPL": {"quantity": 3, "market_value": 600.0}, ... },
+  "positions": { "AAPL": {"quantity": 3, "market_value": 600.0, "average_buy_price": "182.730000"}, ... },
   "quotes": { "AAPL": 196.4, ... },
   "analyses": [ <each analyze.py JSON from STEP 3> ],
   "target_weights": <STEP 3b construct output; OMIT entirely on the classic path>,

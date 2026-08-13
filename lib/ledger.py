@@ -277,6 +277,16 @@ CREATE TABLE IF NOT EXISTS strategy_change_log (
     proof_json  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_strategy_change_goal ON strategy_change_log(goal_id, changed_at);
+-- The broker's OWN average cost per held name, snapshotted by the tick glue from
+-- the STEP 2 positions payload. The ledger cannot DERIVE this: a naive average of
+-- our buy fills ignores sells and drifts (SPCX by 7.7%). Recording the broker
+-- figure keeps lib/memory on LEDGER data while still telling the brain the truth.
+CREATE TABLE IF NOT EXISTS position_basis (
+    ticker           TEXT PRIMARY KEY,
+    avg_buy_price    REAL NOT NULL,
+    quantity         REAL,
+    as_of            TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS run_lock (
     id          INTEGER PRIMARY KEY CHECK (id = 1),      -- single-row mutex
     holder      TEXT NOT NULL,
@@ -1059,6 +1069,36 @@ class Ledger:
                 "UPDATE orders SET fill_avg_price=?, fill_quantity=?, fill_fees=?, "
                 "fill_state=?, fill_captured_at=? WHERE ref_id=?",
                 (avg_price, quantity, fees, str(fill_state or ""), now_iso, ref_id))
+
+    # --- broker cost basis, snapshotted by the tick glue ----------------------
+
+    def upsert_position_basis(self, ticker: str, *, avg_buy_price: float,
+                              quantity, as_of: str) -> None:
+        """Record the broker's average cost for one held name."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO position_basis (ticker, avg_buy_price, quantity, as_of) "
+                "VALUES (?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
+                "avg_buy_price=excluded.avg_buy_price, quantity=excluded.quantity, "
+                "as_of=excluded.as_of",
+                (str(ticker).upper(), float(avg_buy_price), quantity, as_of))
+
+    def get_position_basis(self, ticker: str):
+        """The recorded broker cost for ``ticker``, or None."""
+        with self._conn() as c:
+            r = c.execute("SELECT * FROM position_basis WHERE ticker=?",
+                          (str(ticker).upper(),)).fetchone()
+            return dict(r) if r else None
+
+    def clear_position_basis(self, keep_tickers) -> None:
+        """Drop rows for names no longer held, so a closed name never reads as open."""
+        keep = [str(t).upper() for t in (keep_tickers or [])]
+        with self._conn() as c:
+            if keep:
+                marks = ",".join("?" for _ in keep)
+                c.execute(f"DELETE FROM position_basis WHERE ticker NOT IN ({marks})", keep)
+            else:
+                c.execute("DELETE FROM position_basis")
 
     # --- email-digest dedup ---------------------------------------------------
     # Email is best-effort: we mark a digest as sent AFTER the orchestrator

@@ -163,7 +163,7 @@ def build_scorecard(ticker: str, rows: List[dict], recent: int = 6) -> str:
     return "\n".join(lines)
 
 
-def build_position_block(ticker: str, rows: List[dict]) -> str:
+def build_position_block(ticker: str, rows: List[dict], basis: Optional[dict] = None) -> str:
     """Render the CURRENT open run of decisions on ``ticker`` (newest first).
 
     The model judges the stock but never sees the position, so it cannot weigh a
@@ -203,13 +203,22 @@ def build_position_block(ticker: str, rows: List[dict]) -> str:
     bases = [str(r.get("basis") or "").strip() for r in opens if (r.get("basis") or "").strip()]
     if bases:
         lines.append(f"- The thesis you bought on: {bases[-1]}.")
+    # The broker's own average cost, snapshotted into the ledger by the tick glue.
+    # This is what the bot actually PAID, net of any sells.
+    cost = None
+    try:
+        cost = float((basis or {}).get("avg_buy_price")) if basis else None
+    except (TypeError, ValueError):
+        cost = None
+    if cost and cost > 0:
+        lines.append(f"- Your average cost is {cost:.2f} per share.")
     for r in opens:
         dp = r.get("decision_price")
         px = f"{float(dp):.2f}" if dp is not None else "unrecorded"
         sr = score_return(r)
         move = f", moved {_fmt_pct(sr)} since" if sr is not None else ""
-        lines.append(f"- {r.get('trade_date')}: quote at decision time {px}"
-                     f" (the fill price is not recorded){move}.")
+        tail = "" if cost else " (the fill price is not recorded)"
+        lines.append(f"- {r.get('trade_date')}: quote at decision time {px}{tail}{move}.")
     pnl = {r["unrealized_pnl"] for r in run if r.get("unrealized_pnl") is not None}
     if pnl:
         lines.append(f"- Open P&L at the position level: ${sum(pnl):+.2f}.")
@@ -264,6 +273,7 @@ def scorecard(led, ticker: str, limit: int = 8) -> str:
     # The open run can be older than the scorecard window, so read a WIDER window
     # for it. This is a query window, never a rule: it bounds how far back the
     # position block looks, and it decides nothing.
-    pos = build_position_block(ticker,
-                               led.decisions_with_outcomes(ticker, limit=POSITION_WINDOW))
+    pos = build_position_block(
+        ticker, led.decisions_with_outcomes(ticker, limit=POSITION_WINDOW),
+        basis=led.get_position_basis(ticker))
     return "\n\n".join([s for s in (pos, card) if s])

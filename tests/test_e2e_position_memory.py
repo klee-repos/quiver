@@ -149,5 +149,30 @@ ok("S4b the real decide.mjs injects ${PAST} into the Trader turn", "${PAST}" in 
 ok("S4b every turn that reads memory gets it (6 sites)", _txt.count("${PAST}") == 6,
    _txt.count("${PAST}"))
 
+# --- the REAL cost basis, recorded from the broker by the tick glue -----------
+# The ledger cannot derive this: averaging our buy fills ignores sells (SPCX drifts
+# 7.7% from the broker figure). The glue snapshots the broker value; memory reads it
+# from the LEDGER, so the analysis path still never touches the broker.
+with tempfile.TemporaryDirectory() as d:
+    led = _seed(str(Path(d) / "l.db"))
+    rows = led.decisions_with_outcomes("ANET", limit=memory.POSITION_WINDOW)
+    ok("without a recorded basis it says the fill price is unrecorded",
+       "fill price is not recorded" in memory.build_position_block("ANET", rows))
+
+    led.upsert_position_basis("ANET", avg_buy_price=182.73, quantity=0.577339,
+                              as_of="2026-08-13T10:00:00-04:00")
+    blk = memory.build_position_block("ANET", rows, basis=led.get_position_basis("ANET"))
+    ok("with a recorded basis it states the average cost",
+       "average cost is 182.73 per share" in blk, blk)
+    ok("and it drops the unrecorded-fill caveat",
+       "fill price is not recorded" not in blk, blk)
+
+    ctx = reflect_memory.build_past_context({}, led, "ANET", compact=False)
+    ok("the basis reaches the injected context", "average cost is 182.73" in ctx, ctx[:300])
+
+    # a name no longer held must not read as open
+    led.clear_position_basis(["BOT"])
+    ok("a closed name drops its basis", led.get_position_basis("ANET") is None)
+
 print("%d passed, %d failed" % (PASS, len(FAILED)))
 sys.exit(1 if FAILED else 0)

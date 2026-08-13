@@ -333,7 +333,8 @@ def build_past_context(bundle: dict, led, ticker: str, *, compact: bool = False)
     # Its own try/except, so a hiccup can never shrink the proven scorecard below.
     try:
         pos = memory.build_position_block(
-            ticker, led.decisions_with_outcomes(ticker, limit=memory.POSITION_WINDOW))
+            ticker, led.decisions_with_outcomes(ticker, limit=memory.POSITION_WINDOW),
+            basis=led.get_position_basis(ticker))
         if pos:
             parts.append(pos)
     except Exception:  # noqa: BLE001

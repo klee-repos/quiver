@@ -443,6 +443,23 @@ def _run_plan(cfg, led, data) -> dict:
     # via allocate._DEFAULTS, so a strategy.yaml predating these knobs is BYTE-IDENTICAL. The
     # glue reads the knobs and only passes a BINDING value (risk_cap not None / exposure_scalar
     # < 1.0 / an R:R skip) when the operator opted in — the pure fns are otherwise no-ops.
+    # Snapshot the broker's OWN average cost for every held name. lib/memory reads
+    # it from the LEDGER, so the analysis side never touches the broker. The ledger
+    # cannot derive this: averaging our buy fills ignores sells and drifts (SPCX by
+    # 7.7%). A name no longer held is dropped, so a closed position never reads open.
+    try:
+        _held = []
+        for _tk, _pos in (positions or {}).items():
+            _b = _to_float((_pos or {}).get("average_buy_price"))
+            _q = _to_float((_pos or {}).get("quantity"))
+            if _b and _b > 0:
+                led.upsert_position_basis(str(_tk).upper(), avg_buy_price=_b,
+                                          quantity=_q, as_of=now_iso)
+                _held.append(str(_tk).upper())
+        led.clear_position_basis(_held)
+    except Exception:  # noqa: BLE001  — observability only, never blocks a tick
+        pass
+
     _rp = (getattr(cfg.strategy, "risk_policy", None) or {}) if cfg.strategy is not None else {}
 
     def _pol(key):
