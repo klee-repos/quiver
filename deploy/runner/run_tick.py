@@ -404,6 +404,19 @@ def main() -> int:
                 "--dangerously-skip-permissions",  # unattended; the order guard is the real gate
                 "Follow ./TICK.md exactly for today's tick.",
             ]
+            # Record WHICH binary is about to trade. CLAUDE_BIN defaults to a bare
+            # "claude", which systemd resolves on ITS path — never ~/.local/bin. On
+            # 2026-08-13 that silently ran a months-old build while the operator
+            # updated a different install, and nothing in any log said so. Print the
+            # path + version every tick so the drift is visible on line one.
+            try:
+                _v = subprocess.run([CLAUDE_BIN, "--version"], capture_output=True,
+                                    text=True, timeout=30)
+                _emit({"stage": "orchestrator_bin", "path": CLAUDE_BIN,
+                       "version": (_v.stdout or _v.stderr).strip()[:40]})
+            except Exception as e:  # noqa: BLE001 — observability only; never block a tick
+                _emit({"stage": "orchestrator_bin", "path": CLAUDE_BIN,
+                       "error": f"{type(e).__name__}: {e}"})
             # Snapshot how much the ledger has recorded for today BEFORE the orchestrator
             # runs, so the silent-noop guard below can measure a RUN-SCOPED delta (correct
             # even in intraday mode, where earlier ticks already wrote rows). Best-effort:

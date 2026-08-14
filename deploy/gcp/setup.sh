@@ -34,6 +34,11 @@ _ensure_node24() {
 _ensure_node24
 
 echo "[3/9] claude CLI + EVE brain deps"
+# Root-global install. This is only the FALLBACK on PATH — the service runs the
+# quiver-owned copy installed at [5/9] and pinned via CLAUDE_BIN. Both are kept
+# current by quiver-claude-update.timer, because a STALE fallback is invisible:
+# on 2026-08-13 the service silently ran /usr/bin/claude 2.1.177 while the
+# operator's shell ran a newer build, so updating by hand fixed nothing.
 npm i -g @anthropic-ai/claude-code
 # The EVE brain (quiver_eve/) is committed; install its deps at provision time.
 # node_modules/ is gitignored. npm ci = reproducible from the lockfile once it exists;
@@ -55,6 +60,15 @@ python3 -m venv "$QUIVER_HOME/.venv"
 "$QUIVER_HOME/.venv/bin/pip" install -q -r "$QUIVER_HOME/requirements.lock.txt"
 "$QUIVER_HOME/.venv/bin/pip" install -q -e "$QUIVER_HOME" --no-deps
 chown -R "$QUIVER_USER:$QUIVER_USER" "$QUIVER_HOME" /var/log/quiver
+
+# The SERVICE's own claude CLI, in a quiver-OWNED npm prefix.
+# npm's default global prefix is /usr (root), and the service user has no sudo,
+# so `npm -g` there can never self-update. /opt/quiver IS writable by the
+# service: ProtectSystem=full locks only /usr, /boot and /efi. Keeping this
+# under /opt also dodges ProtectHome=read-only, which blocks ~/.local.
+sudo -u "$QUIVER_USER" env HOME="$(getent passwd "$QUIVER_USER" | cut -d: -f6)" \
+  npm_config_cache="$QUIVER_HOME/state/.npm-cache" \
+  npm install -g --prefix "$QUIVER_HOME/npm-global" @anthropic-ai/claude-code@latest
 
 echo "[6/9] secrets: Secret Manager -> /etc/quiver/quiver.env (instance SA via metadata token)"
 _sm_token() { curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" | jq -r .access_token; }
@@ -131,6 +145,12 @@ install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/state/chat"
   echo "TELEGRAM_BOT_TOKEN=$(fetch_opt TELEGRAM_BOT_TOKEN)"
   echo "TELEGRAM_ALLOWED_CHAT_IDS=$(fetch_opt TELEGRAM_ALLOWED_CHAT_IDS)"
   echo "TELEGRAM_ALERT_CHAT_IDS=$(fetch_opt TELEGRAM_ALERT_CHAT_IDS)"  # optional alert-only override
+  # PIN the orchestrator binary. run_tick.py defaults CLAUDE_BIN to a BARE
+  # "claude", which systemd resolves on ITS path — never ~/.local/bin. That split
+  # the box in two on 2026-08-13: the service ran an old /usr/bin/claude while the
+  # operator updated and re-authed a different install, so the fix never landed.
+  # An absolute path removes the ambiguity.
+  echo "CLAUDE_BIN=$QUIVER_HOME/npm-global/bin/claude"
 } > /etc/quiver/quiver.env
 chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
@@ -173,9 +193,15 @@ cp "$QUIVER_HOME/deploy/quiver.timer" /etc/systemd/system/quiver.timer
 cp "$QUIVER_HOME/deploy/quiver-intel.service" /etc/systemd/system/quiver-intel.service
 cp "$QUIVER_HOME/deploy/quiver-intel.timer" /etc/systemd/system/quiver-intel.timer
 cp "$QUIVER_HOME/deploy/quiver-chat.service" /etc/systemd/system/quiver-chat.service
+cp "$QUIVER_HOME/deploy/quiver-claude-update.service" /etc/systemd/system/quiver-claude-update.service
+cp "$QUIVER_HOME/deploy/quiver-claude-update.timer" /etc/systemd/system/quiver-claude-update.timer
+install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
+touch /var/log/quiver/claude-update.log
+chown "$QUIVER_USER:$QUIVER_USER" /var/log/quiver/claude-update.log
 systemctl daemon-reload
 systemctl enable --now quiver.timer
 systemctl enable --now quiver-intel.timer
+systemctl enable --now quiver-claude-update.timer
 # The read-only Telegram chat bridge is opt-in: only start it if a bot token is configured.
 if grep -q '^TELEGRAM_BOT_TOKEN=.\+' /etc/quiver/quiver.env; then
   systemctl enable --now quiver-chat.service && echo "  chat bridge: enabled"

@@ -1,0 +1,17 @@
+[Unit]
+Description=Quiver — keep every Claude Code install current
+After=network-online.target
+Wants=network-online.target
+# Never update while a tick holds the broker. Separation is by SCHEDULE:
+# the trading timer fires 13:40–21:40 UTC, this runs at 05:00 UTC.
+# Do NOT use Conflicts= here — it would make systemd KILL a running tick,
+# possibly between place_equity_order and commit. After= only orders the
+# two if they ever coincide; it never stops a tick.
+After=quiver.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/quiver-claude-update
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal

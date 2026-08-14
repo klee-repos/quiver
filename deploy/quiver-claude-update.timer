@@ -1,0 +1,12 @@
+[Unit]
+Description=Quiver — daily Claude Code update (well before the market opens)
+
+[Timer]
+# 05:00 UTC: after the trading day ends (21:40 UTC) and before both the
+# intel timer (06:00 UTC) and the first tick (13:40 UTC).
+OnCalendar=*-*-* 05:00:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
