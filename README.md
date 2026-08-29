@@ -293,3 +293,24 @@ longer used by the live alert path.)
 <sub>The EVE brain (`quiver_eve/`) runs on the open-source `eve` agent framework + the AI SDK (Apache-2.0) — installed under `quiver_eve/node_modules/`.</sub>
 
 </div>
+
+## License
+
+**Free for noncommercial use. Commercial use must be purchased.**
+
+`quiver` is licensed under the
+[PolyForm Noncommercial License 1.0.0](LICENSE) (SPDX: `PolyForm-Noncommercial-1.0.0`).
+
+| Your use | Cost |
+|---|---|
+| Personal study, hobby project, experiment, amateur work | **Free** |
+| Charity, school, public research body, government body | **Free** |
+| Work for a company or a client | **Buy a license** |
+| A product or service you sell | **Buy a license** |
+| Internal use at a for-profit company | **Buy a license** |
+
+If you pass on a copy of any part of this software, you must keep the
+`Required Notice:` line from [LICENSE](LICENSE) with it.
+
+To buy a commercial license, write to **kevin@kvnlee.com**.
+See [COMMERCIAL.md](COMMERCIAL.md) for terms and the credit requirement.

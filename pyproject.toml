@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,6 +12,8 @@ name = "quiver"
 version = "0.2.5"
 description = "Quiver — an autonomous trading desk that executes a multi-agent LLM signal on Robinhood's agentic trading platform"
 requires-python = ">=3.10"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE", "NOTICE"]
 # Pared to what the kept GLM signal path actually imports. Dropped from
 # upstream: backtrader, redis, parsel, questionary, rich, typer,
 # langchain-anthropic, langchain-google-genai, langchain-experimental
