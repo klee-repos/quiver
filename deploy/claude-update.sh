@@ -26,6 +26,17 @@ as_quiver() { sudo -u quiver env HOME=/home/quiver CLAUDE_CONFIG_DIR="$CFG" \
 
 ver() { "$1" --version 2>/dev/null | awk '{print $1}'; }
 
+# Clear both npm caches on EVERY exit, including the rollback exits below.
+# npm never evicts old tarballs, so each release adds ~200M across the two
+# caches. On 2026-09-24 they filled the 19G root disk and a tick hung with
+# no alert. The installs do not read the cache again after they finish.
+clean_caches() {
+  as_quiver npm cache clean --force >>"$LOG" 2>&1 || log "service npm cache clean FAILED"
+  npm cache clean --force >>"$LOG" 2>&1 || log "root npm cache clean FAILED"
+  log "npm caches cleaned; root disk free: $(df -h / | awk 'NR==2{print $4}')"
+}
+trap clean_caches EXIT
+
 log "=== claude-update start ==="
 BEFORE=$(ver "$SVC_BIN")
 log "service binary before: ${BEFORE:-none}"

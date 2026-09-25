@@ -198,6 +198,11 @@ cp "$QUIVER_HOME/deploy/quiver-claude-update.timer" /etc/systemd/system/quiver-c
 install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
 touch /var/log/quiver/claude-update.log
 chown "$QUIVER_USER:$QUIVER_USER" /var/log/quiver/claude-update.log
+# Cap the journal. The default cap is 10% of the disk (~1.9G here). A full
+# root disk hangs a tick with no alert (2026-09-24).
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=300M\n' >/etc/systemd/journald.conf.d/quiver.conf
+systemctl restart systemd-journald
 systemctl daemon-reload
 systemctl enable --now quiver.timer
 systemctl enable --now quiver-intel.timer
