@@ -222,6 +222,55 @@ def main() -> int:
     check(rt._orchestrator_reason("") is None, "empty stdout -> None")
     check(rt._orchestrator_reason("not json\n{oops\n") is None, "garbage stdout -> None (never raises)")
 
+    # --- run_tick._orchestrator_auth_ok (probe the login BEFORE the slow fan-out) ---
+    # 2026-09-14: the box's Claude Code OAuth session expired. Each tick still ran all 12
+    # analyses (~60 min of real spend) and only THEN hit an orchestrator that failed in
+    # ~200ms. 97 fan-outs burned over 7 trading sessions. The gate checks the cheap thing
+    # first, and stops ONLY on a definite auth failure.
+    class _FakeProc:
+        def __init__(self, out="", err=""):
+            self.stdout, self.stderr = out, err
+
+    def _with_probe(fn):
+        """Swap rt.subprocess.run for fn, call the gate, restore. Returns (ok, detail)."""
+        real = rt.subprocess.run
+        rt.subprocess.run = fn
+        try:
+            return rt._orchestrator_auth_ok(timeout=1)
+        finally:
+            rt.subprocess.run = real
+
+    ok, detail = _with_probe(lambda *a, **k: _FakeProc(out="AUTH_OK\n"))
+    check(ok is True and detail == "ok", "probe replies AUTH_OK -> gate passes")
+
+    expired = ('{"is_error":true,"result":"Failed to authenticate: OAuth session expired '
+               'and could not be refreshed","type":"result"}')
+    ok, detail = _with_probe(lambda *a, **k: _FakeProc(out=expired))
+    check(ok is False, "expired OAuth session -> gate STOPS the tick before the fan-out")
+    check("OAuth session expired" in detail, "auth failure detail names the real cause")
+
+    ok, _ = _with_probe(lambda *a, **k: _FakeProc(out="You've hit your monthly spend limit"))
+    check(ok is False, "spend limit -> gate stops (same output_tokens:0 symptom as OAuth)")
+
+    ok, _ = _with_probe(lambda *a, **k: _FakeProc(err="Error: 401 Unauthorized"))
+    check(ok is False, "401 on stderr -> gate stops (stderr is inspected too)")
+
+    # Fail-SAFE arm: anything that is NOT a definite auth failure must let the tick run.
+    # A false stop would skip a trading session, which is worse than a wasted fan-out.
+    def _boom(*a, **k):
+        raise rt.subprocess.TimeoutExpired(cmd="claude", timeout=1)
+    ok, detail = _with_probe(_boom)
+    check(ok is True and "inconclusive" in detail,
+          "probe times out -> INCONCLUSIVE, tick proceeds (never skip a session on a blip)")
+
+    ok, detail = _with_probe(lambda *a, **k: _FakeProc(out="some unrelated chatter"))
+    check(ok is True and "inconclusive" in detail,
+          "unrecognized output -> inconclusive, tick proceeds")
+
+    ok, detail = _with_probe(lambda *a, **k: _FakeProc(out="oauth  bad\n\ttoken " + "x" * 500))
+    check(ok is False and len(detail) <= 300, "auth detail is capped at 300 chars")
+    check("\n" not in detail and "\t" not in detail, "auth detail collapses to one line")
+
     # ================= PGSWEEP: the orphaned-grandchild token leak =================
     # Placed AFTER the 30 checks above so that even a catastrophic failure here cannot skip
     # them. Every arm goes through _arm() and asserts against REAL kernel process state.

@@ -182,6 +182,43 @@ def _in_tick_error_paged(led, day) -> bool:
         return False
 
 
+# Text that marks a DEFINITE orchestrator login failure. Mirrors the gate in
+# deploy/claude-update.sh, so the updater and the tick agree on what "auth
+# problem" means.
+_AUTH_FAIL_MARKERS = (
+    "oauth", "authenticat", "401", "expired",
+    "spend limit", "usage limit", "invalid api key",
+)
+
+
+def _orchestrator_auth_ok(timeout=120):
+    """Probe the orchestrator's own Anthropic login with one cheap prompt.
+
+    The analysis fan-out costs ~60 minutes of real model spend and runs BEFORE
+    the orchestrator. An expired Claude Code OAuth session fails the
+    orchestrator in ~200ms, so the tick throws every one of those analyses
+    away. That happened on 2026-09-14: the session expired and 97 full
+    fan-outs burned over 7 trading sessions before a human noticed. Probe the
+    login first and stop early.
+
+    Return ``(ok, detail)``. Only a DEFINITE auth failure returns False. Any
+    other failure — timeout, crash, network — returns True, so a transient
+    blip never skips a tick that would otherwise trade.
+    """
+    try:
+        proc = subprocess.run([CLAUDE_BIN, "-p", "reply with exactly: AUTH_OK"],
+                              capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # noqa: BLE001 — an unusable probe must not stop a tick
+        return True, f"probe inconclusive: {type(e).__name__}: {e}"
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if "AUTH_OK" in out:
+        return True, "ok"
+    low = out.lower()
+    if any(m in low for m in _AUTH_FAIL_MARKERS):
+        return False, " ".join(out.split())[:300]
+    return True, "probe inconclusive: " + " ".join(out.split())[:200]
+
+
 def _orchestrator_reason(stdout):
     """Pull the orchestrator's human-readable closing message out of its stream-json stdout.
 
@@ -304,6 +341,21 @@ def main() -> int:
             if not pre.get("proceed"):
                 _emit({"stage": "preflight", "proceed": False, "reason": pre.get("reason", "")})
                 return 0  # cheap no-op wake — nothing to do (NOT a failure; never page)
+
+            # --- STEP 2b: orchestrator auth gate -------------------------------------
+            # Prove the orchestrator can log in BEFORE the slow fan-out spends money.
+            # The fan-out below runs for ~60 minutes; the orchestrator that consumes it
+            # fails in ~200ms when its OAuth session is dead. Check the cheap thing
+            # first. Only a definite auth failure stops the tick — see
+            # _orchestrator_auth_ok. Page under the canonical "orchestrator" stage, so
+            # this dedups against the existing orchestrator alert instead of paging twice.
+            auth_ok, auth_detail = _orchestrator_auth_ok()
+            if not auth_ok:
+                _emit({"stage": "orchestrator_auth", "ok": False, "detail": auth_detail})
+                _maybe_alert(led, kind="error", stage="orchestrator", day=day,
+                             now_iso=now_iso, event_detail=auth_detail)
+                return 1
+            _emit({"stage": "orchestrator_auth", "ok": True})
 
             # --- STEP 3: analysis fan-out (Python-driven; NOT the orchestrator) -------
             # Run the slow (~20-30 min) per-ticker analyze.py fan-out HERE, blocking, and
