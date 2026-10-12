@@ -23,10 +23,10 @@ ticker is data (an ERROR element), never a process failure.
 
 Env:
   QUIVER_ANALYZE_CONCURRENCY  max parallel analyze.py procs (default 2; the
-                              e2-medium box is 4 GiB and the service cgroup is capped at
-                              MemoryMax=2500M, which must hold claude + EVERY analyze.py
-                              child. 2 keeps a wide margin under that cap; bump it only
-                              after profiling real analyze.py RSS shows headroom. The 4h
+                              e2-small box is 2 GiB, and that RAM must hold claude + EVERY
+                              analyze.py child. At 2 the fan-out holds the box near
+                              0.9 GiB; bump it only after profiling real analyze.py RSS
+                              shows headroom. The 4h
                               tick budget means even sequential (cap 1) finishes in time,
                               so memory safety wins over speed here).
   QUIVER_ANALYZE_TIMEOUT      per-ticker wall-clock seconds for the OUTER guard (this

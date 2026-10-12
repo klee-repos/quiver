@@ -438,7 +438,7 @@ def main() -> int:
                 "--include-partial-messages", "--verbose",
                 "--model", MODEL, "--effort", EFFORT,
                 # NO --strict-mcp-config: the Robinhood MCP is registered at USER scope and
-                # carries its OAuth (done once in the on-box browser); strict mode would
+                # carries its OAuth (written by deploy/gcp/rh-reauth.sh); strict mode would
                 # ignore user-scope servers + their stored OAuth. There is no Resend MCP
                 # (alerting is Telegram); the box's quiver user has no other MCP servers, so
                 # dropping strict mode adds no stray servers.

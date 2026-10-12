@@ -23,9 +23,9 @@ variable "name" {
 }
 
 variable "machine_type" {
-  description = "e2-medium (2 vCPU, 4 GiB) runs XFCE + Chrome + the tick; ~$25-30/mo. Chrome Remote Desktop/Chrome are x86_64, which e2 is."
+  description = "e2-small (2 shared vCPU, 2 GiB) runs the tick with no desktop; ~$12/mo. setup.sh adds a 4G swapfile for the nightly npm update peak."
   type        = string
-  default     = "e2-medium"
+  default     = "e2-small"
 }
 
 variable "repo_url" {

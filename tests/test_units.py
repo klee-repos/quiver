@@ -376,8 +376,8 @@ for _k, _ex in (("auth_error", {"event_detail": "401 <t> & x"}),
     check_true(f"telegram {_k} is prose, not a numbered step list",
                "1. " not in _r and "2. " not in _r)
     check_true(f"telegram {_k} leads with a bold headline sentence", _r.startswith("<b>"))
-check_true("telegram auth_error carries the re-auth URL",
-           "remotedesktop.google.com" in notify.build_digest(
+check_true("telegram auth_error carries the re-auth command",
+           "deploy/gcp/rh-reauth.sh" in notify.build_digest(
                {"date": "d", "now_iso": "t", "kind": "auth_error", "dry_run": False,
                 "event_detail": "401", "tickers": []})["telegram"])
 
@@ -520,10 +520,10 @@ check_true("error html escapes + shows detail", "daily cap math" in _de["text"])
 _m_a2 = {"date": "2026-05-30", "now_iso": "t", "kind": "auth_error", "dry_run": False,
          "event_detail": "401", "subject_prefix": "[Quiver]", "tickers": []}
 _da2 = notify.build_digest(_m_a2)
-check_true("auth_error text has /mcp + remote desktop",
-           "/mcp" in _da2["text"] and "remotedesktop.google.com" in _da2["text"])
-check_true("auth_error html has /mcp + remote desktop",
-           "/mcp" in _da2["html"] and "remotedesktop.google.com" in _da2["html"])
+check_true("auth_error text has the re-auth command, no desktop",
+           "deploy/gcp/rh-reauth.sh" in _da2["text"] and "remotedesktop" not in _da2["text"])
+check_true("auth_error html has the re-auth command, no desktop",
+           "deploy/gcp/rh-reauth.sh" in _da2["html"] and "remotedesktop" not in _da2["html"])
 check("auth_error stage derived", notify.stage_of(_m_a2), "broker_auth")
 check("halt stage derived", notify.stage_of({"kind": "halt"}), "daily_loss_halt")
 # warning severity: no alarmist CTA, self-heal copy

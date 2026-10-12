@@ -93,12 +93,12 @@ Call the Robinhood MCP with the `account_number` from preflight:
      stdout that the headless supervisor keys on — just run it; do NOT transcribe or quote
      its output). Then log `AUTH_ERROR`, **fire the alert** with `kind:"auth_error"`,
      `stage:"broker_auth"` (severity is critical; the alert's "what to do" block carries
-     the Chrome Remote Desktop re-auth steps), `event_detail`=the error text, and **STOP**
+     the re-auth steps), `event_detail`=the error text, and **STOP**
      (never trade on stale auth).
-     Recovery: a human connects to the box's Chrome Remote Desktop
-     (remotedesktop.google.com/access), opens a terminal, and runs `claude` then `/mcp`
-     to re-authenticate Robinhood in the on-box browser — trading auto-resumes next wake
-     (see docs/DEPLOY.md). Robinhood's OAuth expires ~every 3.8 days, no headless refresh.
+     Recovery: a human runs `./deploy/gcp/rh-reauth.sh` on a laptop. The script logs in to
+     Robinhood over IAP SSH with `claude mcp login --no-browser`; the box needs no desktop.
+     Trading resumes on the next wake (see docs/DEPLOY.md). Robinhood's OAuth expires every
+     few days and has no headless refresh.
 2. `get_equity_positions(account_number)` → for each held ticker record
    `{quantity, market_value, average_buy_price}`. Copy `average_buy_price` VERBATIM
    (a string, e.g. `"182.730000"`); omit the key when the broker omits it. Python

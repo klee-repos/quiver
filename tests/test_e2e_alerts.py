@@ -203,8 +203,8 @@ def main() -> int:
     rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
                     event_detail="401", send=lambda **k: sent.append(k) or {"ok": True})
     ok("last-resort sends once", len(sent) == 1)
-    ok("alert copy is actionable (/mcp + remote desktop in the Telegram body)",
-       "/mcp" in sent[0]["text"] and "remotedesktop.google.com" in sent[0]["text"])
+    ok("alert copy is actionable (the re-auth command in the Telegram body, no desktop)",
+       "deploy/gcp/rh-reauth.sh" in sent[0]["text"] and "remotedesktop" not in sent[0]["text"])
     ok("last-resort targets Telegram (token + chat ids, not email)",
        sent[0].get("token") == "tok" and sent[0].get("chat_ids") == ["560501084"])
     ok("critical alert is LOUD (disable_notification False)",

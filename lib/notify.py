@@ -79,14 +79,12 @@ def action_steps(model: dict):
         return []
     if kind == "auth_error" or stage == AUTH_STAGE:
         return [
-            "Connect to the box's desktop: https://remotedesktop.google.com/access "
-            "(enter your PIN).",
-            "Open a terminal there and run: claude  then  /mcp  -> robinhood-trading -> "
-            "authenticate in the browser that opens.",
-            "Robinhood's OAuth fully expires ~every 3.8 days with no headless refresh — this "
-            "is the routine re-auth, done in the on-box browser (NOT over a remote shell: the "
-            "localhost OAuth redirect needs the box's own browser).",
-            "Trading resumes automatically on the next wake once the OAuth is refreshed.",
+            "On your laptop, in the quiver repo, run ./deploy/gcp/rh-reauth.sh.",
+            "It prints a Robinhood link: open it, log in and approve, then paste the localhost "
+            "address the browser lands on back into the terminal.",
+            "Robinhood's login expires every few days and has no headless refresh, so this is "
+            "the routine re-auth. The box needs no desktop for it.",
+            "Trading resumes automatically on the next wake.",
         ]
     if kind == "halt" or stage == HALT_STAGE:
         return [
@@ -220,7 +218,7 @@ def _subject(model: dict) -> str:
     date = model.get("date", "")
     kind = model.get("kind", "digest")
     if kind == "auth_error":
-        return f"{prefix} ⚠ AUTH ERROR — run /mcp (trading stopped) · {date}"
+        return f"{prefix} ⚠ AUTH ERROR — run rh-reauth.sh (trading stopped) · {date}"
     if kind == "halt" or model.get("halted"):
         reason = model.get("halt_reason") or "daily loss"
         return f"{prefix} \U0001f6d1 HALT — {reason} · {date}"
@@ -336,8 +334,8 @@ def _preheader(model: dict) -> str:
     doesn't preview as 'Quiver — <date>'."""
     kind = model.get("kind", "digest")
     if kind == "auth_error":
-        return ("Broker auth expired — no orders placed. Re-auth via the box's Chrome "
-                "Remote Desktop (run /mcp).")
+        return ("Broker auth expired — no orders placed. Re-auth from your laptop: "
+                "./deploy/gcp/rh-reauth.sh.")
     if kind == "halt":
         return f"Daily-loss halt fired: {model.get('halt_reason') or 'daily loss'}. Trading stopped."
     if kind == "error":

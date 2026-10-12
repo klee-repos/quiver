@@ -38,7 +38,7 @@ RestrictSUIDSGID=true
 # dir. The ledger, the repo, config.yaml, and the tick's log dirs are all read-only here.
 ReadWritePaths=/opt/quiver/state/claude-config /opt/quiver/state/.npm-cache /opt/quiver/state/chat
 # The chat spawns one `claude -p` (sonnet) read session; light, but cap it so a spike can't
-# starve a concurrent trading tick on the 4 GiB box (the 2 GiB swapfile absorbs any overlap).
+# starve a concurrent trading tick on the 2 GiB box (the 4 GiB swapfile absorbs any overlap).
 MemoryMax=1536M
 
 [Install]

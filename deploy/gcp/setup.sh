@@ -15,9 +15,11 @@ echo "[1/9] apt deps"
 apt-get update -y
 apt-get install -y curl ca-certificates gnupg jq git python3-venv build-essential unzip
 
-echo "[1b/9] 2G swapfile backstop (a transient tick+desktop memory peak swaps, not OOM-kills)"
+echo "[1b/9] 4G swapfile backstop (a memory peak swaps, not OOM-kills)"
+# The box has 2 GiB of RAM. The tick fits in it. The nightly claude npm update and the intel
+# refresh peaked near 2.7 GiB (Cloud Monitoring, Sept-Oct 2026), so those swap for some minutes.
 if ! swapon --show 2>/dev/null | grep -q .; then
-  { fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048; } \
+  { fallocate -l 4G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=4096; } \
     && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile \
     && { grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab; } \
     || echo "  NOTE: swap setup skipped/failed (non-fatal)"
@@ -105,16 +107,17 @@ for _k in OPENROUTER_API_KEY GLM_API_KEY DEEPSEEK_API_KEY RH_ACCOUNT_NUMBER RESE
   printf -v "$_k" '%s' "$_v"
 done
 
-# Claude auth is OPTIONAL (on-box `claude login` in the desktop is the fallback). Write one.
+# Claude auth: the subscription token from `claude setup-token` (one year), or an API key.
+# Write one. With neither, every tick fails its auth gate until an operator logs in.
 _CCOT=$(fetch_opt CLAUDE_CODE_OAUTH_TOKEN)
 _AAK=$(fetch_opt ANTHROPIC_API_KEY)
 CLAUDE_AUTH_LINE=""
 if [ -n "$_CCOT" ]; then CLAUDE_AUTH_LINE="CLAUDE_CODE_OAUTH_TOKEN=$_CCOT";
 elif [ -n "$_AAK" ]; then CLAUDE_AUTH_LINE="ANTHROPIC_API_KEY=$_AAK";
-else echo "  NOTE: no Claude auth secret — relying on an on-box 'claude login' in the desktop."; fi
+else echo "  NOTE: no Claude auth secret — run 'claude setup-token' on a laptop and push it (docs/DEPLOY.md)."; fi
 
 # All claude + MCP credential/OAuth state under /opt/quiver/state (writable; survives the
-# service's ProtectHome=read-only). Same dir the desktop OAuth writes and the tick reads.
+# service's ProtectHome=read-only). Same dir the Robinhood login writes and the tick reads.
 CLAUDE_CONFIG_DIR="$QUIVER_HOME/state/claude-config"
 # Create state/ ITSELF as quiver FIRST: `install -d a/b` gives the intermediate `a` default
 # (root) ownership and only chowns the named leaf — which would leave /opt/quiver/state
@@ -156,15 +159,15 @@ chmod 600 /etc/quiver/quiver.env
 chown "$QUIVER_USER:$QUIVER_USER" /etc/quiver/quiver.env
 [ -f "$QUIVER_HOME/deploy/runner/mcp.json" ] || cp "$QUIVER_HOME/deploy/runner/mcp.json.example" "$QUIVER_HOME/deploy/runner/mcp.json"
 
-# Register the Robinhood MCP at USER scope (no header -> OAuth done in the on-box browser).
+# Register the Robinhood MCP at USER scope (no header -> OAuth via deploy/gcp/rh-reauth.sh).
 # run_tick.py drops --strict-mcp-config so the headless tick reuses this + its stored OAuth.
 _QHOME="$(getent passwd "$QUIVER_USER" | cut -d: -f6)"
 if sudo -u "$QUIVER_USER" env HOME="$_QHOME" CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
      claude mcp add robinhood-trading --scope user --transport http \
      https://agent.robinhood.com/mcp/trading >/dev/null 2>&1; then
-  echo "  registered robinhood-trading (user scope) — authenticate it via /mcp in the desktop"
+  echo "  registered robinhood-trading (user scope) — authenticate it with deploy/gcp/rh-reauth.sh"
 else
-  echo "  NOTE: 'claude mcp add robinhood-trading' skipped/failed — add it via /mcp on the box"
+  echo "  NOTE: 'claude mcp add robinhood-trading' skipped/failed — add it over IAP SSH"
 fi
 
 # strategy.yaml (the trading universe) is per-user + gitignored, so NOT in the public clone:
@@ -240,12 +243,12 @@ sudo -u "$QUIVER_USER" bash -c 'set -a; . /etc/quiver/quiver.env; set +a; exec "
   || echo "  NOTE: healthcheck reported issues (see above) — inspect before trusting a live tick"
 
 cat <<'NOTE'
-DONE (GCP trading stack). The only steps left are interactive, done ONCE in the on-box
-browser (Chrome Remote Desktop) — see docs/DEPLOY.md:
-  1) claude   (sign into your Pro/Max plan, unless a Claude token was set in Secret Manager)
-  2) /mcp -> robinhood-trading -> authenticate. Re-auth ~every 3.8 days (Robinhood OAuth,
-     no headless refresh).
-Both persist under CLAUDE_CONFIG_DIR (/opt/quiver/state/claude-config), which the headless
-tick reuses. config.yaml ships dry_run:false (LIVE) by design — straight-to-live per the
+DONE (GCP trading stack). One step is left. It is interactive and runs on your LAPTOP — see
+docs/DEPLOY.md:
+  ./deploy/gcp/rh-reauth.sh   (log in to Robinhood; repeat when the AUTH_ERROR page arrives —
+                               the Robinhood OAuth has no headless refresh)
+The login persists under CLAUDE_CONFIG_DIR (/opt/quiver/state/claude-config), which the
+headless tick reuses. The orchestrator's own Claude login is the CLAUDE_CODE_OAUTH_TOKEN
+secret. config.yaml ships dry_run:false (LIVE) by design — straight-to-live per the
 operator; touch /opt/quiver/KILL to halt.
 NOTE

@@ -1,8 +1,8 @@
 # Quiver headless trader — GCP (Compute Engine) infrastructure.
-# One hardened e2-medium running the systemd timer; secrets in
-# Secret Manager; a desktop + Chrome + Chrome Remote Desktop for the on-server Robinhood
-# OAuth; Cloud Logging metrics -> Monitoring alert policies -> email; no public inbound
-# (admin via IAP-tunneled SSH; CRD dials out to Google's relay). Secret VALUES are created
+# One hardened e2-small running the systemd timer; secrets in Secret Manager; Cloud Logging
+# metrics -> Monitoring alert policies -> email; no public inbound (admin via IAP-tunneled
+# SSH). The box has NO desktop: the Robinhood OAuth runs over SSH (deploy/gcp/rh-reauth.sh)
+# and the orchestrator logs in with a subscription token. Secret VALUES are created
 # out-of-band (bootstrap-gcp.sh) so they never enter tfstate.
 
 terraform {
@@ -32,10 +32,10 @@ resource "google_service_account" "quiver" {
 locals {
   # Secrets the box reads (created out-of-band by bootstrap-gcp.sh). Per-secret accessor
   # grants = least privilege (the SA can read ONLY these, not every secret in the project).
-  # The OPTIONAL secrets quiver-CLAUDE_CODE_OAUTH_TOKEN / quiver-NOTIFY_ALERTS_TO /
-  # quiver-TELEGRAM_BOT_TOKEN / quiver-TELEGRAM_ALLOWED_CHAT_IDS are NOT listed here on purpose:
-  # they're usually unset (Claude auth is the on-box `claude login`; alerts fall back to
-  # NOTIFY_TO; the chat bridge is opt-in). To enable one from Secret Manager, create the secret
+  # The OPTIONAL secrets quiver-NOTIFY_ALERTS_TO / quiver-TELEGRAM_BOT_TOKEN /
+  # quiver-TELEGRAM_ALLOWED_CHAT_IDS are NOT listed here on purpose: they're often unset
+  # (alerts fall back to NOTIFY_TO; the chat bridge is opt-in). To enable one from Secret
+  # Manager, create the secret
   # AND add its name here, then re-apply — for_each requires the secret to exist. (Or, to avoid a
   # full apply on the live box, grant just that secret manually:
   #   gcloud secrets add-iam-policy-binding quiver-TELEGRAM_BOT_TOKEN \
@@ -43,6 +43,8 @@ locals {
   # then refresh /etc/quiver/quiver.env on the box — see docs/CHAT.md.)
   secrets = [
     "OPENROUTER_API_KEY", "RH_ACCOUNT_NUMBER", "STRATEGY_YAML",
+    # The orchestrator's Claude login: a one-year subscription token from `claude setup-token`.
+    "CLAUDE_CODE_OAUTH_TOKEN",
     # Rollback-only (kept so a rollback path can still read them):
     "GLM_API_KEY", "DEEPSEEK_API_KEY", "RESEND_API_KEY", "NOTIFY_TO", "RESEND_FROM",
   ]
@@ -82,7 +84,7 @@ resource "google_compute_subnetwork" "quiver" {
 }
 
 # Only inbound rule: SSH from Google's IAP range (admin via `gcloud ssh --tunnel-through-iap`).
-# CRD is outbound-only, so nothing else is reachable from the internet.
+# Nothing else is reachable from the internet.
 resource "google_compute_firewall" "iap_ssh" {
   name      = "${var.name}-allow-iap-ssh"
   network   = google_compute_network.quiver.id
@@ -100,6 +102,10 @@ resource "google_compute_instance" "quiver" {
   name         = var.name
   machine_type = var.machine_type
   zone         = var.zone
+
+  # A machine_type change needs a stop. This lets terraform stop, resize, and start the SAME
+  # instance in place. The boot disk (ledger + OAuth state) is kept. It is not a replace.
+  allow_stopping_for_update = true
 
   boot_disk {
     initialize_params {
@@ -142,7 +148,6 @@ resource "google_compute_instance" "quiver" {
       apt-get update -y && apt-get install -y git curl jq
       git clone ${var.repo_url} /opt/quiver || git -C /opt/quiver pull --ff-only || true
       if bash /opt/quiver/deploy/gcp/setup.sh; then
-        bash /opt/quiver/deploy/setup-desktop.sh || echo "desktop layer had issues; trading stack is up"
         touch /opt/quiver/.gcp-provisioned
       else
         echo "setup.sh FAILED — leaving unprovisioned so the next boot re-runs it"
