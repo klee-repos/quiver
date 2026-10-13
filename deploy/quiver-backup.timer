@@ -1,0 +1,12 @@
+[Unit]
+Description=Quiver — nightly ledger backup (after the last tick of the day)
+
+[Timer]
+# 22:15 UTC: the last tick starts at 21:40 UTC. Every day, not Mon-Fri: the intel
+# timer writes to the ledger on weekends too.
+OnCalendar=*-*-* 22:15:00
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

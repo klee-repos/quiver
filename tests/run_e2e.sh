@@ -28,6 +28,7 @@ SUITES=(
   "chat-history|tests/test_chat_history.py"
   "brain-node|quiver_eve/test"
   "run-analyses|tests/test_run_analyses.py"
+  "backup|tests/test_backup.py"
   "e2e-dryrun|tests/test_e2e.py"
   "e2e-alerts|tests/test_e2e_alerts.py"
   "e2e-consistency|tests/test_e2e_consistency.py"

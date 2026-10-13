@@ -13,7 +13,7 @@ PROJECT="$(curl -s -H 'Metadata-Flavor: Google' http://metadata.google.internal/
 
 echo "[1/9] apt deps"
 apt-get update -y
-apt-get install -y curl ca-certificates gnupg jq git python3-venv build-essential unzip
+apt-get install -y curl ca-certificates gnupg jq git python3-venv build-essential unzip sqlite3
 
 echo "[1b/9] 4G swapfile backstop (a memory peak swaps, not OOM-kills)"
 # The box has 2 GiB of RAM. The tick fits in it. The nightly claude npm update and the intel
@@ -198,6 +198,8 @@ cp "$QUIVER_HOME/deploy/quiver-intel.timer" /etc/systemd/system/quiver-intel.tim
 cp "$QUIVER_HOME/deploy/quiver-chat.service" /etc/systemd/system/quiver-chat.service
 cp "$QUIVER_HOME/deploy/quiver-claude-update.service" /etc/systemd/system/quiver-claude-update.service
 cp "$QUIVER_HOME/deploy/quiver-claude-update.timer" /etc/systemd/system/quiver-claude-update.timer
+cp "$QUIVER_HOME/deploy/quiver-backup.service" /etc/systemd/system/quiver-backup.service
+cp "$QUIVER_HOME/deploy/quiver-backup.timer" /etc/systemd/system/quiver-backup.timer
 install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
 touch /var/log/quiver/claude-update.log
 chown "$QUIVER_USER:$QUIVER_USER" /var/log/quiver/claude-update.log
@@ -210,6 +212,9 @@ systemctl daemon-reload
 systemctl enable --now quiver.timer
 systemctl enable --now quiver-intel.timer
 systemctl enable --now quiver-claude-update.timer
+# Nightly ledger backup to Cloud Storage. The box service account needs objectCreator +
+# objectViewer on the bucket (see docs/DEPLOY.md).
+systemctl enable --now quiver-backup.timer
 # The read-only Telegram chat bridge is opt-in: only start it if a bot token is configured.
 if grep -q '^TELEGRAM_BOT_TOKEN=.\+' /etc/quiver/quiver.env; then
   systemctl enable --now quiver-chat.service && echo "  chat bridge: enabled"

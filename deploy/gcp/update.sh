@@ -95,7 +95,7 @@ else
 fi
 
 echo "[5/6] systemd units"
-if grep -qE '^deploy/(quiver(-intel|-chat|-claude-update)?\.(service|timer)|claude-update\.sh)$' <<<"$CHANGED"; then
+if grep -qE '^deploy/(quiver(-intel|-chat|-claude-update|-backup)?\.(service|timer)|claude-update\.sh)$' <<<"$CHANGED"; then
   echo "  unit files changed -> reinstalling + daemon-reload"
   cp "$QUIVER_HOME/deploy/quiver.service"        /etc/systemd/system/quiver.service
   cp "$QUIVER_HOME/deploy/quiver.timer"          /etc/systemd/system/quiver.timer
@@ -104,12 +104,16 @@ if grep -qE '^deploy/(quiver(-intel|-chat|-claude-update)?\.(service|timer)|clau
   cp "$QUIVER_HOME/deploy/quiver-chat.service"   /etc/systemd/system/quiver-chat.service
   cp "$QUIVER_HOME/deploy/quiver-claude-update.service" /etc/systemd/system/quiver-claude-update.service
   cp "$QUIVER_HOME/deploy/quiver-claude-update.timer"   /etc/systemd/system/quiver-claude-update.timer
+  cp "$QUIVER_HOME/deploy/quiver-backup.service" /etc/systemd/system/quiver-backup.service
+  cp "$QUIVER_HOME/deploy/quiver-backup.timer"   /etc/systemd/system/quiver-backup.timer
   install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
   systemctl daemon-reload
   # the intel timer is separate from the trading timer; enable it so the daily refresh runs.
   systemctl enable --now quiver-intel.timer 2>/dev/null || true
   # keeps every claude install current; a stale orchestrator binary is invisible.
   systemctl enable --now quiver-claude-update.timer 2>/dev/null || true
+  # the nightly ledger backup; with no timer the newest backup goes stale and nothing says so.
+  systemctl enable --now quiver-backup.timer 2>/dev/null || true
 else
   echo "  no unit changes — skipping"
 fi

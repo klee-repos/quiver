@@ -190,6 +190,32 @@ Cloud Monitoring `agent.googleapis.com/memory/bytes_used` (state `used`), 28 day
 Do not go below 2 GiB (`e2-micro`) without a new measurement. If a tick logs an OOM kill
 (`journalctl -k | grep -i oom`), resize up with the commands above.
 
+## Ledger backup (nightly, Cloud Storage)
+`state/ledger.db` is the only copy of the decisions, the outcomes, the orders and the targets.
+`quiver-backup.timer` runs `deploy/runner/backup_ledger.py` each day at 22:15 UTC. The job
+takes a consistent snapshot (SQLite online backup API), runs `integrity_check`, gzips it and
+uploads it as `gs://quiver-state-<project id>/ledger/<UTC time>.db.gz`. Each object is
+create-only. A failure sends one Telegram page and does not stop a tick.
+
+One-time setup of the bucket (out-of-band, not Terraform):
+```bash
+P=$(gcloud config get-value project); B=gs://quiver-state-$P; SA=quiver-box@$P.iam.gserviceaccount.com
+gcloud storage buckets create $B --location us-central1 --default-storage-class STANDARD \
+  --uniform-bucket-level-access --public-access-prevention
+gcloud storage buckets update $B --versioning
+# Create + read, NO delete: a faulty box cannot remove backup history.
+gcloud storage buckets add-iam-policy-binding $B --member serviceAccount:$SA --role roles/storage.objectCreator
+gcloud storage buckets add-iam-policy-binding $B --member serviceAccount:$SA --role roles/storage.objectViewer
+```
+Set `QUIVER_BACKUP_BUCKET` in `/etc/quiver/quiver.env` only for a different bucket name.
+
+```bash
+sudo systemctl start quiver-backup.service && tail -1 /var/log/quiver/backup.log   # one backup now
+gcloud storage ls -l gs://quiver-state-$P/ledger/ | tail -3                         # the newest copies
+gcloud storage cp gs://quiver-state-$P/ledger/<name>.db.gz - | gunzip > ledger.db  # restore
+```
+Stop `quiver.timer` before you replace the live ledger with a restored copy.
+
 ## Controls
 - **Stop trading now:** IAP SSH in, `sudo -u quiver touch /opt/quiver/KILL` (or `sudo
   systemctl stop quiver.timer`).

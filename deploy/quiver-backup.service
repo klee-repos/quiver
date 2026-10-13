@@ -1,0 +1,25 @@
+[Unit]
+Description=Quiver — one ledger backup to Cloud Storage
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=quiver
+Group=quiver
+WorkingDirectory=/opt/quiver
+# The Telegram credentials for the failure page. QUIVER_BACKUP_BUCKET is optional here:
+# with no value the job uses quiver-state-<project id> from the metadata server.
+EnvironmentFile=/etc/quiver/quiver.env
+Environment=QUIVER_BACKUP_LOG=/var/log/quiver/backup.log
+ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/backup_ledger.py
+# The ledger is a few MB. The job reads it with the SQLite online backup API, so a tick
+# that writes at the same time is safe. It never writes to the ledger.
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/quiver/state /var/log/quiver
