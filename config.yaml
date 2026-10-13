@@ -179,11 +179,13 @@ goal:
 # `enabled: true` (and seed the "Legislative Catalyst" allow-list via `strategy-set`) only
 # after live validation. Analysis path reads no limits/broker (a wall test enforces this).
 legislative:
-  # OFF since 2026-10-13. The passage gate cannot pass: the heuristic gives at most 0.50
-  # below passed-both-chambers, and `passage_prob_min` is 0.55. The phase made no proposal
-  # and used model tokens on each tick. Do not set `true` before the gate is repaired
-  # (the threshold, the must-pass pattern, the cosponsor count). `intel` below is a separate
-  # service with its own flag.
+  # OFF since 2026-10-13. Two faults, repair both before you set `true`:
+  # 1. The phase did not review a bill after 2026-07-13. The first poll stored a date-only
+  #    cursor (`bill_cursor.last_update_date`). Congress.gov rejects that value (HTTP 400),
+  #    so each later tick returned "poll failed". The tick log does not print the reason.
+  # 2. The passage gate cannot pass: the heuristic gives at most 0.50 below
+  #    passed-both-chambers, and `passage_prob_min` is 0.55.
+  # `intel` below is a separate service with its own flag.
   enabled: false                       # true = run `bills-review` at the end of a tick (propose-only)
   passage_prob_min: 0.55               # HIGH-passage gate (Python heuristic number), (0,1]
   impact_min: 0.5                      # HIGH-impact advisory pre-filter on magnitude, (0,1]
