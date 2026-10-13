@@ -54,6 +54,13 @@ def build_target_context(led, ticker: str, strategy_cfg) -> Optional[dict]:
             if match:
                 target_weight = match.get("target_weight")
                 status = str(match.get("status", "active"))
+            # The tier word follows the STRATEGIC weight in the strategy file. The ledger
+            # weight is the conviction target. Reading it here feeds the model its own
+            # sizing back as a CORE / SATELLITE label.
+            book = strategy_cfg.books.get(goal_row["active_book"])
+            strategic = next((h.weight for h in book.holdings if h.ticker == tk), None) if book else None
+            if strategic is not None:
+                target_weight = strategic
             prog = _goal.compute_from_ledger(led, goal_row)
             if prog:
                 regime = prog.get("regime")

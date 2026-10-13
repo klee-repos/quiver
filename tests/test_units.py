@@ -3081,6 +3081,58 @@ check("F3 hyst: case-insensitive prior lookup", _hy({"AAA": 14.0}, {"aaa": 15.0}
 # revert-not-blend: a 1pt daily nudge never walks the target off its static anchor.
 check("F3 hyst: revert prevents 1pt/day accumulation", _hy({"AAA": 14.0}, {"AAA": 15.0}, 2.0), {"AAA": 15.0})
 
+# --- fund_increases: only the names that moved UP give weight back ---------------------------
+_fi = _alloc.fund_increases
+check("fund: a funded increase is unchanged (+3 from a -3 decrease)",
+      _fi({"UP": 9.0, "DN": 6.0, "H": 8.0}, {"UP": 6.0, "DN": 9.0, "H": 8.0}, 23.0, 2.0),
+      {"UP": 9.0, "DN": 6.0, "H": 8.0})
+check("fund: an unfunded increase reverts, a Hold name is untouched",
+      _fi({"UP": 9.0, "H": 8.0}, {"UP": 6.0, "H": 8.0}, 14.0, 2.0), {"UP": 6.0, "H": 8.0})
+check("fund: cash above the floor is funding (room 2.5 -> +2.5)",
+      _fi({"UP": 9.0, "H": 8.0}, {"UP": 6.0, "H": 8.0}, 16.5, 2.0), {"UP": 8.5, "H": 8.0})
+check("fund: no gate -> the increases shrink in proportion (room 3 of 6)",
+      _fi({"A": 10.0, "B": 8.0}, {"A": 6.0, "B": 6.0}, 15.0, 0.0), {"A": 8.0, "B": 7.0})
+# gate 2, room 3, increases 4 and 2: the pro-rata share of B is 1.0 < 2 -> B reverts, A takes 3.
+check("fund: the smallest sub-gate increase reverts and frees its room",
+      _fi({"A": 10.0, "B": 8.0}, {"A": 6.0, "B": 6.0}, 15.0, 2.0), {"A": 9.0, "B": 6.0})
+check("fund: a decrease is never touched",
+      _fi({"UP": 9.0, "DN": 2.0}, {"UP": 6.0, "DN": 5.0}, 9.0, 2.0)["DN"], 2.0)
+check("fund: a name with no prior is an increase from 0",
+      _fi({"NEW": 4.0, "H": 8.0}, {"H": 8.0}, 10.0, 2.0), {"NEW": 2.0, "H": 8.0})
+check("fund: prior weights above the ceiling -> the increase reverts (backstop is the caller's)",
+      _fi({"UP": 9.0, "H": 20.0}, {"UP": 6.0, "H": 20.0}, 20.0, 0.0), {"UP": 6.0, "H": 20.0})
+check_true("fund: the result never exceeds the ceiling when the prior fits",
+           sum(_fi({"A": 30.0, "B": 25.0, "C": 5.0}, {"A": 10.0, "B": 10.0, "C": 5.0}, 40.0, 2.0).values()) <= 40.0 + 1e-6)
+
+# --- Buy / Overweight is ADD-ONLY (the mirror of item 4) ------------------------------------
+# Production shape: SMH is the largest name and Overweight, with a lower score than ANET.
+# The conviction share of SMH is below its prior weight. The target must not fall.
+_POLao = {"per_name_max_pct": 25, "sleeve_max_pct": 50, "cash_floor_pct": 18, "smoothing_alpha": 0.4}
+# The priors sum to 82 = 100 - cash floor, so a decrease is the only funding of an increase.
+_cand_ao = [{"ticker": "SMH", "sleeve": "c", "prior_weight": 15}, {"ticker": "ANET", "sleeve": "n", "prior_weight": 6},
+            {"ticker": "CEG", "sleeve": "p", "prior_weight": 9}, {"ticker": "QQQ", "sleeve": "h", "prior_weight": 8},
+            {"ticker": "H1", "sleeve": "x", "prior_weight": 22}, {"ticker": "H2", "sleeve": "y", "prior_weight": 22}]
+_alAO = _alloc.allocate_targets(_cand_ao, {
+    "SMH": {"signal": "Overweight", "conviction": 60, "uncertainty": 42},
+    "ANET": {"signal": "Overweight", "conviction": 85, "uncertainty": 15},
+    "CEG": {"signal": "Underweight", "conviction": 55, "uncertainty": 58},
+    "QQQ": {"signal": "Hold"}, "H1": {"signal": "Hold"}, "H2": {"signal": "Hold"}}, policy=_POLao)
+check_true("add-only: an Overweight name is never cut below its prior weight",
+           _alAO.weights["SMH"] >= 15.0 - 1e-6)
+check_true("add-only: the higher-conviction Overweight still grows", _alAO.weights["ANET"] > 6.0)
+check_true("add-only: the Underweight name funds it (reduce-only still holds)", _alAO.weights["CEG"] < 9.0)
+check("add-only: a Hold name keeps its weight", _alAO.weights["QQQ"], 8.0)
+check_true("add-only: the engine never exceeds 100 - cash floor", sum(_alAO.weights.values()) <= 82.0 + 1e-6)
+check_true("add-only: the increase is no larger than the decrease that funds it",
+           (_alAO.weights["ANET"] - 6.0) <= (9.0 - _alAO.weights["CEG"]) + 1e-6)
+# A derisking regime shrinks the whole book. The add-only clamp must not block that.
+_alAOr = _alloc.allocate_targets(
+    [{"ticker": "SMH", "sleeve": "c", "prior_weight": 40}, {"ticker": "ANET", "sleeve": "n", "prior_weight": 40}],
+    {"SMH": {"signal": "Overweight", "conviction": 60}, "ANET": {"signal": "Overweight", "conviction": 60}},
+    regime_scalar=0.5, policy={"per_name_max_pct": 100, "sleeve_max_pct": 100, "cash_floor_pct": 10,
+                               "smoothing_alpha": 1.0})
+check_true("add-only: a STAND_DOWN regime still cuts a bullish name", _alAOr.weights["SMH"] < 40.0)
+
 # --- D2: ERROR / missing HOLDS prior weight, never sells to cash -------------
 _alD2 = _alloc.allocate_targets(
     [{"ticker": "SMH", "sleeve": "c", "prior_weight": 15}, {"ticker": "CEG", "sleeve": "p", "prior_weight": 9}],

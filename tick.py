@@ -1253,6 +1253,26 @@ def cmd_construct(args) -> dict:
     return _run_construct(cfg, led, _load_input(args))
 
 
+def _strategic_cash_weight(cfg, goal, targets, cash_tk: str):
+    """The cash sleeve weight of the goal's book in strategy.yaml, or None.
+
+    This is the STRATEGIC weight. The ledger cash row is the residual of the conviction
+    targets and can sit above it. A floor read from the ledger first would ratchet cash up,
+    so the ledger row is only the fallback for a book that strategy.yaml no longer has."""
+    import lib.strategy as strategy
+    try:
+        book = cfg.strategy.book(goal["active_book"])
+        w = sum(float(h.weight) for h in book.holdings
+                if str(h.ticker).upper() == cash_tk or (h.sleeve or "") == strategy.CASH_SLEEVE)
+        if w > 0:
+            return w
+    except Exception:  # noqa: BLE001 — fall through to the ledger row
+        pass
+    w = sum(float(t.get("target_weight", 0) or 0) for t in targets
+            if str(t["ticker"]).upper() == cash_tk or (t.get("sleeve") or "") == strategy.CASH_SLEEVE)
+    return w if w > 0 else None
+
+
 def _run_construct(cfg, led, data) -> dict:
     """Between preflight and plan: emit the deterministic target_weights the plan
     consumes. Reads the active goal + targets + the broker snapshot (--input:
@@ -1321,6 +1341,7 @@ def _run_construct(cfg, led, data) -> dict:
     # book verbatim — quiet days never re-clip the book; we only re-size when the pipeline
     # actually expresses conviction (Buy/Overweight/Underweight/Sell).
     conviction_detail = None
+    conviction_skipped = None
     if cfg.strategy is not None:
         import lib.allocate as allocate
         import lib.calibrate as calibrate
@@ -1337,11 +1358,26 @@ def _run_construct(cfg, led, data) -> dict:
             and (t.get("sleeve") or "") != strategy.CASH_SLEEVE
         ]
         policy = dict(cfg.strategy.risk_policy or {})
+        # The cash floor defaults to the STRATEGIC cash sleeve weight, not the allocator's bare
+        # fallback. Conviction moves weight between the engine names. It spends the cash sleeve
+        # only when the operator sets a lower `risk_policy.cash_floor_pct`.
+        if policy.get("cash_floor_pct") is None:
+            _cash_w = _strategic_cash_weight(cfg, goal, targets, cash_tk)
+            if _cash_w is not None:
+                policy["cash_floor_pct"] = _cash_w
+        # ONE conviction re-target per trading day. The re-target is persisted (below), so a
+        # second construct on the same day would smooth again from the moved target.
+        try:
+            if led.conviction_retargeted_on(goal["id"], str(now_iso)[:10]):
+                conviction_skipped = "retargeted_today"
+        except Exception:  # noqa: BLE001 — cannot read the log -> do not re-target (fail closed)
+            conviction_skipped = "retarget_log_unreadable"
         # Only re-allocate when the pipeline expresses conviction this tick; otherwise every
-        # name is D2 hold-prior and the allocation just reproduces the static book — so we
+        # name is D2 hold-prior and the allocation just reproduces the carried book — so we
         # SKIP it and keep the book verbatim (quiet/all-Hold ticks never re-clip the book).
-        if any(allocate.effective_conviction(analyses_map.get(c["ticker"]), policy) is not None
-               for c in candidates):
+        if conviction_skipped is None and any(
+                allocate.effective_conviction(analyses_map.get(c["ticker"]), policy) is not None
+                for c in candidates):
             rscalar = strategy.regime_scalar(
                 effective_regime, min_factor=float(policy.get("regime_min_factor", 0.5) or 0.5))
             calib = calibrate.build_calibration(
@@ -1370,7 +1406,8 @@ def _run_construct(cfg, led, data) -> dict:
                         pass
             alloc = allocate.allocate_targets(
                 candidates, analyses_map, calibration=calib, regime_scalar=rscalar,
-                policy=policy, hold_floors=hold_floors)
+                policy=policy, hold_floors=hold_floors,
+                min_delta_pct=cfg.risk.conviction_rebalance_min_delta_pct)
             # F3: material-change HYSTERESIS on the conviction target. Keep each name at its PRIOR
             # target weight unless the fresh reading moved it >= conviction_rebalance_min_delta_pct
             # weight-points — a noisy ~0-alpha signal no longer wanders the target (and churns the
@@ -1383,6 +1420,12 @@ def _run_construct(cfg, led, data) -> dict:
                 alloc.weights, prior_map, cfg.risk.conviction_rebalance_min_delta_pct)
             cash_floor = float(policy["cash_floor_pct"]) if (policy and policy.get("cash_floor_pct") is not None) else 5.0
             eng_ceiling = max(0.0, 100.0 - cash_floor)
+            # The gate reverts a small DECREASE to its prior weight, so the increase it funded
+            # has no funding now. Shrink ONLY the increases to the room that is left (the kept
+            # decreases + the cash above the floor). A name the tick did not raise keeps its
+            # weight. An increase that shrinks below the gate reverts.
+            eng_weights = allocate.fund_increases(
+                eng_weights, prior_map, eng_ceiling, cfg.risk.conviction_rebalance_min_delta_pct)
             # F3: conviction-driven deployment (the reallocation teeth). regime_scalar sets
             # deployment from the MACRO read; this adds a per-tick BOOK-CONVICTION scalar so a
             # broadly-BEARISH book (weak mean fresh conviction) deploys LESS -> raises cash, while
@@ -1423,6 +1466,46 @@ def _run_construct(cfg, led, data) -> dict:
                 scale = eng_ceiling / eng_sum
                 eng_weights = {t: round(w * scale, 4) for t, w in eng_weights.items()}
             cash_pct = round(max(cash_floor, 100.0 - sum(eng_weights.values())), 4)
+            # CARRY THE TARGET FORWARD. `prior_weight` is the ledger target, so a persisted move
+            # is the anchor of the next tick: the gate compares against YESTERDAY's target. With
+            # no persist the anchor is the seed book every day, the smoothed step can never reach
+            # the gate, and the target is bistable when it does (the SOXX buy/sell of 07-14/15).
+            # FAIL CLOSED: a move the ledger does not hold must not trade, because the next tick
+            # would revert it. On a persist error this tick keeps the prior targets.
+            moved = {}
+            for c in candidates:
+                _w_old = float(c["prior_weight"])
+                _w_new = float(eng_weights.get(c["ticker"], 0.0))
+                # 5e-4: the allocator rounds to 4 places, so a seed weight with more places
+                # (a universe add funded from cash) must not read as a move.
+                if abs(_w_new - _w_old) > 5e-4:
+                    moved[c["ticker"]] = (_w_old, _w_new)
+            persist_error = None
+            if moved:
+                try:
+                    _changes = []
+                    for _tk, (_w_old, _w_new) in sorted(moved.items()):
+                        _a = analyses_map.get(_tk) or {}
+                        _changes.append({
+                            "ticker": _tk, "from_value": round(_w_old, 4), "to_value": round(_w_new, 4),
+                            "reason": f"{_a.get('signal')} conviction={_a.get('conviction')} "
+                                      f"uncertainty={_a.get('uncertainty')}",
+                            "proof_json": json.dumps({
+                                "detail": alloc.detail.get(_tk), "calibration": calib.get(_tk),
+                                "gate_pct": cfg.risk.conviction_rebalance_min_delta_pct,
+                                "cash_floor_pct": cash_floor, "cash_pct": cash_pct}),
+                        })
+                    _rows = {_tk: v[1] for _tk, v in moved.items()}
+                    for t in targets:
+                        if (str(t["ticker"]).upper() == cash_tk
+                                or (t.get("sleeve") or "") == strategy.CASH_SLEEVE):
+                            _rows[str(t["ticker"]).upper()] = cash_pct
+                    led.retarget_weights(goal["id"], _rows, now_iso, _changes)
+                except Exception as e:  # noqa: BLE001 — fail closed, never block construct
+                    persist_error = f"{type(e).__name__}: {e}"
+                    eng_weights = {c["ticker"]: float(c["prior_weight"]) for c in candidates}
+                    cash_pct = round(max(0.0, 100.0 - sum(eng_weights.values())), 4)
+                    moved = {}
             new_targets = []
             for t in targets:
                 tk = str(t["ticker"]).upper()
@@ -1445,7 +1528,10 @@ def _run_construct(cfg, led, data) -> dict:
             targets = new_targets
             conviction_detail = {"regime_scalar": rscalar, "cash_pct": cash_pct,
                                  "weights": eng_weights, "calibration": calib,
-                                 "hysteresis_min_delta_pct": cfg.risk.conviction_rebalance_min_delta_pct}
+                                 "hysteresis_min_delta_pct": cfg.risk.conviction_rebalance_min_delta_pct,
+                                 "cash_floor_pct": cash_floor,
+                                 "moved": {tk: [round(a, 4), round(b, 4)] for tk, (a, b) in moved.items()},
+                                 "persist_error": persist_error}
 
     rows = portfolio.construct_target_book(
         targets, positions_mv, deployable, cash_sleeve_ticker=cfg.risk.cash_sleeve_ticker,
@@ -1482,6 +1568,7 @@ def _run_construct(cfg, led, data) -> dict:
             "reconcile_unmanaged": cfg.risk.reconcile_unmanaged, "unmanaged": unmanaged,
             "conviction_weights": conviction_detail is not None,
             "conviction_detail": conviction_detail,
+            "conviction_skipped": conviction_skipped,
             "target_weights": target_weights}
 
 

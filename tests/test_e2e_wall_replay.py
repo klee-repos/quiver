@@ -262,13 +262,21 @@ def test_conviction_moves_target():
             con = T._run_construct(cfg, led, {**snap, "macro_reading": None, "analyses": analyses})
         market.set_clock(None)
         tw = con.get("target_weights") or {}
-        return (tw.get("SMH") or {}).get("target_dollars")
-    static = _smh_target([])                                   # all-Hold -> static book
-    conv = _smh_target([{"ticker": "SMH", "signal": "Buy", "conviction": 0.95,
-                         "position_pct": 15.0, "basis": "conviction"}])
+        return ((tw.get("SMH") or {}).get("target_dollars"),
+                (tw.get("SGOV") or {}).get("target_weight"))
+    _buy = {"ticker": "SMH", "signal": "Buy", "conviction": 0.95,
+            "position_pct": 15.0, "basis": "conviction"}
+    static, cash0 = _smh_target([])                            # all-Hold -> static book
+    lone, cash1 = _smh_target([_buy])
+    # A Sell on XLV frees weight. That decrease is the funding of the SMH increase.
+    conv, cash2 = _smh_target([_buy, {"ticker": "XLV", "signal": "Sell", "conviction": 80}])
     ok("all-Hold keeps a static SMH target", static is not None, static)
-    ok("a high-conviction Buy MOVES SMH's target (allocate actually ran)",
-       conv is not None and static is not None and abs(conv - static) > 1e-6, (static, conv))
+    ok("a lone Buy does NOT spend the cash sleeve (no funding -> no move)",
+       lone == static and cash1 == cash0, (static, lone, cash0, cash1))
+    ok("a funded Buy MOVES SMH's target UP (allocate actually ran)",
+       conv is not None and static is not None and conv > static + 1e-6, (static, conv))
+    ok("the funded move keeps the cash sleeve at its strategic weight",
+       cash2 is not None and cash0 is not None and cash2 >= cash0 - 1e-6, (cash0, cash2))
 
 
 # ---------------------------------------------------------------- consistency (e)

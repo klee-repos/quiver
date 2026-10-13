@@ -54,7 +54,8 @@ def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
         "macro_thesis: {deploy_trigger_pce_pct: 2.5, standdown_trigger_pce_pct: 3.5}\n"
         f"rh_tradable_confirmed: {rh}\n"
         f"risk_policy: {{per_name_max_pct: {per_name}, sleeve_max_pct: {sleeve_max}, "
-        f"cash_floor_pct: {cash_floor}, smoothing_alpha: {smoothing_alpha}"
+        + (f"cash_floor_pct: {cash_floor}, " if cash_floor is not None else "")
+        + f"smoothing_alpha: {smoothing_alpha}"
         + (f", conviction_deploy_min_factor: {dep_min_factor}" if dep_min_factor is not None else "")
         + "}\n"
         + (sleeves or "")
@@ -207,6 +208,105 @@ def main() -> int:
         _static_cash = 20.0            # _bear_holds' SGOV weight
         ok("F3 regression: net-bullish book does NOT get cash inflated above the static book",
            _cash_r <= _static_cash + 0.5, (_cash_r, _static_cash))
+
+    # --- CARRIED TARGET: a conviction move persists and is the anchor of the next tick --------
+    # Shipped rails: smoothing_alpha 0.4, gate 2.0 (the lib.config default), and NO
+    # cash_floor_pct, so the floor is the book's cash sleeve weight (40).
+    _c_holds = ["      - {sleeve: A, ticker: AAA, weight: 20, band: 3}",
+                "      - {sleeve: B, ticker: BBB, weight: 20, band: 3}",
+                "      - {sleeve: C, ticker: CCC, weight: 20, band: 3}",
+                "      - {sleeve: Cash, ticker: SGOV, weight: 40}"]
+    _c_rh = "[AAA, BBB, CCC, SGOV]"
+    _c_kw = dict(rh=_c_rh, holdings=_c_holds, smoothing_alpha=0.4, cash_floor=None)
+    _c_an = [{"ticker": "AAA", "signal": "Buy", "conviction": 90, "uncertainty": 10},
+             {"ticker": "BBB", "signal": "Underweight", "conviction": 60, "uncertainty": 20},
+             {"ticker": "CCC", "signal": "Hold", "conviction": 50, "uncertainty": 50}]
+
+    def _w(out):
+        return {t: out["target_weights"][t]["target_weight"] for t in out["target_weights"]}
+
+    def _ledger_w(led):
+        g = led.get_active_goal()
+        return {r["ticker"]: r["target_weight"] for r in led.active_target_portfolio(g["id"])}
+
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)
+        gid = led.get_active_goal()["id"]
+        d1 = _w(tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                               "analyses": _c_an}))
+        ok("carry: the Buy moves UP and the Underweight moves DOWN",
+           d1["AAA"] > 22.0 and d1["BBB"] < 18.0, d1)
+        ok("carry: the Hold name keeps its weight exactly", d1["CCC"] == 20.0, d1)
+        ok("carry: the cash sleeve stays at its strategic weight (default floor)",
+           abs(d1["SGOV"] - 40.0) < 1e-6, d1)
+        ok("carry: the move is PERSISTED to the ledger target", _ledger_w(led) == d1, (_ledger_w(led), d1))
+        _log = led.strategy_change_history(gid, change_type="weight")
+        ok("carry: one `weight` change-log row per moved name, trigger=conviction",
+           sorted(r["ticker"] for r in _log) == ["AAA", "BBB"]
+           and all(r["trigger"] == "conviction" for r in _log), _log)
+
+        # the same day again: ONE re-target per day, the smoothing does not step twice
+        again = tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T15:00:00-04:00",
+                                               "analyses": _c_an})
+        ok("carry: a second construct on the same day does NOT step again",
+           _w(again) == d1 and again["conviction_skipped"] == "retargeted_today",
+           (_w(again), again.get("conviction_skipped")))
+
+        # the next day, all Hold: the CARRIED book stays. No snap back to the seed weights.
+        _hold = [{"ticker": t, "signal": "Hold", "conviction": 50, "uncertainty": 50}
+                 for t in ("AAA", "BBB", "CCC")]
+        d2 = tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-23T11:00:00-04:00",
+                                            "analyses": _hold})
+        ok("carry: an all-Hold day keeps the carried targets (no revert to the seed book)",
+           _w(d2) == d1 and d2["conviction_weights"] is False, _w(d2))
+
+        # the same signals again: the step starts from YESTERDAY's target, not from the seed
+        d3 = _w(tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-24T11:00:00-04:00",
+                                               "analyses": _c_an}))
+        ok("carry: the next step starts from the carried target",
+           d3["AAA"] > d1["AAA"] + 2.0 - 1e-6 and d3["BBB"] < d1["BBB"] - 2.0 + 1e-6, (d1, d3))
+        # ...and the steps shrink below the gate, so the target settles. No endless walk.
+        d4 = _w(tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-25T11:00:00-04:00",
+                                               "analyses": _c_an}))
+        ok("carry: a step below the gate does not move the target (it settles)", d4 == d3, (d3, d4))
+        ok("carry: the book conserves to ~100% after every move",
+           all(abs(sum(x.values()) - 100.0) < 0.01 for x in (d1, d3, d4)), (d1, d3, d4))
+
+    # A Buy never lowers a target. The conviction share only ranks the pool.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)
+        _an_rank = [{"ticker": "AAA", "signal": "Buy", "conviction": 20, "uncertainty": 40},
+                    {"ticker": "BBB", "signal": "Buy", "conviction": 95, "uncertainty": 5},
+                    {"ticker": "CCC", "signal": "Hold", "conviction": 50, "uncertainty": 50}]
+        r = _w(tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                              "analyses": _an_rank}))
+        ok("direction: a low-conviction Buy is NOT cut to pay for a peer", r["AAA"] >= 20.0 - 1e-6, r)
+        ok("direction: with no decrease and no spare cash, nothing moves",
+           r == {"AAA": 20.0, "BBB": 20.0, "CCC": 20.0, "SGOV": 40.0}, r)
+
+    # The operator opts in to spending the cash sleeve with an explicit, lower floor.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **{**_c_kw, "cash_floor": 10})
+        r = _w(tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                              "analyses": [_c_an[0]]}))
+        ok("cash floor: an explicit lower cash_floor_pct lets a Buy use the cash above it",
+           r["AAA"] > 22.0 and 10.0 - 1e-6 <= r["SGOV"] < 40.0, r)
+
+    # FAIL CLOSED: a move the ledger does not hold must not trade.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)
+        _seed = _ledger_w(led)
+
+        def _boom(*a, **k):
+            raise RuntimeError("disk full")
+        led.retarget_weights = _boom
+        out = tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                             "analyses": _c_an})
+        ok("fail closed: a persist error keeps the prior targets for this tick",
+           _w(out) == _seed and _ledger_w(led) == _seed, (_w(out), _seed))
+        ok("fail closed: the error is reported, construct still proceeds",
+           out["proceed"] is True and "disk full" in (out["conviction_detail"]["persist_error"] or ""),
+           out["conviction_detail"])
 
     # --- Q3: screener ADD -> human-approve -> apply_add conserves -> in universe ---
     _sleeves = ('sleeves:\n  "US large cap": {screen: {sector: Technology, '

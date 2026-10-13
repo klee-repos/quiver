@@ -1362,6 +1362,39 @@ class Ledger:
             )
             return int(cur.lastrowid or 0)
 
+    def retarget_weights(self, goal_id: int, weights: dict, changed_at: str,
+                         changes: list) -> None:
+        """ATOMIC conviction re-target: the new target weights and their `weight`
+        change-log rows commit together or not at all.
+
+        weights: {ticker: target_weight} for the rows that change (the cash row included,
+        so the book still sums to ~100). changes: [{ticker, from_value, to_value, reason,
+        proof_json}], one per engine name that moved. A crash between the two writes would
+        leave a moved target with no log row, and `conviction_retargeted_on` reads the log.
+        """
+        with self._conn() as c:
+            for tk, w in weights.items():
+                c.execute(
+                    "UPDATE target_portfolio SET target_weight=?, updated_at=? "
+                    "WHERE goal_id=? AND ticker=?",
+                    (float(w), changed_at, goal_id, str(tk).upper()))
+            for ch in changes:
+                c.execute(
+                    "INSERT INTO strategy_change_log (goal_id, changed_at, change_type, ticker, "
+                    "from_value, to_value, trigger, reason, proof_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (goal_id, changed_at, "weight", str(ch["ticker"]).upper(),
+                     str(ch.get("from_value")), str(ch.get("to_value")), "conviction",
+                     ch.get("reason"), ch.get("proof_json")))
+
+    def conviction_retargeted_on(self, goal_id: int, day: str) -> bool:
+        """True when a conviction re-target is already logged for this date (YYYY-MM-DD)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM strategy_change_log WHERE goal_id=? AND change_type='weight' "
+                "AND trigger='conviction' AND substr(changed_at,1,10)=? LIMIT 1",
+                (goal_id, str(day)[:10])).fetchone()
+            return row is not None
+
     def strategy_change_history(self, goal_id: int, *, limit: int = 50,
                                 change_type: Optional[str] = None) -> list:
         """Strategic changes for a goal, NEWEST first (optionally one change_type)."""

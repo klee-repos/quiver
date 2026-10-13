@@ -206,6 +206,7 @@ def allocate_targets(
     regime_scalar: float = 1.0,
     policy: Optional[dict] = None,
     hold_floors: Optional[Dict[str, float]] = None,
+    min_delta_pct: float = 0.0,
 ) -> Allocation:
     """Turn per-candidate conviction into a clamped, smoothed target-weight vector.
 
@@ -216,6 +217,9 @@ def allocate_targets(
     regime_scalar: deploys less in STAND_DOWN, full when leaning in (see _deployed_budget).
     policy: strategy.yaml risk_policy (per_name/sleeve caps, cash_floor, curve_k, alpha...).
     hold_floors: {ticker: floor%} — D3 reversal-suppressed names pinned at their prior weight.
+    min_delta_pct: the caller's material-change gate (weight-points). When the cash floor
+                 binds, an increase that cannot reach the gate reverts first, so the room goes
+                 to the increases that can. 0 shares the room in proportion.
 
     Returns an Allocation: engine weights (summing to <= 100 - cash_floor) + the cash
     residual + a per-ticker audit detail. Pure; deterministic; no I/O.
@@ -241,12 +245,16 @@ def allocate_targets(
     conv_score: Dict[str, float] = {}   # names with a fresh conviction opinion
     keep_prior: Dict[str, float] = {}   # Hold / ERROR / missing -> hold prior weight (D2)
     reduce_only: set = set()            # Underweight -> a REDUCE intent; target may never exceed prior
+    add_only: set = set()               # Buy / Overweight -> an ADD intent; target may never fall below prior
     for c in cand:
         t = str(c["ticker"]).upper()
         a = analyses.get(t)
         ec = effective_conviction(a, policy)
-        if str((a or {}).get("signal") or "").strip().lower() == "underweight":
+        sig_l = str((a or {}).get("signal") or "").strip().lower()
+        if sig_l == "underweight":
             reduce_only.add(t)
+        elif sig_l in ("buy", "overweight") and ec is not None:
+            add_only.add(t)
         if ec is None:
             keep_prior[t] = prior.get(t, 0.0)
             # ERROR / missing data is a HARD hold-prior floor (D2): never sell on bad data.
@@ -281,6 +289,15 @@ def allocate_targets(
     # blends a reduction, never an inflation. Never blocks a trim-down, a Sell, or a real add.
     for t in reduce_only:
         fresh[t] = min(fresh[t], prior.get(t, 0.0))
+    # The mirror of item 4: Buy / Overweight is ADD-ONLY. The share above ranks the conviction
+    # names against each other, so a bullish name with a below-average score gets a share BELOW
+    # its prior weight. That cut is the inverse of the model's intent. Replay of the production
+    # signals (2026-08-11..10-13) cut SMH 15 -> 10 on two Overweight days. Clamp BEFORE the
+    # smoothing. A derisking regime (budget below the base) is exempt: STAND_DOWN shrinks the
+    # whole book, bullish names included. The caps and the cash floor still bind after this.
+    if budget >= max(0.0, 100.0 - cash_floor) - 1e-9:
+        for t in add_only:
+            fresh[t] = max(fresh[t], prior.get(t, 0.0))
 
     # Day-to-day stickiness: EWMA-blend the fresh target with the prior weight.
     smoothed = {t: _ewma(fresh[t], prior.get(t, 0.0), alpha) for t in fresh}
@@ -317,6 +334,10 @@ def allocate_targets(
             capped[t] = 0.0
     total = sum(capped.values())
     ceiling = 100.0 - cash_floor
+    if total > ceiling + 1e-9:
+        # The increases give back first. A name the tick did not raise keeps its weight.
+        capped = fund_increases(capped, prior, ceiling, min_delta_pct)
+        total = sum(capped.values())
     if total > ceiling + 1e-9:
         floored_sum = sum(hold_floors.get(t, 0.0) for t in capped)
         adj_total = total - floored_sum
@@ -364,4 +385,46 @@ def apply_target_hysteresis(
             out[t] = round(float(w_prior), 4)
         else:
             out[t] = w_new
+    return out
+
+
+def fund_increases(
+    new_weights: Dict[str, float], prior_weights: Dict[str, float],
+    ceiling_pct: float, min_delta_pct: float = 0.0,
+) -> Dict[str, float]:
+    """Conserve the book by shrinking ONLY the names whose target moved up.
+
+    An increase is funded by the decreases of this tick and by the cash above the floor
+    (``ceiling_pct`` = 100 - cash floor). When the increases need more than that room, they
+    shrink in proportion. A name at or below its prior weight is never touched, so a Hold
+    name keeps its weight and a bullish name is never cut to pay for a peer.
+
+    ``min_delta_pct`` > 0 keeps the material-change gate: an increase that shrinks below
+    the gate reverts to its prior weight (smallest first), and the room it frees goes to
+    the increases that remain. A name with no prior weight is an increase from 0.
+
+    The result can still exceed the ceiling when the PRIOR weights alone exceed it. The
+    caller keeps its proportional scale as the backstop for that case. Pure + total.
+    """
+    prior_u = {str(k).upper(): max(0.0, float(v or 0.0)) for k, v in (prior_weights or {}).items()}
+    out = {t: float(w) for t, w in new_weights.items()}
+    ups = {t: w - prior_u.get(str(t).upper(), 0.0) for t, w in out.items()
+           if w > prior_u.get(str(t).upper(), 0.0) + 1e-9}
+    if not ups:
+        return out
+    moved_up = set(ups)
+    room = max(0.0, float(ceiling_pct) - (sum(out.values()) - sum(ups.values())))
+    gate = max(0.0, float(min_delta_pct or 0.0))
+    while ups:
+        total = sum(ups.values())
+        if total <= room + 1e-9:
+            break
+        scale = room / total
+        short = [t for t in ups if ups[t] * scale < gate - 1e-9]
+        if not short:
+            ups = {t: d * scale for t, d in ups.items()}
+            break
+        ups.pop(min(short, key=lambda t: (ups[t], t)))   # deterministic: smallest, then ticker
+    for t in moved_up:
+        out[t] = round(prior_u.get(str(t).upper(), 0.0) + ups.get(t, 0.0), 4)
     return out

@@ -195,7 +195,10 @@ Write `state/tmp/construct_input.json`:
 ```
 Include `analyses` (the verbatim STEP 3 list): construct uses the pipeline's CONVICTION to
 set each name's target weight (Q1, ALWAYS ON), clamped by `strategy.yaml: risk_policy` + the
-dollar caps. An all-Hold / no-conviction tick falls back to the static book exactly, so
+dollar caps. construct writes each conviction move to the ledger target, and the next tick
+starts from that target. A Buy / Overweight can only raise a target. An Underweight / Sell can
+only lower it. An increase needs funding: a decrease in the same tick, or cash above the cash
+floor. An all-Hold / no-conviction tick keeps the ledger targets, so
 passing `analyses` is always correct (and required for conviction sizing to engage).
 The book is sized against TOTAL DEPLOYABLE capital = sum(held positions' market value) +
 `buying_power` (idle cash), so the bot deploys its cash toward target weights rather than

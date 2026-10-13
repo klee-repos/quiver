@@ -112,7 +112,10 @@ def test_rr_gate_below_floor_is_VOID_not_zero_edge():
     r_below = run("oracle_rr1.88", below, strategy=_rr_strategy)
     # NOTE: the initial book deploy can still place a handful of rebalance orders; what makes
     # the run void is that the gate refused the overwhelming majority of WOULD-BE entries.
-    ok("below-floor arm placed few orders", r_below.summary["total_orders"] <= 20, r_below.summary)
+    # Count BUYS. The R:R gate governs entries only. A bearish signal now lowers the carried
+    # target, and the trim that follows is a sell the gate never sees.
+    _buys = sum(1 for f in r_below.fills if f.get("side") == "buy")
+    ok("below-floor arm placed few BUY orders", _buys <= 20, (_buys, r_below.summary))
     ok("below-floor arm suppressed nearly every entry",
        r_below.skip_reasons.get("reward_risk", 0) >= 100, r_below.skip_reasons)
     ok("skip_reasons captured reward_risk",

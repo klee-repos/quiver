@@ -204,10 +204,11 @@ def main() -> int:
     # the new weight; otherwise the name sits inside a now-too-wide static band and never
     # rebalances toward its conviction target (conviction sizing wouldn't bind).
     with tempfile.TemporaryDirectory() as d:
-        # AAA carries a WIDE static band (12); conviction sizes it to ~13.3%, so the clamp
-        # tightens its band to ~6.6% (= 13.3 * 0.5). Held at $250 the drift is ~6.7% — INSIDE
-        # the static 12% band (would HOLD without the clamp) but OUTSIDE the tightened band,
-        # so it must TRIM. Reverting the clamp flips this back to "hold" and fails the test.
+        # AAA carries a WIDE static band (12); an Underweight sizes it to ~7%, so the clamp
+        # tightens its band to ~3.6% (= weight * 0.5). Held at $250 the drift is ~18% — it
+        # must TRIM. Reverting the clamp flips this back to "hold" and fails the test.
+        # AAA is Underweight, not a low-conviction Buy: a Buy is add-only (it never lowers a
+        # target), so only a reduce intent can size a name down.
         _wideband = ["      - {sleeve: Tech, ticker: AAA, weight: 30, band: 12}",
                      "      - {sleeve: Fin, ticker: BBB, weight: 30, band: 5}",
                      "      - {sleeve: Cash, ticker: SGOV, weight: 40}"]
@@ -216,7 +217,7 @@ def main() -> int:
             "now_iso": "2026-06-19T11:00:00-04:00", "equity": 1000.0, "buying_power": 1000.0,
             "positions": {"AAA": {"market_value": 250.0, "quantity": 5.0}},
             "quotes": {"AAA": 50.0, "BBB": 50.0},
-            "analyses": [{"ticker": "AAA", "signal": "Buy", "conviction": 20, "uncertainty": 40},
+            "analyses": [{"ticker": "AAA", "signal": "Underweight", "conviction": 20, "uncertainty": 40},
                          {"ticker": "BBB", "signal": "Buy", "conviction": 95, "uncertainty": 5}]})
         _aaa = out["target_weights"].get("AAA", {})
         ok("MED-fix: conviction-shrunk name trims (tightened band binds, not stale wide band)",

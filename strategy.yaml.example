@@ -115,13 +115,19 @@ sleeves:
 # Read by lib/allocate (conviction sizing is ALWAYS ON). These are the operator's sizing
 # guardrails (the strategy, not the stocks). Every key is optional (lib/allocate has safe
 # fallbacks). Conviction can tilt a name UP only within per_name_max_pct/sleeve_max_pct
-# and never past the dollar caps; an all-Hold tick falls back to the static book exactly.
+# and never past the dollar caps. Each move is written to the ledger target and the next
+# tick starts from it; an all-Hold tick keeps the ledger targets. A Buy / Overweight only
+# raises a target and an Underweight / Sell only lowers it. An increase needs funding: a
+# decrease in the same tick, or cash above the cash floor.
 # Set these to accommodate your book (e.g. per_name_max_pct >= your largest holding) so a
 # quiet tick is never re-clipped.
 risk_policy:
   per_name_max_pct: 20         # no single name above this % of the book (conviction can't breach it)
   sleeve_max_pct: 45           # no single sleeve above this %
-  cash_floor_pct: 5            # always hold >= this % cash (a HARD floor)
+  # cash_floor_pct: 5          # always hold >= this % cash (a HARD floor). OMIT it and the
+                               # floor is the book's cash sleeve weight: conviction then moves
+                               # weight between names and never spends the cash sleeve. Set a
+                               # lower value to let a Buy use the cash above it.
   conviction_curve_k: 1.0      # >1 sharpens into best ideas; 1.0 = linear
   smoothing_alpha: 0.4         # EWMA weight on TODAY's target (lower = stickier day-to-day)
   uncertainty_damp: 0.5        # how much self-reported uncertainty shrinks conviction
