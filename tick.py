@@ -3134,9 +3134,12 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
     orders = led.day_orders(date)
     _tg_token, _tg_chats = telegram.resolve_env()
 
-    equity = data.get("equity")
+    # The plan's `equity` is the TOTAL account value (positions + buying power). It is the
+    # base of `baseline_equity` and `drop_pct`. The orchestrator's `equity` is the broker's
+    # positions-only figure. Use it only when no plan ran (an alert before STEP 4).
+    equity = plan.get("equity")
     if equity is None:
-        equity = plan.get("equity")
+        equity = data.get("equity")
     baseline_equity = baseline.baseline_equity if baseline else plan.get("baseline_equity")
     drop_pct = plan.get("drop_pct")
     if drop_pct is None and equity is not None and baseline_equity:

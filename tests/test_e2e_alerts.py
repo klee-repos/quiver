@@ -175,6 +175,25 @@ def main() -> int:
     ok("digest carries the FYI hiccup (folded delivery)",
        "yfinance 403 blip" in dr["html"] and "yfinance 403 blip" in dr["text"])
 
+    # ---- E2. digest lead: equity, baseline and drop_pct share ONE base ----
+    # The orchestrator passes the broker's positions-only `equity`. The plan computes the
+    # TOTAL (positions + buying power). The lead must print the total. The plan comes from
+    # the real `_run_plan`, so the fixture is one the producer emits.
+    print("\n[E2] digest lead prints the plan's TOTAL equity, not positions-only")
+    cfg, led_e2 = _cfg(ENABLED), _led()
+    plan_e2 = T._run_plan(cfg, led_e2, {
+        "run_id": "E2", "now_iso": NOW, "equity": 1682.71, "buying_power": 388.18,
+        "positions": {"SMH": {"market_value": 1682.71}},
+        "analyses": [{"ticker": "SMH", "signal": "Hold"}]})
+    ok("plan equity is the total (positions + buying power)", plan_e2["equity"] == 2070.89)
+    lead = T._run_report(cfg, led_e2, {"date": DAY, "now_iso": NOW, "kind": "digest",
+                                      "equity": 1682.71, "plan": plan_e2})["telegram"]
+    ok("lead prints the total equity", "flat on the day at $2,070.89" in lead)
+    ok("lead never prints the positions-only figure", "$1,682.71" not in lead)
+    # No plan (an alert before STEP 4): the orchestrator's `equity` is the only figure.
+    m_noplan = T._build_report_model(cfg, _led(), {"equity": 961.0}, DAY, NOW, "halt")
+    ok("no plan -> falls back to the orchestrator's equity", m_noplan["equity"] == 961.0)
+
     # ---- F. cross-sender dedup: orchestrator + last-resort agree on the hash ----
     print("\n[F] cross-sender dedup: in-tick + last-resort produce the SAME hash")
     cfg, led_f = _cfg(ENABLED), _led()

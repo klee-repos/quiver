@@ -425,6 +425,9 @@ Write `state/tmp/report_input.json`:
   "plan": <the FULL JSON object STEP 4 plan returned>
 }
 ```
+`equity` is a fallback only. The digest prints `plan.equity`, the TOTAL account value
+(positions + buying power). That total is the base of `baseline_equity` and `drop_pct`.
+
 `warnings` is the list of any best-effort hiccups you logged THIS tick (a
 `REFLECT_SKIPPED` / `PRUNE_SKIPPED` / `ALERT_SKIPPED` etc.) — they ride along in the
 digest's "FYI" section so nothing is lost without paging you separately (omit / `[]`
