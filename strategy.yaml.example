@@ -137,6 +137,7 @@ risk_policy:
   # ever REDUCES risk (skips/shrinks a buy, or trims into a drawdown); the code defaults keep a
   # book that omits them BYTE-IDENTICAL, so turning them on is a deliberate opt-in. ---
   # min_reward_risk: 3.0         # F1/P1: skip a buy whose (target-entry)/(entry-stop) < this (PTJ ~5:1; 0=off)
+  #                              # A refused Buy / Overweight also does not raise its target weight.
   # require_target_for_buy: false # F1/C7: true = a fresh buy with no target is skipped (else 'ungraded' passes)
   # per_trade_risk_pct: 1.0      # F2/P3: max % of equity lost if the stop hits -> stop-distance size cap (0=off)
   # downside_vol_target: 0.30    # F3/P5: shrink a buy when a name's annualized downside-vol exceeds this (0=off)

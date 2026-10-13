@@ -218,6 +218,45 @@ def detect_external_flows(points: list, flows: list, *, min_pct: float, min_abs:
     return out
 
 
+def flow_adjusted_returns(points: list, flows: list, *, min_pct: float, min_abs: float) -> tuple:
+    """Per-interval returns of the equity curve with external cash flows removed.
+
+    ``points`` = ``[(date, equity)]`` date-ASC; ``flows`` = ``[(date, amount)]`` recorded
+    (deposit > 0, withdrawal < 0). Returns ``(returns, skipped)``.
+
+    For each consecutive pair ``(prev, cur)``:
+      * a recorded flow in ``(prev_date, cur_date]`` -> ``r = (cur - flow) / prev - 1``. This
+        is the bucketing and the end-of-period convention of ``time_weighted_return_pct``.
+      * no recorded flow, and ``detect_external_flows`` flags the pair (a jump of
+        ``>= min_pct`` AND ``>= min_abs``) -> the pair is NOT a return. It goes to
+        ``skipped`` (the detector's record). The cause is an unrecorded flow or a data
+        fault; a market move of that size is not credible for this book.
+      * else ``r = cur / prev - 1``.
+
+    A pair with a missing or non-positive ``prev`` is dropped (no division by zero). Pure.
+    The caller builds the drawdown and the Sharpe from ``returns`` and reports
+    ``len(skipped)``, so an unexplained jump is visible and never a silent gain or loss.
+    """
+    pts = points or []
+    fl = [(str(d), float(a or 0.0)) for d, a in (flows or [])]
+    unexplained = {j["trade_date"]: j for j in detect_external_flows(
+        pts, fl, min_pct=min_pct, min_abs=min_abs)}
+    returns, skipped = [], []
+    for i in range(1, len(pts)):
+        prev_date, prev_eq = pts[i - 1]
+        cur_date, cur_eq = pts[i]
+        if prev_eq is None or cur_eq is None or prev_eq <= 0:
+            continue
+        in_interval = [a for d, a in fl if str(prev_date) < d <= str(cur_date)]
+        if in_interval:
+            returns.append((float(cur_eq) - sum(in_interval)) / float(prev_eq) - 1.0)
+        elif cur_date in unexplained:
+            skipped.append(unexplained[cur_date])
+        else:
+            returns.append(float(cur_eq) / float(prev_eq) - 1.0)
+    return returns, skipped
+
+
 def confirmable_flows(points: list, candidates: list, *, confirm_days: int) -> list:
     """The subset of ``candidates`` safe to AUTO-write (vs merely surface for a human).
 
@@ -294,7 +333,7 @@ def compute_from_ledger(led, goal_row: Optional[dict]) -> Optional[dict]:
     target_return_pct = goal_row.get("target_return_pct")
     horizon_months = goal_row.get("horizon_months")
     start_date = goal_row.get("start_date")
-    if start_equity is None or target_return_pct is None or horizon_months is None or not start_date:
+    if target_return_pct is None or horizon_months is None or not start_date:
         return None
     start_date = str(start_date)
     # Deposit-adjust the return with recorded external flows (best-effort; cash_flows() is
@@ -302,6 +341,13 @@ def compute_from_ledger(led, goal_row: Optional[dict]) -> Optional[dict]:
     # suggest_flows_from_ledger so the >=/> boundary rule can never drift between them).
     flows_raw = led.cash_flows() if hasattr(led, "cash_flows") else []
     points, flows = _goal_window(series, flows_raw, start_date)
+    if start_equity is None:
+        # A goal row with no start_equity (a `strategy-set` with no equity input). Anchor at
+        # the first baseline of the goal window: the account value when the goal started.
+        # No baseline in the window yet -> no return to report.
+        start_equity = next((e for _d, e in points if e is not None and e > 0), None)
+        if start_equity is None:
+            return None
     twr = time_weighted_return_pct(float(start_equity), start_date, points, flows)
     return goal_progress(
         start_equity=float(start_equity),

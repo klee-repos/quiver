@@ -133,7 +133,22 @@ def _account_risk_line(ar: dict) -> str:
     sh = ar.get("sharpe")
     dd_s = f"{dd:.1f}%" if dd is not None else "—"
     sh_s = f"{sh:.2f} (N={ar.get('sharpe_n', 0)})" if sh is not None else "—"
-    return f"Account risk: max drawdown {dd_s}, daily Sharpe {sh_s}"
+    return f"Account risk: max drawdown {dd_s}, daily Sharpe {sh_s}" + _unexplained_jumps_note(ar)
+
+
+def _unexplained_jumps_note(ar: dict) -> str:
+    """The clause that tells the operator a jump was left out of the risk numbers.
+
+    Empty when every jump has a recorded flow. A deposit that is not recorded yet shows
+    here, so the numbers never count it as a gain without a word."""
+    try:
+        n = int(ar.get("unexplained_jumps") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return ""
+    return (f" ({n} unexplained equity jump" + ("" if n == 1 else "s")
+            + " left out; record the deposit or withdrawal with flow-record)")
 
 
 def _counts(tickers):
@@ -721,7 +736,7 @@ def _tg_risk_sentence(ar: dict) -> str:
     if sh is not None:
         n = ar.get("sharpe_n", 0)
         bits.append(f"a {sh:.2f} daily Sharpe over {n} day" + ("" if n == 1 else "s"))
-    return "Risk check: " + " and ".join(bits) + "." if bits else ""
+    return "Risk check: " + " and ".join(bits) + _unexplained_jumps_note(ar) + "." if bits else ""
 
 
 def _render_telegram_alert(model: dict, kind: str) -> str:

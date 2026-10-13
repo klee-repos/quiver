@@ -116,8 +116,18 @@ def test_rr_gate_below_floor_is_VOID_not_zero_edge():
     # target, and the trim that follows is a sell the gate never sees.
     _buys = sum(1 for f in r_below.fills if f.get("side") == "buy")
     ok("below-floor arm placed few BUY orders", _buys <= 20, (_buys, r_below.summary))
+    # Compare the refusals with the buys that got through, not with a fixed count. `construct`
+    # does not raise the target of a name the gate refuses, so that name is not under its
+    # target on the next tick and `plan` has no buy to refuse again: fewer refusals in total
+    # (92 here, 100+ when the refused name kept a raised target).
+    _refused = r_below.skip_reasons.get("reward_risk", 0)
     ok("below-floor arm suppressed nearly every entry",
-       r_below.skip_reasons.get("reward_risk", 0) >= 100, r_below.skip_reasons)
+       _refused >= 50 and _refused >= 5 * max(1, _buys), (_refused, _buys, r_below.skip_reasons))
+    # The sells of this arm are trims of bearish names. A refused buy must not add to them:
+    # with a raised target that the gate never funds, this arm placed 18 sells.
+    _sells = sum(1 for f in r_below.fills if f.get("side") == "sell")
+    ok("below-floor arm: the refused buys do not turn into extra trims", _sells <= 10,
+       (_sells, r_below.summary))
     ok("skip_reasons captured reward_risk",
        any("reward_risk" in k for k in r_below.skip_reasons), r_below.skip_reasons)
     ok("VOID guard fires", r_below.void is not None, r_below.void)

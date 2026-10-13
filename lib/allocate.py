@@ -357,7 +357,7 @@ def allocate_targets(
 
 def apply_target_hysteresis(
     new_weights: Dict[str, float], prior_weights: Dict[str, float],
-    min_delta_pct: float,
+    min_delta_pct: float, exempt: Optional[set] = None,
 ) -> Dict[str, float]:
     """Material-change gate on the TARGET weight (F3, anti-churn).
 
@@ -374,14 +374,22 @@ def apply_target_hysteresis(
     takes its new weight. ``min_delta_pct <= 0`` disables the gate (byte-identical to
     re-clipping every tick). Pure + total; the CALLER re-derives the cash residual /
     book conservation after (this only decides engine weights).
+
+    ``exempt`` names skip the gate: the new weight always carries. The caller passes the
+    names with a grounded Sell. The gate filters noise in the SIZE of a position. A Sell is
+    an exit decision, not a size. With the gate on, each smoothed step of a Sell is
+    ``alpha x weight``, so the step falls below the gate while the name still has weight
+    (9 -> 5.4 -> 3.24, then no move) and a name below ``gate / alpha`` never moves at all.
     """
     if min_delta_pct is None or min_delta_pct <= 0:
         return dict(new_weights)
     prior_u = {str(k).upper(): v for k, v in (prior_weights or {}).items()}
+    exempt_u = {str(t).upper() for t in (exempt or ())}
     out: Dict[str, float] = {}
     for t, w_new in new_weights.items():
         w_prior = prior_u.get(str(t).upper())
-        if w_prior is not None and abs(float(w_new) - float(w_prior)) < min_delta_pct:
+        if (w_prior is not None and str(t).upper() not in exempt_u
+                and abs(float(w_new) - float(w_prior)) < min_delta_pct):
             out[t] = round(float(w_prior), 4)
         else:
             out[t] = w_new

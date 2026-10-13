@@ -198,7 +198,10 @@ set each name's target weight (Q1, ALWAYS ON), clamped by `strategy.yaml: risk_p
 dollar caps. construct writes each conviction move to the ledger target, and the next tick
 starts from that target. A Buy / Overweight can only raise a target. An Underweight / Sell can
 only lower it. An increase needs funding: a decrease in the same tick, or cash above the cash
-floor. An all-Hold / no-conviction tick keeps the ledger targets, so
+floor. A Sell that the consistency gate allows skips the material-change gate, so a Sell on
+each day moves the target to 0. A Buy / Overweight that the R:R gate refuses (when
+`risk_policy.min_reward_risk` is set) does not raise its target. An all-Hold / no-conviction
+tick keeps the ledger targets, so
 passing `analyses` is always correct (and required for conviction sizing to engage).
 The book is sized against TOTAL DEPLOYABLE capital = sum(held positions' market value) +
 `buying_power` (idle cash), so the bot deploys its cash toward target weights rather than

@@ -1494,6 +1494,23 @@ check("account_risk excluded from content_hash (no spurious re-sends)",
       notify.digest_hash(_m_ar), _base_hash)
 check_true("digest with no account_risk omits the line",
            "Account risk" not in notify.build_digest(MODEL)["text"])
+# An equity jump with no recorded flow is left out of the risk numbers. The line says so.
+_m_uj = copy.deepcopy(_m_ar)
+_m_uj["account_risk"] = {"drawdown_pct": 7.9, "sharpe": -0.01, "sharpe_n": 73, "unexplained_jumps": 1}
+check_true("risk line names an unexplained equity jump (text)",
+           "(1 unexplained equity jump left out; record the deposit or withdrawal with flow-record)"
+           in notify.build_digest(_m_uj)["text"])
+check("telegram risk sentence carries the clause, one period, singular",
+      notify._tg_risk_sentence(_m_uj["account_risk"]),
+      "Risk check: 7.9% max drawdown and a -0.01 daily Sharpe over 73 days (1 unexplained equity "
+      "jump left out; record the deposit or withdrawal with flow-record).")
+check_true("telegram risk sentence: plural",
+           "(3 unexplained equity jumps left out;" in notify._tg_risk_sentence(
+               {"drawdown_pct": 1.0, "sharpe": 0.1, "sharpe_n": 5, "unexplained_jumps": 3}))
+check("telegram risk sentence: no jump -> no clause (unchanged wording)",
+      notify._tg_risk_sentence({"drawdown_pct": 7.9, "sharpe": -0.01, "sharpe_n": 74, "unexplained_jumps": 0}),
+      "Risk check: 7.9% max drawdown and a -0.01 daily Sharpe over 74 days.")
+check("unexplained-jump clause excluded from content_hash", notify.digest_hash(_m_uj), _base_hash)
 
 
 # ============================================================================
@@ -1802,6 +1819,48 @@ check("flow: single point -> []", _goal.detect_external_flows([("d0", 100.0)], [
 check("flow: multi-jump date-ASC order",
       [c["trade_date"] for c in _goal.detect_external_flows(
           [("d0", 100.0), ("d1", 1000.0), ("d2", 100.0)], [], min_pct=25, min_abs=30)], ["d1", "d2"])
+# flow_adjusted_returns: the return series of the digest risk line. A deposit is not a gain.
+# The points are the production curve around the 2026-07-09 deposit ($800, checked against the
+# broker's cost basis + realized P&L and against hourly bars across the jump).
+_fa_pts = [("2026-07-07", 235.73), ("2026-07-08", 238.84), ("2026-07-09", 1045.09), ("2026-07-10", 1046.36)]
+_fa_r, _fa_skip = _goal.flow_adjusted_returns(_fa_pts, [("2026-07-09", 800.0)], min_pct=25, min_abs=30)
+check("flow-adj: a recorded deposit leaves the market return of its day",
+      [round(r, 6) for r in _fa_r],
+      [round(238.84 / 235.73 - 1, 6), round((1045.09 - 800.0) / 238.84 - 1, 6), round(1046.36 / 1045.09 - 1, 6)])
+check("flow-adj: nothing is skipped when the flow is recorded", _fa_skip, [])
+_fa_r0, _fa_skip0 = _goal.flow_adjusted_returns(_fa_pts, [], min_pct=25, min_abs=30)
+check("flow-adj: an UNRECORDED jump is not a return (2 returns, not 3)", len(_fa_r0), 2)
+check_true("flow-adj: no +337% day reaches the return series", max(_fa_r0) < 0.02)
+check("flow-adj: the unrecorded jump is reported with its date",
+      [j["trade_date"] for j in _fa_skip0], ["2026-07-09"])
+_fa_wr, _fa_ws = _goal.flow_adjusted_returns(
+    [("d0", 1000.0), ("d1", 700.0)], [("d1", -300.0)], min_pct=25, min_abs=30)
+check("flow-adj: a recorded withdrawal is not a loss", ([round(r, 9) for r in _fa_wr], _fa_ws), ([0.0], []))
+check("flow-adj: a non-positive / missing prior equity is dropped, never divided",
+      _goal.flow_adjusted_returns([("d0", 0.0), ("d1", 100.0), ("d2", None), ("d3", 101.0)], [],
+                                  min_pct=25, min_abs=30), ([], []))
+check("flow-adj: fewer than two points -> no returns",
+      _goal.flow_adjusted_returns([("d0", 100.0)], [], min_pct=25, min_abs=30), ([], []))
+
+# compute_from_ledger with NO start_equity on the goal row (a `strategy-set` with no equity
+# input). Production had this from 2026-08-07: goal-track returned "insufficient equity
+# history" and wrote no row for two months. The anchor is the first baseline of the window.
+_ndb = tempfile.mktemp(suffix=".db")
+_nled = Ledger(_ndb)
+_nled.set_strategy_goal(created_at="t", target_return_pct=15, horizon_months=12,
+    benchmark="SGOV", benchmark_annual_pct=3.6, constraint_note="", macro_thesis_version="v",
+    macro_thesis_json="{}", active_book="core_55_45", as_of="d",
+    start_date="2026-08-07", start_equity=None)
+_nled.get_or_create_baseline("2026-08-06", 2014.57, "t")     # before the window: not the anchor
+check("goal: no start_equity + no baseline in the window -> None (nothing to report yet)",
+      _goal.compute_from_ledger(_nled, _nled.get_active_goal()), None)
+_nled.get_or_create_baseline("2026-08-07", 2033.22, "t")
+_nled.get_or_create_baseline("2026-10-13", 2070.89, "t")
+_nprog = _goal.compute_from_ledger(_nled, _nled.get_active_goal())
+check_true("goal: no start_equity -> anchored at the first baseline of the window",
+           _nprog is not None and abs(_nprog["cumulative_return_pct"] - (2070.89 / 2033.22 - 1) * 100) < 1e-3)
+Path(_ndb).unlink(missing_ok=True)
+
 # confirmable_flows (Gate-B F-WALL-1): only SETTLED + PERSISTED jumps are auto-writable.
 _cand = _goal.detect_external_flows([("d0", 100.0), ("d1", 1000.0)], [], min_pct=25, min_abs=30)
 check("flow: unsettled jump (no later baselines) NOT confirmable",
@@ -3080,6 +3139,14 @@ check("F3 hyst: min_delta 0 disables (identity)", _hy({"AAA": 14.0}, {"AAA": 15.
 check("F3 hyst: case-insensitive prior lookup", _hy({"AAA": 14.0}, {"aaa": 15.0}, 2.0), {"AAA": 15.0})
 # revert-not-blend: a 1pt daily nudge never walks the target off its static anchor.
 check("F3 hyst: revert prevents 1pt/day accumulation", _hy({"AAA": 14.0}, {"AAA": 15.0}, 2.0), {"AAA": 15.0})
+
+# A grounded Sell is exempt: each smoothed step of a Sell is alpha x weight, so with the gate the
+# exit stops while the name still has weight (9 -> 5.4 -> 3.24 -> stop: 1.296 < 2).
+check("F3 hyst: a sub-gate step on an EXEMPT name carries (the Sell tail completes)",
+      _hy({"AAA": 1.944, "BBB": 14.0}, {"AAA": 3.24, "BBB": 15.0}, 2.0, exempt={"aaa"}),
+      {"AAA": 1.944, "BBB": 15.0})
+check("F3 hyst: exempt=None is the plain gate", _hy({"AAA": 1.944}, {"AAA": 3.24}, 2.0, exempt=None),
+      {"AAA": 3.24})
 
 # --- fund_increases: only the names that moved UP give weight back ---------------------------
 _fi = _alloc.fund_increases

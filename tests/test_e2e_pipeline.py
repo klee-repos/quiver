@@ -38,7 +38,7 @@ def ok(name, cond, detail=""):
 
 def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
         auto_apply=False, rh="[AAA, BBB, NVDA, SGOV]", sleeves="", holdings=None,
-        smoothing_alpha=1.0, dep_min_factor=None):
+        smoothing_alpha=1.0, dep_min_factor=None, min_rr=None):
     """Write a strategy + config and return a loaded Config + a freshly-seeded Ledger."""
     from lib.config import load_config
     from lib.strategy import load_strategy
@@ -57,6 +57,7 @@ def _mk(tmp: Path, *, per_name=80, sleeve_max=100, cash_floor=10,
         + (f"cash_floor_pct: {cash_floor}, " if cash_floor is not None else "")
         + f"smoothing_alpha: {smoothing_alpha}"
         + (f", conviction_deploy_min_factor: {dep_min_factor}" if dep_min_factor is not None else "")
+        + (f", min_reward_risk: {min_rr}" if min_rr is not None else "")
         + "}\n"
         + (sleeves or "")
         + f"learning: {{auto_apply_universe_changes: {str(auto_apply).lower()}}}\n"
@@ -307,6 +308,92 @@ def main() -> int:
         ok("fail closed: the error is reported, construct still proceeds",
            out["proceed"] is True and "disk full" in (out["conviction_detail"]["persist_error"] or ""),
            out["conviction_detail"])
+
+    # A persistent Sell completes the exit. Each smoothed step is 0.4 x the weight, so with the
+    # gate the walk stops at 4.32 (20 -> 12 -> 7.2 -> 4.32, next step 1.728 < 2). A grounded
+    # Sell skips the gate, the weight falls below the dust floor, and the target is 0.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)
+        _sell = [{"ticker": "AAA", "signal": "Sell", "conviction": 80, "uncertainty": 10},
+                 {"ticker": "BBB", "signal": "Hold", "conviction": 50, "uncertainty": 50},
+                 {"ticker": "CCC", "signal": "Hold", "conviction": 50, "uncertainty": 50}]
+        _walk = []
+        for _i in range(10):
+            _o = _w(tick._run_construct(cfg, led, {**base, "now_iso": f"2026-07-{6 + _i:02d}T11:00:00-04:00",
+                                                   "analyses": _sell}))
+            _walk.append(_o)
+        _aaa = [round(x["AAA"], 4) for x in _walk]
+        ok("sell: the first steps are 0.4 x the weight (20 -> 12 -> 7.2 -> 4.32)",
+           _aaa[:3] == [12.0, 7.2, 4.32], _aaa)
+        ok("sell: the walk does NOT stop where the gate stopped it (below 4.32 on day 4)",
+           _aaa[3] < 4.32 - 1e-6, _aaa)
+        ok("sell: a persistent Sell ends at target 0 (the exit completes)", _aaa[-1] == 0.0, _aaa)
+        ok("sell: the target never moves UP on the way", all(b <= a + 1e-9 for a, b in zip(_aaa, _aaa[1:])), _aaa)
+        ok("sell: the Hold names keep their weight; the sold weight goes to cash",
+           all(x["BBB"] == 20.0 and x["CCC"] == 20.0 for x in _walk)
+           and abs(_walk[-1]["SGOV"] - 60.0) < 1e-6, _walk[-1])
+        ok("sell: the book conserves to ~100% on every step",
+           all(abs(sum(x.values()) - 100.0) < 0.01 for x in _walk), [sum(x.values()) for x in _walk])
+        ok("sell: target 0 on a held name is a trim to exactly zero (band 0)",
+           (lambda r: r["intent"] == "trim" and r["target_dollars"] == 0.0 and r["band_dollars"] == 0.0)(
+               tick._run_construct(cfg, led, {
+                   "equity": 1000.0, "buying_power": 900.0, "now_iso": "2026-07-20T11:00:00-04:00",
+                   "positions": {"AAA": {"market_value": 100.0}}, "analyses": _sell})["target_weights"]["AAA"]))
+
+    # The R:R gate and the conviction target agree. `plan` refuses a buy below the floor, so
+    # `construct` does not raise that name's target: the room goes to a name `plan` can buy.
+    _rr_an = [{"ticker": "AAA", "signal": "Buy", "conviction": 90, "uncertainty": 10,
+               "entry_price": 100.0, "stop_loss": 95.0, "target_price": 105.0},     # R:R 1.0
+              {"ticker": "BBB", "signal": "Underweight", "conviction": 60, "uncertainty": 20},
+              {"ticker": "CCC", "signal": "Buy", "conviction": 70, "uncertainty": 10,
+               "entry_price": 100.0, "stop_loss": 95.0, "target_price": 130.0}]     # R:R 6.0
+    # ONE broker snapshot for construct and plan: $200 in each name + $400 cash = $1000.
+    _rr_snap = {"equity": 600.0, "buying_power": 400.0,
+                "positions": {t: {"market_value": 200.0, "quantity": 2.0} for t in ("AAA", "BBB", "CCC")},
+                "quotes": {"AAA": 100.0, "BBB": 100.0, "CCC": 100.0}}
+    _rr_holds = [h.replace("band: 3", "band: 1") for h in _c_holds]
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **{**_c_kw, "holdings": _rr_holds, "min_rr": 3.0})
+        out = tick._run_construct(cfg, led, {**_rr_snap, "now_iso": "2026-06-22T11:00:00-04:00",
+                                             "analyses": _rr_an})
+        r = _w(out)
+        ok("R:R: a Buy below the floor does NOT raise its target", r["AAA"] == 20.0, r)
+        ok("R:R: the refused name is reported", out["conviction_detail"]["rr_blocked"] == ["AAA"],
+           out["conviction_detail"].get("rr_blocked"))
+        ok("R:R: the Underweight still moves down, and the Buy above the floor takes the room",
+           r["BBB"] < 18.0 and r["CCC"] > 22.0 and abs(r["SGOV"] - 40.0) < 1e-6, r)
+        _pl = tick._run_plan(cfg, led, {
+            **_rr_snap, "run_id": "rr", "now_iso": "2026-06-22T11:05:00-04:00",
+            "analyses": _rr_an, "target_weights": out["target_weights"]})
+        _buys = sorted(o["ticker"] for o in _pl["orders"] if o["side"] == "buy")
+        _sells = sorted(o["ticker"] for o in _pl["orders"] if o["side"] == "sell")
+        ok("R:R: plan trims the Underweight AND buys the name above the floor (weight is not left in cash)",
+           _buys == ["CCC"] and _sells == ["BBB"], (_buys, _sells, _pl["decisions"]))
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **{**_c_kw, "min_rr": 3.0})
+        out = tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                             "analyses": [_rr_an[0], _hold[1], _hold[2]]})
+        ok("R:R: a tick whose only conviction is a refused Buy keeps the book (allocation skipped)",
+           _w(out) == {"AAA": 20.0, "BBB": 20.0, "CCC": 20.0, "SGOV": 40.0}
+           and out["conviction_weights"] is False, _w(out))
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)                       # gate OFF (the default)
+        out = tick._run_construct(cfg, led, {**base, "now_iso": "2026-06-22T11:00:00-04:00",
+                                             "analyses": _rr_an})
+        ok("R:R gate OFF: the same low-R:R Buy raises its target (no change from the default path)",
+           _w(out)["AAA"] > 20.0 and out["conviction_detail"]["rr_blocked"] == [], _w(out))
+
+    # `strategy-set` with no equity input must not write a goal with no start_equity. Goal-track
+    # needs it: production wrote no goal row from 2026-08-07 to 2026-10-13 for this reason.
+    with tempfile.TemporaryDirectory() as d:
+        cfg, led = _mk(Path(d), **_c_kw)
+        led.get_or_create_baseline("2026-06-18", 990.0, "t")
+        led.get_or_create_baseline("2026-06-19", 1003.5, "t")
+        _ss = tick._run_strategy_set(cfg, led, {"now_iso": "2026-06-22T11:00:00-04:00"})
+        ok("strategy-set: no equity input -> start_equity is the latest baseline",
+           _ss["start_equity"] == 1003.5 and led.get_active_goal()["start_equity"] == 1003.5, _ss)
+        _ss2 = tick._run_strategy_set(cfg, led, {"equity": 1234.0, "now_iso": "2026-06-22T11:00:00-04:00"})
+        ok("strategy-set: an explicit equity input still wins", _ss2["start_equity"] == 1234.0, _ss2)
 
     # --- Q3: screener ADD -> human-approve -> apply_add conserves -> in universe ---
     _sleeves = ('sleeves:\n  "US large cap": {screen: {sector: Technology, '

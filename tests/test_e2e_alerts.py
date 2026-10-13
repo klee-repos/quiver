@@ -194,6 +194,49 @@ def main() -> int:
     m_noplan = T._build_report_model(cfg, _led(), {"equity": 961.0}, DAY, NOW, "halt")
     ok("no plan -> falls back to the orchestrator's equity", m_noplan["equity"] == 961.0)
 
+    # ---- E3. digest risk line: a deposit is not a gain, a base change is not a drawdown ----
+    # The curve is the production one around the two deposits (2026-07-09 $800, 2026-07-22
+    # $1000). The raw curve gave "39.5% max drawdown" and counted each deposit as a return.
+    print("\n[E3] digest risk line is flow-adjusted")
+    cfg, led_e3 = _cfg(ENABLED), _led()
+    # The plan comes from the real `_run_plan`. It writes the baseline of the CURRENT trading
+    # day: the last point of the curve. Its total (1600 + 388.63) equals the point before it,
+    # so that interval is a 0% return.
+    plan_e3 = T._run_plan(cfg, led_e3, {
+        "run_id": "E3", "now_iso": NOW, "equity": 1600.0, "buying_power": 388.63,
+        "positions": {"SMH": {"market_value": 1600.0}},
+        "analyses": [{"ticker": "SMH", "signal": "Hold"}]})
+    for _d, _e in (("2026-07-06", 239.54), ("2026-07-07", 235.73), ("2026-07-08", 238.84),
+                   ("2026-07-09", 1045.09), ("2026-07-10", 1046.36), ("2026-07-13", 1035.57),
+                   ("2026-07-14", 1037.48), ("2026-07-15", 998.28), ("2026-07-16", 1000.97),
+                   ("2026-07-17", 989.19), ("2026-07-20", 989.55), ("2026-07-21", 1006.56),
+                   ("2026-07-22", 2006.51), ("2026-07-23", 1997.02), ("2026-07-24", 1988.63)):
+        led_e3.get_or_create_baseline(_d, _e, _d + "T10:30:00-04:00")
+    ar0 = T._account_risk(led_e3, cfg)
+    ok("no recorded flow: both deposit jumps are left out and counted",
+       ar0["unexplained_jumps"] == 2
+       and ar0["unexplained_jump_dates"] == ["2026-07-09", "2026-07-22"])
+    ok("no recorded flow: a deposit day is never a return (Sharpe N = 15 intervals - 2)",
+       ar0["sharpe_n"] == 13)
+    tg0 = T._run_report(cfg, led_e3, {"date": DAY, "now_iso": NOW, "kind": "digest",
+                                     "plan": plan_e3})["telegram"]
+    ok("the digest tells the operator to record the flow",
+       "2 unexplained equity jumps left out; record the deposit or withdrawal with flow-record" in tg0)
+    led_e3.record_cash_flow(trade_date="2026-07-09", amount=800.0, note="deposit", created_at=NOW)
+    led_e3.record_cash_flow(trade_date="2026-07-22", amount=1000.0, note="deposit", created_at=NOW)
+    ar1 = T._account_risk(led_e3, cfg)
+    ok("recorded flows: nothing is left out, every interval is a return",
+       ar1["unexplained_jumps"] == 0 and ar1["sharpe_n"] == 15)
+    # peak 2026-07-10, trough 2026-07-17: 989.19 / 1046.36 - 1 = -5.46%. No deposit in between.
+    ok("recorded flows: the drawdown is the real one (5.5%), not the deposit-distorted one",
+       abs(ar1["drawdown_pct"] - (1 - 989.19 / 1046.36) * 100) < 1e-6)
+    ok("recorded flows: the deposit day keeps its market return (+2.6%), not +337%",
+       "flow-adjusted index" in ar1["drawdown_proof"] and "2 interval(s) with a recorded flow" in ar1["drawdown_proof"])
+    tg1 = T._run_report(cfg, led_e3, {"date": DAY, "now_iso": NOW, "kind": "digest",
+                                     "plan": plan_e3})["telegram"]
+    ok("the digest risk sentence is clean again", "Risk check: 5.5% max drawdown" in tg1
+       and "unexplained" not in tg1)
+
     # ---- F. cross-sender dedup: orchestrator + last-resort agree on the hash ----
     print("\n[F] cross-sender dedup: in-tick + last-resort produce the SAME hash")
     cfg, led_f = _cfg(ENABLED), _led()

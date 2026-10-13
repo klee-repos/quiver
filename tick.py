@@ -405,6 +405,25 @@ def _consistency_context(cfg, led, ticker, new_intent, quote, new_basis,
         return True, "gate_error_degraded", None, proof
 
 
+def _rr_gate(a, min_rr: float, require_target: bool):
+    """(allowed, detail) for a BUY under the asymmetric R:R gate (F1). Gate OFF
+    (min_rr<=0) -> allow. Uncomputable R:R (missing target/stop) is VISIBLE, not
+    silent (C7): skip when require_target, else pass tagged 'ungraded_pass'.
+
+    ONE verdict for two callers. `plan` refuses the buy. `construct` does not raise the
+    target of a name whose buy `plan` refuses, so the room goes to a name `plan` can buy."""
+    if min_rr <= 0:
+        return (True, None)
+    rr = signals.reward_risk_ratio(_to_float(a.get("entry_price")),
+                                   _to_float(a.get("stop_loss")),
+                                   _to_float(a.get("target_price")))
+    if rr is None:
+        return (False, "reward_risk:ungraded") if require_target else (True, "reward_risk:ungraded_pass")
+    if rr < min_rr:
+        return (False, "reward_risk:below_floor")
+    return (True, None)
+
+
 def cmd_plan(args) -> dict:
     cfg, led = _cfg_and_ledger()
     data = json.loads(Path(args.input).read_text(encoding="utf-8"))
@@ -490,19 +509,7 @@ def _run_plan(cfg, led, data) -> dict:
     _derisked: set = set()
 
     def _rr_verdict(a):
-        """(allowed, detail) for a BUY under the asymmetric R:R gate (F1). Gate OFF
-        (min_rr<=0) -> allow. Uncomputable R:R (missing target/stop) is VISIBLE, not
-        silent (C7): skip when require_target, else pass tagged 'ungraded_pass'."""
-        if _min_rr <= 0:
-            return (True, None)
-        rr = signals.reward_risk_ratio(_to_float(a.get("entry_price")),
-                                       _to_float(a.get("stop_loss")),
-                                       _to_float(a.get("target_price")))
-        if rr is None:
-            return (False, "reward_risk:ungraded") if _require_target else (True, "reward_risk:ungraded_pass")
-        if rr < _min_rr:
-            return (False, "reward_risk:below_floor")
-        return (True, None)
+        return _rr_gate(a, _min_rr, _require_target)
 
     def _ptj_buy_clamps(a, ticker):
         """(risk_cap, exposure_scalar) for a BUY — both no-op (None/None) when knobs OFF.
@@ -1134,13 +1141,21 @@ def _run_strategy_set(cfg, led, data) -> dict:
     """Write the active goal + target book from strategy.yaml into the ledger.
 
     STRICT: load_strategy validate-or-raise (a bad book fails loudly at setup).
-    Snapshots start_equity (from --input) + start_date (today). Supersedes any
-    prior goal and re-upserts the targets idempotently. Places NO orders."""
+    Snapshots start_equity (from --input, else the latest baseline) + start_date (today).
+    Supersedes any prior goal and re-upserts the targets idempotently. Places NO orders."""
     import lib.strategy as strategy
     sc = strategy.load_strategy(cfg.strategy_path)
     day = market.trading_day_et()
     now_iso = data.get("now_iso") or market.now_et().isoformat()
     equity = _to_float(data.get("equity"))
+    if equity is None or equity <= 0:
+        # No equity in --input. Use the latest baseline (total account value, the base of the
+        # goal return). A goal with no start_equity gives no goal return: goal-track wrote no
+        # row from 2026-08-07 to 2026-10-13 for this reason.
+        _series = led.baseline_equity_series() or []
+        _known = [r["baseline_equity"] for r in _series
+                  if r.get("baseline_equity") and str(r.get("trade_date")) <= day]
+        equity = float(_known[-1]) if _known else None
     book = sc.book(sc.default_book)
     # Component D3: capture the PRIOR active book before we supersede it, so we can diff
     # and log each changed weight / added / removed holding to the strategy_change_log.
@@ -1372,11 +1387,28 @@ def _run_construct(cfg, led, data) -> dict:
                 conviction_skipped = "retargeted_today"
         except Exception:  # noqa: BLE001 — cannot read the log -> do not re-target (fail closed)
             conviction_skipped = "retarget_log_unreadable"
+        # A Buy / Overweight that the R:R gate refuses in `plan` does not raise its target here.
+        # The allocator sees it as a Hold: the target does not move and takes no funding. With
+        # no such rule the refused name takes the room that an Underweight freed, `plan` trims
+        # the Underweight and refuses the buy, and the weight moves to cash each time (a
+        # benchmark run with the gate armed placed 18 sells; with this rule, 7). Gate OFF (the
+        # default) -> no name is refused -> `sizing_analyses` is `analyses_map`.
+        _min_rr_c = _to_float(policy.get("min_reward_risk")) or 0.0
+        _require_target_c = bool(policy.get("require_target_for_buy"))
+        rr_blocked = []
+        if _min_rr_c > 0:
+            for c in candidates:
+                _a = analyses_map.get(c["ticker"])
+                if _a and str(_a.get("signal") or "") in ("Buy", "Overweight"):
+                    if not _rr_gate(_a, _min_rr_c, _require_target_c)[0]:
+                        rr_blocked.append(c["ticker"])
+        sizing_analyses = ({t: ({**a, "signal": "Hold"} if t in rr_blocked else a)
+                            for t, a in analyses_map.items()} if rr_blocked else analyses_map)
         # Only re-allocate when the pipeline expresses conviction this tick; otherwise every
         # name is D2 hold-prior and the allocation just reproduces the carried book — so we
         # SKIP it and keep the book verbatim (quiet/all-Hold ticks never re-clip the book).
         if conviction_skipped is None and any(
-                allocate.effective_conviction(analyses_map.get(c["ticker"]), policy) is not None
+                allocate.effective_conviction(sizing_analyses.get(c["ticker"]), policy) is not None
                 for c in candidates):
             rscalar = strategy.regime_scalar(
                 effective_regime, min_factor=float(policy.get("regime_min_factor", 0.5) or 0.5))
@@ -1405,19 +1437,27 @@ def _run_construct(cfg, led, data) -> dict:
                     except Exception:  # noqa: BLE001 — gate is best-effort; never blocks construct
                         pass
             alloc = allocate.allocate_targets(
-                candidates, analyses_map, calibration=calib, regime_scalar=rscalar,
+                candidates, sizing_analyses, calibration=calib, regime_scalar=rscalar,
                 policy=policy, hold_floors=hold_floors,
                 min_delta_pct=cfg.risk.conviction_rebalance_min_delta_pct)
             # F3: material-change HYSTERESIS on the conviction target. Keep each name at its PRIOR
             # target weight unless the fresh reading moved it >= conviction_rebalance_min_delta_pct
             # weight-points — a noisy ~0-alpha signal no longer wanders the target (and churns the
-            # book with $5-40 trims) day to day. Applies to names the allocator KEPT (>0); a grounded
-            # reduction to 0 (a real Sell/exit) is NOT reverted. Then CONSERVE: engines never exceed
+            # book with $5-40 trims) day to day. Applies to names the allocator KEPT (>0); a weight
+            # the allocator dropped to 0 (dust) is NOT reverted. Then CONSERVE: engines never exceed
             # (100 - cash_floor); cash takes the residual so the book still sums to ~100%. min_delta
             # 0 -> no-op (byte-identical to re-clipping every tick — the pre-F3 behavior).
             prior_map = {c["ticker"]: c["prior_weight"] for c in candidates}
+            # A grounded Sell skips the gate. Each smoothed step of a Sell is alpha x weight, so
+            # with the gate the step falls below it while the name still has weight, and the
+            # exit never completes. A Sell the consistency gate suppressed has a hold floor: it
+            # is not in this set and it does not move.
+            sell_exits = {c["ticker"] for c in candidates
+                          if str((analyses_map.get(c["ticker"]) or {}).get("signal") or "") == "Sell"
+                          and hold_floors.get(c["ticker"], 0.0) <= 0.0}
             eng_weights = allocate.apply_target_hysteresis(
-                alloc.weights, prior_map, cfg.risk.conviction_rebalance_min_delta_pct)
+                alloc.weights, prior_map, cfg.risk.conviction_rebalance_min_delta_pct,
+                exempt=sell_exits)
             cash_floor = float(policy["cash_floor_pct"]) if (policy and policy.get("cash_floor_pct") is not None) else 5.0
             eng_ceiling = max(0.0, 100.0 - cash_floor)
             # The gate reverts a small DECREASE to its prior weight, so the increase it funded
@@ -1531,6 +1571,7 @@ def _run_construct(cfg, led, data) -> dict:
                                  "hysteresis_min_delta_pct": cfg.risk.conviction_rebalance_min_delta_pct,
                                  "cash_floor_pct": cash_floor,
                                  "moved": {tk: [round(a, 4), round(b, 4)] for tk, (a, b) in moved.items()},
+                                 "rr_blocked": sorted(rr_blocked),
                                  "persist_error": persist_error}
 
     rows = portfolio.construct_target_book(
@@ -3184,22 +3225,51 @@ def _read_reasoning(date: str, ticker: str):
     return j.get("final_trade_decision"), j.get("investment_plan")
 
 
-def _account_risk(led) -> dict:
+def _account_risk(led, cfg=None) -> dict:
     """Account-equity drawdown + daily Sharpe for the digest (T1). Equity is in
     scope HERE (the digest path); it is deliberately NEVER read on the analysis/
-    memory path. Best-effort: returns empty fields if the series is too thin."""
+    memory path. Best-effort: returns empty fields if the series is too thin.
+
+    The returns are FLOW-ADJUSTED (`lib.goal.flow_adjusted_returns`). A deposit is not a
+    gain and a withdrawal is not a loss: a recorded `cash_flows` row is removed from its
+    interval. A jump with no recorded flow that is too large for a market move is LEFT OUT
+    and counted in `unexplained_jumps`. The raw curve gave "39.5% max drawdown" on
+    2026-10-13: the drop was a change of the measured base in the first week, and two
+    deposits counted as +338% and +99% days in the Sharpe."""
     try:
         from lib import risk  # local: analysis-side math reused for an operator metric
-        eq = [r["baseline_equity"] for r in led.baseline_equity_series()
-              if r.get("baseline_equity") is not None]
-        dd = risk.max_drawdown(eq, kind="equity") if eq else None
-        rets = [(eq[i] - eq[i - 1]) / eq[i - 1] for i in range(1, len(eq)) if eq[i - 1]]
+        import lib.goal as goal_mod
+        pts = [(str(r["trade_date"]), float(r["baseline_equity"]))
+               for r in led.baseline_equity_series() if r.get("baseline_equity") is not None]
+        if not pts:
+            return {}
+        try:
+            flows = [(str(f["trade_date"]), float(f.get("amount") or 0.0))
+                     for f in (led.cash_flows() or [])]
+        except Exception:  # noqa: BLE001 — no flow table -> the jump detector still guards
+            flows = []
+        rets, skipped = goal_mod.flow_adjusted_returns(
+            pts, flows,
+            min_pct=float(getattr(cfg, "goal_flow_min_pct", 25.0)),
+            min_abs=float(getattr(cfg, "goal_flow_min_abs", 30.0)))
+        # Growth of 100 on the flow-adjusted returns. The peak-to-trough walk runs on this
+        # index, so a deposit does not lift the peak and a withdrawal is not a trough.
+        index = [100.0]
+        for r in rets:
+            index.append(index[-1] * (1.0 + r))
+        dd = risk.max_drawdown(index, kind="equity")
         sh = risk.sharpe(rets) if rets else None
+        n_flow = sum(1 for i in range(1, len(pts))
+                     if any(pts[i - 1][0] < d <= pts[i][0] for d, _ in flows))
         return {
             "drawdown_pct": (dd.value * 100.0) if (dd and dd.value is not None) else None,
-            "drawdown_proof": dd.proof() if dd else "",
+            "drawdown_proof": (f"{dd.proof()}; flow-adjusted index (start=100), "
+                               f"{n_flow} interval(s) with a recorded flow, "
+                               f"{len(skipped)} unexplained jump(s) left out") if dd else "",
             "sharpe": sh.value if (sh and sh.value is not None) else None,
             "sharpe_n": sh.n if sh else 0,
+            "unexplained_jumps": len(skipped),
+            "unexplained_jump_dates": [j["trade_date"] for j in skipped],
         }
     except Exception:  # noqa: BLE001 — observability only; never break the digest
         return {}
@@ -3303,7 +3373,7 @@ def _build_report_model(cfg, led, data: dict, date: str, now_iso: str, kind: str
         # Telegram loudness policy input (is_silent): a routine digest pings LOUD unless
         # the operator opted into the quiet-daily-record mode via notify.loud_digest: false.
         "loud_digest": cfg.notify.loud_digest,
-        "account_risk": _account_risk(led),
+        "account_risk": _account_risk(led, cfg),
         "tickers": [rows[t] for t in sorted(rows)],
     }
 
