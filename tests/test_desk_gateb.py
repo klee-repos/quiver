@@ -237,4 +237,18 @@ r.eq("M6: a venue time ahead of our clock is not aged (exec-check already checke
 ok, why, _ = broker_guard.review_verdict({**_leg, "ticker": "ANET"}, _review(300.0), now=_now, tolerance_pct=1.5)
 r.ok("M6: a review for another symbol fails before the quote check", ok == 0 and "another symbol" in why, why)
 
+# --- M7: an audit failure halts the day even before the day's first baseline -----------
+import test_desk_execution as tde  # noqa: E402
+
+with tde.case("gateb audit no baseline", at="2026-08-04T19:00:00Z", snap=False) as c:
+    c.snap()                                   # yesterday's snapshot: today has no day_baseline row
+    c.at("2026-08-05T13:40:00Z")
+    r.eq("M7: today has no day_baseline row", c.led.get_baseline("2026-08-05"), None)
+    out = tde._dump([tde.ev_use("t1", "mcp__robinhood-trading__place_equity_order", {"ref_id": "not-a-leg"}),
+                     tde.ev_result("t1", "{}", False)])
+    bad = c.broker().audit(out)
+    r.eq("M7: the audit flags the unguarded place", bad, ["not-a-leg"])
+    r.eq("M7: the day is halted with no prior baseline (no KILL write needed)", c.led.is_halted("2026-08-05"), True)
+    r.ok("M7: the audit pages", any("place call" in str(p) for p in c.pages.sent), c.pages.sent)
+
 raise SystemExit(r.done())

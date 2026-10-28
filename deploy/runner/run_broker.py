@@ -305,8 +305,10 @@ class Broker:
     def audit(self, out: str):
         """Every place call that ran (no error result) must belong to a leg the guard
         moved to placing, and one job places a leg at most once (the guard allows one place
-        per check). A bad call halts the day and pages. With no day_baseline row the halt
-        flag cannot be set, so the audit writes KILL instead."""
+        per check). A bad call halts the day and pages. With no day_baseline row yet (a
+        recovery job before the day's first snapshot) the audit inserts the row from the
+        newest real snapshot equity, already halted. This unit cannot write KILL
+        (ProtectSystem=strict)."""
         bad, seen = [], {}
         with self.led.connect() as conn:
             for c in tool_calls(out):
@@ -322,10 +324,13 @@ class Broker:
             day = market.trading_day_et()
             self.led.mark_halted(day, why)
             if not self.led.is_halted(day):
-                try:
-                    Path(self.cfg.kill_switch_file).write_text(why + "\n", encoding="utf-8")
-                except OSError:
-                    pass
+                with self.led.transaction() as conn:
+                    row = conn.execute("SELECT equity, captured_at FROM broker_snapshots "
+                                       "ORDER BY id DESC LIMIT 1").fetchone()
+                    if row is not None:
+                        conn.execute("INSERT OR IGNORE INTO day_baseline (trade_date, baseline_equity, captured_at, "
+                                     "halted, halt_reason) VALUES (?,?,?,1,?)", (day, row[0], row[1], why))
+                        conn.execute("UPDATE day_baseline SET halted=1, halt_reason=? WHERE trade_date=?", (why, day))
             self.page("error", "broker", f"place call with no guard allow row: {', '.join(bad)}; trading halted")
         return bad
 

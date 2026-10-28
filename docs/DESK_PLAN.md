@@ -3564,7 +3564,7 @@ home suites). These rules changed:
 | M3 | `broker_rejected` only for a body that starts with `400`/`422` and names a field as a quoted JSON key, or an object with `status` 400/422. | Any `4xx` number anywhere in the text. |
 | M4 | exec-commit binds order objects first; a `broker_guard: denied:` result binds nothing; an error body binds only when one error and one placing leg are left. | The next placing leg in call order. |
 | M6 | The review hook refuses a review whose own `quote_data` moved more than `requote_tolerance_pct` from `check_quote`. | The hook ignored `quote_data`. |
-| M7 | The canary runs before a recovery job too; one job may place a leg once; an audit with no `day_baseline` row writes `KILL`. | Recovery skipped the canary. |
+| M7 | The canary runs before a recovery job too; one job may place a leg once; an audit with no `day_baseline` row inserts the row (newest real snapshot equity) already halted, because the broker unit cannot write `KILL`. | Recovery skipped the canary; the halt was a no-op with no baseline row. |
 | M8 | A cancelled order with a fill counts as partial, and its text names the shares sold. | It counted as failed. |
 | SEC-1 | No ledger cell holds the account number (§13 Remaining risks). | `broker_snapshots.raw_json` held it. |
 | SEC-2 | The analyst's `notify_owner` uses the desk renderer (`outbox.render_model_text`): model HTML reaches the owner as text, a URL is never hidden. | The analyst sent raw HTML. |
