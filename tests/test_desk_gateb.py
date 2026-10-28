@@ -251,4 +251,15 @@ with tde.case("gateb audit no baseline", at="2026-08-04T19:00:00Z", snap=False) 
     r.eq("M7: the day is halted with no prior baseline (no KILL write needed)", c.led.is_halted("2026-08-05"), True)
     r.ok("M7: the audit pages", any("place call" in str(p) for p in c.pages.sent), c.pages.sent)
 
+# --- D6: the chat bridge's start limit is in [Unit], where systemd reads it -------------
+_sec, _keys = None, {}
+for _ln in (REPO / "deploy" / "quiver-chat.service").read_text(encoding="utf-8").splitlines():
+    _ln = _ln.strip()
+    if _ln.startswith("[") and _ln.endswith("]"):
+        _sec = _ln
+    elif "=" in _ln and not _ln.startswith("#"):
+        _keys.setdefault(_ln.split("=", 1)[0], _sec)
+r.eq("D6: StartLimitIntervalSec is in [Unit]", _keys.get("StartLimitIntervalSec"), "[Unit]")
+r.eq("D6: StartLimitBurst is in [Unit]", _keys.get("StartLimitBurst"), "[Unit]")
+
 raise SystemExit(r.done())

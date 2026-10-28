@@ -2,6 +2,10 @@
 Description=Quiver — desk chat bridge (Telegram long poll, desk agent, button taps)
 After=network-online.target
 Wants=network-online.target
+# A crash loop ends in the failed state (5 starts in 10 minutes); the monitor pages on it.
+# Both keys belong in [Unit]: systemd ignores StartLimitIntervalSec in [Service].
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -17,9 +21,6 @@ ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/chat_bridge.py
 # Exit 0 only when TELEGRAM_BOT_TOKEN or the allowlist is empty.
 Restart=on-failure
 RestartSec=15
-# A crash loop ends in the failed state (5 starts in 10 minutes); the monitor pages on it.
-StartLimitIntervalSec=600
-StartLimitBurst=5
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
