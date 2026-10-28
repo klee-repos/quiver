@@ -16,6 +16,7 @@ from desk_fakes import FakeOpener, Results, fx, temp_root
 from lib.desk import edgar, store, transcripts, xbrl
 
 r = Results("desk-transcripts")
+transcripts._sleep = lambda s: None   # the pace case below checks the 1.5 s spacing itself
 KEY = "AVKEY-TEST-7Q3Z"
 AV = "https://www.alphavantage.co/query"
 NOW = "2026-08-05T14:00:00Z"
@@ -265,5 +266,19 @@ with temp_root() as root, root.led().connect() as conn:
         return base_op(url, headers, timeout)
     transcripts.fetch_transcript(conn, "ANET", "2026Q2", api_key=KEY, now=NOW, opener=locked_opener)
     r.eq("lock: the transcript call runs after the budget row is committed", free, [True])
+
+# --- the 1 request a second limit of the free key -----------------------------------
+_clock = {"t": 1000.0}
+_slept = []
+transcripts._mono = lambda: _clock["t"]
+transcripts._sleep = lambda s: (_slept.append(round(s, 3)), _clock.__setitem__("t", _clock["t"] + s))
+transcripts._last_call[0] = float("-inf")
+with temp_root() as root, root.led().connect() as conn:
+    transcripts.fetch_transcript(conn, "ANET", "2026Q2", api_key=KEY, now=NOW, opener=_opener("av_anet"))
+    _clock["t"] += 0.4
+    transcripts.fetch_transcript(conn, "CEG", "2026Q2", api_key=KEY, now=NOW, opener=_opener("av_anet"))
+    _clock["t"] += 5.0
+    transcripts.fetch_transcript(conn, "VST", "2026Q2", api_key=KEY, now=NOW, opener=_opener("av_anet"))
+r.eq("pace: the first call waits 0 s, the second waits the rest of 1.5 s, the third 0 s", _slept, [1.1])
 
 raise SystemExit(r.done())

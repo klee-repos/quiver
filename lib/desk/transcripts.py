@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,13 @@ DAILY_LIMIT = 25
 RETRY_DAYS = 7
 BASE_URL = "https://www.alphavantage.co/query"
 TIMEOUT = 30.0
+# The free key allows 1 request a second; a burst gets a refusal note in place of the
+# transcript and still uses one of the 25 daily calls. Space the calls (seen on the box at
+# the 2026-10-28 seed). Tests replace the two seams.
+MIN_GAP_S = 1.5
+_sleep = time.sleep
+_mono = time.monotonic
+_last_call = [float("-inf")]
 # An earnings release comes within about 90 days of its quarter end. The quarter before
 # that ends at least about 105 days before the release. 100 days splits the two.
 MATCH_WINDOW_DAYS = 100
@@ -127,6 +135,10 @@ def fetch_transcript(conn, ticker: str, quarter: str, *, api_key: str, now, open
 
     url = request_url(ticker, quarter, api_key)
     safe_url = request_url(ticker, quarter, None)
+    wait = MIN_GAP_S - (_mono() - _last_call[0])
+    if wait > 0:
+        _sleep(wait)
+    _last_call[0] = _mono()
     try:
         status, _headers, body = (opener or _default_opener)(url, {"User-Agent": "Quiver"}, TIMEOUT)
     except Exception as exc:  # noqa: BLE001 - the opener may raise any network error
