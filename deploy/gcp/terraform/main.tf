@@ -1,9 +1,9 @@
-# Quiver headless trader — GCP (Compute Engine) infrastructure.
-# One hardened e2-small running the systemd timer; secrets in Secret Manager; Cloud Logging
-# metrics -> Monitoring alert policies -> email; no public inbound (admin via IAP-tunneled
-# SSH). The box has NO desktop: the Robinhood OAuth runs over SSH (deploy/gcp/rh-reauth.sh)
-# and the orchestrator logs in with a subscription token. Secret VALUES are created
-# out-of-band (bootstrap-gcp.sh) so they never enter tfstate.
+# Quiver Desk — GCP (Compute Engine) infrastructure.
+# One hardened box (var.machine_type, e2-medium) running the desk services; secrets in Secret
+# Manager; Cloud Logging metrics -> Monitoring alert policies -> email; no public inbound (admin
+# via IAP-tunneled SSH). The box has NO desktop: the Robinhood OAuth runs over SSH
+# (deploy/gcp/rh-reauth.sh) and every Claude process logs in with a subscription token. Secret
+# VALUES are created out-of-band (bootstrap-gcp.sh) so they never enter tfstate.
 
 terraform {
   required_version = ">= 1.5"
@@ -32,21 +32,15 @@ resource "google_service_account" "quiver" {
 locals {
   # Secrets the box reads (created out-of-band by bootstrap-gcp.sh). Per-secret accessor
   # grants = least privilege (the SA can read ONLY these, not every secret in the project).
-  # The OPTIONAL secrets quiver-NOTIFY_ALERTS_TO / quiver-TELEGRAM_BOT_TOKEN /
-  # quiver-TELEGRAM_ALLOWED_CHAT_IDS are NOT listed here on purpose: they're often unset
-  # (alerts fall back to NOTIFY_TO; the chat bridge is opt-in). To enable one from Secret
-  # Manager, create the secret
-  # AND add its name here, then re-apply — for_each requires the secret to exist. (Or, to avoid a
-  # full apply on the live box, grant just that secret manually:
-  #   gcloud secrets add-iam-policy-binding quiver-TELEGRAM_BOT_TOKEN \
-  #     --member=serviceAccount:<box-sa-email> --role=roles/secretmanager.secretAccessor
-  # then refresh /etc/quiver/quiver.env on the box — see docs/CHAT.md.)
+  # An unlisted required secret returns 403, and setup.sh stops with FATAL after about 60 s.
+  # for_each requires each secret to exist. CLAUDE_CODE_OAUTH_TOKEN is the one-year
+  # subscription token from `claude setup-token`. TELEGRAM_ALERT_CHAT_IDS is optional and is
+  # not listed. To read it from Secret Manager, create it, add it here, and re-apply.
   secrets = [
-    "OPENROUTER_API_KEY", "RH_ACCOUNT_NUMBER", "STRATEGY_YAML",
-    # The orchestrator's Claude login: a one-year subscription token from `claude setup-token`.
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    # Rollback-only (kept so a rollback path can still read them):
-    "GLM_API_KEY", "DEEPSEEK_API_KEY", "RESEND_API_KEY", "NOTIFY_TO", "RESEND_FROM",
+    "RH_ACCOUNT_NUMBER", "STRATEGY_YAML", "CLAUDE_CODE_OAUTH_TOKEN",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_IDS", "SEC_USER_AGENT", "ALPHA_VANTAGE_API_KEY",
+    # Rollback window only. Remove at §15.6 S23.
+    "OPENROUTER_API_KEY", "GLM_API_KEY", "DEEPSEEK_API_KEY", "RESEND_API_KEY", "RESEND_FROM", "NOTIFY_TO",
   ]
 }
 
@@ -188,13 +182,14 @@ resource "google_compute_instance" "quiver" {
 
 # --- Cloud Logging metrics + Monitoring alerts (log-based metric -> alert policy -> email) ---
 # The Ops Agent ships /var/log/quiver/tick.log to the log "quiver_tick" (see setup.sh).
-# NOTE: these filters are validated/tuned against the real log structure on first boot;
-# the Resend pager (run_tick.py / in-tick MCP) is the PRIMARY, cloud-agnostic alert path.
+# run_monitor.py and run_broker.py write tick.log lines with "event": "AUTH_ERROR",
+# "daily_halt" or "stage_error". The Telegram pager is the PRIMARY alert path.
+# Keep these three keys: a new key replaces the metric and its alert policy.
 locals {
   log_patterns = {
     auth_error = "AUTH_ERROR"
-    daily_halt = "write_kill"
-    tick_error = "stopped"
+    daily_halt = "daily_halt"
+    tick_error = "stage_error"
   }
 }
 

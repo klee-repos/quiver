@@ -2,10 +2,9 @@
 """Deterministic e2e for the benchmark measurement (`benchmark-backfill`).
 
 WHAT IT PINS. `outcomes.benchmark_return` feeds `alpha`, which `lib.memory.score_return`
-prefers over the raw directional return, which `lib.calibrate` turns into a conviction
-multiplier, which `lib.allocate` turns into a target weight, which becomes order
-dollars. So this is a trading-loop input, not plumbing, and every case below asserts
-REAL column values in a REAL sqlite file after driving the REAL CLI in a subprocess.
+prefers over the raw directional return. The track record (`get_track_record`) and the close
+brief read it, so a wrong market leg misstates the desk's skill to the owner. Every case below
+asserts REAL column values in a REAL sqlite file after it drives the REAL CLI in a subprocess.
 
 THE INCIDENT BEING PINNED. Seven rows carried 0.007521 -- SPY 2026-06-08 -> 2026-07-02 --
 while the position leg of those same outcomes used 2026-07-06 prices. The true window
@@ -24,25 +23,18 @@ assertion fails while the feature still imports, restore, confirm green):
   * refusal preserves instead of clears         -> T10b (the wrong value survives)
   * cmd_reflect honors the supplied benchmark   -> T12 (alpha non-NULL through the real CLI)
   * strategy_change_log not written on --apply  -> T9
-  * typo'd trust kwarg in lib/wall_replay.py    -> the replay assertion in test_e2e_wall_replay
   * producer calendar bounded by max(series)    -> BM1 (producer-contract assertions)
   * lib.benchmark coverage check removed        -> BM1 (coverage assertions)
   * BOTH of the previous two                    -> BM1 end-to-end: the truncated series is
       written instead of refused (11 assertions red) -- this is the defect that actually
       shipped and passed a green suite, because both fixtures hand-wrote a session calendar
       the producer could not emit. `_producer_sessions` now calls the REAL builder.
-  * _benchmark_scorecard returns a constant     -> T11 (was vacuous: the old fixture had one
-      decision per ticker, so n=1 < min_n=5 pinned every multiplier at 1.0 and the diff was
-      always empty). The fixture now clears min_n AND flips the hit/miss sign.
   * alpha written where directional_return NULL -> T17 (was a constant 0: the old fixture had
       no such row at all, so the count could never become non-zero)
-  * hyphenated `--trust-input-benchmark` flag   -> T19 (the source scan matched only the
-      underscore spelling, so argparse's hyphen->underscore dest mapping slipped past it)
 """
 
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -80,6 +72,13 @@ def _producer_sessions(series: dict) -> list:
     return _tick._benchmark_sessions(series, max(series))
 
 
+def _bmod_window(series, start, end):
+    """The window return through the producer (lib.benchmark) on the producer's calendar."""
+    from lib import benchmark as _bm
+    v, _why = _bm.window_return(series, start, end, _producer_sessions(series))
+    return v
+
+
 def ok(name, cond, extra=None):
     global PASS, FAIL
     if cond:
@@ -112,11 +111,8 @@ def _write_sidecar(path: Path, series=None, sessions=None):
     return path
 
 
-# Returns chosen so the re-measurement FLIPS the hit/miss sign, and enough rows per
-# ticker to clear calibrate.DEFAULT_MIN_N=5. An earlier fixture used one decision per
-# ticker, which pinned every multiplier at the neutral 1.0 and left calibration_diff
-# empty -- so T11/T18 passed against a _benchmark_scorecard that returned a constant.
-# A fixture that cannot move the number under test cannot test it.
+# Returns chosen so the re-measurement FLIPS the hit/miss sign of the alpha. A fixture that
+# cannot move the number under test cannot test it.
 WRG_DRET = 0.012    # bearish call, sits BETWEEN the wrong (0.007521) and true (0.016315)
                     # benchmark: MISS while the wrong value stands, HIT once corrected.
 NUL_DRET = -0.005   # bearish call over a window where SPY FELL (06-01 -> 07-06):
@@ -144,9 +140,8 @@ def _seed(db: Path):
                            realized_pnl=4.0, adherence="within")
         ids[f"NUL{i}"] = d
     # A resolved row with NO position leg. alpha MUST stay NULL here however the window
-    # resolves, or the `alpha non-NULL implies directional_return non-NULL` subset breaks
-    # and the graded sample size could move across the min_n cliff. Without this row T17
-    # counts zero candidates and can never fail.
+    # resolves, or the `alpha non-NULL implies directional_return non-NULL` subset breaks.
+    # Without this row T17 counts zero candidates and can never fail.
     d = led.record_decision(trade_date="2026-06-08", ticker="NODR", run_id="r",
                             signal="Buy", intent="buy",
                             decided_at="2026-06-08T10:00:00-04:00", decision_price=100.0)
@@ -196,46 +191,6 @@ def main() -> int:
         ok("T4 dry-run classifies 7 corrections + 6 fills",
            out and out["counts"].get("correct") == 7 and out["counts"].get("fill") == 6, out)
 
-        # --- T11: the printed diff cannot lie -------------------------------------
-        # Recompute the same multipliers independently, through the real consumer.
-        shadow = td / "shadow.db"
-        shutil.copy(str(db), str(shadow))
-        sled = Ledger(str(shadow))
-        from lib import benchmark as _bmod
-        _sess = _producer_sessions(SPY)
-        for row in sled.outcomes_for_backfill():
-            b, _ = _bmod.window_return(SPY, row["trade_date"],
-                                       str(row["resolved_at"])[:10], _sess)
-            dr = row["directional_return"]
-            sled.update_outcome_benchmark(row["decision_id"], b,
-                                          (dr - b) if (b is not None and dr is not None) else None)
-        import lib.calibrate as calibrate
-        from lib.config import load_config
-        cfg = load_config(REPO / "config.yaml")
-        names = sorted({r["ticker"] for r in Ledger(str(db)).outcomes_for_backfill()})
-        indep_before = calibrate.build_calibration(
-            Ledger(str(db)), names, min_n=int(cfg.strategy.learning.min_resolved_n))
-        indep_after = calibrate.build_calibration(
-            sled, names, min_n=int(cfg.strategy.learning.min_resolved_n))
-        moved = [t for t in names if abs(indep_before[t] - indep_after[t]) > 1e-9]
-        # Vacuity guard: if the fixture cannot move a multiplier, everything below passes
-        # against a _benchmark_scorecard that just returns a constant.
-        ok("T11 (non-vacuity) the fixture actually MOVES a real multiplier", len(moved) >= 2, moved)
-        ok("T11 (non-vacuity) the command printed a non-empty diff",
-           len((out or {}).get("calibration_diff", [])) >= 2, (out or {}).get("calibration_diff"))
-        printed = {d["ticker"]: d for d in (out or {}).get("calibration_diff", [])}
-        mismatch = [t for t in names
-                    if (abs(indep_before[t] - indep_after[t]) > 1e-9) != (t in printed)]
-        ok("T11 the printed diff names exactly the names whose multiplier really moves",
-           not mismatch, mismatch)
-        ok("T11 printed before/after match an independent lib.calibrate computation",
-           all(abs(printed[t]["multiplier_before"] - round(indep_before[t], 4)) < 1e-9
-               and abs(printed[t]["multiplier_after"] - round(indep_after[t], 4)) < 1e-9
-               for t in printed), printed)
-        ok("T11 the printed guidance tier is a real derive_guidance tier",
-           all(("conviction" in (p["tier_before"] or "") or "DATA" in (p["tier_before"] or ""))
-               for p in printed.values()), printed)
-
         # --- T5/T6/T7/T17: --apply ------------------------------------------------
         proc, out = _run(db, sidecar, "benchmark-backfill", "--apply")
         ok("T5 apply exits 0", proc.returncode == 0, proc.stderr[-400:])
@@ -275,13 +230,6 @@ def main() -> int:
         c.close()
         ok("T17 alpha non-NULL implies directional_return non-NULL", viol == 0, viol)
 
-        # T18 — the graded sample size must NOT move (no min_n cliff crossing).
-        ok("T18 graded sample size per ticker is unchanged by the re-measurement",
-           all(len(calibrate._graded_hits(Ledger(str(db)).decisions_with_outcomes(t, limit=20)))
-               == len(calibrate._graded_hits(
-                   Ledger(str(shadow)).decisions_with_outcomes(t, limit=20)))
-               for t in names))
-
         # --- T8: idempotency -------------------------------------------------------
         settled = _digest(db)
         proc, out = _run(db, sidecar, "benchmark-backfill", "--apply")
@@ -313,9 +261,8 @@ def main() -> int:
             ok("T9 with an active goal -> exactly one change-log row", len(grows) == 1, grows)
             ok("T9 row is change_type=measurement / trigger=benchmark-backfill",
                grows and grows[0][0] == "measurement" and grows[0][1] == "benchmark-backfill", grows)
-            ok("T9 proof carries the counts and the calibration diff",
-               grows and "counts" in json.loads(grows[0][2])
-               and "calibration_diff" in json.loads(grows[0][2]), grows)
+            ok("T9 proof carries the counts",
+               grows and "counts" in json.loads(grows[0][2]), grows)
 
         # --- T10a/T10b: refusal clears, never preserves a bad value ----------------
         with tempfile.TemporaryDirectory() as td3:
@@ -424,7 +371,7 @@ def main() -> int:
             ok("BM1 the coverage refusal explains itself", "calendar ends" in (why or ""), why)
 
         # --- SAME-TICK: a row resolved during a still-open session must NOT be filled --
-        # run_tick.py fetches and backfills in the SAME tick, minutes after reflect stamped
+        # The monitor fetches and backfills in the SAME run, minutes after reflect stamped
         # resolved_at=now. yfinance publishes no bar for an in-progress equity session, so
         # the series ends at the PRIOR session while the calendar extends past it -- the
         # row's own session is therefore missing and the fill is refused until tomorrow.
@@ -450,6 +397,60 @@ def main() -> int:
             ok("same-tick: alpha stays NULL until the session settles",
                _col(sdb, sid, "alpha") is None)
             ok("same-tick: the refusal is reported", out and out.get("refusals"), out)
+
+
+        # --- MON: the monitor's after-close step drives the SAME backfill (plan §9.1 step 11) --
+        # run_monitor.py runs `benchmark-backfill --apply --fill-only --max-rows 12` after a
+        # fetch that has observations. The fetch is the one networked step, so a recorder
+        # stands in for it; the backfill is the REAL CLI on the temp ledger.
+        sys.path.insert(0, str(REPO / "deploy" / "runner"))
+        os.environ.setdefault("RH_ACCOUNT_NUMBER", "12345678")
+        import run_monitor
+        from lib.config import load_config
+
+        class _Box:
+            chat_id = None
+
+            def send(self, *a, **k):
+                return {"ok": True}
+
+        for label, observations in (("with observations", 5), ("no observations", 0)):
+            with tempfile.TemporaryDirectory() as td8:
+                td8 = Path(td8)
+                mdb, mside = td8 / "m.db", td8 / "b.json"
+                _, mids = _seed(mdb)
+                _write_sidecar(mside)
+                calls = []
+
+                def _tick(args, timeout=None, _db=mdb, _side=mside, _obs=observations, _calls=calls):
+                    _calls.append(list(args))
+                    if args[0] == "benchmark-fetch":
+                        return {"ok": bool(_obs), "benchmark": "SPY", "trading_day": "2026-07-25",
+                                "observations": _obs, "last_observation": "2026-07-06" if _obs else None,
+                                "path": str(_side)}
+                    return _run(_db, _side, *args)[1]
+
+                mon = run_monitor.Monitor(led=Ledger(str(mdb)), cfg=load_config(REPO / "config.yaml"),
+                                          box=_Box(), tick=_tick, page=lambda **k: None)
+                res = mon.benchmark()
+                if observations:
+                    ok("MON the monitor runs the backfill with --apply --fill-only --max-rows 12",
+                       calls[-1] == ["benchmark-backfill", "--apply", "--fill-only", "--max-rows", "12"], calls)
+                    ok("MON the 6 NULL rows fit under 12, so the monitor's run applies them",
+                       (res.get("backfill") or {}).get("applied") is True
+                       and (res.get("backfill") or {}).get("changes") == 6, res)
+                    ok("MON the NULL rows are filled with the true window return",
+                       abs(_col(mdb, mids["NUL0"], "benchmark_return")
+                           - _bmod_window(SPY, "2026-06-01", "2026-07-06")) < 1e-12)
+                    ok("MON fill-only leaves the 7 wrong rows for a reviewed --apply",
+                       all(abs(_col(mdb, mids[f"WRG{i}"], "benchmark_return") - WRONG_WINDOW) < 1e-12
+                           for i in range(7)))
+                else:
+                    ok("MON a fetch with no observations skips the backfill (no backfill call)",
+                       [c[0] for c in calls] == ["benchmark-fetch"], calls)
+                    ok("MON the skip says why", "skipped" in str(res.get("backfill")), res)
+                    ok("MON a skipped run writes nothing",
+                       _col(mdb, mids["NUL0"], "benchmark_return") is None)
 
     return 1 if FAIL else 0
 

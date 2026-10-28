@@ -2,8 +2,9 @@
 Description=Quiver — nightly ledger backup (after the last tick of the day)
 
 [Timer]
-# 22:15 UTC: the last tick starts at 21:40 UTC. Every day, not Mon-Fri: the intel
-# timer writes to the ledger on weekends too.
+# 22:15 UTC, every day: the chat bridge and the worker write the ledger on weekends too.
+# The upload uses the SQLite backup API, so a monitor run or a chat turn at the same
+# time is safe.
 OnCalendar=*-*-* 22:15:00
 Persistent=true
 RandomizedDelaySec=120

@@ -1,298 +1,292 @@
-```
-       ___        _
-      / _ \ _   _(_)_   _____ _ __     »»———————————————►
-     | | | | | | | \ \ / / _ \ '__|    »»——————————►
-     | |_| | |_| | |\ V /  __/ |        »»————————————————►
-      \__\_\\__,_|_| \_/ \___|_|        »»—————————►
-```
+# Quiver Desk
 
-<div align="center">
+Quiver Desk is a chat-first investing partner on Telegram. You talk to it like you text a
+person. It reads SEC filings, earnings calls, and news for the companies in your book. It
+tells you what changed. When a change calls for a trade, it sends you a proposal with
+buttons. **Nothing trades without your tap.**
 
-**An agent that buys and sells stocks for you — with the safety rules baked in.**
-
-Smart AI studies each stock and picks a side. Plain, fixed rules decide how much to spend.
-A separate helper places the orders. The AI is never allowed to touch the money on its own.
-
-`runs on its own` · `hard safety limits` · `keeps a logbook`
-
-</div>
+> **Quiver trades real money in a real Robinhood account.** Each order needs your tap on an
+> Approve button in Telegram. It can still lose money. This is not financial advice. Read
+> [The nine walls](#the-nine-walls) before you connect a broker account.
 
 ---
 
-> [!WARNING]
-> **Quiver places live trades on its own.** It starts in "practice mode" (no live orders) until
-> you turn that off. It can lose money. This is not financial advice. Please read the whole
-> page — especially **[Safety controls](#-safety-controls)** — before you let it trade live.
+## What the desk does
+
+- **It talks with you.** It puts a reaction on each of your messages, chosen for what the
+  message says. Then it answers in short messages, one idea per message.
+- **It holds the premise.** The premise is the top-level strategy of the book. The desk
+  seeds it from `strategy.yaml` and `STRATEGY.md` once. You change it in conversation. Each
+  change is a proposal that you confirm with a tap.
+- **It builds the company list with you.** It searches SEC full-text filings, the yfinance
+  screener, and the top holdings of the themed ETFs in the book. It loads each company: its
+  filings, its XBRL numbers, and its latest earnings call. You decide what goes in the book.
+- **It keeps a thesis for each holding.** A thesis says why we own the company, what drives
+  it, what makes us sell, and what it is worth. Python computes the value from the filings
+  (reverse DCF and scenarios). The desk proposes a buy-below level and a trim-above level.
+- **It acts only on change.** A new filing or earnings release, a price that crosses an
+  agreed level, drift past a band, or material news creates an event. No event, no proposal.
+- **It remembers everything.** Every filing section, transcript, article, finding, thesis
+  version, proposal, and chat message is stored in the ledger with full-text search.
+
+ETFs stay as sleeves. The desk analyzes an ETF through its top holdings (the look-through).
+The cash sleeve (`SGOV`) is never bought or sold.
 
 ---
 
-## What is Quiver?
+## How a day works
 
-Quiver is an automated stock-trading agent. Each day it reviews a short list of stocks you
-choose, decides whether to buy, sell, or hold each one, and places the orders through your
-broker — all on its own, with real money.
+```
+  11:40 to 23:40 UTC, hourly at :40, Monday to Friday
+    │
+    ├─ quiver.service (the monitor, pure Python, no LLM, no broker)
+    │    queues a broker snapshot during the session
+    │    sweeps SEC EDGAR for new filings, ingests news
+    │    checks prices against the agreed levels (session only)
+    │    after the close: drift, the close brief, outcomes, benchmark, goal, prune
+    │    each change becomes an event → an analysis job for the worker
+    │
+    ├─ quiver-worker (the analyst, Opus 5.5)
+    │    reads the new material, records findings with exact quotes
+    │    states a verdict on the thesis: intact, strengthened, weakened, or broken
+    │    tells you in two to four messages; proposes a trade only when the rules allow it
+    │
+    ├─ You, on Telegram
+    │    ask questions at any time (the desk agent, Sonnet 5.5)
+    │    tap Approve, Reject, or Confirm on a card
+    │
+    └─ quiver-broker (the only process with Robinhood access)
+         takes portfolio snapshots
+         on your Approve: re-quotes, places exactly the checked orders, reports the fills
+```
 
-To keep that safe, Quiver separates the thinking from the spending:
-
-> **The AI decides which stocks to trade. The code decides how much to spend — and enforces hard limits the AI can't override.**
-
-So the AI's job is to make a recommendation; it never controls the dollar amounts or the risk
-limits. That separation is the core of how Quiver works.
+Each trading day ends with a **close brief**: two to four short messages with the day's
+P&L, what moved, what happened, what waits on you, and earnings in the next five trading
+days.
 
 ---
 
-## The big idea: thinking and spending are kept apart
+## The three roles
 
-Most of the scary stories about trading bots come from letting the "smart" part also pull the
-trigger. Quiver splits that into three separate jobs, and puts a wall between them:
+| Role | Runs in | Model (env var, default) | What it does |
+|---|---|---|---|
+| Desk agent | `quiver-chat` | `QUIVER_DESK_MODEL=claude-sonnet-5-5` | Talks with you. Reads the research memory. Sends proposals. |
+| Analyst | `quiver-worker` | `QUIVER_ANALYST_MODEL=claude-opus-5-5` | Analyzes each event and each deep-dive. Records findings and verdicts. |
+| News classifier | `quiver-worker` | `QUIVER_CLASSIFIER_MODEL=claude-haiku-5-5` | Marks each headline material or not. JSON only, no tools. |
 
-```
-   🧠  THE THINKER — the AI
-   ──────────────────────────────────────────────────────────
-   A team of AI analysts reads the news, charts, and numbers.
-   It only gives an opinion: buy, sell, or wait.
-   It never sees your money or your limits.
-          │
-          ▼   "I think: BUY"
-   ⚙️  THE RULE-KEEPER — plain code
-   ──────────────────────────────────────────────────────────
-   Takes the opinion and works out the real, safe order.
-   It can never go over the limits you set. No AI guesswork.
-          │
-          ▼   "Buy $25 of AAPL"
-   🤖  THE HANDS — the helper
-   ──────────────────────────────────────────────────────────
-   Places the orders with your broker, and nothing more.
-   It just does exactly what the rule-keeper said.
-```
+The classifier model also picks the quick reaction for a message that arrives while a turn
+runs. The broker runbooks (`EXECUTE.md`, `SNAPSHOT.md`) run as `claude -p` with
+`QUIVER_BROKER_MODEL=claude-sonnet-5-5`. The code holds these defaults. Set an env var only
+to override one.
 
-- **The thinker** is the EVE brain — a team of AI analysts (running on GLM 5.2 via
-  OpenRouter, one key). They argue it out — a bull case, a bear case, a risk check, a
-  final call — and produce one opinion per stock.
-- **The rule-keeper** is plain code. It takes that opinion and works out the real order, while
-  obeying every limit you set (how much per trade, per day, per stock). The AI never gets to
-  override these. If the math says "spend nothing," it spends nothing.
-- **The hands** just place the orders. This part can't reason about the market even if it
-  wanted to — it only carries out what the rule-keeper handed it.
-
-Quiver also keeps a **logbook** of every past pick and how it turned out (did the stock go the
-way it guessed? did it make or lose money?). It shows that report card to the AI next time, so
-the picks can get a little smarter over time.
+No model places an order. No model sizes an order. Python sizes every order, and only your
+tap approves one.
 
 ---
 
-## How one trading run works
+## The four desk services
 
-A "run" is one full pass over your stock list. Quiver wakes up, checks if it should do
-anything, and most of the time quietly goes back to sleep. Here is a full run, start to finish:
+| Unit | Program | Starts | Broker | LLM |
+|---|---|---|---|---|
+| `quiver-chat.service` | `deploy/runner/chat_bridge.py` | always on | none | desk agent |
+| `quiver-worker.path` → `quiver-worker.service` | `deploy/runner/run_worker.py` | a job is queued | none | analyst, news classifier |
+| `quiver-broker.path` → `quiver-broker.service` | `deploy/runner/run_broker.py` | a snapshot or execute job is queued | yes, the only one | broker runbook |
+| `quiver.service` + `quiver.timer` | `deploy/runner/run_monitor.py` | hourly at :40, 11:40 to 23:40 UTC, Monday to Friday | none | none |
 
-```
-  Wake up (about once an hour)
-    │
-    ├─ 1. Safety check        Is the off-switch on? Did we lose too much today?
-    │                         Is the market even open? Already traded this stock today?
-    │                         → If anything looks wrong, stop here and sleep.
-    │
-    ├─ 2. Look at the account  Read your balances and prices (read-only — touches nothing).
-    │
-    ├─ 3. Think                The AI studies each stock and gives its opinion.
-    │
-    ├─ 4. Apply the rules      The rule-keeper turns each opinion into a real, safe order
-    │                         (or decides to do nothing).
-    │
-    ├─ 5. Place the orders     The hands place exactly those orders with the broker.
-    │
-    └─ 6. Write it down        Save what happened in the logbook.
-```
+Two housekeeping services also run: `quiver-backup` (the nightly ledger backup to Cloud
+Storage, 22:15 UTC) and `quiver-claude-update` (the daily Claude Code update, 05:00 UTC).
 
-By default this happens **once a day**. There is an optional mode where it can check a few
-times a day instead — but even then, the same safety limits apply, and it can only trade a
-stock a set number of times per day. That mode is **off** unless you turn it on.
+A writer starts the worker or the broker with a trigger file
+(`state/triggers/worker`, `state/triggers/broker`). The runner deletes the file, then drains
+its queue. A trigger written during a drain starts the runner again, so no trigger is lost.
+
+The ledger (`state/ledger.db`, SQLite) is the one source of truth. It holds the premise, the
+book, the theses, the research memory, the proposals, the orders, and the chat.
 
 ---
 
-## Getting started
+## The tap flow
 
-### 1 · Turn it on
+1. The desk or the analyst calls `propose_trade` or `propose_change`.
+2. Python builds the proposal. For a trade, it sizes each leg toward the target weight and
+   reserves one `orders` row per leg with a fixed `ref_id`. A retry can never mint a second
+   order.
+3. The outbox sends a card in plain prose: the exact orders, the dollars, the effect on the
+   book, the reason, and the evidence. A trade card has **Approve** and **Reject**. A change
+   card has **Confirm** and **Reject**.
+4. You tap. `lib/desk/approvals.handle_tap` checks your user id, the chat, the message, the
+   nonce, the state, and the expiry. Then it claims the proposal in one conditional `UPDATE`.
+   A second tap gets "Already approved".
+5. On **Approve**, the broker runner starts. Python fetches a fresh Robinhood quote. If the
+   price moved more than 1.5% (`requote_tolerance_pct`), the desk sends new numbers with new
+   buttons and places nothing. Otherwise the broker places the checked orders, and the desk
+   tells you the fills.
+6. On **Confirm**, Python applies the change (for example a new target weight). If the
+   change implies a trade, Python sends a second card with its own **Approve** button. A
+   Confirm never approves a trade.
 
-First-time setup — make your private config, strategy book, and secrets from the
-committed templates (all three are gitignored, so your live posture and macro book
-never get shared):
+Rules that apply to every proposal:
+
+- A proposal expires at the close of the current regular session.
+- A new trade proposal for the same name replaces the old one. The old buttons change to
+  "Replaced by #N" and stop working.
+- An Approve tap is refused when the `KILL` file exists, when today is halted, when the
+  market is closed, or less than 5 minutes before the close. The proposal stays open.
+- A "yes" in chat is not an approval. Only the button approves.
+
+The seven change kinds are `add_company`, `drop_company`, `set_weights`, `set_risk`,
+`set_premise`, `set_thesis`, and `resume_trading`.
+
+---
+
+## The nine walls
+
+1. **Broker isolation at the kernel.** Only `quiver-broker` can read the Robinhood OAuth.
+   Every unit hides `/etc/quiver`. `quiver-chat`, `quiver-worker`, and `quiver` hide
+   `state/claude-config`. The desk and the analyst use their own config dir
+   (`state/claude-desk`) with no Robinhood server registered.
+2. **Exact, checked orders only.** `broker_guard` allows a place call only for a leg of the
+   current `execute` job. `exec-check` must have passed that leg less than 120 s ago, and the
+   call fields must match the leg. The guard also needs no `KILL`, no halt, and more than
+   120 s to the close. It denies every other broker write. A broken guard blocks.
+   `run_broker.py` self-tests the guard before each job.
+3. **Approval only by a tap.** `approvals.handle_tap` is the only code that sets
+   `approved`. No tool can reach it.
+4. **No shell and no file writes for the desk or the analyst.** They have typed tools,
+   read-only file tools confined to the repo, and web search. A `PreToolUse` hook enforces
+   the allowlist. If the hook fails, it denies.
+5. **Secrets stay out of model processes.** The bridge and the worker move every secret
+   into a `Secrets` object and delete it from `os.environ` before the first Claude client
+   starts. The broker runner passes an explicit env to `claude -p`. No tool returns a secret.
+6. **Owner allowlist by user id.** A message or a tap counts only from a `from.id` in
+   `TELEGRAM_ALLOWED_CHAT_IDS`, in a private chat with that same id.
+7. **Change before trade.** An agent proposes a trade only from an event with new evidence,
+   or from your message in the current turn. Python sizes every order. A trade only moves a
+   name toward its confirmed target.
+8. **Halts.** The `KILL` file stops all execution. The daily-loss halt stops execution for
+   the rest of the day.
+9. **SSRF-safe fetch.** `fetch_document` refuses private and metadata addresses and pins the
+   checked address.
+
+**Remaining risks:**
+
+- A person who holds your Telegram session can chat with the desk and tap Approve. Turn on
+  Telegram two-step verification (Settings → Privacy and Security → Two-Step Verification).
+- Telegram bot chats are not end-to-end encrypted. Positions and P&L pass through Telegram.
+- A prompt injection in a filing, an article, or a web page can make the desk propose
+  something. It cannot execute anything: you see every proposal and tap it yourself.
+
+---
+
+## How to talk to it
+
+Send a message to the bot. Examples:
+
+- "What do we own, and how did today go?"
+- "Find more companies in AI power."
+- "What did ANET say about AI back-end networks last quarter?"
+- "Why did we add GEV?"
+- "Trim CEG a bit."
+- "Do a deep-dive on VRT."
+
+Commands that Python answers without a model turn:
+
+| Command | Effect |
+|---|---|
+| `/status` | Snapshot age, pending proposals, the last monitor run, the halt state, the Robinhood login state. |
+| `/clear` (also `/reset`, `/new`) | Starts a new conversation. The research memory and the chat log stay. |
+| `/stop` | Stops the running turn. |
+
+[docs/CHAT.md](docs/CHAT.md) gives the full conversation model, the tools of each role, the
+cards, and the research memory.
+
+---
+
+## Operator commands
+
+Use the venv interpreter (`.venv/bin/python`). On the box, run each command as the `quiver`
+user with `/etc/quiver/quiver.env` loaded ([docs/DEPLOY.md](docs/DEPLOY.md)).
+
+`tick.py` has 21 subcommands. Each prints one JSON line.
+
+| Subcommand | Who calls it |
+|---|---|
+| `fills`, `wait` | `EXECUTE.md` (the broker runbook) |
+| `exec-prepare`, `exec-check`, `exec-commit` | `run_broker.py` and `EXECUTE.md` |
+| `snapshot-prepare`, `snapshot-commit` | `run_broker.py` and `SNAPSHOT.md` |
+| `auth-stop` | `SNAPSHOT.md` and `EXECUTE.md` on a Robinhood 401 |
+| `reflect`, `benchmark-fetch`, `benchmark-backfill`, `goal-track`, `prune` | `run_monitor.py`, after the close |
+| `flow-record`, `flow-suggest` | You (record a deposit or a withdrawal) |
+| `attribution`, `factors-fetch` | You (read-only factor attribution) |
+| `strategy-history`, `decision-proof` | You (the change log and the proof of one decision) |
+| `send-test` | You (the deploy gate: sends one real Telegram page) |
+| `desk-seed` | You, once at the cutover (idempotent) |
 
 ```bash
-cd ~/dev/quiver
-cp strategy.yaml.example strategy.yaml   # your portfolio book = what it trades (private)
-cp .env.example .env && chmod 600 .env   # your keys + account number
-# then open config.yaml (already in the repo), strategy.yaml, and .env and fill them in
+.venv/bin/python tick.py desk-seed                         # seed the premise, the book, the companies
+.venv/bin/python tick.py send-test --kind auth_error       # send one real page to Telegram
+.venv/bin/python tick.py strategy-history --limit 20       # the change log
+.venv/bin/python tick.py decision-proof --id <decision_id> # the proof of one placed leg
+.venv/bin/python tick.py flow-suggest                      # suspected deposits, as flow-record commands
+.venv/bin/python tick.py attribution --benchmark SPY       # market exposure vs selection
+.venv/bin/python deploy/runner/healthcheck.py              # offline checks
+.venv/bin/python deploy/runner/healthcheck.py --live       # plus the units, the walls, the logins
+.venv/bin/python deploy/runner/chat_query.py "SELECT id,state FROM proposals ORDER BY id DESC LIMIT 5"
+.venv/bin/python -m lib.market                             # market hours (XNYS calendar)
 ```
 
-Quiver runs inside a Claude Code session that stays open. These commands start it and tell it
-to do one trading run at a time:
-
-```bash
-cd ~/dev/quiver
-claude
-#   → connect it to your broker:   /mcp
-#   → start the daily loop:
-/loop 1h Run one trading tick for the daily stock bot. Follow ~/dev/quiver/TICK.md exactly.
-```
-
-It wakes up about once an hour and does almost nothing (a quick check, no AI, no orders) until
-the market is open and a stock is due for a look. Leave the session open while it waits.
-
-### 2 · Watch a practice run
-
-Quiver starts in **practice mode**: it does everything a real run does *except* place orders.
-While the market is open, you should see it check the account, think about each stock, and then
-place nothing. You can confirm it placed nothing:
-
-```bash
-sqlite3 state/ledger.db "SELECT trade_date,ticker,signal,intent,status FROM ticker_action;"  # says: dry_run
-sqlite3 state/ledger.db "SELECT COUNT(*) FROM orders;"                                        # should be 0
-tail -n 20 logs/orchestrator.log
-```
-
-### 3 · Let it trade live
-
-When you're happy with how practice runs look, open `config.yaml` and change `dry_run` to
-`false`. Do this at the start of a fresh trading day. After that, the next run trades live —
-still inside every limit you set.
+Stop all execution: `touch KILL`. Resume: `rm KILL`.
 
 ---
 
-## Settings (`config.yaml`)
+## Tests
 
-Everything Quiver does is set here. There is **no fixed dollar cap on trade size** — the per-trade
-and per-day limits are worked out from your live account every time it runs, so they scale
-automatically as you add or lose money. Nothing to bump by hand.
+```bash
+tests/run_e2e.sh            # every deterministic suite: no network, no LLM, no broker
+tests/run_e2e.sh --live     # also the live desk e2e (real models; costs tokens)
+.venv/bin/python tests/test_units.py   # one suite: sizing, the decision wall, the renderer
+```
 
-| Setting | Example | What it means (in plain words) |
+`tests/run_e2e.sh` exits non-zero on any failure. The suites read captured fixtures under
+`tests/fixtures/desk/`. The live suite runs only with `--live`.
+
+---
+
+## Data sources
+
+| Source | Used for | Key |
 |---|---|---|
-| `dry_run` | `true` | **Practice mode.** `true` = no live orders. Set to `false` to trade live. |
-| *(per-trade limit)* | *none* | No knob, and no per-trade cap at all. How much goes into a name is set by its **target weight** in `strategy.yaml` (which is already capped at `per_name_max_pct`), bounded by your available cash. |
-| *(per-day limit)* | *calculated* | No knob. Total buys in a day are bounded by your live cash and your target weights, not a fixed dollar figure. |
-| `daily_loss_halt_pct` | `5.0` | If you're down this much in a day, it stops everything. |
-| `min_buying_power_buffer` | `5` | Always leave at least this much cash untouched. |
-| `intraday_enabled` | `false` | `false` = trade once a day. `true` = let it check a few times a day. |
-| `buy_type` | `market` | How it buys. The other option only buys whole shares at a set price. |
-| `protective_stop` | `false` | If on, it sets an automatic "sell if it drops too far" order after a buy. |
-| `retention_days` | `30` | How long to keep old logs before cleaning them up. |
-
-> [!TIP]
-> The two "advanced" features — checking several times a day, and the fancy order types — are
-> **off by default**. With the defaults, Quiver does the simple, well-tested thing: one careful
-> buy or sell a day. Only turn the extras on after you've watched plenty of practice runs.
-
-> [!NOTE]
-> **Which stocks does it look at?** There's no separate "watchlist" to maintain. Quiver looks
-> at whatever is in your **portfolio plan** (`strategy.yaml` — the target weights it's trying to
-> hold). Cash (SGOV) and anything it can't get a live price for are skipped automatically. To
-> change what it trades, edit `strategy.yaml`, not `config.yaml`.
+| SEC EDGAR | filings, sections, XBRL facts, full-text search, N-PORT holdings | `SEC_USER_AGENT` (required, "Quiver" plus your contact email) |
+| yfinance | prices, news, the screener, ETF top holdings, technicals | none |
+| Alpha Vantage | earnings-call transcripts | `ALPHA_VANTAGE_API_KEY` (optional, 25 calls a day) |
+| Robinhood MCP | snapshots, quotes at the tap, orders, fills | OAuth, `quiver-broker` only |
+| Claude | every model | `CLAUDE_CODE_OAUTH_TOKEN` (subscription token) |
 
 ---
 
-## 🛑 Safety controls
+## Files
 
-These are the brakes. Know where they are before you start.
-
-| Control | What it does |
+| File or folder | What it holds |
 |---|---|
-| **Off switch** | Type `touch KILL` and Quiver stops trading on its next wake-up. Type `rm KILL` to let it start again. |
-| **Daily loss limit** | If your account drops past the limit you set in a single day, Quiver halts itself *and* flips the off switch — no more trades until you check on it. |
-| **Lost connection** | If the link to your broker expires, Quiver stops instead of guessing. You reconnect by running `/mcp`. It will **never** trade on stale information. |
+| `deploy/runner/` | The four runners, `broker_guard.py`, `healthcheck.py`, `backup_ledger.py`. |
+| `deploy/*.service`, `*.path`, `*.timer` | The systemd units. |
+| `deploy/gcp/` | Provisioning (`setup.sh`), updates (`update.sh`, `sync.sh`), secrets (`bootstrap-gcp.sh`), Robinhood login (`rh-reauth.sh`), Terraform. |
+| `lib/desk/` | The desk: store, EDGAR, sections, XBRL, valuation, transcripts, news, ETF look-through, events, levels, proposals, approvals, execution, outbox, tools, agent. |
+| `lib/` | Sizing, market hours, the ledger, the run locks, the renderer, Telegram. |
+| `prompts/` | The prompts of the desk agent, the analyst, the news classifier, the quick reaction, and the broker. |
+| `EXECUTE.md`, `SNAPSHOT.md` | The broker runbooks. |
+| `tick.py` | The operator and runbook subcommands. |
+| `config.yaml` | Start values for the risk and desk settings. Committed; it holds no secrets. |
+| `strategy.yaml`, `STRATEGY.md` | Your book and premise, read once by `desk-seed`. Private and gitignored. Copy `strategy.yaml.example` to start. |
+| `.env` | Your secrets. Gitignored. Copy `.env.example` to start. |
+| `state/ledger.db` | The ledger. Gitignored. |
+| `docs/DESK_PLAN.md` | The build plan and the spec. |
+
+After `desk-seed`, the ledger holds the book and the settings. `config.yaml` gives only the
+start values. A confirmed `set_risk` proposal changes a setting. The daily-loss halt starts
+at 20% (`risk.daily_loss_halt_pct`).
 
 ---
-
-## Watching it work
-
-You can see everything Quiver does:
-
-- **Listen in live** — `logs/reasoning/<date>_<TICKER>.log` shows the AI's thinking as it
-  happens. Run `tail -f` on it during a run to watch in real time.
-- **Read the full write-up** — `state/analyze_logs/<date>_<TICKER>.json` has the complete
-  analysis for each stock: the research, the bull-vs-bear debate, and the final call.
-- **See what it actually did** — `logs/orchestrator.log` plus its logbook:
-  ```bash
-  sqlite3 state/ledger.db "SELECT * FROM ticker_action ORDER BY updated_at DESC LIMIT 20;"
-  sqlite3 state/ledger.db "SELECT * FROM orders        ORDER BY submitted_at DESC LIMIT 20;"
-  ```
-- **Get a daily Telegram message** (optional) — a short recap of each real day: what it looked
-  at, what it decided, what it traded, and how the account did — plus a loud page if it ever
-  halts itself or the broker login expires. See below to switch it on.
-
-### Daily Telegram recap + alerts (optional)
-
-Quiver messages you on **Telegram** after each real trading day (and pages you on a halt /
-auth-error / error). It's a plain HTTPS message from the bot — no email, no extra service. It's
-off until you turn it on, and it's totally separate from trading — if a message fails to send,
-trading carries on as normal. It reuses the **same bot** as the read-only "chat with Quiver"
-bridge (see [docs/CHAT.md](docs/CHAT.md)).
-
-1. **Create the bot + get your chat id** (one-time) — message **@BotFather** → `/newbot` for a
-   token, and grab your numeric chat id (see docs/CHAT.md). Put them in `.env`:
-   ```
-   TELEGRAM_BOT_TOKEN=123456:ABC...
-   TELEGRAM_ALLOWED_CHAT_IDS=123456789   # your chat id (also the alert recipient)
-   ```
-2. **Switch it on:** in `config.yaml`, set `notify.enabled: true`.
-3. **Test it:** `.venv/bin/python tick.py send-test --kind auth_error` sends a real sample alert
-   to your Telegram and prints `{"sent": true, ...}`.
-
-(Email via Resend is kept as a dormant rollback only — `lib/mailer.py` + `RESEND_*` — and is no
-longer used by the live alert path.)
-
----
-
-## Handy commands
-
-```bash
-.venv/bin/python tests/test_units.py        # run the safety tests (no money, no internet)
-.venv/bin/python analyze.py AAPL            # ask the AI about one stock and print its opinion
-.venv/bin/python tick.py preflight          # run just the safety check
-.venv/bin/python -m lib.market              # is the market open right now?
-```
-
-> Always use `.venv/bin/python` — the project's tools live there.
-
----
-
-## Good to know
-
-- **What data does it use?** Stock prices, charts, company numbers, and news all come from a
-  free source — **no paid data key needed**. The only AI key you must have is `OPENROUTER_API_KEY`
-  (the brain runs GLM 5.2 through OpenRouter — the deep reasoning/debate role is `glm-5.2`, the
-  quick analyst/tool-calling role is `glm-4.7-flash`; both use the same single key).
-- **What does it cost to run?** The AI is cheap — a full run is a few cents, roughly
-  **$5–20 a month** if you watch three stocks a day.
-- **One small gap:** it can't read Reddit (the site blocks it), so it just skips that and uses
-  its other sources. Nothing breaks.
-
----
-
-## What's in the box
-
-| File or folder | What it's for |
-|---|---|
-| `analyze.py` | The thinker. Give it a stock, it prints back one opinion. |
-| `tick.py` | The rule-keeper. All the safety math and order decisions live here. |
-| `lib/` | The building blocks: market hours, the logbook, the safety rules, alerts, memory. |
-| `TICK.md` | The exact step-by-step the helper follows on every run. |
-| `config.yaml` | Your settings (the table above). Committed — carries no secrets (those live in `.env`). |
-| `strategy.yaml` | Your portfolio book = the stocks it trades. Private — gitignored. |
-| `strategy.yaml.example` | The committed template you copy to make `strategy.yaml`. Safe defaults. |
-| `state/ledger.db` | The logbook — every decision, order, and result. Survives restarts. |
-| `quiver_eve/` | The EVE brain — the AI analyst team that powers the thinking (Node/TypeScript). |
-| `.env` | Your private keys and account number. Never shared, never committed. |
-
----
-
-<div align="center">
-
-*The code decides. The AI advises. The agent only ever pulls the trigger.*
-
-<sub>The EVE brain (`quiver_eve/`) runs on the open-source `eve` agent framework + the AI SDK (Apache-2.0) — installed under `quiver_eve/node_modules/`.</sub>
-
-</div>
 
 ## License
 
@@ -312,5 +306,5 @@ longer used by the live alert path.)
 If you pass on a copy of any part of this software, you must keep the
 `Required Notice:` line from [LICENSE](LICENSE) with it.
 
-To buy a commercial license, write to **kevin@kvnlee.com**.
-See [COMMERCIAL.md](COMMERCIAL.md) for terms and the credit requirement.
+To buy a commercial license, see [COMMERCIAL.md](COMMERCIAL.md) for the terms, the credit
+requirement, and the contact address.

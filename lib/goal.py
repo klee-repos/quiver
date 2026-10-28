@@ -4,10 +4,8 @@ Proof-bearing and divide-by-zero-safe (lib.risk discipline): bad inputs
 (start_equity<=0, horizon<=0, unparseable dates) return None rather than raising
 or dividing by zero. The glidepath is LINEAR to +target% over the horizon.
 
-NOTE on the decision wall: account equity is digest-side state. Only the COARSE
-regime label (AHEAD / ON-TRACK / BEHIND) from coarse_regime() may cross into the
-analysis path (decision D2) — never a raw equity/dollar value. The numeric
-fields here feed the digest + goal_tracking ledger, not analyze.py.
+The numeric fields here feed the close brief (the deposit-adjusted return toward the
+goal) and the goal_tracking ledger. Nothing here sizes an order.
 """
 
 from __future__ import annotations

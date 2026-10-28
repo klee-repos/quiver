@@ -1,373 +1,327 @@
 #!/usr/bin/env python3
-"""End-to-end coverage for the ALERTING logic — WHEN/WHERE alerts are sent (now Telegram).
+"""End-to-end coverage of the PAGER: when, and to which chat, an alert goes to Telegram.
 
-Drives the real deterministic pipeline offline (no network, no `claude`, no MCP):
+Drives the real code offline (no network, no ``claude``, no MCP):
 
-  * tick.py `_run_report` — the should_send / dedup / per-event-toggle / recipient-
-    routing decisions, across the run-complete + alert scenarios.
-  * run_tick.py `_maybe_alert` — the headless last-resort Telegram sender: dedup against the
-    SAME ledger row the in-tick path uses, injectable transport, never-raises, and the
-    "pager unconfigured" (no token) path.
+  * ``deploy/runner/runner_common._maybe_alert``: the one pager that the monitor, the worker,
+    the broker runner and the chat bridge share (plan §14.3 ``runner_common`` row). It dedups
+    on the ledger ``(date, kind, stage)`` row, takes an injectable transport, never raises,
+    and handles an unconfigured pager (no token, no chat).
+  * the critical pages (halt, auth_error) and the per-stage error pages.
+  * two senders in process (``run_broker.Broker.page`` and ``run_monitor.Monitor.page``, and a
+    later run of either) agree on the hash, so one event pages once per day per stage.
   * the ledger stage-keyed dedup + the (date, kind) -> (date, kind, stage) migration.
-  * lib/mailer payload construction + best-effort no-raise (QUIVER_MAILER_DISABLE) — kept as
-    the email rollback path.
-  * the import-graph invariant: the trading brain never imports lib.mailer NOR lib.telegram.
-  * (opt-in) LIVE Telegram delivery of one of each alert kind via the production egress.
+  * the import graph: no research module of plan §14.10 ``_RESEARCH`` loads ``lib.telegram``.
 
-Run: .venv/bin/python tests/test_e2e_alerts.py
-Live Telegram delivery (opt-in): QUIVER_E2E_TELEGRAM=1 TELEGRAM_BOT_TOKEN=... \
-    TELEGRAM_ALERT_CHAT_IDS=<chat id> .venv/bin/python tests/test_e2e_alerts.py
+Every sender here runs with ``QUIVER_TELEGRAM_DISABLE=1`` or an injected ``send``, so nothing
+reaches Telegram. Run: .venv/bin/python tests/test_e2e_alerts.py
 """
 
 import contextlib
-import importlib.util
 import io
+import json
 import os
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / "tests"))
+sys.path.insert(0, str(_REPO / "deploy" / "runner"))
+# A default sender must never post from a test.
+os.environ["QUIVER_TELEGRAM_DISABLE"] = "1"
 
-import yaml  # noqa: E402
-
-import tick as T  # noqa: E402
-from lib import mailer, notify, telegram  # noqa: E402
-from lib.config import load_config  # noqa: E402
+from desk_fakes import FakeClock, Results, temp_root  # noqa: E402
+from lib import notify  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
+import runner_common as rc  # noqa: E402
 
-PASS = 0
-FAIL = 0
+r = Results("e2e-alerts")
 
-
-def ok(name, cond):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f"  ✓ {name}")
-    else:
-        FAIL += 1
-        print(f"  ✗ FAIL: {name}")
+DAY = "2026-08-05"
+NOW = "2026-08-05T15:00:00Z"
+SECRETS = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_ALERT_CHAT_IDS": "900000111"}
+_TG_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALERT_CHAT_IDS", "TELEGRAM_ALLOWED_CHAT_IDS")
 
 
-def _cfg(notify_block):
-    for _k in ("NOTIFY_TO", "NOTIFY_ALERTS_TO"):  # env-isolate config assertions
-        os.environ.pop(_k, None)
-    d = {
-        "account_number": "12345678", "dry_run": True, "kill_switch_file": "/tmp/alerts_kill",
-        "risk": {"max_dollars_per_trade": 25, "daily_loss_halt_pct": 5.0,
-                 "daily_capital_deploy_cap": 75,
-                 "min_buying_power_buffer": 5},
-        "glm": {"chat_model": "glm-5.2", "reasoner_model": "glm-5.2"},
-        "notify": notify_block,
-    }
-    p = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
-    yaml.safe_dump(d, p)
-    p.close()
-    return load_config(p.name)
+class _Recorder:
+    """A transport that records each call and answers with ``result``."""
+
+    def __init__(self, result=None):
+        self.calls = []
+        self.result = {"ok": True} if result is None else result
+
+    def __call__(self, **kw):
+        self.calls.append(kw)
+        return dict(self.result)
 
 
-def _led():
-    return Ledger(Path(tempfile.mkdtemp()) / "alerts_ledger.db")
+@contextlib.contextmanager
+def _pager(extra_config: str = ""):
+    """A temp root whose config.yaml the pager reads (``rc.ROOT``), and a temp tick log."""
+    saved_root, saved_log = rc.ROOT, rc.TICK_LOG
+    saved_env = {k: os.environ.get(k) for k in _TG_KEYS}
+    with temp_root(extra_config=extra_config) as root:
+        rc.ROOT = root.path
+        rc.TICK_LOG = str(root.path / "logs" / "tick.log")
+        for k in _TG_KEYS:
+            os.environ.pop(k, None)
+        try:
+            yield root
+        finally:
+            rc.ROOT, rc.TICK_LOG = saved_root, saved_log
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
-def _run_tick_module():
-    """Import deploy/runner/run_tick.py as a module (resolves _REPO via __file__)."""
-    spec = importlib.util.spec_from_file_location(
-        "run_tick_under_test", _REPO / "deploy" / "runner" / "run_tick.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _page(led, kind, stage, detail="boom", *, send, secrets=SECRETS, severity="critical"):
+    """One page through the shared pager. Returns the JSON events ``_emit`` printed."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc._maybe_alert(led, kind=kind, stage=stage, day=DAY, now_iso=NOW, event_detail=detail,
+                        send=send, secrets=secrets, severity=severity)
+    return [json.loads(ln) for ln in buf.getvalue().splitlines() if ln.startswith("{")]
 
 
-DAY = "2026-06-14"
-NOW = "2026-06-14T11:00:00-04:00"
-ENABLED = {"enabled": True, "to": ["digest@x.com"], "from": "bot@quiver.dev",
-           "on_complete": True, "on_error": True, "on_warning": False,
-           "alerts_to": ["pager@x.com"]}
+def _events(evs):
+    return [e.get("event") for e in evs]
 
 
-def _digest_data(tickers=True):
-    plan = {"dry_run": True, "decisions": []}
-    if tickers:
-        plan["decisions"] = [{"ticker": "AAPL", "signal": "Hold", "intent": "hold",
-                              "status": "skipped", "detail": "hold"}]
-    return {"date": DAY, "now_iso": NOW, "kind": "digest", "equity": 100.0, "plan": plan}
+# ---- C. critical pages: halt and auth_error, gated on notify.on_error ----------------
+with _pager() as root:
+    led = root.led()
+    tx = _Recorder()
+    ev = _page(led, "halt", notify.HALT_STAGE, "drop 21.4% vs the baseline", send=tx)
+    r.ok("[C] halt pages once", len(tx.calls) == 1, ev)
+    r.eq("[C] the stage of a halt model with no stage is daily_loss_halt",
+         notify.stage_of({"kind": "halt"}), "daily_loss_halt")
+    r.eq("[C] a halt is critical", notify.severity_of({"kind": "halt"}), "critical")
+    halt_text = tx.calls[0]["text"]
+    r.ok("[C] the halt page says trading halted for today", "halted trading for today" in halt_text, halt_text)
+    r.ok("[C] the halt page names the resume_trading proposal, not rm KILL",
+         "resume_trading" in halt_text and "rm KILL" not in halt_text, halt_text)
+    r.ok("[C] a critical page is LOUD (disable_notification False)",
+         tx.calls[0].get("disable_notification") is False)
+    _page(led, "halt", notify.HALT_STAGE, "drop 25.0% vs the baseline", send=tx)
+    r.ok("[C] a repeat halt with a different detail dedups", len(tx.calls) == 1)
+    _page(led, "auth_error", notify.AUTH_STAGE, "401 Unauthorized", send=tx)
+    r.ok("[C] auth_error pages independently of the halt", len(tx.calls) == 2)
+    r.eq("[C] auth_error stage is broker_auth", notify.stage_of({"kind": "auth_error"}), "broker_auth")
+    r.eq("[C] auth_error is critical", notify.severity_of({"kind": "auth_error", "severity": "warning"}),
+         "critical")
+    r.ok("[C] auth_error and halt have different dedup hashes",
+         notify.content_hash({"kind": "auth_error"}) != notify.content_hash({"kind": "halt"}))
+
+with _pager(extra_config="\nnotify:\n  enabled: true\n  on_error: false\n") as root:
+    tx = _Recorder()
+    ev = _page(root.led(), "halt", notify.HALT_STAGE, send=tx)
+    r.ok("[C] notify.on_error false -> no page", tx.calls == [], tx.calls)
+    r.ok("[C] ... and the skip is logged with reason disabled",
+         any(e.get("event") == "alert_skipped" and e.get("reason") == "disabled" for e in ev), ev)
+
+with _pager(extra_config="\nnotify:\n  enabled: false\n") as root:
+    tx = _Recorder()
+    _page(root.led(), "auth_error", notify.AUTH_STAGE, send=tx)
+    r.ok("[C] notify.enabled false -> no page (fails SAFE)", tx.calls == [], tx.calls)
+
+with _pager() as root:
+    (root.path / "config.yaml").write_text("schema: [this is: not, a valid config\n", encoding="utf-8")
+    tx = _Recorder()
+    _page(root.led(), "auth_error", notify.AUTH_STAGE, send=tx)
+    r.ok("[C] a config that does not load does NOT silence the pager (on_error defaults on)",
+         len(tx.calls) == 1, tx.calls)
+
+# ---- D. hard errors page per (kind, stage), independently -------------------------------
+with _pager() as root:
+    led = root.led()
+    tx = _Recorder()
+    _page(led, "error", "monitor", "KeyError: 'positions'", send=tx)
+    r.ok("[D] error/monitor pages", len(tx.calls) == 1)
+    _page(led, "error", "monitor", "ValueError: other text", send=tx)
+    r.ok("[D] error/monitor repeat with a different detail dedups (anti-spam)", len(tx.calls) == 1)
+    _page(led, "error", "edgar", "SEC returned 403", send=tx)
+    r.ok("[D] error/edgar pages independently (a different stage)", len(tx.calls) == 2)
+    _page(led, "error", "news", "yfinance 429", send=tx, severity="warning")
+    r.ok("[D] a warning stage pages once too", len(tx.calls) == 3)
+    warn_text = tx.calls[-1]["text"]
+    r.ok("[D] a warning page says the step is best-effort and retries",
+         "best-effort" in warn_text and "What to do" not in warn_text, warn_text)
+    r.ok("[D] a critical error page names the stage and the recovery",
+         "stopped at the edgar step" in tx.calls[1]["text"] and "What to do" in tx.calls[1]["text"],
+         tx.calls[1]["text"])
+    r.ok("[D] the raw detail rides in the page", "SEC returned 403" in tx.calls[1]["text"])
+    for st in ("monitor", "worker", "broker", "desk", "edgar", "snapshot", "execute", "path_unit"):
+        r.eq(f"[D] stage {st} is critical", notify.severity_of({"kind": "error", "stage": st}), "critical")
+    for st in ("levels", "drift", "expire", "queue", "reflect", "benchmark", "goal", "prune",
+               "news", "transcripts", "brief"):
+        r.eq(f"[D] stage {st} is a warning", notify.severity_of({"kind": "error", "stage": st}), "warning")
+
+# ---- F. two senders in process agree on the hash: one event pages once ------------------
+# The broker runner pages auth_error at a Robinhood 401. A later broker run (a new process)
+# meets the same 401 with other text. Both go through runner_common with the PRODUCTION
+# default transport (lib.telegram.send_message, offline under QUIVER_TELEGRAM_DISABLE=1).
+import run_broker  # noqa: E402
+import run_monitor  # noqa: E402
 
 
-def _alert_data(kind, stage=None, severity=None, detail="boom"):
-    return {"date": DAY, "now_iso": NOW, "kind": kind, "stage": stage,
-            "severity": severity, "event_detail": detail}
+class _Box:
+    chat_id = None
+
+    def send(self, *a, **k):
+        return {"ok": True}
 
 
-def main() -> int:
-    print("=" * 70)
-    print("E2E ALERTS — when (and to whom) emails are sent")
-    print("=" * 70)
-    # Snapshot live-delivery creds NOW — section G mutates/pops these env vars.
-    live_to = os.environ.get("QUIVER_E2E_LIVE_TO", "").strip()
-    live_key = os.environ.get("RESEND_API_KEY", "").strip()
-    live_from = os.environ.get("RESEND_FROM", "").strip()
+clk = FakeClock("2026-08-05T15:00:00Z").pin_market()
+try:
+    with _pager() as root:
+        os.environ.update(TELEGRAM_BOT_TOKEN="tok", TELEGRAM_ALLOWED_CHAT_IDS="900000111")
+        led, cfg = root.led(), root.cfg()
+        broker1 = run_broker.Broker(led=led, cfg=cfg, box=_Box(), now_fn=lambda: clk.now)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            broker1.page("auth_error", notify.AUTH_STAGE, "401 at get_portfolio")
+        e1 = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        row_hash = led.last_notified_hash(DAY, "auth_error", notify.AUTH_STAGE)
+        r.ok("[F] the first sender pages and writes the shared row",
+             "alert_sent" in _events(e1) and row_hash is not None, e1)
+        r.eq("[F] the row holds the hash of (kind, stage, severity) only",
+             row_hash, notify.build_alert({"kind": "auth_error", "stage": notify.AUTH_STAGE,
+                                           "severity": "critical"})["content_hash"])
+        r.ok("[F] the hash ignores the detail and the host",
+             notify.content_hash({"kind": "auth_error", "event_detail": "a", "host": "x"})
+             == notify.content_hash({"kind": "auth_error", "event_detail": "b", "host": "y"}))
+        broker2 = run_broker.Broker(led=root.led(), cfg=cfg, box=_Box(), now_fn=lambda: clk.now)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            broker2.page("auth_error", notify.AUTH_STAGE, "401 Unauthorized: token expired at 14:59Z")
+        e2 = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        r.ok("[F] the second sender sees the row and skips (no double page)",
+             any(e.get("event") == "alert_skipped" and e.get("reason") == "already_sent" for e in e2), e2)
+        # The monitor is the other in-process sender. Its error page has its own stage.
+        mon = run_monitor.Monitor(led=root.led(), cfg=cfg, box=_Box(), now_fn=lambda: clk.now)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mon.page("edgar", "SEC returned 403")
+            mon.page("edgar", "SEC returned 403 again")
+        e3 = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        r.eq("[F] the monitor pages its stage once, then dedups", _events(e3), ["alert_sent", "alert_skipped"])
+        r.ok("[F] the monitor's row is its own (error, edgar)",
+             led.last_notified_hash(DAY, "error", "edgar") == notify.content_hash({"kind": "error", "stage": "edgar"}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            broker1.page("error", "broker", "order guard check failed")
+        e4 = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+        r.ok("[F] the broker's error/broker page is independent of the monitor's error/edgar",
+             "alert_sent" in _events(e4), e4)
+finally:
+    clk.unpin()
 
-    # ---- A. run-complete digest: send once, then dedup ----
-    print("\n[A] run-complete digest gating + dedup")
-    cfg, led = _cfg(ENABLED), _led()
-    r1 = T._run_report(cfg, led, _digest_data())
-    ok("digest should_send True (new)", r1["should_send"] and r1["reason"] == "new")
-    ok("digest routes to `to` (not alerts_to)", r1["recipients"] == ["digest@x.com"])
-    led.mark_notified(r1["date"], r1["kind"], r1["content_hash"], "digest@x.com", NOW,
-                      stage=r1.get("stage", ""))
-    r2 = T._run_report(cfg, led, _digest_data())
-    ok("identical wake dedups (already_sent)",
-       not r2["should_send"] and r2["reason"] == "already_sent")
-
-    # ---- B. toggles + nothing-to-report ----
-    print("\n[B] per-event toggles + nothing_to_report guard")
-    cfg_oc, led_b = _cfg({**ENABLED, "on_complete": False}), _led()
-    ok("on_complete False -> complete_disabled",
-       T._run_report(cfg_oc, led_b, _digest_data())["reason"] == "complete_disabled")
-    cfg_off, led_b2 = _cfg({**ENABLED, "enabled": False}), _led()
-    ok("notify disabled -> notify_disabled",
-       T._run_report(cfg_off, led_b2, _digest_data())["reason"] == "notify_disabled")
-    ok("empty digest -> nothing_to_report",
-       T._run_report(cfg, _led(), _digest_data(tickers=False))["reason"] == "nothing_to_report")
-
-    # ---- C. critical alerts: halt / auth_error ----
-    print("\n[C] critical alerts (halt, auth_error) gate on on_error + route to alerts_to")
-    cfg, led_c = _cfg(ENABLED), _led()
-    rh = T._run_report(cfg, led_c, _alert_data("halt", detail="-6.1%"))
-    ok("halt should_send True", rh["should_send"])
-    ok("halt stage derived = daily_loss_halt", rh["stage"] == "daily_loss_halt")
-    ok("alert routes to alerts_to", rh["recipients"] == ["pager@x.com"])
-    led_c.mark_notified(rh["date"], rh["kind"], rh["content_hash"], "p", NOW, stage=rh["stage"])
-    ok("halt repeat dedups", not T._run_report(cfg, led_c, _alert_data("halt", detail="-9%"))["should_send"])
-    ra = T._run_report(cfg, _led(), _alert_data("auth_error"))
-    ok("auth_error should_send True + stage broker_auth",
-       ra["should_send"] and ra["stage"] == "broker_auth" and ra["severity"] == "critical")
-
-    # ---- D. hard errors: per-stage independence ----
-    print("\n[D] hard errors page per (kind, stage), independently")
-    cfg, led_d = _cfg(ENABLED), _led()
-    rp = T._run_report(cfg, led_d, _alert_data("error", stage="plan", severity="critical"))
-    ok("error/plan should_send True", rp["should_send"] and rp["stage"] == "plan")
-    led_d.mark_notified(rp["date"], rp["kind"], rp["content_hash"], "p", NOW, stage=rp["stage"])
-    ok("error/plan repeat (different detail) dedups — anti-spam",
-       not T._run_report(cfg, led_d, _alert_data("error", stage="plan", detail="other"))["should_send"])
-    rc = T._run_report(cfg, led_d, _alert_data("error", stage="commit", severity="critical"))
-    ok("error/commit pages independently (different stage)", rc["should_send"])
-
-    # ---- E. warning hiccups: off by default, opt-in via on_warning ----
-    print("\n[E] warning hiccups suppressed by default, fold into digest, opt-in to email")
-    cfg, led_e = _cfg(ENABLED), _led()
-    rw = T._run_report(cfg, led_e, _alert_data("error", stage="prune", severity="warning"))
-    ok("warning suppressed by default -> warning_disabled",
-       not rw["should_send"] and rw["reason"] == "warning_disabled")
-    cfg_w = _cfg({**ENABLED, "on_warning": True})
-    ok("on_warning True -> warning emails",
-       T._run_report(cfg_w, _led(), _alert_data("error", stage="prune", severity="warning"))["should_send"])
-    # folded delivery: a hiccup rides along in the digest FYI section
-    d = _digest_data()
-    d["warnings"] = [{"stage": "reflect", "detail": "yfinance 403 blip"}]
-    dr = T._run_report(cfg, _led(), d)
-    ok("digest carries the FYI hiccup (folded delivery)",
-       "yfinance 403 blip" in dr["html"] and "yfinance 403 blip" in dr["text"])
-
-    # ---- E2. digest lead: equity, baseline and drop_pct share ONE base ----
-    # The orchestrator passes the broker's positions-only `equity`. The plan computes the
-    # TOTAL (positions + buying power). The lead must print the total. The plan comes from
-    # the real `_run_plan`, so the fixture is one the producer emits.
-    print("\n[E2] digest lead prints the plan's TOTAL equity, not positions-only")
-    cfg, led_e2 = _cfg(ENABLED), _led()
-    plan_e2 = T._run_plan(cfg, led_e2, {
-        "run_id": "E2", "now_iso": NOW, "equity": 1682.71, "buying_power": 388.18,
-        "positions": {"SMH": {"market_value": 1682.71}},
-        "analyses": [{"ticker": "SMH", "signal": "Hold"}]})
-    ok("plan equity is the total (positions + buying power)", plan_e2["equity"] == 2070.89)
-    lead = T._run_report(cfg, led_e2, {"date": DAY, "now_iso": NOW, "kind": "digest",
-                                      "equity": 1682.71, "plan": plan_e2})["telegram"]
-    ok("lead prints the total equity", "flat on the day at $2,070.89" in lead)
-    ok("lead never prints the positions-only figure", "$1,682.71" not in lead)
-    # No plan (an alert before STEP 4): the orchestrator's `equity` is the only figure.
-    m_noplan = T._build_report_model(cfg, _led(), {"equity": 961.0}, DAY, NOW, "halt")
-    ok("no plan -> falls back to the orchestrator's equity", m_noplan["equity"] == 961.0)
-
-    # ---- E3. digest risk line: a deposit is not a gain, a base change is not a drawdown ----
-    # The curve is the production one around the two deposits (2026-07-09 $800, 2026-07-22
-    # $1000). The raw curve gave "39.5% max drawdown" and counted each deposit as a return.
-    print("\n[E3] digest risk line is flow-adjusted")
-    cfg, led_e3 = _cfg(ENABLED), _led()
-    # The plan comes from the real `_run_plan`. It writes the baseline of the CURRENT trading
-    # day: the last point of the curve. Its total (1600 + 388.63) equals the point before it,
-    # so that interval is a 0% return.
-    plan_e3 = T._run_plan(cfg, led_e3, {
-        "run_id": "E3", "now_iso": NOW, "equity": 1600.0, "buying_power": 388.63,
-        "positions": {"SMH": {"market_value": 1600.0}},
-        "analyses": [{"ticker": "SMH", "signal": "Hold"}]})
-    for _d, _e in (("2026-07-06", 239.54), ("2026-07-07", 235.73), ("2026-07-08", 238.84),
-                   ("2026-07-09", 1045.09), ("2026-07-10", 1046.36), ("2026-07-13", 1035.57),
-                   ("2026-07-14", 1037.48), ("2026-07-15", 998.28), ("2026-07-16", 1000.97),
-                   ("2026-07-17", 989.19), ("2026-07-20", 989.55), ("2026-07-21", 1006.56),
-                   ("2026-07-22", 2006.51), ("2026-07-23", 1997.02), ("2026-07-24", 1988.63)):
-        led_e3.get_or_create_baseline(_d, _e, _d + "T10:30:00-04:00")
-    ar0 = T._account_risk(led_e3, cfg)
-    ok("no recorded flow: both deposit jumps are left out and counted",
-       ar0["unexplained_jumps"] == 2
-       and ar0["unexplained_jump_dates"] == ["2026-07-09", "2026-07-22"])
-    ok("no recorded flow: a deposit day is never a return (Sharpe N = 15 intervals - 2)",
-       ar0["sharpe_n"] == 13)
-    tg0 = T._run_report(cfg, led_e3, {"date": DAY, "now_iso": NOW, "kind": "digest",
-                                     "plan": plan_e3})["telegram"]
-    ok("the digest tells the operator to record the flow",
-       "2 unexplained equity jumps left out; record the deposit or withdrawal with flow-record" in tg0)
-    led_e3.record_cash_flow(trade_date="2026-07-09", amount=800.0, note="deposit", created_at=NOW)
-    led_e3.record_cash_flow(trade_date="2026-07-22", amount=1000.0, note="deposit", created_at=NOW)
-    ar1 = T._account_risk(led_e3, cfg)
-    ok("recorded flows: nothing is left out, every interval is a return",
-       ar1["unexplained_jumps"] == 0 and ar1["sharpe_n"] == 15)
-    # peak 2026-07-10, trough 2026-07-17: 989.19 / 1046.36 - 1 = -5.46%. No deposit in between.
-    ok("recorded flows: the drawdown is the real one (5.5%), not the deposit-distorted one",
-       abs(ar1["drawdown_pct"] - (1 - 989.19 / 1046.36) * 100) < 1e-6)
-    ok("recorded flows: the deposit day keeps its market return (+2.6%), not +337%",
-       "flow-adjusted index" in ar1["drawdown_proof"] and "2 interval(s) with a recorded flow" in ar1["drawdown_proof"])
-    tg1 = T._run_report(cfg, led_e3, {"date": DAY, "now_iso": NOW, "kind": "digest",
-                                     "plan": plan_e3})["telegram"]
-    ok("the digest risk sentence is clean again", "Risk check: 5.5% max drawdown" in tg1
-       and "unexplained" not in tg1)
-
-    # ---- F. cross-sender dedup: orchestrator + last-resort agree on the hash ----
-    print("\n[F] cross-sender dedup: in-tick + last-resort produce the SAME hash")
-    cfg, led_f = _cfg(ENABLED), _led()
-    # orchestrator side: report auth_error, commit it (as TICK.md report-commit would)
-    orch = T._run_report(cfg, led_f, _alert_data("auth_error"))
-    led_f.mark_notified(orch["date"], orch["kind"], orch["content_hash"], "p", NOW,
-                        stage=orch["stage"])
-    # last-resort side: reconstruct the SAME event's model (dry_run must match cfg.dry_run)
-    lr_model = {"date": DAY, "now_iso": NOW, "kind": "auth_error", "stage": "broker_auth",
-                "severity": "critical", "dry_run": cfg.dry_run, "event_detail": "AUTH_ERROR",
-                "subject_prefix": "[Quiver]", "tickers": []}
-    lr_hash = notify.build_digest(lr_model)["content_hash"]
-    ok("orchestrator + last-resort hashes match (no double page)",
-       lr_hash == orch["content_hash"])
-    ok("last-resort sees the row already present -> would skip",
-       led_f.last_notified_hash(DAY, "auth_error", "broker_auth") == lr_hash)
-
-    # ---- G. run_tick last-resort: inject + dedup + never-raise + unconfigured ----
-    print("\n[G] run_tick._maybe_alert (the headless safety net)")
-    rt = _run_tick_module()
-    led_g = _led()
-    # Snapshot + restore so this block never clobbers a real .env token for a later LIVE block.
-    _saved_tg = {_k: os.environ.get(_k) for _k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALERT_CHAT_IDS")}
-    os.environ.update(TELEGRAM_BOT_TOKEN="tok", TELEGRAM_ALERT_CHAT_IDS="560501084")
-    sent = []
-    rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
-                    event_detail="401", send=lambda **k: sent.append(k) or {"ok": True})
-    ok("last-resort sends once", len(sent) == 1)
-    ok("alert copy is actionable (the re-auth command in the Telegram body, no desktop)",
-       "deploy/gcp/rh-reauth.sh" in sent[0]["text"] and "remotedesktop" not in sent[0]["text"])
-    ok("last-resort targets Telegram (token + chat ids, not email)",
-       sent[0].get("token") == "tok" and sent[0].get("chat_ids") == ["560501084"])
-    ok("critical alert is LOUD (disable_notification False)",
-       sent[0].get("disable_notification") is False)
-    rt._maybe_alert(led_g, kind="auth_error", stage="broker_auth", day=DAY, now_iso=NOW,
-                    event_detail="different", send=lambda **k: sent.append(k) or {"ok": True})
-    ok("last-resort dedups against the shared row (no double page)", len(sent) == 1)
-    rt._maybe_alert(led_g, kind="error", stage="plan", day=DAY, now_iso=NOW,
-                    event_detail="x", send=lambda **k: sent.append(k) or {"ok": True})
-    ok("different stage pages independently", len(sent) == 2)
+# ---- G. runner_common._maybe_alert (the shared pager) -------------------------------------
+with _pager() as root:
+    led = root.led()
+    tx = _Recorder()
+    _page(led, "auth_error", "broker_auth", "401", send=tx)
+    r.ok("[G] the pager sends once", len(tx.calls) == 1)
+    text = tx.calls[0]["text"]
+    r.ok("[G] the auth copy is actionable (the re-auth command, no desktop)",
+         "deploy/gcp/rh-reauth.sh" in text and "remotedesktop" not in text, text)
+    r.ok("[G] it targets Telegram with the token and chat ids from Secrets",
+         tx.calls[0].get("token") == "tok" and tx.calls[0].get("chat_ids") == ["900000111"], tx.calls[0])
+    r.ok("[G] the row records the chat ids it reached",
+         led.last_notified_hash(DAY, "auth_error", "broker_auth") is not None)
+    _page(led, "auth_error", "broker_auth", "different", send=tx)
+    r.ok("[G] it dedups against the shared row", len(tx.calls) == 1)
+    _page(led, "error", "execute", "x", send=tx)
+    r.ok("[G] a different stage pages independently", len(tx.calls) == 2)
 
     def _boom(**k):
         raise RuntimeError("network down")
-    before = len(sent)
-    rt._maybe_alert(led_g, kind="error", stage="commit", day=DAY, now_iso=NOW,
-                    event_detail="y", send=_boom)  # must not raise
-    ok("a raising transport is swallowed (never crashes the supervisor)", len(sent) == before)
-    # Simulate an UNCONFIGURED box by blanking the token (present-but-empty, not popped):
-    # _maybe_alert calls load_config -> load_dotenv, which would re-inject TELEGRAM_BOT_TOKEN from
-    # a real .env (dotenv only fills UNSET vars; override=False leaves a present-but-empty one).
-    os.environ["TELEGRAM_BOT_TOKEN"] = ""
-    rt._maybe_alert(led_g, kind="error", stage="reflect", day=DAY, now_iso=NOW,
-                    event_detail="z", send=lambda **k: sent.append(k) or {"ok": True})
-    ok("unconfigured (no token) -> no send, no raise", len(sent) == before)
-    for _k, _v in _saved_tg.items():  # restore (don't leak into a later LIVE block)
-        if _v is None:
-            os.environ.pop(_k, None)
-        else:
-            os.environ[_k] = _v
-    # generic orchestrator-crash alert is suppressed when the in-tick path already paged
-    # a hard-stop error (so it can't double-page the same failure under a different stage)
-    led_gate = _led()
-    ok("no in-tick error -> generic orchestrator alert allowed",
-       rt._in_tick_error_paged(led_gate, DAY) is False)
-    led_gate.mark_notified(DAY, "error", "h", "p", NOW, stage="plan")
-    ok("in-tick plan error -> generic orchestrator alert suppressed",
-       rt._in_tick_error_paged(led_gate, DAY) is True)
+    ev = _page(led, "error", "snapshot", "y", send=_boom)
+    r.ok("[G] a raising transport is swallowed (never crashes a runner)",
+         any(e.get("event") == "alert_failed" and "network down" in str(e.get("alert_detail")) for e in ev), ev)
+    r.ok("[G] ... and no row is written, so the next run tries again",
+         led.last_notified_hash(DAY, "error", "snapshot") is None)
+    fail = _Recorder({"ok": False, "error": "chat not found"})
+    _page(led, "error", "worker", "z", send=fail)
+    r.ok("[G] a refused send writes no row", led.last_notified_hash(DAY, "error", "worker") is None)
+    _page(led, "error", "worker", "z", send=tx)
+    r.ok("[G] ... so the same event pages on the next run (at-least-once)", len(tx.calls) == 3)
+    part = _Recorder({"ok": True, "partial": True})
+    ev = _page(led, "error", "desk", "w", send=part)
+    r.ok("[G] a partial send (primary ok) writes the row and logs alert_partial",
+         led.last_notified_hash(DAY, "error", "desk") is not None and "alert_partial" in _events(ev), ev)
 
-    # ---- G2. run_tick.main brain-outage branch: the all-ERROR page must be REACHED ----
-    # Regression for a NameError: main() built the brain-outage alert detail with
-    # `_brain_engine(cfg)`, but `cfg` was never bound in main() (it lived only in
-    # _alert_target). On a total brain outage (every analysis == "ERROR") that f-string
-    # arg raised NameError BEFORE _maybe_alert ran, and — being outside the RunLockError
-    # except — it crashed the supervisor instead of paging. Drive the full main() path
-    # with a stubbed preflight (proceed + a pending ticker) and an all-ERROR fan-out, and
-    # assert the brain-outage page is REACHED (its detail evaluated) without raising.
-    print("\n[G2] run_tick.main brain-outage page is reached without a NameError")
-    _tmp_led2 = _led()
-    _saved = {"Ledger": rt.Ledger, "tick_json": rt._tick_json,
-              "run_analyses": rt.run_analyses, "subprocess": rt.subprocess,
-              "maybe_alert": rt._maybe_alert}
+    # Unconfigured: no token, or no chat.
+    nt = _Recorder()
+    ev = _page(led, "error", "levels", "a", send=nt, secrets={"TELEGRAM_BOT_TOKEN": "",
+                                                              "TELEGRAM_ALERT_CHAT_IDS": "1"})
+    r.ok("[G] no token -> no send, no raise", nt.calls == [], nt.calls)
+    r.ok("[G] ... logged as alert_unconfigured no_token",
+         any(e.get("event") == "alert_unconfigured" and e.get("reason") == "no_token" for e in ev), ev)
+    ev = _page(led, "error", "levels", "a", send=nt, secrets={"TELEGRAM_BOT_TOKEN": "tok"})
+    r.ok("[G] no chat id -> no send, logged as no_chats",
+         nt.calls == [] and any(e.get("reason") == "no_chats" for e in ev), ev)
 
-    class _FakeProc:  # a clean orchestrator exit (rc 0, no stdout/stderr)
-        returncode, stdout, stderr = 0, "", ""
+    # Secrets win over os.environ (the runner scrubbed it); an object works like a dict.
+    os.environ.update(TELEGRAM_BOT_TOKEN="envtok", TELEGRAM_ALLOWED_CHAT_IDS="999")
+    obj = types.SimpleNamespace(telegram_bot_token="sectok", telegram_allowed_chat_ids="111",
+                                telegram_alert_chat_ids="")
+    so = _Recorder()
+    _page(led, "error", "drift", "b", send=so, secrets=obj)
+    r.ok("[G] a Secrets object supplies the token and chats, not os.environ",
+         so.calls and so.calls[0]["token"] == "sectok" and so.calls[0]["chat_ids"] == ["111"], so.calls)
+    obj2 = types.SimpleNamespace(telegram_bot_token="sectok", telegram_allowed_chat_ids="111",
+                                 telegram_alert_chat_ids="222 333")
+    _page(led, "error", "expire", "c", send=so, secrets=obj2)
+    r.ok("[G] TELEGRAM_ALERT_CHAT_IDS wins over TELEGRAM_ALLOWED_CHAT_IDS",
+         so.calls[-1]["chat_ids"] == ["222", "333"], so.calls[-1])
+    env_tx = _Recorder()
+    _page(led, "error", "queue", "d", send=env_tx, secrets=None)
+    r.ok("[G] with no Secrets the pager reads os.environ",
+         env_tx.calls and env_tx.calls[0]["token"] == "envtok" and env_tx.calls[0]["chat_ids"] == ["999"],
+         env_tx.calls)
 
-    class _FakeSub:  # only .run is exercised (the orchestrator call); _tick_json is stubbed out
-        run = staticmethod(lambda *a, **k: _FakeProc())
-        TimeoutExpired = rt.subprocess.TimeoutExpired  # keep the `except` type valid
+    # The shipped tick log drops the noisy keys (an alert's raw text and its kind).
+    lines = [json.loads(x) for x in Path(rc.TICK_LOG).read_text(encoding="utf-8").splitlines() if x.strip()]
+    r.ok("[G] the tick log carries the alert events", any(x.get("event") == "alert_sent" for x in lines), lines[:3])
+    r.ok("[G] the tick log drops alert_detail and kind",
+         all("alert_detail" not in x and "kind" not in x for x in lines), lines)
 
-    class _FakeRA:  # every pending ticker returns signal ERROR -> total brain outage
-        run = staticmethod(lambda pending, timeout=None: [{"ticker": t, "signal": "ERROR"}
-                                                          for t in pending])
-
-    alerts = []
-    rt.Ledger = lambda *a, **k: _tmp_led2  # never touch the real state/ledger.db
-    rt._tick_json = lambda args, timeout=None: (
-        {"proceed": True, "pending": ["AAPL"]} if args and args[0] == "preflight" else {})
-    rt.run_analyses = _FakeRA
-    rt.subprocess = _FakeSub
-    rt._maybe_alert = lambda led, **kw: alerts.append(kw)  # recorder: kw is built BEFORE this runs
-    raised, rc = None, None
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):  # swallow the per-stage _emit chatter
-            rc = rt.main()
-    except Exception as e:  # noqa: BLE001 — the pre-fix failure surfaced here as a NameError
-        raised = e
-    finally:
-        rt.Ledger, rt._tick_json = _saved["Ledger"], _saved["tick_json"]
-        rt.run_analyses, rt.subprocess = _saved["run_analyses"], _saved["subprocess"]
-        rt._maybe_alert = _saved["maybe_alert"]
-    ok(f"main() reaches the brain-outage page without raising (cfg is bound), got rc={rc}",
-       raised is None)
-    _brain_pages = [a for a in alerts if a.get("stage") == "analyze"
-                    and "brain outage" in (a.get("event_detail") or "")]
-    ok("brain-outage alert is reached exactly once (event_detail evaluated)",
-       len(_brain_pages) == 1)
-    ok("brain-outage detail names the engine (brain_engine=...)",
-       bool(_brain_pages) and "brain_engine=" in _brain_pages[0]["event_detail"])
-
-    # ---- H. ledger: stage isolation + (date,kind)->(date,kind,stage) migration ----
-    print("\n[H] ledger stage-keyed dedup + schema migration preserves old rows")
-    led_h = _led()
-    led_h.mark_notified(DAY, "error", "h_plan", "p", NOW, stage="plan")
+# ---- H. ledger: stage isolation + (date, kind) -> (date, kind, stage) migration ---------
+with tempfile.TemporaryDirectory() as td:
+    led_h = Ledger(Path(td) / "h.db")
+    led_h.mark_notified(DAY, "error", "h_mon", "p", NOW, stage="monitor")
     led_h.mark_notified(DAY, "error", "h_prune", "p", NOW, stage="prune")
-    ok("same kind, different stage -> independent rows (no clobber)",
-       led_h.last_notified_hash(DAY, "error", "plan") == "h_plan"
-       and led_h.last_notified_hash(DAY, "error", "prune") == "h_prune")
-    ok("digest stage='' isolated", led_h.last_notified_hash(DAY, "digest") is None)
-    # migration: build an OLD (date,kind)-keyed table, open with Ledger, assert rebuild
-    olddir = Path(tempfile.mkdtemp())
-    oldp = olddir / "old.db"
+    r.ok("[H] same kind, different stage -> independent rows (no clobber)",
+         led_h.last_notified_hash(DAY, "error", "monitor") == "h_mon"
+         and led_h.last_notified_hash(DAY, "error", "prune") == "h_prune")
+    r.ok("[H] the stage '' row is isolated", led_h.last_notified_hash(DAY, "brief") is None)
+    led_h.mark_notified(DAY, "error", "h_mon2", "p", NOW, stage="monitor")
+    r.eq("[H] a second mark on the same key replaces the hash",
+         led_h.last_notified_hash(DAY, "error", "monitor"), "h_mon2")
+    # The close brief keeps its own row (kind 'brief', stage 'brief', plan §14.9). An error
+    # page of the brief step is kind 'error', stage 'brief': a separate row, so neither one
+    # blocks the other.
+    from lib.desk import brief as _brief
+    _brief.mark_sent(led_h, DAY, "900000111", NOW)
+    r.ok("[H] the brief row is kind 'brief', stage 'brief'",
+         led_h.last_notified_hash(DAY, "brief", "brief") == _brief.content_hash(DAY))
+    with _pager() as _root:
+        btx = _Recorder()
+        _page(led_h, "error", "brief", "render failed", send=btx, severity="warning")
+        r.ok("[H] a sent brief does not block an error page of the brief step", len(btx.calls) == 1, btx.calls)
+    r.ok("[H] ... and the error page does not mark the brief sent",
+         led_h.last_notified_hash(DAY, "brief", "brief") == _brief.content_hash(DAY)
+         and led_h.last_notified_hash(DAY, "error", "brief") == notify.content_hash(
+             {"kind": "error", "stage": "brief", "severity": "warning"}))
+    oldp = Path(td) / "old.db"
     con = sqlite3.connect(oldp)
     con.executescript(
         "CREATE TABLE notifications (trade_date TEXT NOT NULL, kind TEXT NOT NULL, "
@@ -378,124 +332,26 @@ def main() -> int:
     con.close()
     migrated = Ledger(oldp)  # __init__ -> ensure_schema -> _migrate_notifications
     with migrated._conn() as c:
-        cols = {r[1] for r in c.execute("PRAGMA table_info(notifications)").fetchall()}
-    ok("migration adds the stage column", "stage" in cols)
-    ok("migration preserves the old row at stage=''",
-       migrated.last_notified_hash("2026-06-14", "digest", "") == "oldhash")
+        cols = {row[1] for row in c.execute("PRAGMA table_info(notifications)").fetchall()}
+    r.ok("[H] the migration adds the stage column", "stage" in cols, cols)
+    r.ok("[H] the migration keeps the old row at stage=''",
+         migrated.last_notified_hash("2026-06-14", "digest", "") == "oldhash")
 
-    # ---- I. lib/mailer: payload + best-effort no-raise + blank-from ----
-    print("\n[I] lib/mailer payload construction + best-effort guards")
-    pay = mailer.build_payload(from_addr="b@q.dev", to="x@a.com,y@a.com",
-                               subject="s", html="<p>h</p>", text="t")
-    ok("payload normalizes recipients + carries all fields",
-       pay["to"] == ["x@a.com", "y@a.com"] and pay["from"] == "b@q.dev" and pay["subject"] == "s")
-    ok("blank from short-circuits (HTTP api needs a sender)",
-       mailer.send_email(api_key="k", from_addr="", to=["x@a.com"], subject="s",
-                         html="h", text="t")["ok"] is False)
-    ok("missing key short-circuits",
-       mailer.send_email(api_key="", from_addr="b@q.dev", to=["x@a.com"], subject="s",
-                         html="h", text="t")["ok"] is False)
-    ok("non-iterable `to` -> {ok:False}, never raises (contract)",
-       mailer.send_email(api_key="k", from_addr="b@q.dev", to=42, subject="s",
-                         html="h", text="t").get("ok") is False)
-    ok("junk recipients dropped (None/int filtered)",
-       mailer.build_payload(from_addr="b@q.dev", to=["a@b.com", None, 123], subject="s",
-                            html="h", text="t")["to"] == ["a@b.com"])
-    os.environ["QUIVER_MAILER_DISABLE"] = "1"
-    dis = mailer.send_email(api_key="k", from_addr="b@q.dev", to=["x@a.com"], subject="s",
-                            html="h", text="t")
-    ok("QUIVER_MAILER_DISABLE=1 builds payload without sending",
-       dis["ok"] and dis.get("disabled") and dis["payload"]["to"] == ["x@a.com"])
-    os.environ.pop("QUIVER_MAILER_DISABLE", None)
+# ---- J. import graph: no research module loads lib.telegram ------------------------------
+_RESEARCH = ("edgar", "sections", "xbrl", "valuation", "transcripts", "news", "etf", "documents",
+             "findings", "events", "levels")
+for m in _RESEARCH:
+    code = (f"import sys; import lib.desk.{m}; "
+            "print('LOADED' if 'lib.telegram' in sys.modules else 'CLEAN')")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=str(_REPO), capture_output=True, text=True,
+                          timeout=120)
+    r.ok(f"[J] importing lib.desk.{m} does not load lib.telegram",
+         proc.stdout.strip() == "CLEAN", proc.stdout + proc.stderr[-300:])
+for m in ("tick", "lib.notify"):
+    proc = subprocess.run([sys.executable, "-c", f"import sys; import {m}; "
+                           "print('LOADED' if 'lib.telegram' in sys.modules else 'CLEAN')"],
+                          cwd=str(_REPO), capture_output=True, text=True, timeout=120)
+    r.ok(f"[J] importing {m} does not load lib.telegram (tick imports it inside send-test only)",
+         proc.stdout.strip() == "CLEAN", proc.stdout + proc.stderr[-300:])
 
-    # ---- J. import-graph invariant: the trading brain never imports the network egress ----
-    print("\n[J] import-graph: lib.mailer + lib.telegram are ops-layer only (not in the brain)")
-    code = ("import sys; import tick, lib.signals, lib.memory; "
-            "bad=[m for m in sys.modules if m in ('lib.mailer','lib.telegram')]; "
-            "print('LOADED:'+','.join(bad) if bad else 'CLEAN')")
-    proc = subprocess.run([sys.executable, "-c", code], cwd=str(_REPO),
-                          capture_output=True, text=True)
-    ok("importing tick/signals/memory loads NEITHER lib.mailer NOR lib.telegram",
-       "CLEAN" in proc.stdout and "LOADED" not in proc.stdout)
-
-    # ---- K. LIVE delivery (opt-in) — actually send one of EACH kind ----
-    # Strictly opt-in so the default suite stays offline (CLAUDE.md): set
-    #   QUIVER_E2E_LIVE_TO=you@example.com  RESEND_API_KEY=...  RESEND_FROM=<verified sender>
-    # and each kind is rendered + sent through the PRODUCTION lib.mailer HTTP path (the
-    # same path the headless last-resort sender uses) — the real deploy acceptance gate.
-    if live_to:
-        print(f"\n[K] LIVE delivery -> {live_to} (production lib.mailer HTTP path)")
-        ok("RESEND_API_KEY present for live send", bool(live_key))
-        ok("RESEND_FROM present for live send", bool(live_from))
-        for kind, m in _LIVE_SAMPLES().items():
-            built = notify.build_digest(m)
-            res = mailer.send_email(api_key=live_key, from_addr=live_from, to=[live_to],
-                                    subject="[E2E] " + built["subject"],
-                                    html=built["html"], text=built["text"])
-            ok(f"live send '{kind}' -> {res.get('id') or res.get('error')}", bool(res.get("ok")))
-
-    # ---- K2. LIVE Telegram delivery (opt-in) — the PRODUCTION alert channel ----
-    # QUIVER_E2E_TELEGRAM=1 + TELEGRAM_BOT_TOKEN + TELEGRAM_ALERT_CHAT_IDS (or _ALLOWED) sends one
-    # of EACH kind through the real lib.telegram HTTPS path — the actual deploy acceptance gate.
-    if os.environ.get("QUIVER_E2E_TELEGRAM", "").strip().lower() in ("1", "true", "yes", "on"):
-        tok, chats = telegram.resolve_env()
-        print(f"\n[K2] LIVE Telegram delivery -> chats {chats} (production lib.telegram path)")
-        ok("TELEGRAM_BOT_TOKEN present for live Telegram send", bool(tok))
-        ok("a chat id present for live Telegram send", bool(chats))
-        for kind, m in _LIVE_SAMPLES().items():
-            built = notify.build_digest(m)
-            res = telegram.send_message(token=tok, chat_ids=chats,
-                                        text="[E2E] " + built["telegram"],
-                                        disable_notification=notify.is_silent(m))
-            ok(f"live Telegram send '{kind}' -> ok={res.get('ok')} {res.get('error') or ''}",
-               bool(res.get("ok")))
-
-    print("\n" + "=" * 70)
-    print(f"E2E ALERTS: {PASS} passed, {FAIL} failed")
-    print("=" * 70)
-    return 1 if FAIL else 0
-
-
-def _LIVE_SAMPLES():
-    """Representative model dicts (with tickers / real detail) for live delivery — one
-    per email kind, so the inbox shows what each looks like in production."""
-    return {
-        "digest": {
-            "date": DAY, "now_iso": "2026-06-14T16:00:00-04:00", "kind": "digest",
-            "dry_run": False, "subject_prefix": "[Quiver]", "equity": 1042.55,
-            "baseline_equity": 1024.00, "drop_pct": 1.81, "mailer_armed": True,
-            "account_risk": {"drawdown_pct": 3.2, "sharpe": 1.1, "sharpe_n": 12},
-            "warnings": [{"stage": "reflect", "detail": "yfinance 403 transient blip"}],
-            "tickers": [
-                {"ticker": "AAPL", "signal": "Buy", "intent": "buy", "status": "placed",
-                 "amount": 25.0, "side": "buy", "broker_order_id": "abc123",
-                 "decision": "Strong Services growth; phased entry into strength.",
-                 "debate": "Bull wins on margin expansion; bear flags valuation."},
-                {"ticker": "MSFT", "signal": "Hold", "intent": "hold", "status": "skipped",
-                 "detail": "hold", "decision": "Fairly valued; await a pullback.",
-                 "debate": "Stalemate."}]},
-        "auth_error": {
-            "date": DAY, "now_iso": NOW, "kind": "auth_error", "dry_run": False,
-            "subject_prefix": "[Quiver]", "host": "ubuntu@52.1.2.3",
-            "event_detail": "401 Unauthorized: OAuth token expired at 2026-06-14T09:31Z",
-            "tickers": []},
-        "halt": {
-            "date": DAY, "now_iso": NOW, "kind": "halt", "dry_run": False,
-            "subject_prefix": "[Quiver]", "halted": True,
-            "halt_reason": "daily_loss -6.1% vs baseline", "equity": 961.0,
-            "baseline_equity": 1024.0, "drop_pct": -6.1, "tickers": []},
-        "error_critical": {
-            "date": DAY, "now_iso": NOW, "kind": "error", "severity": "critical",
-            "stage": "plan", "dry_run": False, "subject_prefix": "[Quiver]",
-            "host": "ubuntu@52.1.2.3",
-            "event_detail": "KeyError: 'buying_power' in tick.py plan (line 212)",
-            "tickers": []},
-        "error_warning": {
-            "date": DAY, "now_iso": NOW, "kind": "error", "severity": "warning",
-            "stage": "prune", "dry_run": True, "subject_prefix": "[Quiver]",
-            "event_detail": "PermissionError pruning state/cache", "tickers": []},
-    }
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+raise SystemExit(r.done())

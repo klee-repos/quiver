@@ -6,6 +6,6 @@
 project      = "your-gcp-project-id"
 region       = "us-central1"
 zone         = "us-central1-a"
-machine_type = "e2-small"
+machine_type = "e2-medium"
 repo_url     = "https://github.com/klee-repos/quiver.git" # public — HTTPS clone, no key
 alert_email  = "ops@yourdomain.com"

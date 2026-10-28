@@ -4,8 +4,8 @@ A core fetcher that returns an *error string* instead of raising is the fail-OPE
 bug: ``route_to_vendor`` can't tell success from failure, so the fallback vendor
 never fires and "No data found"/"Error retrieving…" text feeds a confident,
 tradable Buy/Sell on real money. Raising ``DataUnavailableError`` instead lets the
-router advance to the next vendor, and lets ``analyze.py`` fail SAFE (emit
-``signal:ERROR`` -> the allocator holds the prior weight) rather than trade on nothing.
+router advance to the next vendor, and lets a caller fail SAFE (a missing value, never a
+guessed one).
 """
 
 from __future__ import annotations

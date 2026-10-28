@@ -1,0 +1,9 @@
+[Unit]
+Description=Quiver — start the broker runner when a snapshot or execute job is queued
+
+[Path]
+PathExists=/opt/quiver/state/triggers/broker
+Unit=quiver-broker.service
+
+[Install]
+WantedBy=paths.target

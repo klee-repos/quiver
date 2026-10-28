@@ -3,34 +3,31 @@ requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Quiver — the autonomous trading desk this repo builds. The distribution is
-# named "quiver". The analysis brain lives in quiver_eve/ (Node runtime), not
-# under this distribution; the Python package only ships lib/ + the CLI
-# entrypoints (tick.py / analyze.py). The tradingagents/ framework was deleted
-# in the EVE migration (2026-07-06) — do not re-add it.
+# Quiver Desk: a chat-first investing partner on Telegram. Nothing trades without the
+# owner's tap. The Python package ships lib/ and the CLI entrypoint tick.py. The desk
+# agents run in-process through the Claude Agent SDK. The box installs ONLY
+# requirements.lock.txt: add every new import there, not only here.
 name = "quiver"
-version = "0.2.5"
-description = "Quiver — an autonomous trading desk that executes a multi-agent LLM signal on Robinhood's agentic trading platform"
+version = "0.3.0"
+description = "Quiver Desk: a chat-first investing partner that reads filings, proposes trades, and places an order only after the owner's tap"
 requires-python = ">=3.10"
 license = "PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE", "NOTICE"]
-# Pared to what the kept GLM signal path actually imports. Dropped from
-# upstream: backtrader, redis, parsel, questionary, rich, typer,
-# langchain-anthropic, langchain-google-genai, langchain-experimental
-# (no import of any of these survives in the kept package — verified by grep).
+# The imports of lib/, deploy/runner/ and tick.py (checked by an AST scan).
 dependencies = [
-    "langchain-core>=0.3.81",
-    "langchain-openai>=0.3.23",
-    "langgraph>=0.4.8",
-    "langgraph-checkpoint-sqlite>=2.0.0",
+    "claude-agent-sdk==0.2.174",
+    "beautifulsoup4>=4.14.3",
+    "lxml>=6.1.1",
+    "python-dotenv>=1.2.2",
+    "PyYAML>=6.0.3",
+    "numpy>=2.4.6",
     "pandas>=2.3.0",
-    "pandas-market-calendars>=5.4.0",   # lib/market XNYS calendar (preflight) — was only in the lock file
+    "pandas-market-calendars>=5.4.0",   # lib/market XNYS calendar
     "yfinance>=0.2.63",
     "stockstats>=0.6.5",
     "requests>=2.32.4",
     "pytz>=2025.2",
     "typing-extensions>=4.14.0",
-    "tqdm>=4.67.1",
 ]
 
 [tool.setuptools.packages.find]

@@ -127,6 +127,87 @@ def next_market_time_et(after: datetime, lookahead_days: int = 10):
     return after
 
 
+_CAL = None
+
+
+def _calendar():
+    """The XNYS calendar object, built once per process (the build is slow)."""
+    global _CAL
+    if _CAL is None:
+        import pandas_market_calendars as mcal
+        _CAL = mcal.get_calendar("XNYS")
+    return _CAL
+
+
+def sessions_between(start: datetime, end: datetime) -> list:
+    """XNYS sessions from the date of ``start`` to the date of ``end``, in order.
+
+    Each item is ``(session_date "YYYY-MM-DD", open_dt, close_dt)`` with ET datetimes.
+    Half-days carry their early close. Holidays have no row."""
+    s = start.astimezone(ET).strftime("%Y-%m-%d")
+    e = end.astimezone(ET).strftime("%Y-%m-%d")
+    sched = _calendar().schedule(start_date=s, end_date=e)
+    out = []
+    for idx, row in sched.iterrows():
+        out.append((idx.strftime("%Y-%m-%d"), row["market_open"].tz_convert(ET).to_pydatetime(),
+                    row["market_close"].tz_convert(ET).to_pydatetime()))
+    return out
+
+
+def session_close_et(now: datetime | None = None) -> tuple:
+    """``(session_date, close_dt)`` of the session that is open at ``now``, else of the
+    next session. A proposal expires at this close (plan §10.1 rule 2)."""
+    now = (now or now_et()).astimezone(ET)
+    for day, _open, close in sessions_between(now, now + timedelta(days=12)):
+        if close > now:
+            return day, close
+    raise RuntimeError("no XNYS session in the next 12 days")
+
+
+def session_open_et(now: datetime | None = None) -> tuple:
+    """``(session_date, open_dt, close_dt)`` of the session that is open at ``now``, else
+    of the next session. The tap refusal texts name these times."""
+    now = (now or now_et()).astimezone(ET)
+    for day, open_t, close in sessions_between(now, now + timedelta(days=12)):
+        if close > now:
+            return day, open_t, close
+    raise RuntimeError("no XNYS session in the next 12 days")
+
+
+def last_close_et(now: datetime | None = None):
+    """The close of the latest session that closed at or before ``now`` (ET datetime)."""
+    now = (now or now_et()).astimezone(ET)
+    last = None
+    for _day, _open, close in sessions_between(now - timedelta(days=12), now):
+        if close <= now:
+            last = close
+    if last is None:
+        raise RuntimeError("no XNYS close in the last 12 days")
+    return last
+
+
+def is_open_at(now: datetime) -> bool:
+    """True when the regular session is open at ``now`` (uses ``now``, not the clock)."""
+    now = now.astimezone(ET)
+    for _day, open_t, close in sessions_between(now, now):
+        if open_t <= now < close:
+            return True
+    return False
+
+
+def trading_days_after(day: str, n: int) -> list:
+    """The ``n`` XNYS session dates after ``day`` ("YYYY-MM-DD"), in order."""
+    start = datetime.fromisoformat(day).replace(tzinfo=ET) + timedelta(days=1)
+    rows = sessions_between(start, start + timedelta(days=n * 2 + 10))
+    return [d for d, _o, _c in rows][:n]
+
+
+def fmt_et(dt: datetime) -> str:
+    """'4:00 PM' style clock time in ET, the form every desk message uses."""
+    t = dt.astimezone(ET)
+    return t.strftime("%I:%M %p").lstrip("0")
+
+
 def status() -> dict:
     now = now_et()
     return {

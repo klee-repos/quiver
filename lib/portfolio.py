@@ -10,10 +10,10 @@ Two deliberate behaviors, both from the plan's decisions:
   * A non-quotable ticker (spot crypto, no equities-MCP quote) is flagged and
     SKIPPED from the executable book; its weight stays in cash (decision D7).
 
-This module is on the SIZING side of the decision wall: like lib.signals it must
-never import lib.risk / lib.reflect_memory / the broker. The actual share
-conversion for a trim happens once, in lib.signals.resolve_target_sell_quantity,
-at plan time — construct here works in DOLLARS so there is no duplicated math.
+This module is on the SIZING side of the decision wall: like lib.sizing it never
+imports the broker. The share conversion for a trim happens once, in
+lib.sizing.resolve_target_sell_quantity, when ``proposals.build_trade`` sizes a leg;
+this module works in DOLLARS so there is no duplicated math.
 """
 
 from __future__ import annotations

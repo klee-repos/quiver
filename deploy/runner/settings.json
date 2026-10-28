@@ -1,13 +1,28 @@
 {
-  "_comment": "claude CLI settings for the headless tick. The PreToolUse hook is the mechanical order-authorization guard (decision D5): it runs order_guard.py before every order/cancel tool and DENIES any ref_id the Python plan did not reserve in the ledger. The matcher is a substring/regex over the tool name, so it also matches the mcp__robinhood-trading__ prefixed names. Fails CLOSED on error.",
+  "_comment": "claude CLI settings for the broker runner (run_broker.py passes --settings with this file). Two hooks run broker_guard.py (plan §11.3). PreToolUse with matcher .* sends every tool call to the guard. The guard allows only the calls that §11.3 lists, and it denies with exit code 2. PostToolUse on review_equity_order records the review (review_ok). onFailure block makes a hook that cannot start, crashes, exits 1, or times out block the call. It needs Claude Code 2.1.295 or later.",
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "place_equity_order|cancel_equity_order|place_option_order|cancel_option_order",
+        "matcher": ".*",
         "hooks": [
           {
             "type": "command",
-            "command": ".venv/bin/python deploy/runner/order_guard.py"
+            "command": "/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/broker_guard.py",
+            "timeout": 30,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__robinhood-trading__review_equity_order",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/broker_guard.py --record-review",
+            "timeout": 30,
+            "onFailure": "block"
           }
         ]
       }

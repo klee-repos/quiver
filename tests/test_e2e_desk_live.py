@@ -1,0 +1,292 @@
+"""The live desk e2e (plan §18.7). Gated: the cases run only with ``QUIVER_LIVE_E2E=1``.
+
+Without the gate it prints ``0 passed, 0 failed, 2 skipped``. With the gate it needs
+``CLAUDE_CODE_OAUTH_TOKEN`` and ``CLAUDE_BIN``; a missing one FAILS the case, it does not skip.
+Both cases bill the subscription token. Run ``tests/run_e2e.sh --live`` before a cutover and
+after a prompt change.
+
+Each case uses a temp root made by the real ``desk-seed`` (ANET and CEG loaded from the
+captured SEC files), the real tool server, a ``FakeTelegram`` that replays the captured Bot API
+answers, and a temp ``CLAUDE_CONFIG_DIR``. No broker. ``WebSearch`` is not a desk tool.
+
+  * desk_turn: one real desk turn (``QUIVER_DESK_MODEL``) through ``chat_bridge.Bridge``.
+  * deep_dive: the seed's ANET ``deep_dive`` job (``QUIVER_ANALYST_MODEL``) through
+    ``run_worker.Worker.run_one``.
+
+Run one case: ``QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_e2e_desk_live.py desk_turn``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from desk_fakes import REPO, Results, fx, seed_desk, temp_root  # noqa: E402
+
+sys.path.insert(0, str(REPO / "deploy" / "runner"))
+
+OWNER = 111
+QUESTION = ("What did ANET say about AI networking in its last 10-Q? "
+            "Two or three short messages.")
+
+
+class FakeTelegram:
+    """Replays the captured Bot API answers and records every call."""
+
+    def __init__(self):
+        self.tg = fx("tg")
+        self.calls = []
+        self.next_id = 5000
+
+    def __call__(self, method, params):
+        self.calls.append((method, copy.deepcopy(params)))
+        if method == "sendMessage":
+            ans = copy.deepcopy(self.tg["sendMessage"])
+            self.next_id += 1
+            ans["result"].update(message_id=self.next_id, text=str(params.get("text", "")))
+            ans["result"].pop("reply_markup", None)
+            if params.get("reply_markup"):
+                ans["result"]["reply_markup"] = params["reply_markup"]
+            return ans
+        if method in ("setMessageReaction", "sendChatAction", "editMessageReplyMarkup"):
+            return copy.deepcopy(self.tg[method])
+        return {"ok": True, "result": True}
+
+    def sent(self):
+        return [p for m, p in self.calls if m == "sendMessage"]
+
+    def reactions(self):
+        return [p for m, p in self.calls if m == "setMessageReaction"]
+
+
+def owner_update(update_id: int, message_id: int, text: str) -> dict:
+    """An owner message update, made from the captured Message object (values changed)."""
+    msg = copy.deepcopy(fx("tg")["sendMessage"]["result"])
+    msg.pop("reply_markup", None)
+    msg.pop("entities", None)
+    msg.update(message_id=message_id, date=int(time.time()), text=text,
+               **{"from": {"id": OWNER, "is_bot": False, "first_name": "Owner", "username": "owner_test"}})
+    return {"update_id": update_id, "message": msg}
+
+
+def need_env(R, label) -> bool:
+    missing = [k for k in ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_BIN") if not os.environ.get(k)]
+    R.ok(f"{label}: CLAUDE_CODE_OAUTH_TOKEN and CLAUDE_BIN are set", not missing, missing)
+    return not missing
+
+
+def build_runtime(root):
+    """Runtime and Secrets for a desk process in the temp root. The fake Telegram token
+    never reaches the network: every call goes through ``FakeTelegram``."""
+    from lib.desk import agent
+    cfg_dir = root.path / "state" / "claude-desk"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["CLAUDE_CONFIG_DIR"] = str(cfg_dir)
+    runtime = agent.Runtime.from_env()
+    secrets = agent.Secrets(telegram_bot_token="x", telegram_allowed_chat_ids=str(OWNER),
+                            sec_user_agent=os.environ.get("SEC_USER_AGENT", ""))
+    return runtime, secrets
+
+
+class Recorder:
+    """Wraps the real ``ClaudeSDKClient`` and records the name of every tool call."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.tools = []
+        self.results = []
+
+    async def query(self, prompt):
+        await self.inner.query(prompt)
+
+    async def receive_response(self):
+        from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+        async for m in self.inner.receive_response():
+            if isinstance(m, AssistantMessage):
+                self.tools += [b.name for b in m.content if isinstance(b, ToolUseBlock)]
+            elif isinstance(m, ResultMessage):
+                self.results.append({"is_error": m.is_error, "subtype": m.subtype,
+                                     "usage": getattr(m, "usage", None)})
+            yield m
+
+    async def interrupt(self):
+        await self.inner.interrupt()
+
+    async def disconnect(self):
+        await self.inner.disconnect()
+
+
+def case_desk_turn(R):
+    if not need_env(R, "desk_turn"):
+        return
+    import chat_bridge
+    from lib.desk import agent, reactions
+    with temp_root() as root:
+        seed_desk(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        rec = {}
+
+        async def factory(options):
+            from claude_agent_sdk import ClaudeSDKClient
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            rec["c"] = Recorder(client)
+            return rec["c"]
+
+        bridge = chat_bridge.Bridge(runtime=runtime, secrets=secrets, led=root.led(), transport=tg,
+                                    client_factory=factory)
+
+        async def go():
+            await bridge.handle_update(owner_update(1, 7001, QUESTION), offline=False)
+            await bridge.maybe_turn()
+            await bridge.turn_task
+            await bridge.disconnect()
+
+        t0 = time.monotonic()
+        asyncio.run(go())
+        secs = round(time.monotonic() - t0, 1)
+        tools = rec["c"].tools if "c" in rec else []
+        print(f"  desk_turn: {secs}s, tools={tools}, results={rec['c'].results if 'c' in rec else None}")
+        R.ok("desk_turn: the first tool call is react", tools[:1] == ["mcp__desk__react"], tools)
+        reacts = tg.reactions()
+        emoji = (((reacts[0].get("reaction") or [{}])[0]).get("emoji") if reacts else None)
+        R.ok("desk_turn: the reaction emoji is in the 73 allowed", reactions.check(emoji or "") is not None,
+             emoji)
+        R.ok("desk_turn: the reaction is on the owner's message",
+             bool(reacts) and int(reacts[0].get("message_id", 0)) == 7001, reacts[:1])
+        R.ok("desk_turn: two or more say calls", tools.count("mcp__desk__say") >= 2, tools)
+        R.ok("desk_turn: one or more search_research calls", "mcp__desk__search_research" in tools, tools)
+        sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        R.ok("desk_turn: two or more messages reach the owner chat", len(sent) >= 2, len(sent))
+        R.eq("desk_turn: one message per say (no recap after the last say)", len(sent),
+             tools.count("mcp__desk__say"))
+        R.ok("desk_turn: no error result", all(not r["is_error"] for r in rec["c"].results) if "c" in rec
+             else False, rec["c"].results if "c" in rec else None)
+        with root.led().connect() as c:
+            row = c.execute("SELECT session_id, last_turn_at FROM chat_sessions WHERE chat_id=?",
+                            (str(OWNER),)).fetchone()
+            undelivered = c.execute("SELECT COUNT(*) FROM chat_messages WHERE role='owner' "
+                                    "AND delivered_to_session=0").fetchone()[0]
+        R.ok("desk_turn: the session id is stored", bool(row and row[0] and row[1]), row and tuple(row))
+        R.eq("desk_turn: the owner message is delivered", undelivered, 0)
+        for p in sent:
+            print("    say>", str(p.get("text"))[:300].replace("\n", " "))
+
+
+def case_deep_dive(R):
+    if not need_env(R, "deep_dive"):
+        return
+    import run_worker
+    from lib.desk import agent, findings as findings_mod, outbox, store
+    with temp_root() as root:
+        seed_desk(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        led = root.led()
+        box = outbox.Outbox(led, transport=tg, chat_id=str(OWNER))
+        worker = run_worker.Worker(runtime=runtime, secrets=secrets, led=led, box=box)
+        captured = []
+        orig_query = run_worker._run_query
+
+        async def recording_query(prompt, options, timeout):
+            msgs = await orig_query(prompt, options, timeout)
+            captured.extend(msgs)
+            return msgs
+        run_worker._run_query = recording_query
+        with led.connect() as c:
+            job = c.execute("SELECT * FROM jobs WHERE kind='deep_dive' AND payload_json LIKE '%\"ANET\"%'"
+                            ).fetchone()
+        R.ok("deep_dive: desk-seed queued the ANET deep_dive", job is not None)
+        if job is None:
+            return
+        job = dict(job)
+        t0 = time.monotonic()
+        try:
+            worker.run_one(job)
+        finally:
+            run_worker._run_query = orig_query
+        secs = round(time.monotonic() - t0, 1)
+        from claude_agent_sdk import AssistantMessage, ToolUseBlock
+        calls = [b for m in captured if isinstance(m, AssistantMessage) for b in m.content
+                 if isinstance(b, ToolUseBlock)]
+        print("  deep_dive tools:", [b.name.replace("mcp__desk__", "") for b in calls])
+        for b in calls:
+            if b.name.endswith("propose_change"):
+                print("    propose_change input:", json.dumps(b.input)[:700])
+        with led.connect() as c:
+            j = dict(c.execute("SELECT status, error, attempts FROM jobs WHERE id=?", (job["id"],)).fetchone())
+            finds = [dict(r) for r in c.execute(
+                "SELECT f.*, d.text AS doc_text FROM findings f JOIN documents d ON d.id=f.document_id "
+                "WHERE f.ticker='ANET' AND f.created_by='analyst'").fetchall()]
+            props_all = [dict(r) for r in c.execute(
+                "SELECT id, state, superseded_by, payload_json FROM proposals WHERE kind='change'").fetchall()]
+            props = [p for p in props_all if p["state"] == "pending"]
+            ids = {int(r[0]) for r in c.execute("SELECT id FROM findings").fetchall()}
+        print(f"  deep_dive: {secs}s, job={j}, findings={len(finds)}, kinds={sorted({f['kind'] for f in finds})}")
+        print("  change proposals:", [(p["id"], p["state"], p["superseded_by"]) for p in props_all])
+        R.eq("deep_dive: the job is done", j["status"], "done")
+        R.ok("deep_dive: done within 1,800 s", secs <= 1800, secs)
+        R.ok("deep_dive: 8 or more analyst findings", len(finds) >= 8, len(finds))
+        # findings.py stores the normalized quote and its offset in the normalized document.
+        bad = [f["id"] for f in finds
+               if findings_mod.normalize(f["doc_text"])[f["quote_start"]:f["quote_start"] + len(f["quote"])]
+               != f["quote"]]
+        R.eq("deep_dive: every finding quote is at its quote_start in its normalized document", bad, [])
+        R.ok("deep_dive: 5 or more finding kinds", len({f["kind"] for f in finds}) >= 5,
+             sorted({f["kind"] for f in finds}))
+        def change_kind(p):
+            return ((store.loads(p["payload_json"], {}) or {}).get("change") or {}).get("kind")
+        thesis = [p for p in props if change_kind(p) == "set_thesis"]
+        R.ok("deep_dive: a pending set_thesis proposal", len(thesis) >= 1, [p["id"] for p in props])
+        if thesis:
+            pay = (store.loads(thesis[0]["payload_json"], {}) or {}).get("change") or {}
+            scen = ((pay.get("valuation") or {}).get("scenarios") or {})
+            cited = set()
+            for sc in scen.values() if isinstance(scen, dict) else []:
+                if not isinstance(sc, dict):
+                    continue
+                for k in ("finding_ids", "evidence"):
+                    for e in sc.get(k) or []:
+                        v = e.get("finding_id") if isinstance(e, dict) else e
+                        if isinstance(v, int) or (isinstance(v, str) and v.isdigit()):
+                            cited.add(int(v))
+                if sc.get("finding_id") is not None:
+                    cited.add(int(sc["finding_id"]))
+            R.ok("deep_dive: the thesis scenarios cite findings", bool(cited), scen)
+            R.eq("deep_dive: every cited finding exists", sorted(cited - ids), [])
+        sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        R.ok("deep_dive: 3 to 6 messages to the owner", 3 <= len(sent) <= 6, len(sent))
+        for p in sent:
+            print("    msg>", str(p.get("text"))[:300].replace("\n", " "))
+
+
+CASES = {"desk_turn": case_desk_turn, "deep_dive": case_deep_dive}
+
+
+def main(argv) -> int:
+    R = Results("e2e-desk-live")
+    names = [a for a in argv[1:] if a in CASES] or list(CASES)
+    if os.environ.get("QUIVER_LIVE_E2E") != "1":
+        R.skip(len(names))
+        return R.done()
+    for n in names:
+        try:
+            CASES[n](R)
+        except Exception as e:  # noqa: BLE001 — a crash is a failed case, never a skip
+            import traceback
+            traceback.print_exc()
+            R.ok(f"{n}: ran without an exception", False, f"{type(e).__name__}: {e}")
+    return R.done()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

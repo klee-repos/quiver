@@ -172,16 +172,29 @@ def load_ohlcv(symbol: str, curr_date: str) -> pd.DataFrame:
     return data
 
 
-def filter_financials_by_date(data: pd.DataFrame, curr_date: str) -> pd.DataFrame:
-    """Drop financial statement columns (fiscal period timestamps) after curr_date.
+def get_technicals(ticker: str, *, curr_date: "str | None" = None, load=None) -> dict:
+    """The ``lib.trend.trend_metrics`` bundle over the full 5-year frame of ``load_ohlcv``.
 
-    yfinance financial statements use fiscal period end dates as columns.
-    Columns after curr_date represent future data and are removed to
-    prevent look-ahead bias.
+    ``curr_date`` defaults to today in ET. A shorter frame leaves ``mom_12_1``, ``ret_2y``
+    and ``ret_3y`` empty (``momentum_12_1`` needs 253 rows). ``load`` is the test seam for
+    ``load_ohlcv``. The return is a JSON-safe dict: the bundle fields plus ``ticker``,
+    ``as_of`` and ``last_close``. Technicals are facts. They never create an event.
     """
-    if not curr_date or data.empty:
-        return data
-    cutoff = pd.Timestamp(curr_date)
-    mask = pd.to_datetime(data.columns, errors="coerce") <= cutoff
-    return data.loc[:, mask]
+    from dataclasses import asdict
+    from lib import market, trend
 
+    day = curr_date or market.now_et().date().isoformat()
+    frame = (load or load_ohlcv)(ticker, day)
+    if frame is None or len(frame) == 0 or "Close" not in frame.columns:
+        from .errors import DataUnavailableError
+        raise DataUnavailableError(f"no OHLCV rows for '{ticker}' at {day}")
+    close = [float(x) for x in frame["Close"].tolist()]
+    high = [float(x) for x in frame["High"].tolist()] if "High" in frame.columns else None
+    low = [float(x) for x in frame["Low"].tolist()] if "Low" in frame.columns else None
+    bundle = trend.trend_metrics(close, high=high, low=low)
+    out = asdict(bundle)
+    last = frame["Date"].iloc[-1] if "Date" in frame.columns else None
+    out["ticker"] = str(ticker).upper()
+    out["as_of"] = pd.Timestamp(last).strftime("%Y-%m-%d") if last is not None else day
+    out["last_close"] = close[-1] if close else None
+    return out

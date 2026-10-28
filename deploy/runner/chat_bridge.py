@@ -1,266 +1,64 @@
 #!/usr/bin/env python3
-"""Quiver chat bridge — a read-only Telegram front-end to the bot's own reasoning.
+"""The desk chat bridge: Telegram long poll, the desk agent's turns, and button taps (plan §4).
 
-Long-polls Telegram (OUTBOUND https only, so it works behind the box's IAP-only firewall — no
-public inbound endpoint, no phone-number registration), and for each message from an ALLOWLISTED
-chat runs `claude -p` in the repo with a read-only tool profile and ZERO MCP servers, then sends
-the reply back. It can inspect the ledger, strategy, logs, and per-decision proofs; it CANNOT
-trade, move money, send email, or write to disk. The four walls that make "read-only" real:
+``quiver-chat.service`` runs this always. It is the only process that polls the bot token.
+It keeps one Claude Agent SDK session per chat connected, so a turn starts with no process
+start. The walls (plan §13):
+  1. The unit hides the Robinhood config and /etc/quiver at the kernel level.
+  2. The desk agent has typed tools, read-only file tools confined to the repo, and web
+     search. No shell, no file write, no broker tool. A PreToolUse hook enforces it.
+  3. ``scrub_process_env`` removes every secret from ``os.environ`` before the first SDK
+     client starts; the Telegram token lives in ``Secrets`` only.
+  4. A message or tap counts only from an owner ``from.id``, in a private chat with that id.
+  5. A tap runs ``lib/desk/approvals.handle_tap``, the only code that approves. No tool
+     reaches it.
 
-  1. `--mcp-config chat_mcp.json --strict-mcp-config`  -> zero MCP servers -> no broker, no Resend
-  2. `chat_guard.py` PreToolUse hook (chat_settings.json) -> denies writes/mutations/secret reads
-  3. systemd ReadWritePaths (deploy/quiver-chat.service)  -> OS-level read-only on ledger + repo
-  4. TELEGRAM_ALLOWED_CHAT_IDS allowlist                  -> only you can talk to it
-
-Self-contained (stdlib urllib, mirrors lib/mailer.py — the ONE other network egress). Best-effort
-and separate from the trading path: a crash just restarts (systemd Restart=on-failure); it never
-imports or touches the trading brain. Reuses the box's Claude auth via CLAUDE_CONFIG_DIR.
-
-Local smoke test (no Telegram, no token needed):
-    .venv/bin/python deploy/runner/chat_bridge.py --ask "how did the last tick go?"
-    .venv/bin/python deploy/runner/chat_bridge.py --print-cmd
+Intake is crash-safe: each owner message is stored in ``chat_messages`` (unique on
+``chat_id, tg_message_id``) before the update offset moves, so a crash re-delivers the
+update and the unique index drops the duplicate. The backlog at start is processed, not
+discarded.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import html as _htmllib
 import json
-import os
 import re
-import signal
-import subprocess
 import sys
-import urllib.error
-import urllib.request
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-# The bridge runs as a script (systemd ExecStart / `python .../chat_bridge.py`), so its own dir is
-# on sys.path[0]; insert it explicitly too so the sibling import also resolves when a test imports
-# this module (mirrors tests/test_chat_guard.py's sys.path convention).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import chat_history  # noqa: E402 — sibling module: per-thread conversation memory
-
 _REPO = Path(__file__).resolve().parent.parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# --- config (env; sensible defaults) ----------------------------------------------------------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-ALLOWED = {
-    s.strip() for s in os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "").replace(",", " ").split()
-    if s.strip()
-}
-CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-MODEL = (os.environ.get("QUIVER_CHAT_MODEL")
-         or os.environ.get("QUIVER_MODEL") or "claude-sonnet-4-6")
-EFFORT = os.environ.get("QUIVER_CHAT_EFFORT", "medium")
-MAX_TURNS = int(os.environ.get("QUIVER_CHAT_MAX_TURNS", "40"))
-# Per-question wall-clock. A ledger trace is a few read tool-calls; 240s is generous.
-TIMEOUT_SEC = int(os.environ.get("QUIVER_CHAT_TIMEOUT_SEC", "240"))
-LONG_POLL_SEC = int(os.environ.get("QUIVER_CHAT_POLL_SEC", "50"))
-MAX_INPUT_CHARS = int(os.environ.get("QUIVER_CHAT_MAX_INPUT", "2000"))
-LOG = os.environ.get("QUIVER_CHAT_LOG", str(_REPO / "logs" / "chat.log"))
+from lib.desk.outbox import render_model_text  # noqa: E402
 
-# --- per-thread conversation memory (chat_history) --------------------------------------------
-# Default ON: the whole point is that follow-ups carry context. Set QUIVER_CHAT_HISTORY=0 to get the
-# classic stateless bridge (byte-identical single-question prompt). The store lives under the chat's
-# OWN writable dir — derived from the log path so it lands in state/chat/ on the box (the one place
-# the systemd unit's ReadWritePaths allows), logs/ locally; NEVER the read-only repo or ledger.
-HISTORY_ENABLED = (os.environ.get("QUIVER_CHAT_HISTORY", "1").strip().lower()
-                   not in ("0", "false", "no", "off", ""))
-HISTORY_DIR = os.environ.get("QUIVER_CHAT_HISTORY_DIR") or str(Path(LOG).parent / "history")
-HISTORY_TURNS = int(os.environ.get("QUIVER_CHAT_HISTORY_TURNS", "30"))
-HISTORY_CHARS = int(os.environ.get("QUIVER_CHAT_HISTORY_CHARS", "12000"))
-HISTORY_TURN_CHARS = int(os.environ.get("QUIVER_CHAT_HISTORY_TURN_CHARS", "1500"))
-HISTORY_STORE = int(os.environ.get("QUIVER_CHAT_HISTORY_STORE", "500"))
+LONG_POLL_SEC = 50
+TURN_TIMEOUT_S = 600
+IDLE_DISCONNECT_S = 30 * 60
+TYPING_EVERY_S = 4
+OFFLINE_TAP_S = 60
+QUICK_PICK_S = 10
+BROKER_WATCH_S = 180
+_MSG_LIMIT = 4000
 
-CHAT_MCP = str(_REPO / "deploy" / "runner" / "chat_mcp.json")
-CHAT_SETTINGS = str(_REPO / "deploy" / "runner" / "chat_settings.json")
-
-_TG = f"https://api.telegram.org/bot{TOKEN}/"
-_MSG_LIMIT = 4000  # Telegram hard cap is 4096; leave headroom.
-
-
-def _load_prompt() -> str:
-    """The read-only analyst persona (prompts/chat.md), read directly (no lib import)."""
-    try:
-        return (_REPO / "prompts" / "chat.md").read_text(encoding="utf-8").strip()
-    except OSError:
-        return "You are Quiver's strictly read-only analyst. Never trade or write anything."
-
-
-SYSTEM_PROMPT = _load_prompt()
-
-
-def _log(obj) -> None:
-    line = json.dumps(obj)
-    print(line, flush=True)
-    try:
-        Path(LOG).parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass  # logging is best-effort, never fails the bridge
-
-
-# --- the read-only claude call ----------------------------------------------------------------
-# Env vars the `claude` child legitimately needs. EVERYTHING ELSE is stripped so the trading
-# secrets in the bridge's env (GLM/RESEND/RH_ACCOUNT/NOTIFY/CONGRESS/TELEGRAM_BOT_TOKEN, …) never
-# reach the child — then no `/proc/self/environ`, `printenv`, or env read the assistant might do
-# can leak them (audit: the secret-exfil cluster). The Robinhood broker OAuth lives in the shared
-# CLAUDE_CONFIG_DIR and is excluded from the chat at load time by --strict-mcp-config.
-_CHILD_ENV_KEYS = (
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ",
-    "CLAUDE_CONFIG_DIR", "npm_config_cache", "XDG_CACHE_HOME", "XDG_CONFIG_HOME",
-    # Claude auth (needed for the child to run). NOT a broker credential; only present on boxes
-    # that auth via a token rather than an on-box `claude login` (config-dir OAuth).
-    "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY",
-)
-
-
-def _child_env() -> dict:
-    """A minimal, secret-free environment for the `claude` subprocess (allowlist, not denylist)."""
-    return {k: os.environ[k] for k in _CHILD_ENV_KEYS if os.environ.get(k)}
-
-
-def _claude_cmd(question: str) -> list:
-    return [
-        CLAUDE_BIN, "-p", "--output-format", "json",
-        "--model", MODEL, "--effort", EFFORT,
-        # Zero MCP servers: strict mode + an empty config overrides the box's user-scope
-        # Robinhood OAuth server, so this assistant has NO broker and NO Resend.
-        "--mcp-config", CHAT_MCP, "--strict-mcp-config",
-        # The read-only guard hook is the mechanical gate (like the tick's order_guard).
-        "--settings", CHAT_SETTINGS, "--add-dir", str(_REPO),
-        "--max-turns", str(MAX_TURNS),
-        "--append-system-prompt", SYSTEM_PROMPT,
-        # Unattended: no interactive approval possible. The guard hook + strict-mcp are the gate.
-        "--dangerously-skip-permissions",
-        question,
-    ]
-
-
-def answer(question: str, history_block: str = "") -> tuple[str, bool]:
-    """Run one read-only claude pass and return (final_text, ok). `history_block` is a prior-thread
-    context block (empty for a stateless call) prepended to the question via chat_history — with an
-    empty block the prompt is byte-identical to the classic single-question prompt. The `ok` flag
-    lets callers record only real answers (never an error/timeout note) into thread memory."""
-    q = (question or "").strip()[:MAX_INPUT_CHARS]
-    if not q:
-        return ("Ask me something about the bot — today's run, the strategy, or a decision trace.",
-                False)
-    prompt = chat_history.compose_prompt(history_block, q)
-    # Run in its OWN process group (start_new_session) so a timeout can kill the WHOLE tree —
-    # otherwise a heavy grandchild (e.g. a runaway chat_query.py) would orphan and keep burning.
-    try:
-        proc = subprocess.Popen(_claude_cmd(prompt), cwd=str(_REPO), stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, env=_child_env(),
-                                start_new_session=True)
-    except Exception as e:  # noqa: BLE001 — a spawn failure must not crash the bridge
-        _log({"event": "answer", "ok": False, "reason": f"{type(e).__name__}: {e}", "q": q[:200]})
-        return ("I couldn't reach my reasoning engine just now. Try again in a moment.", False)
-    try:
-        stdout, stderr = proc.communicate(timeout=TIMEOUT_SEC)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-        try:
-            proc.communicate(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
-        _log({"event": "answer", "ok": False, "reason": "timeout", "q": q[:200]})
-        return ("That took too long to work out — try a narrower question.", False)
-
-    out = (stdout or "").strip()
-    try:
-        data = json.loads(out.splitlines()[-1]) if out else {}
-    except (ValueError, IndexError):
-        data = {}
-    text = (data.get("result") or "").strip()
-    ok = proc.returncode == 0 and not data.get("is_error") and bool(text)
-    _log({"event": "answer", "ok": ok, "returncode": proc.returncode,
-          "subtype": data.get("subtype"), "cost_usd": data.get("total_cost_usd"),
-          "q": q[:200], "stderr": (stderr or "")[-200:] if not ok else ""})
-    if not ok:
-        # A common real cause is expired box Claude auth — surface a hint, not a stack trace.
-        return ("I hit an error answering that. If this keeps happening the box's Claude login "
-                "may need a refresh (/mcp on the box).", False)
-    return (text, True)
-
-
-# --- Telegram transport (stdlib urllib) -------------------------------------------------------
-def _tg(method: str, params: dict, timeout: float) -> dict | None:
-    body = json.dumps(params).encode("utf-8")
-    req = urllib.request.Request(_TG + method, data=body,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        _log({"event": "tg_http_error", "method": method, "code": e.code,
-              "body": (e.read()[:200].decode("utf-8", "replace") if e.fp else "")})
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
-        # A long-poll read timeout is normal (no updates) — don't spam the log for getUpdates.
-        if method != "getUpdates":
-            _log({"event": "tg_error", "method": method, "err": f"{type(e).__name__}: {e}"})
-        return None
-    if not payload.get("ok"):
-        _log({"event": "tg_not_ok", "method": method, "desc": payload.get("description")})
-        return None
-    return payload.get("result")
-
+# --- formatting (kept from the earlier bridge) ------------------------------------------
 
 _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 
 
-def _to_telegram_html(text: str) -> str:
-    """Convert the model's GitHub-flavored markdown to the SMALL subset Telegram renders
-    (<b>, <code>, <pre>). Everything else is HTML-escaped or flattened — so literal `**`/backticks
-    stop showing, tables collapse to readable lines, and no markdown Telegram ignores leaks
-    through. Markdown links become `text (url)` (visible URL, never a hidden href)."""
-    stash: list = []
-
-    def _stash(tag, content):
-        stash.append((tag, content))
-        return f"\x00{len(stash) - 1}\x00"
-
-    # 1) pull code blocks/spans out BEFORE escaping so their contents aren't transformed.
-    text = re.sub(r"```[^\n]*\n?(.*?)```", lambda m: _stash("pre", m.group(1).rstrip("\n")),
-                  text, flags=re.DOTALL)
-    text = re.sub(r"`([^`\n]+)`", lambda m: _stash("code", m.group(1)), text)
-    # 2) links -> "text (url)" (URL stays visible; no deceptive hidden href)
-    text = _MD_LINK.sub(lambda m: f"{m.group(1)} ({m.group(2)})", text)
-    # 3) escape the remaining prose (so any <, >, & in the answer is safe)
-    text = _htmllib.escape(text, quote=False)
-    # 4) bold: **x** / __x__
-    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<!\w)__(.+?)__(?!\w)", r"<b>\1</b>", text)
-    # 5) line-level: headers -> bold, bullets -> •, drop table separators, flatten table rows
-    out = []
-    for ln in text.split("\n"):
-        s = ln.rstrip()
-        stripped = s.strip()
-        if stripped and set(stripped) <= set("|:- ") and "-" in stripped:
-            continue  # markdown table separator (|---|:--:|) or horizontal rule
-        h = re.match(r"#{1,6}\s+(.*)", stripped)
-        if h:
-            out.append(f"<b>{h.group(1)}</b>"); continue
-        s = re.sub(r"^(\s*)[-*+]\s+", r"\1• ", s)  # bullet
-        if s.count("|") >= 2:  # a table data row -> space-separated cells
-            s = "  ".join(c.strip() for c in s.strip().strip("|").split("|"))
-        out.append(s)
-    text = "\n".join(out)
-    # 6) restore code (escaped, wrapped in the tag)
-    text = re.sub(r"\x00(\d+)\x00",
-                  lambda m: (lambda tg, c: f"<{tg}>{_htmllib.escape(c, quote=False)}</{tg}>")(*stash[int(m.group(1))]),
-                  text)
-    return text
+# One renderer for every model text (desk and analyst): lib.desk.outbox.render_model_text.
+_to_telegram_html = render_model_text
 
 
 def _strip_md(text: str) -> str:
-    """Plain-text fallback: drop markup so a Telegram HTML parse failure still delivers a clean
-    message (no literal ** / backticks)."""
+    """Plain-text fallback: drop the markup."""
     text = re.sub(r"```[^\n]*\n?(.*?)```", r"\1", text, flags=re.DOTALL).replace("`", "")
     text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
     text = re.sub(r"^\s*#{1,6}\s+", "", text, flags=re.M)
@@ -272,159 +70,522 @@ def _chunks(text: str, limit: int):
     """Split at line boundaries so an HTML tag is never cut across two messages."""
     out, buf, cur = [], [], 0
     for ln in text.split("\n"):
-        while len(ln) > limit:  # a single over-long line: hard-split
-            out.append(ln[:limit]); ln = ln[limit:]
+        while len(ln) > limit:
+            out.append(ln[:limit])
+            ln = ln[limit:]
         if cur + len(ln) + 1 > limit and buf:
-            out.append("\n".join(buf)); buf, cur = [], 0
-        buf.append(ln); cur += len(ln) + 1
+            out.append("\n".join(buf))
+            buf, cur = [], 0
+        buf.append(ln)
+        cur += len(ln) + 1
     if buf:
         out.append("\n".join(buf))
     return out or [text]
 
 
-def send_message(chat_id, text: str) -> None:
-    text = text or "(no answer)"
-    # Chunk the ORIGINAL below the 4096 cap with headroom for the <b>/<code> tags we add.
-    for chunk in _chunks(text, _MSG_LIMIT - 400):
-        # Try Telegram HTML (renders bold/monospace); on ANY failure resend as clean plain text
-        # so a message is never lost to a parse error.
-        r = _tg("sendMessage", {"chat_id": chat_id, "text": _to_telegram_html(chunk),
-                                "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=30)
-        if r is None:
-            _tg("sendMessage", {"chat_id": chat_id, "text": _strip_md(chunk),
-                                "disable_web_page_preview": True}, timeout=30)
+def _esc(text) -> str:
+    """Escape ``<`` and ``>`` in embedded text, so quoted text cannot forge a tag."""
+    return str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _typing(chat_id) -> None:
-    _tg("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=10)
+def classify_error(text: str) -> str:
+    """``auth``, ``limit`` or ``other`` for an SDK error text (§4.7)."""
+    low = str(text or "").lower()
+    if any(m in low for m in ("spend limit", "usage limit", "rate limit", "limit reached", "credit balance")):
+        return "limit"
+    if any(m in low for m in ("authenticat", "oauth", "401", "invalid api key", "invalid x-api-key", "expired")):
+        return "auth"
+    return "other"
 
 
-HELP = (
-    "I'm Quiver — your bot's read-only analyst. Ask me things like:\n"
-    "• how did today's run go?\n"
-    "• what did it do today?\n"
-    "• what's the current strategy / book?\n"
-    "• why did it buy NVDA? (I'll trace the decision)\n"
-    "• are we halted? any trades this week?\n\n"
-    "I can look at the ledger, strategy, and logs — but I can't trade or change anything.\n"
-    "I remember our conversation in this chat, so follow-ups work — send /clear to start fresh."
-)
+class Bridge:
+    """The bridge's state and loops. Every network call goes through ``transport``
+    (``transport(method, params) -> dict``, sync) and the SDK ``client_factory``."""
 
+    def __init__(self, *, runtime, secrets, led=None, transport=None, client_factory=None, quick_pick=None,
+                 clock=time.monotonic, wall=None, sleep=asyncio.sleep, page=None, log_path=None):
+        from lib.desk import agent, outbox, tools
+        from lib.ledger import Ledger
+        self.runtime = runtime
+        self.secrets = secrets
+        self.led = led or Ledger(runtime.ledger_db)
+        self.owner_ids = set(secrets.owner_ids)
+        self.transport = transport or functools.partial(_tg_api, secrets.telegram_bot_token)
+        self.clock = clock
+        self.wall = wall or (lambda: datetime.now(timezone.utc))
+        self.sleep = sleep
+        self.page = page
+        self.log_path = Path(log_path or Path(runtime.root) / "logs" / "desk" / "bridge.log")
+        self.notified_unauth = set()
+        self.turn = agent.TurnState()
+        self.chat_id = (secrets.owner_ids or [""])[0]
+        self.box = outbox.Outbox(self.led, transport=self.transport, chat_id=self.chat_id)
+        self.ctx = tools.ToolContext.build(role="desk", runtime=runtime, secrets=secrets, turn=self.turn,
+                                           led=self.led, transport=self.transport, box=self.box,
+                                           render=_to_telegram_html)
+        self.client_factory = client_factory or self._default_client
+        self.quick_pick = quick_pick or self._default_quick_pick
+        self.client = None
+        self.client_session = None
+        self.turn_task = None
+        self.quick_busy = False
+        self.last_owner_at = None
+        self.stopping = False
 
-def _answer_with_memory(chat_id, question: str) -> str:
-    """Answer one question WITH this chat's thread context, then record the exchange. Shared by the
-    Telegram handler and the `--ask --chat-id` CLI so both drive the identical stateful path.
+    # --- plumbing -----------------------------------------------------------------
+    async def tg(self, method, params):
+        return await asyncio.to_thread(self.transport, method, params)
 
-    The history READ is gated on HISTORY_ENABLED (not just the write): with history off — or an
-    unusable chat id — `hp` is None, so nothing is loaded or written and the prompt is byte-identical
-    to the classic stateless bridge (chat_history.compose_prompt("", q) == q). Only a real answer
-    (`ok`) is recorded, so error/timeout notes never pollute the thread."""
-    hp = (chat_history.path_for(HISTORY_DIR, chat_id)
-          if (HISTORY_ENABLED and chat_id is not None) else None)
-    block = ""
-    if hp is not None:
-        block = chat_history.render_context(chat_history.load_turns(hp),
-                                            HISTORY_TURNS, HISTORY_CHARS, HISTORY_TURN_CHARS)
-    reply, ok = answer(question, block)
-    if ok and hp is not None:
-        chat_history.append_turn(hp, "user", (question or "").strip()[:MAX_INPUT_CHARS], HISTORY_STORE)
-        chat_history.append_turn(hp, "assistant", reply, HISTORY_STORE)
-    return reply
+    def log(self, obj):
+        line = json.dumps({"at": datetime.now(timezone.utc).isoformat(), **obj}, default=str)
+        print(line, flush=True)
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
+    def state(self, key, default=None):
+        from lib.desk import store
+        with self.led.connect() as c:
+            return store.get_state(c, key, default)
 
-def _handle_message(msg: dict, notified_unauth: set) -> None:
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    text = (msg.get("text") or "").strip()
-    if chat_id is None or not text:
-        return
-    # Only answer PRIVATE chats — the allowlist holds personal user ids. A group/channel chat.id
-    # (Telegram makes these negative / type != "private") would let anyone the operator added to
-    # that group post to the bot, silently voiding "only you can talk to it".
-    if chat.get("type") not in (None, "private") or (isinstance(chat_id, int) and chat_id < 0):
-        _log({"event": "non_private_chat_ignored", "chat_id": chat_id, "type": chat.get("type")})
-        return
-    if str(chat_id) not in ALLOWED:
-        # Pairing helper: tell an unknown chat its own id ONCE, so setup is copy-paste. Never
-        # reveals anything but the chat's own id; capped so it can't be turned into a spammer.
-        if str(chat_id) not in notified_unauth and len(notified_unauth) < 50:
-            notified_unauth.add(str(chat_id))
-            send_message(chat_id, f"Not authorized. Your chat id is {chat_id} — add it to "
-                                  "TELEGRAM_ALLOWED_CHAT_IDS to enable this bot.")
-        _log({"event": "unauthorized", "chat_id": chat_id})
-        return
-    low = text.lower()
-    if low in ("/start", "/help", "start", "help"):
-        send_message(chat_id, HELP)
-        return
-    if low in ("/clear", "/reset", "/new"):
-        hp = chat_history.path_for(HISTORY_DIR, chat_id) if HISTORY_ENABLED else None
-        if hp is not None:
-            chat_history.clear(hp)
-        _log({"event": "clear", "chat_id": chat_id})
-        send_message(chat_id, "Cleared this thread's context — starting fresh.")
-        return
-    _log({"event": "question", "chat_id": chat_id, "text": text[:200]})
-    _typing(chat_id)
-    send_message(chat_id, _answer_with_memory(chat_id, text))
+    def set_state(self, key, value):
+        from lib.desk import store
+        with self.led.connect() as c:
+            store.set_state(c, key, value)
 
+    async def send_text(self, text, *, source="chat", reply_to=None):
+        return await asyncio.to_thread(self.box.send, text, source=source, reply_to=reply_to)
 
-def _drain(offset_holder: list) -> None:
-    """On startup, confirm any backlog WITHOUT answering it, so a restart never replays stale
-    questions. Advances the offset past the newest pending update."""
-    pending = _tg("getUpdates", {"timeout": 0, "allowed_updates": ["message"]}, timeout=15) or []
-    if pending:
-        offset_holder[0] = max(u["update_id"] for u in pending) + 1
-        _log({"event": "drained", "count": len(pending), "next_offset": offset_holder[0]})
+    # --- intake (§4.1) ------------------------------------------------------------
+    def accepted(self, msg) -> bool:
+        chat = msg.get("chat") or {}
+        frm = msg.get("from") or {}
+        return (chat.get("type") == "private" and str(frm.get("id")) in self.owner_ids
+                and str(chat.get("id")) == str(frm.get("id")))
 
+    async def handle_update(self, u, *, offline: bool):
+        from lib.desk import store
+        if "callback_query" in u:
+            asyncio.create_task(self.handle_tap(u["callback_query"], offline=offline))
+            self.set_state("tg_offset", int(u["update_id"]) + 1)
+            return
+        msg = u.get("message")
+        if msg:
+            await self.handle_message(msg)
+        self.set_state("tg_offset", int(u["update_id"]) + 1)
 
-def run() -> int:
-    if not TOKEN:
-        _log({"event": "no_token", "note": "TELEGRAM_BOT_TOKEN unset — chat bridge idle"})
-        return 0
-    if not ALLOWED:
-        _log({"event": "no_allowlist",
-              "note": "TELEGRAM_ALLOWED_CHAT_IDS unset — refusing to run without an allowlist"})
-        return 0
-    _log({"event": "start", "model": MODEL, "allowed": sorted(ALLOWED)})
-    offset_holder = [None]
-    _drain(offset_holder)
-    notified_unauth: set = set()
-    while True:
-        params = {"timeout": LONG_POLL_SEC, "allowed_updates": ["message"]}
-        if offset_holder[0] is not None:
-            params["offset"] = offset_holder[0]
-        # Socket timeout must exceed the long-poll or urlopen would abort every empty poll.
-        updates = _tg("getUpdates", params, timeout=LONG_POLL_SEC + 15)
-        if not updates:
-            continue
-        for u in updates:
-            offset_holder[0] = u["update_id"] + 1
-            msg = u.get("message")
-            if msg:
+    async def handle_message(self, msg):
+        from lib.desk import store
+        chat = msg.get("chat") or {}
+        text = (msg.get("text") or "").strip()
+        if not self.accepted(msg):
+            cid = chat.get("id")
+            if chat.get("type") == "private" and cid is not None and str(cid) not in self.notified_unauth \
+                    and len(self.notified_unauth) < 50:
+                self.notified_unauth.add(str(cid))
+                await self.tg("sendMessage", {"chat_id": cid, "text": f"Not authorized. Your chat id is {cid}."})
+            self.log({"event": "ignored", "chat_type": chat.get("type"), "chat_id": cid})
+            return
+        if not text:
+            return
+        created = datetime.fromtimestamp(int(msg.get("date") or time.time()), tz=timezone.utc)
+        with self.led.connect() as c:
+            fresh = store.insert_owner_message(c, chat_id=chat["id"], tg_message_id=int(msg["message_id"]),
+                                               text=text, created_at=store.iso(created))
+        if not fresh:
+            return  # a re-delivered update after a crash
+        self.last_owner_at = self.clock()
+        low = text.lower()
+        if low in ("/clear", "/reset", "/new", "/stop", "/status", "/start", "/help"):
+            with self.led.connect() as c:
+                c.execute("UPDATE chat_messages SET delivered_to_session=1 WHERE chat_id=? AND tg_message_id=?",
+                          (str(chat["id"]), int(msg["message_id"])))
+            await self.command(low, chat["id"])
+            return
+        if self.turn_task is not None and not self.turn_task.done():
+            asyncio.create_task(self.quick_react(int(msg["message_id"]), text))
+
+    # --- commands (§4.3 step 3) ----------------------------------------------------
+    async def command(self, cmd, chat_id):
+        from lib.desk import store
+        if cmd in ("/clear", "/reset", "/new"):
+            await self.disconnect()
+            with self.led.connect() as c:
+                c.execute("INSERT INTO chat_sessions (chat_id, session_id, started_at, last_turn_at) "
+                          "VALUES (?, ?, ?, NULL) ON CONFLICT(chat_id) DO UPDATE SET session_id=excluded.session_id, "
+                          "started_at=excluded.started_at, last_turn_at=NULL",
+                          (str(chat_id), str(uuid.uuid4()), store.now_iso()))
+            await self.send_text("Started a fresh conversation. The research memory and our chat log stay.",
+                                 source="system")
+        elif cmd == "/stop":
+            if self.client is not None and self.turn_task is not None and not self.turn_task.done():
                 try:
-                    _handle_message(msg, notified_unauth)
-                except Exception as e:  # noqa: BLE001 — one bad message must not kill the loop
-                    _log({"event": "handle_error", "err": f"{type(e).__name__}: {e}"})
+                    await self.client.interrupt()
+                except Exception:  # noqa: BLE001
+                    pass
+                await self.send_text("Stopped.", source="system")
+            else:
+                await self.send_text("Nothing is running.", source="system")
+        elif cmd == "/status":
+            await self.send_text(self.status_text(), source="system")
+        else:
+            await self.send_text("I'm your desk. Ask me about the book, a company, a filing, or a trade. "
+                                 "Nothing trades unless you tap Approve. /status, /clear, /stop.",
+                                 source="system")
+
+    def status_text(self) -> str:
+        from lib import market
+        from lib.desk import store
+        with self.led.connect() as c:
+            snap = c.execute("SELECT captured_at FROM broker_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+            pending = c.execute("SELECT COUNT(*) FROM proposals WHERE state='pending'").fetchone()[0]
+            last_run = store.get_state(c, "monitor_last_run")
+            job = c.execute("SELECT status, error, finished_at FROM broker_jobs WHERE kind='snapshot' AND status IN "
+                            "('done','failed') ORDER BY id DESC LIMIT 1").fetchone()
+        halted = self.led.is_halted(market.trading_day_et())
+        age = store.age_seconds(snap[0]) if snap else None
+        parts = [f"Snapshot: {round(age / 60)} min old." if age is not None else "Snapshot: none yet.",
+                 f"Pending proposals: {pending}.",
+                 f"Last monitor run: {last_run}." if last_run else "Last monitor run: none yet.",
+                 "Trading is halted today." if halted else "Trading is not halted.",
+                 ("Robinhood login: expired, run ./deploy/gcp/rh-reauth.sh." if job and job[0] == "failed"
+                  and "auth" in str(job[1] or "") else "Robinhood login: OK as of the last snapshot." if job
+                  else "Robinhood login: no snapshot job yet.")]
+        return " ".join(parts)
+
+    # --- reactions (§4.2) ----------------------------------------------------------
+    async def quick_react(self, message_id: int, text: str):
+        """The quick pick for a message that arrives during a turn (at most one at a time)."""
+        from lib.desk import reactions, store
+        if self.quick_busy:
+            return False
+        self.quick_busy = True
+        try:
+            try:
+                emoji = await asyncio.wait_for(self.quick_pick(text), QUICK_PICK_S)
+            except Exception as e:  # noqa: BLE001
+                self.log({"event": "quick_pick_failed", "error": f"{type(e).__name__}: {e}"})
+                return False
+            emoji = reactions.check(emoji)
+            if not emoji:
+                return False
+            await self.tg("setMessageReaction", {"chat_id": self.chat_id, "message_id": message_id,
+                                                 "reaction": [{"type": "emoji", "emoji": emoji}]})
+            with self.led.connect() as c:
+                c.execute("UPDATE chat_messages SET reaction=?, reacted_at=? WHERE chat_id=? AND tg_message_id=?",
+                          (emoji, store.now_iso(), str(self.chat_id), int(message_id)))
+            self.turn.reacted_ids.add(int(message_id))
+            return True
+        finally:
+            self.quick_busy = False
+
+    async def _default_quick_pick(self, text: str):
+        from claude_agent_sdk import AssistantMessage, query
+        from lib.desk import agent
+        from lib.prompts import load_prompt
+        opts = agent.small_job_options(self.runtime, system_prompt=load_prompt("quick_reaction"))
+        out = ""
+        async for m in query(prompt=text[:2000], options=opts):
+            if isinstance(m, AssistantMessage):
+                out += "".join(getattr(b, "text", "") or "" for b in m.content)
+        return out.strip()
+
+    # --- turns (§4.3) --------------------------------------------------------------
+    def pending_owner(self):
+        with self.led.connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM chat_messages WHERE role='owner' AND chat_id=? AND delivered_to_session=0 "
+                "AND tg_message_id IS NOT NULL ORDER BY id", (str(self.chat_id),)).fetchall()]
+
+    def desk_updates(self):
+        with self.led.connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM chat_messages WHERE role='desk' AND source != 'chat' AND delivered_to_session=0 "
+                "ORDER BY id").fetchall()]
+
+    def build_input(self, owners, updates) -> str:
+        from lib import market
+        from lib.desk import store
+
+        def clock(ts):
+            dt = store.parse_ts(ts)
+            return market.fmt_et(dt) + " ET" if dt else ""
+        parts = []
+        if updates:
+            since = updates[0]["created_at"]
+            parts.append(f'<desk_updates since="{since}">')
+            for u in updates:
+                # One row is one line: a newline in a model text cannot forge a second row.
+                one_line = " / ".join(x.strip() for x in str(u["text"] or "").splitlines() if x.strip())
+                parts.append(f"[{clock(u['created_at'])} · {u['source']}] {_esc(one_line)}")
+            parts.append("</desk_updates>")
+        for o in owners:
+            parts.append(f'<owner message_id="{o["tg_message_id"]}" sent="{clock(o["created_at"])}">'
+                         f'{_esc(o["text"])}</owner>')
+        return "\n".join(parts)
+
+    async def _default_client(self, options):
+        from claude_agent_sdk import ClaudeSDKClient
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        return client
+
+    async def ensure_client(self):
+        from lib.desk import agent, store
+        if self.client is not None:
+            return self.client
+        with self.led.connect() as c:
+            row = c.execute("SELECT session_id, last_turn_at FROM chat_sessions WHERE chat_id=?",
+                            (str(self.chat_id),)).fetchone()
+        opts = agent.desk_options(self.runtime, self.secrets, self.turn, ctx=self.ctx,
+                                  resume=row[0] if row and row[1] else None)
+        if row and not row[1]:
+            opts.session_id = row[0]
+        self.client = await self.client_factory(opts)
+        self.client_session = row[0] if row else None
+        return self.client
+
+    async def disconnect(self):
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+        self.client = None
+
+    async def typing_loop(self):
+        while True:
+            await self.tg("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
+            await self.sleep(TYPING_EVERY_S)
+
+    async def run_turn(self):
+        from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage
+        from lib.desk import store, tools
+        owners = self.pending_owner()
+        if not owners:
+            return
+        updates = self.desk_updates()
+        reacted = [o["tg_message_id"] for o in owners if o.get("reaction")]
+        self.turn.start(chat_id=self.chat_id, owner_message_ids=[o["tg_message_id"] for o in owners],
+                        started_at=store.now_iso(), reacted=reacted)
+        prompt = self.build_input(owners, updates)
+        typing = asyncio.create_task(self.typing_loop())
+        last_text, session_id, error = "", None, None
+        try:
+            client = await self.ensure_client()
+            await client.query(prompt)
+
+            async def consume():
+                nonlocal last_text, session_id
+                async for m in client.receive_response():
+                    if isinstance(m, AssistantMessage):
+                        t = "".join(getattr(b, "text", "") or "" for b in m.content if hasattr(b, "text"))
+                        if t.strip():
+                            last_text = t.strip()
+                    elif isinstance(m, SystemMessage) and m.subtype == "init":
+                        session_id = (m.data or {}).get("session_id") or session_id
+                    elif isinstance(m, ResultMessage):
+                        session_id = m.session_id or session_id
+                        if m.is_error:
+                            raise RuntimeError(m.result or m.subtype or "error result")
+            await asyncio.wait_for(consume(), TURN_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            try:
+                await self.client.interrupt()
+            except Exception:  # noqa: BLE001
+                pass
+            error = "timeout"
+            await self.send_text("That took too long, so I stopped. Ask again, or ask me for a deep-dive.",
+                                 source="system")
+        except Exception as e:  # noqa: BLE001
+            error = f"{type(e).__name__}: {e}"
+            await self.report_error(str(e))
+        finally:
+            typing.cancel()
+        self.turn.session_id = session_id or self.turn.session_id
+        # The trailing text (§4.4 step 4): a turn with no `say` sends its last text as the answer.
+        # A turn that sent with `say` drops it. Two live runs on 2026-10-28 showed it is a recap.
+        if not error and last_text and self.turn.said:
+            self.log({"event": "trailing_dropped", "chars": len(last_text)})
+        if not error and last_text and not self.turn.said:
+            for mid in self.turn.unreacted():
+                text = next((o["text"] for o in owners if o["tg_message_id"] == mid), "")
+                await self.quick_react(mid, text)
+            if not self.turn.unreacted():
+                for part in _chunks(last_text, tools.SAY_LIMIT):
+                    # §4.4 step 2: the typing action goes before each message.
+                    await self.tg("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
+                    await self.send_text(_to_telegram_html(part), source="chat",
+                                         reply_to=self.turn.first_reply_to if not self.turn.said else None)
+                    self.turn.said.append(part)
+            else:
+                # The quick pick failed, so `say` checks forbid the send. Log it: the owner got no reply.
+                self.log({"event": "trailing_unsent", "reason": "unreacted", "chars": len(last_text)})
+        with self.led.connect() as c:
+            ids = [o["id"] for o in owners] + [u["id"] for u in updates]
+            c.executemany("UPDATE chat_messages SET delivered_to_session=1 WHERE id=?", [(i,) for i in ids])
+            if session_id:
+                c.execute("INSERT INTO chat_sessions (chat_id, session_id, started_at, last_turn_at) VALUES (?,?,?,?) "
+                          "ON CONFLICT(chat_id) DO UPDATE SET session_id=excluded.session_id, "
+                          "last_turn_at=excluded.last_turn_at", (str(self.chat_id), session_id, store.now_iso(),
+                                                                 store.now_iso()))
+        self.log({"event": "turn", "owners": len(owners), "updates": len(updates), "said": len(self.turn.said),
+                  "error": error})
+
+    async def report_error(self, text: str):
+        from lib import market
+        kind = classify_error(text)
+        self.log({"event": "turn_error", "kind": kind, "error": str(text)[:2000]})
+        if kind == "auth":
+            await self.send_text("My Claude login stopped working. Rotate CLAUDE_CODE_OAUTH_TOKEN "
+                                 "(see docs/DEPLOY.md).", source="system")
+            if self.page:
+                self.page("auth_error", "desk", str(text)[:300])
+            else:
+                import runner_common as rc
+                rc._maybe_alert(self.led, kind="auth_error", stage="desk", day=market.trading_day_et(),
+                                now_iso=datetime.now(timezone.utc).isoformat(), event_detail=str(text)[:300],
+                                secrets=self.secrets)
+        elif kind == "limit":
+            await self.send_text(f"I hit a usage limit: {str(text).strip()[:300]}", source="system")
+        else:
+            first = (str(text).strip().splitlines() or ["unknown error"])[0][:300]
+            await self.send_text(f"I hit an error: {first}", source="system")
+
+    async def maybe_turn(self):
+        if self.turn_task is not None and not self.turn_task.done():
+            return
+        if self.pending_owner():
+            self.turn_task = asyncio.create_task(self.run_turn())
+            # Messages that arrived during this turn start the next one at once.
+            self.turn_task.add_done_callback(lambda _t: asyncio.ensure_future(self.maybe_turn()))
+
+    # --- taps (§4.6) ---------------------------------------------------------------
+    async def handle_tap(self, cbq, *, offline: bool):
+        from lib.desk import approvals, outbox
+        cid = cbq.get("id")
+        frm = (cbq.get("from") or {}).get("id")
+        msg = cbq.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        if offline:
+            await self.tg("answerCallbackQuery", {"callback_query_id": cid,
+                                                  "text": "I was offline when you tapped. Tap again."})
+            return {"offline": True}
+        res = await asyncio.to_thread(
+            approvals.handle_tap, self.led, self.runtime.cfg, callback_data=cbq.get("data"), from_id=frm,
+            chat_id=chat_id, message_id=msg.get("message_id"), owner_ids=self.owner_ids)
+        await self.tg("answerCallbackQuery", {"callback_query_id": cid, "text": str(res["answer"])[:200]})
+        if res.get("label") and msg.get("message_id"):
+            await asyncio.to_thread(self.box.set_label, msg["message_id"], res["label"])
+        for t in res.get("touch", []):
+            from lib.desk import store
+            store.touch_trigger(self.runtime.root, t)
+        for m in res.get("messages", []):
+            await self.send_text(m, source="proposal")
+        for old in res.get("superseded", []) or []:
+            await self._relabel(old)
+        for pid in res.get("cards", []):
+            await asyncio.to_thread(self._send_card, pid)
+        if res.get("ok") and "broker" in res.get("touch", []) and res.get("proposal_id"):
+            asyncio.create_task(self.broker_watch(res["proposal_id"]))
+        self.log({"event": "tap", "result": {k: res.get(k) for k in ("answer", "label", "ok", "proposal_id")}})
+        return res
+
+    async def _relabel(self, pid):
+        from lib.desk import proposals
+        with self.led.connect() as c:
+            p = proposals.get_proposal(c, pid)
+        if p and p.get("tg_message_id"):
+            label = f"Replaced by #{p['superseded_by']}" if p.get("superseded_by") else "Replaced"
+            await asyncio.to_thread(self.box.set_label, p["tg_message_id"], label)
+
+    def _send_card(self, pid):
+        from lib.desk import outbox, proposals
+        with self.led.connect() as c:
+            p = proposals.get_proposal(c, pid)
+        if p is None:
+            return
+        if p["kind"] == "trade":
+            payload = json.loads(p["payload_json"])
+            built = {"proposal_id": pid, "legs": _legs_for_card(self.led, pid, payload),
+                     "skipped": payload.get("skipped", []), "scaled": payload.get("scaled"),
+                     "superseded": []}
+            outbox.send_trade_card(self.led, self.box, self.led.connect, built)
+        else:
+            outbox.send_change_card(self.led, self.box, self.runtime.cfg, pid)
+
+    async def broker_watch(self, pid):
+        await self.sleep(BROKER_WATCH_S)
+        with self.led.connect() as c:
+            row = c.execute("SELECT 1 FROM broker_jobs WHERE kind='execute' AND proposal_id=? AND status != 'queued'",
+                            (pid,)).fetchone()
+        if not row:
+            await self.send_text(f"The broker has not started #{pid} yet.", source="system")
+
+    # --- the loops -----------------------------------------------------------------
+    async def poll_once(self):
+        from lib.desk import store
+        off = self.state("tg_offset")
+        params = {"timeout": LONG_POLL_SEC, "allowed_updates": ["message", "callback_query"]}
+        if off is not None:
+            params["offset"] = int(off)
+        res = await self.tg("getUpdates", params)
+        if not res or not res.get("ok"):
+            await self.sleep(5)
+            return []
+        now = self.wall()
+        prev = store.parse_ts(self.state("last_poll_at"))
+        offline = prev is None or (now - prev).total_seconds() > OFFLINE_TAP_S
+        self.set_state("last_poll_at", store.iso(now))
+        updates = res.get("result") or []
+        for u in updates:
+            try:
+                await self.handle_update(u, offline=offline)
+            except Exception as e:  # noqa: BLE001 — one bad update never stops the loop
+                self.log({"event": "update_error", "error": f"{type(e).__name__}: {e}"})
+        return updates
+
+    async def idle_check(self):
+        if self.client is not None and self.last_owner_at is not None and \
+                self.clock() - self.last_owner_at > IDLE_DISCONNECT_S and \
+                (self.turn_task is None or self.turn_task.done()):
+            await self.disconnect()
+
+    async def run(self):
+        self.log({"event": "start", "desk_model": self.runtime.desk_model})
+        while not self.stopping:
+            await self.poll_once()
+            await self.maybe_turn()
+            await self.idle_check()
 
 
-def main(argv: list) -> int:
-    if "--print-cmd" in argv:
-        print(" ".join(_claude_cmd("EXAMPLE QUESTION")))
+def _legs_for_card(led, pid, payload):
+    legs = []
+    for l in led.legs(pid):
+        legs.append({"ticker": l["ticker"], "side": l["side"], "dollars": l["dollar_amount"],
+                     "quantity": l["quantity"], "quote": l["quote_at_proposal"]})
+    return legs
+
+
+def _tg_api(token, method, params):
+    from lib import telegram
+    return telegram.api(token, method, params, timeout=LONG_POLL_SEC + 15 if method == "getUpdates" else 20)
+
+
+def main(argv) -> int:
+    from lib.desk import agent
+    runtime = agent.Runtime.from_env()
+    secrets = agent.Secrets.from_env()
+    agent.scrub_process_env()
+    if not secrets.telegram_bot_token or not secrets.owner_ids:
+        print(json.dumps({"event": "idle", "note": "TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_CHAT_IDS unset"}))
         return 0
-    if "--ask" in argv:
-        i = argv.index("--ask")
-        q = argv[i + 1] if i + 1 < len(argv) else ""
-        # Optional `--chat-id N` drives the SAME stateful thread path the Telegram handler uses
-        # (load context → answer → record), so a two-turn CLI run proves memory carries. Without
-        # it, chat_id is None → stateless, byte-identical to the classic smoke test.
-        cid = None
-        if "--chat-id" in argv:
-            j = argv.index("--chat-id")
-            cid = argv[j + 1] if j + 1 < len(argv) else None
-        print(_answer_with_memory(cid, q))
-        return 0
-    return run()
+    bridge = Bridge(runtime=runtime, secrets=secrets)
+    asyncio.run(bridge.run())
+    return 0
 
 
 if __name__ == "__main__":

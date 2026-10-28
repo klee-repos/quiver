@@ -1,15 +1,16 @@
-"""SQLite-backed state: per-day dedup, order idempotency, P&L baseline, halt.
+"""SQLite-backed state of record: orders, the P&L baseline and halt, the book, and the
+desk tables (``lib/desk/store.py``).
 
-Three guarantees the orchestrator relies on:
-1. ``ticker_action`` (PK trade_date+ticker) -> at most ONE action per ticker
-   per day, even across session restarts or duplicate ticks.
-2. ``orders`` (PK ref_id UUID) reserved BEFORE the broker call -> a crash mid
-   place is recoverable; retries reuse the same ref_id (Robinhood dedups by it).
-3. ``day_baseline.halted`` + the KILL file -> once a halt fires, every later
-   tick no-ops until a human clears it.
+The guarantees the desk relies on:
+1. ``orders`` (PK ref_id UUID) is reserved when a proposal is built, BEFORE any broker
+   call. A crash mid-place is recoverable, and a retry reuses the same ref_id
+   (Robinhood dedups by it). Never mint a second ref_id for an order that might be sent.
+2. ``day_baseline.halted`` stops every execution for the day once the daily-loss check
+   fires. A confirmed ``resume_trading`` proposal lifts it (``clear_halt``).
+3. ``Ledger.transaction()`` gives one connection with ``BEGIN IMMEDIATE``, so a tap claims
+   a proposal, moves its legs and queues its job in one commit.
 
-All writes are atomic sqlite transactions; the DB lives on disk so it survives
-sleep/reboot.
+No table is ever dropped. Retired tables stay in the file and nothing reads them.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import hashlib
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -58,7 +59,10 @@ CREATE TABLE IF NOT EXISTS orders (
     limit_price     REAL,
     stop_price      REAL,
     parent_ref_id   TEXT,                        -- links a protective stop to its entry
-    state           TEXT DEFAULT 'reserved',     -- reserved|filled|partial|unfilled|cancelled|stop_placed|triggered
+    -- Desk leg states: proposed|approved|checked|placing|placed|filled|partially_filled|
+    -- cancelled|broker_rejected|expired|requoted|skipped|outcome_unknown (older rows keep
+    -- the retired values reserved|partial|unfilled|stop_placed|triggered).
+    state           TEXT DEFAULT 'reserved',
     -- The REAL fill, read back from the broker by broker_order_id. `result_json` is
     -- assembled by the orchestrator at PLACE time, so it is inconsistent (15 distinct
     -- key shapes over 159 orders) and wrong as a price: BOT 6a79ec24 stored 27.59
@@ -322,42 +326,49 @@ class Ledger:
         finally:
             conn.close()
 
-    def legislative_conn(self):
-        """Public context manager yielding the raw connection for lib.legislative store
-        operations (which own their SQL + take a cursor, exactly like lib.levers). Commits
-        on clean exit; a raise inside the block leaves the txn uncommitted. Keeps the
-        legislative module's many small ops out of a dozen thin Ledger wrappers while
-        preserving the "SQL lives with the Ledger connection" convention."""
+    def connect(self):
+        """A connection that commits on a clean exit (the same as every method uses)."""
         return self._conn()
 
-    def intel_conn(self):
-        """Public context manager yielding the raw connection for lib.intel store ops
-        (which own their SQL + take the connection, exactly like lib.legislative). Same
-        ledger.db file — one sqlite database, so intel reads/writes join the trading state
-        with no second file to keep consistent."""
-        return self._conn()
+    @contextmanager
+    def transaction(self):
+        """One connection inside ``BEGIN IMMEDIATE``. Commit on a clean exit, roll back
+        on an exception. The tap (plan §10.5) claims, moves the legs and queues the job
+        in one of these, so the three writes commit together or not at all."""
+        conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _use(self, conn):
+        """Yield ``conn`` when the caller passes one (its transaction owns the commit),
+        else a fresh connection that commits on exit."""
+        if conn is not None:
+            yield conn
+            return
+        with self._conn() as c:
+            yield c
 
     def ensure_schema(self) -> None:
+        from lib.desk import store
         with self._conn() as c:
             c.executescript(_SCHEMA)
             self._migrate_orders(c)
             self._migrate_notifications(c)
             self._migrate_decisions(c)
             self._migrate_outcomes(c)
-            self._migrate_thesis_state(c)
-            self._migrate_universe_change_key(c)
-            # Self-learning tail (lib/levers): eval-lever registry + uses. Owns
-            # its own schema so it can evolve independently of the core tables.
-            from lib import levers
-            levers.ensure_schema(c)
-            # Legislative-catalyst store (lib/legislative): bills + impacts + poll cursor.
-            # Owns its own schema, same pattern as levers.
-            from lib import legislative
-            legislative.ensure_schema(c)
-            # Strategy-intelligence store (lib/intel): documents + sections + section_impact +
-            # power map + shadow proposals. Owns its own schema; lives in this same ledger.db.
-            from lib.intel import store as _intel_store
-            _intel_store.ensure_schema(c)
+            self._migrate_target_portfolio(c)
+            store.ensure_desk_schema(c)
 
     @staticmethod
     def _migrate_decisions(c) -> None:
@@ -390,27 +401,8 @@ class Ledger:
             c.execute("ALTER TABLE outcomes ADD COLUMN adherence TEXT")
 
     @staticmethod
-    def _migrate_thesis_state(c) -> None:
-        """Back-fill the regime-confirmation columns on a thesis_state table created
-        earlier. PRAGMA-diff + ADD COLUMN (fresh dbs get them from _SCHEMA)."""
-        # An empty result means the table doesn't exist yet on this db — _SCHEMA's
-        # CREATE IF NOT EXISTS already made it with the columns, so nothing to add.
-        existing = {row[1] for row in c.execute("PRAGMA table_info(thesis_state)").fetchall()}
-        if not existing:
-            return
-        additions = {
-            "pending_regime": "TEXT",
-            "pending_since": "TEXT",
-            "confirm_count": "INTEGER NOT NULL DEFAULT 0",
-            "regime_since": "TEXT",
-        }
-        for col, decl in additions.items():
-            if col not in existing:
-                c.execute(f"ALTER TABLE thesis_state ADD COLUMN {col} {decl}")
-
-    @staticmethod
     def _migrate_orders(c) -> None:
-        """Back-fill Phase 5 lifecycle columns on an orders table created earlier.
+        """Back-fill the lifecycle and desk-leg columns on an orders table created earlier.
 
         SQLite has no 'ADD COLUMN IF NOT EXISTS', so we diff PRAGMA table_info and
         add only what's missing. Idempotent and safe on a fresh db (CREATE already
@@ -427,30 +419,30 @@ class Ledger:
             "fill_fees": "REAL",
             "fill_state": "TEXT",
             "fill_captured_at": "TEXT",
+            # Desk legs (plan §6.1): the proposal that reserved the leg and the checks
+            # that gate its place call.
+            "proposal_id": "INTEGER",
+            "leg_seq": "INTEGER",
+            "quote_at_proposal": "REAL",
+            "clamped_from": "REAL",
+            "check_quote": "REAL",
+            "checked_at": "TEXT",
+            "reconcile_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "skip_reason": "TEXT",
+            "review_ok": "INTEGER NOT NULL DEFAULT 0",
+            "review_json": "TEXT",
+            "reviewed_at": "TEXT",
         }
         for col, decl in additions.items():
             if col not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
 
     @staticmethod
-    def _migrate_universe_change_key(c) -> None:
-        """Add universe_change_log.change_key = sha256(kind|ticker)[:16] on a table
-        created before the column existed, and backfill it from the stored kind/ticker.
-
-        SQLite has no ADD COLUMN IF NOT EXISTS, so diff PRAGMA table_info. Idempotent:
-        a no-op once change_key exists (fresh dbs get it from _SCHEMA). The backfill is
-        computed in Python (SQLite has no sha256) and MUST reproduce Proposal.change_key()
-        byte-for-byte so pre-migration rows pool with post-migration ones. Runs AFTER
-        executescript(_SCHEMA), so on an existing table the column is absent here and gets
-        added; we deliberately do NOT index it (the table is tiny and the pooled reads
-        full-scan a few dozen rows)."""
-        cols = {row[1] for row in c.execute("PRAGMA table_info(universe_change_log)").fetchall()}
-        if not cols or "change_key" in cols:
-            return
-        c.execute("ALTER TABLE universe_change_log ADD COLUMN change_key TEXT")
-        for row in c.execute("SELECT id, kind, ticker FROM universe_change_log").fetchall():
-            key = hashlib.sha256(f"{row[1]}|{row[2]}".encode()).hexdigest()[:16]
-            c.execute("UPDATE universe_change_log SET change_key=? WHERE id=?", (key, row[0]))
+    def _migrate_target_portfolio(c) -> None:
+        """Add ``entry_price_max`` (NULL means no entry condition, plan §6.1)."""
+        existing = {row[1] for row in c.execute("PRAGMA table_info(target_portfolio)").fetchall()}
+        if existing and "entry_price_max" not in existing:
+            c.execute("ALTER TABLE target_portfolio ADD COLUMN entry_price_max REAL")
 
     @staticmethod
     def _migrate_notifications(c) -> None:
@@ -505,15 +497,25 @@ class Ledger:
                 bool(row["halted"]), row["halt_reason"],
             )
 
-    def mark_halted(self, trade_date: str, reason: str) -> None:
-        with self._conn() as c:
+    def mark_halted(self, trade_date: str, reason: str, conn=None) -> None:
+        with self._use(conn) as c:
             c.execute(
                 "UPDATE day_baseline SET halted=1, halt_reason=? WHERE trade_date=?",
                 (reason, trade_date),
             )
 
-    def is_halted(self, trade_date: str) -> bool:
-        with self._conn() as c:
+    def clear_halt(self, trade_date: str, note: str, conn=None) -> int:
+        """Lift today's daily-loss halt (a confirmed ``resume_trading`` proposal). Appends
+        ``note`` to ``halt_reason``. Returns the rows changed (0 when the day is not halted).
+        The KILL file is never touched here."""
+        with self._use(conn) as c:
+            cur = c.execute(
+                "UPDATE day_baseline SET halted=0, halt_reason=COALESCE(halt_reason, '') || ? "
+                "WHERE trade_date=? AND halted=1", ("; " + note, trade_date))
+            return int(cur.rowcount or 0)
+
+    def is_halted(self, trade_date: str, conn=None) -> bool:
+        with self._use(conn) as c:
             row = c.execute(
                 "SELECT halted FROM day_baseline WHERE trade_date=?", (trade_date,)
             ).fetchone()
@@ -535,79 +537,6 @@ class Ledger:
                 row["trade_date"], row["baseline_equity"],
                 bool(row["halted"]), row["halt_reason"],
             )
-
-    # --- per-ticker dedup -----------------------------------------------------
-
-    def already_acted(self, trade_date: str, ticker: str) -> bool:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM ticker_action WHERE trade_date=? AND ticker=?",
-                (trade_date, ticker),
-            ).fetchone()
-            return row is not None
-
-    # A "trade-like" action: one that actually moved the book (order/placed/dry_run),
-    # NOT a skip/defer/error. The rebalance SELL pass uses this (not the broader
-    # already_acted) so a name DEFERRED to it (status "skipped",
-    # detail "deferred_to_rebalance_trim") is NOT blocked from being trimmed by the
-    # book this tick — the deferral is a signal, not a placed trade. Preflight's
-    # per-day dedup still uses the broad already_acted (any row => acted).
-    _TRADE_LIKE_STATUSES = ("order", "placed", "dry_run")
-
-    def has_trade_like_action(self, trade_date: str, ticker: str) -> bool:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM ticker_action WHERE trade_date=? AND ticker=? "
-                "AND status IN ('order','placed','dry_run')",
-                (trade_date, ticker),
-            ).fetchone()
-            return row is not None
-
-    def record_action(
-        self, trade_date: str, ticker: str, *, signal: str, intent: str,
-        status: str, detail: str, now_iso: str,
-    ) -> None:
-        with self._conn() as c:
-            c.execute(
-                "INSERT OR REPLACE INTO ticker_action "
-                "(trade_date, ticker, signal, intent, status, detail, updated_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (trade_date, ticker, signal, intent, status, detail, now_iso),
-            )
-
-    def clear_day(self, trade_date: str) -> int:
-        """Delete a day's ticker_action rows (used to switch dry_run->live on
-        a day that already has dry-run rows). Returns rows deleted."""
-        with self._conn() as c:
-            cur = c.execute("DELETE FROM ticker_action WHERE trade_date=?", (trade_date,))
-            return cur.rowcount
-
-    def day_buys_total(self, trade_date: str) -> float:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT COALESCE(SUM(dollar_amount),0) AS t FROM orders "
-                "WHERE trade_date=? AND side='buy'",
-                (trade_date,),
-            ).fetchone()
-            return float(row["t"] or 0.0)
-
-    # --- read-only day rollups (for the digest; never mutate state) -----------
-
-    def day_actions(self, trade_date: str) -> list:
-        """All committed ticker_action rows for the day, ordered by ticker."""
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT * FROM ticker_action WHERE trade_date=? ORDER BY ticker",
-                (trade_date,),
-            ).fetchall()]
-
-    def day_orders(self, trade_date: str) -> list:
-        """All order rows for the day (finalized or not), ordered by submit time."""
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT * FROM orders WHERE trade_date=? ORDER BY submitted_at",
-                (trade_date,),
-            ).fetchall()]
 
     # --- decision memory (ground of record for the scorecard) ----------------
 
@@ -652,30 +581,6 @@ class Ledger:
         with self._conn() as c:
             row = c.execute("SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
             return dict(row) if row else None
-
-    def count_decisions(self, trade_date: str) -> int:
-        """How many decision rows exist for a trading day. `plan` records a decision
-        for every VALID signal (hold/skip included) but NOT for an ERROR analysis (that
-        records only a ticker_action). Paired with count_ticker_actions by the headless
-        supervisor's silent-noop guard."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT COUNT(*) FROM decisions WHERE trade_date=?", (trade_date,)
-            ).fetchone()
-            return int(row[0]) if row else 0
-
-    def count_ticker_actions(self, trade_date: str) -> int:
-        """How many ticker_action rows exist for a trading day. `plan` writes one for
-        EVERY analysis it processes — a real action, a skip, OR an error — so this is >0
-        whenever plan ran over a non-empty analyses list. The supervisor pairs this with
-        count_decisions: BOTH zero (with pending tickers) means plan never ran at all —
-        the 2026-06-17 silent-noop (analyses backgrounded then reaped). A GLM-outage
-        day records error actions, so it has ticker_actions > 0 and does NOT false-trip."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT COUNT(*) FROM ticker_action WHERE trade_date=?", (trade_date,)
-            ).fetchone()
-            return int(row[0]) if row else 0
 
     def pending_outcome_decisions(self, resolve_on_or_before_date: str) -> list:
         """Decisions with no outcome yet whose trade_date is old enough to score.
@@ -748,127 +653,6 @@ class Ledger:
                 (ticker, limit),
             ).fetchall()]
 
-    # --- cross-day consistency reads (the strategy-consistency gate, Component A) --
-    # These span DAYS (unlike the trade_date-scoped intraday gates) so the plan can
-    # ask "what stance did we last actually take on this name, and what plan did it
-    # declare?" — the ground for deciding whether today's reversal is a consistent
-    # strategy executing or a random flip. Read-only over decisions/actions.
-
-    def last_completed_trade(self, ticker: str) -> Optional[dict]:
-        """The most recent COMPLETED trade for a ticker across ALL days, joined to the
-        decision that drove it (for its recorded plan: stop/target/price/basis).
-
-        A 'completed trade' is an ``actions`` event with intent buy|sell and status
-        placed|dry_run (the same definition the intraday gates use), NOT date-scoped.
-        Joined to the ``decisions`` row sharing (ticker, trade_date, intent) — unique
-        per day in classic mode; the newest decision wins on an intraday tie. Returns
-        the prior stance + its declared plan, or None when the name was never traded.
-        """
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT a.ticker, a.intent, a.trade_date, a.ts, a.signal, "
-                "d.decision_price, d.stop_loss, d.target_price, d.next_review_hours, "
-                "d.decided_at, d.basis "
-                "FROM actions a LEFT JOIN decisions d "
-                # Pick the SINGLE newest matching decision (not a fan-out): a (day,ticker,
-                # intent) can have many decision rows (intraday re-analysis / plan retries).
-                "  ON d.id = (SELECT d2.id FROM decisions d2 WHERE d2.ticker = a.ticker "
-                "             AND d2.trade_date = a.trade_date AND d2.intent = a.intent "
-                "             ORDER BY d2.id DESC LIMIT 1) "
-                # Only a DISCRETIONARY stance counts — exclude system de-risking exits
-                # (reconcile/rebalance), which are not a committed buy/sell view.
-                "WHERE a.ticker = ? AND a.intent IN ('buy','sell') "
-                "  AND a.status IN ('placed','dry_run') "
-                "  AND COALESCE(a.signal,'') NOT IN ('REBALANCE','RECONCILE') "
-                "ORDER BY a.ts DESC, a.id DESC LIMIT 1",
-                (ticker,),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def recent_decisions(self, ticker: str, limit: int = 8) -> list:
-        """Recent decisions for a ticker (newest first) with the consistency fields.
-
-        The ADVISORY read (analysis side, Component F): includes hold/skip rows so the
-        stance-history block can show the full sequence. Reads decisions only, so it
-        stays inside the memory carve-out.
-        """
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT trade_date, decided_at, signal, intent, basis, plan_trigger "
-                "FROM decisions WHERE ticker = ? ORDER BY decided_at DESC, id DESC LIMIT ?",
-                (ticker, limit),
-            ).fetchall()]
-
-    def recent_completed_trades(self, ticker: str, limit: int = 8) -> list:
-        """Recent COMPLETED trades (newest first), joined to each driving decision's
-        plan_trigger/basis — the binding flip-budget read (Component A).
-
-        Counts only trades that ACTUALLY moved the stance (intent buy|sell, status
-        placed|dry_run), so a suppressed/blocked reversal ATTEMPT never inflates the
-        churn budget — only real direction changes do. Same join key as
-        last_completed_trade ((ticker, trade_date, intent)).
-        """
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT a.intent, a.trade_date, a.ts, a.signal, d.plan_trigger, d.basis "
-                "FROM actions a LEFT JOIN decisions d "
-                # Single newest matching decision per event — NOT a fan-out (a (day,ticker,
-                # intent) may have many decision rows; a naive join would fill the LIMIT
-                # window with duplicates and UNDER-count reversals -> fail permissive).
-                "  ON d.id = (SELECT d2.id FROM decisions d2 WHERE d2.ticker = a.ticker "
-                "             AND d2.trade_date = a.trade_date AND d2.intent = a.intent "
-                "             ORDER BY d2.id DESC LIMIT 1) "
-                # Exclude system de-risking exits (reconcile/rebalance) — not a discretionary
-                # stance, so they must not seed the reversal check or the churn budget.
-                "WHERE a.ticker = ? AND a.intent IN ('buy','sell') "
-                "  AND a.status IN ('placed','dry_run') "
-                "  AND COALESCE(a.signal,'') NOT IN ('REBALANCE','RECONCILE') "
-                "ORDER BY a.ts DESC, a.id DESC LIMIT ?",
-                (ticker, limit),
-            ).fetchall()]
-
-    # --- resolved-return series (read-only; for lib/risk metrics) -------------
-    # CHRONOLOGICAL (decided_at ASC) — the inverse of decisions_with_outcomes'
-    # newest-first ordering — because the risk/trend math expects oldest->newest.
-    # Only rows with a scored directional_return; never touch broker/limits.
-
-    def ticker_return_series(self, ticker: str, *, exclude_skips: bool = True) -> list:
-        """Resolved returns for one ticker, OLDEST first. Carries ``intent`` + ``alpha``
-        so the metrics/calibration can grade on SKILL (excess-vs-benchmark) and exclude
-        SKIP decisions (no capital at risk). ``exclude_skips`` defaults True — a skip is
-        not a position we held, so it must not pollute the risk metrics."""
-        skip_clause = "AND COALESCE(d.intent,'') != 'skip' " if exclude_skips else ""
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT d.id, d.trade_date, d.signal, d.intent, d.decision_price, "
-                "o.directional_return, o.alpha, o.holding_days, o.realized_pnl "
-                "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
-                "WHERE d.ticker = ? AND o.directional_return IS NOT NULL " + skip_clause +
-                "ORDER BY d.decided_at ASC, d.id ASC",
-                (ticker,),
-            ).fetchall()]
-
-    def all_return_series(self, *, exclude_skips: bool = True) -> list:
-        """Portfolio-level: every resolved return across all tickers, OLDEST first.
-        Carries ``intent`` + ``alpha`` and excludes SKIP decisions by default (see
-        ``ticker_return_series``)."""
-        skip_clause = "AND COALESCE(d.intent,'') != 'skip' " if exclude_skips else ""
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT d.id, d.ticker, d.trade_date, d.signal, d.intent, d.basis, d.decision_price, "
-                "o.directional_return, o.alpha, o.holding_days, o.realized_pnl "
-                "FROM decisions d JOIN outcomes o ON o.decision_id = d.id "
-                "WHERE o.directional_return IS NOT NULL " + skip_clause +
-                "ORDER BY d.decided_at ASC, d.id ASC"
-            ).fetchall()]
-
-    def all_tickers_with_decisions(self) -> list:
-        """Distinct tickers that have at least one decision (to rebuild per-ticker files)."""
-        with self._conn() as c:
-            return [r["ticker"] for r in c.execute(
-                "SELECT DISTINCT ticker FROM decisions ORDER BY ticker"
-            ).fetchall()]
-
     def baseline_capture_times(self) -> dict:
         """{trade_date: captured_at} for the equity curve. Read-only; diagnostic path.
 
@@ -890,83 +674,6 @@ class Ledger:
                 "SELECT trade_date, baseline_equity FROM day_baseline ORDER BY trade_date ASC"
             ).fetchall()]
 
-    # --- intraday multi-run: action events + per-ticker cadence schedule ------
-    # A "completed trade" (what cooldown / action-cap / on-change gate on) is an
-    # event with intent buy|sell that actually went through or was simulated:
-    # status placed|dry_run. Blocked/error attempts are logged but don't count.
-
-    _TRADE_FILTER = "intent IN ('buy','sell') AND status IN ('placed','dry_run')"
-
-    def record_event(
-        self, *, trade_date: str, ticker: str, ts: str, signal: Optional[str],
-        intent: Optional[str], status: Optional[str], detail: Optional[str] = None,
-        dollar_amount: Optional[float] = None, run_id: Optional[str] = None,
-    ) -> None:
-        with self._conn() as c:
-            c.execute(
-                "INSERT INTO actions (trade_date, ticker, run_id, ts, signal, intent, "
-                "status, detail, dollar_amount) VALUES (?,?,?,?,?,?,?,?,?)",
-                (trade_date, ticker, run_id, ts, signal, intent, status, detail, dollar_amount),
-            )
-
-    def last_trade_action(self, trade_date: str, ticker: str) -> Optional[dict]:
-        """Most recent COMPLETED trade event for the ticker today (cooldown/on-change)."""
-        with self._conn() as c:
-            row = c.execute(
-                f"SELECT * FROM actions WHERE trade_date=? AND ticker=? AND {self._TRADE_FILTER} "
-                "ORDER BY ts DESC, id DESC LIMIT 1",
-                (trade_date, ticker),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def trade_actions_today(self, trade_date: str, ticker: str) -> int:
-        """Count of COMPLETED trades for the ticker today (the action cap)."""
-        with self._conn() as c:
-            row = c.execute(
-                f"SELECT COUNT(*) AS n FROM actions WHERE trade_date=? AND ticker=? "
-                f"AND {self._TRADE_FILTER}",
-                (trade_date, ticker),
-            ).fetchone()
-            return int(row["n"] or 0)
-
-    def derisk_acted_today(self, trade_date: str, ticker: str) -> bool:
-        """True if the graduated de-risk pass TRIMMED this name today (any DERISK-signal
-        action event). The rebalance buy-to-target pass checks this so it never re-buys a
-        position the PTJ de-risk just protected the same day (B4). No DERISK rows exist
-        until the de-risk feature is enabled, so this is False (byte-identical) by default."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM actions WHERE trade_date=? AND ticker=? AND signal='DERISK' LIMIT 1",
-                (trade_date, ticker),
-            ).fetchone()
-            return row is not None
-
-    def get_schedule(self, trade_date: str, ticker: str) -> Optional[dict]:
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM ticker_schedule WHERE trade_date=? AND ticker=?",
-                (trade_date, ticker),
-            ).fetchone()
-            return dict(row) if row else None
-
-    def bump_analysis(self, trade_date: str, ticker: str, *, next_due_ts: Optional[str]) -> int:
-        """Record that the ticker was analyzed: increment analyses_today, set next due.
-
-        Returns the new analyses_today. Upsert keyed by (trade_date, ticker).
-        """
-        with self._conn() as c:
-            c.execute(
-                "INSERT INTO ticker_schedule (trade_date, ticker, next_due_ts, analyses_today) "
-                "VALUES (?,?,?,1) ON CONFLICT(trade_date, ticker) DO UPDATE SET "
-                "next_due_ts=excluded.next_due_ts, analyses_today=analyses_today+1",
-                (trade_date, ticker, next_due_ts),
-            )
-            row = c.execute(
-                "SELECT analyses_today FROM ticker_schedule WHERE trade_date=? AND ticker=?",
-                (trade_date, ticker),
-            ).fetchone()
-            return int(row["analyses_today"]) if row else 0
-
     # --- order idempotency ----------------------------------------------------
 
     def new_ref_id(self) -> str:
@@ -977,21 +684,27 @@ class Ledger:
         dollar_amount: Optional[float], quantity: Optional[float], now_iso: str,
         order_kind: str = "entry", limit_price: Optional[float] = None,
         stop_price: Optional[float] = None, parent_ref_id: Optional[str] = None,
-        state: str = "reserved",
+        state: str = "proposed", proposal_id: Optional[int] = None,
+        leg_seq: Optional[int] = None, quote_at_proposal: Optional[float] = None,
+        conn=None,
     ) -> None:
-        """Persist the order row BEFORE calling the broker (crash safety).
+        """Persist the order row BEFORE any broker call (crash safety).
 
-        Phase 5 fields (order_kind/limit_price/stop_price/parent_ref_id/state)
-        default to a plain reserved market entry, so existing callers are unchanged.
+        A desk leg is reserved when its proposal is built, in state ``proposed``. Its
+        ``submitted_at`` stays NULL: ``broker_guard`` writes it at the first allowed place
+        call. Any other state stores ``now_iso`` as ``submitted_at``.
         """
-        with self._conn() as c:
+        submitted_at = None if state == "proposed" else now_iso
+        with self._use(conn) as c:
             c.execute(
                 "INSERT OR IGNORE INTO orders "
                 "(ref_id, trade_date, ticker, side, type, dollar_amount, quantity, "
-                "submitted_at, order_kind, limit_price, stop_price, parent_ref_id, state) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (ref_id, trade_date, ticker, side, type, dollar_amount, quantity, now_iso,
-                 order_kind, limit_price, stop_price, parent_ref_id, state),
+                "submitted_at, order_kind, limit_price, stop_price, parent_ref_id, state, "
+                "proposal_id, leg_seq, quote_at_proposal) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ref_id, trade_date, ticker, side, type, dollar_amount, quantity, submitted_at,
+                 order_kind, limit_price, stop_price, parent_ref_id, state,
+                 proposal_id, leg_seq, quote_at_proposal),
             )
 
     def get_order(self, ref_id: str) -> Optional[dict]:
@@ -999,44 +712,24 @@ class Ledger:
             row = c.execute("SELECT * FROM orders WHERE ref_id=?", (ref_id,)).fetchone()
             return dict(row) if row else None
 
-    def set_order_state(self, ref_id: str, state: str) -> None:
-        with self._conn() as c:
+    def set_order_state(self, ref_id: str, state: str, conn=None) -> None:
+        with self._use(conn) as c:
             c.execute("UPDATE orders SET state=? WHERE ref_id=?", (state, ref_id))
 
-    def open_protective_stops(self, ticker: str) -> list:
-        """Resting (GTC) protective stops for a ticker — must be cancelled before a
-        sell to avoid an orphaned/oversized stop. Not date-scoped (stops are GTC)."""
-        with self._conn() as c:
+    def legs(self, proposal_id: int, conn=None) -> list:
+        """The order rows (legs) of one proposal, in ``leg_seq`` order."""
+        with self._use(conn) as c:
             return [dict(r) for r in c.execute(
-                "SELECT * FROM orders WHERE ticker=? AND order_kind='protective_stop' "
-                "AND state='stop_placed'",
-                (ticker,),
-            ).fetchall()]
+                "SELECT * FROM orders WHERE proposal_id=? ORDER BY leg_seq, ref_id",
+                (int(proposal_id),)).fetchall()]
 
-    def finalize_order(self, ref_id: str, broker_order_id: Optional[str], result_json: str) -> None:
-        with self._conn() as c:
+    def finalize_order(self, ref_id: str, broker_order_id: Optional[str], result_json: str,
+                       conn=None) -> None:
+        with self._use(conn) as c:
             c.execute(
                 "UPDATE orders SET broker_order_id=?, result_json=?, finalized=1 WHERE ref_id=?",
                 (broker_order_id, result_json, ref_id),
             )
-
-    def unfinalized_orders(self, trade_date: str):
-        """Orders reserved but never finalized — reconcile these on restart.
-
-        Excludes ``protective_stop``. Robinhood rejects that order on a fractional
-        quantity, so the row can never become a real position change. Leaving it in
-        kept preflight awake AND removed its own ticker from ``pending``, which
-        blocked analysis of a held name (2026-08-11).
-
-        ``protective_exit`` STAYS in the set. That order moves shares, so a crash
-        between ``reserve_order`` and the broker call must reconcile the EXISTING
-        ``ref_id`` instead of minting a second one.
-        """
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT * FROM orders WHERE trade_date=? AND finalized=0 "
-                "AND COALESCE(order_kind,'') != 'protective_stop'", (trade_date,)
-            ).fetchall()]
 
     # --- real fills, read back from the broker -------------------------------
     # A fill is retired on the broker's STATE, never on a price. A partially_filled
@@ -1070,43 +763,10 @@ class Ledger:
                 "fill_state=?, fill_captured_at=? WHERE ref_id=?",
                 (avg_price, quantity, fees, str(fill_state or ""), now_iso, ref_id))
 
-    # --- broker cost basis, snapshotted by the tick glue ----------------------
-
-    def upsert_position_basis(self, ticker: str, *, avg_buy_price: float,
-                              quantity, as_of: str) -> None:
-        """Record the broker's average cost for one held name."""
-        with self._conn() as c:
-            c.execute(
-                "INSERT INTO position_basis (ticker, avg_buy_price, quantity, as_of) "
-                "VALUES (?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET "
-                "avg_buy_price=excluded.avg_buy_price, quantity=excluded.quantity, "
-                "as_of=excluded.as_of",
-                (str(ticker).upper(), float(avg_buy_price), quantity, as_of))
-
-    def get_position_basis(self, ticker: str):
-        """The recorded broker cost for ``ticker``, or None."""
-        with self._conn() as c:
-            r = c.execute("SELECT * FROM position_basis WHERE ticker=?",
-                          (str(ticker).upper(),)).fetchone()
-            return dict(r) if r else None
-
-    def clear_position_basis(self, keep_tickers) -> None:
-        """Drop rows for names no longer held, so a closed name never reads as open."""
-        keep = [str(t).upper() for t in (keep_tickers or [])]
-        with self._conn() as c:
-            if keep:
-                marks = ",".join("?" for _ in keep)
-                c.execute(f"DELETE FROM position_basis WHERE ticker NOT IN ({marks})", keep)
-            else:
-                c.execute("DELETE FROM position_basis")
-
-    # --- email-digest dedup ---------------------------------------------------
-    # Email is best-effort: we mark a digest as sent AFTER the orchestrator
-    # confirms delivery, so a crash in the send/commit gap re-sends (at most one
-    # duplicate) rather than silently losing the digest. ``content_hash`` is the
-    # dedup key: the same day's repeat (no-op) wakes produce the same hash and
-    # never re-send; a genuine change (e.g. a halt fires) produces a new hash,
-    # which REPLACEs the stored one so it sends exactly once more.
+    # --- notification dedup ---------------------------------------------------
+    # A message is marked sent AFTER Telegram confirms delivery, so a crash in the
+    # send/commit gap re-sends one duplicate instead of losing the message.
+    # ``content_hash`` is the dedup key per (trade_date, kind, stage).
 
     def last_notified_hash(self, trade_date: str, kind: str,
                            stage: str = "") -> Optional[str]:
@@ -1128,34 +788,9 @@ class Ledger:
                 (trade_date, kind, stage, content_hash, recipients, now_iso),
             )
 
-    # --- strategy layer: goal, target book, goal tracking, thesis state -------
-    # Runtime state of record for the 15%-goal macro book. Written by
-    # `strategy-set` (from strategy.yaml) and read by `construct`/`goal-track`.
-    # Read-only-safe for the analysis path: no trading limits, no broker here.
-
-    def set_strategy_goal(self, *, created_at: str, target_return_pct, horizon_months,
-                          benchmark, benchmark_annual_pct, constraint_note,
-                          macro_thesis_version, macro_thesis_json, active_book,
-                          as_of, start_date, start_equity) -> int:
-        """Make exactly ONE active goal: supersede any others, then insert.
-
-        Mirrors how a halt supersedes a prior state — there is always at most one
-        status='active' row. Returns the new goal id."""
-        with self._conn() as c:
-            c.execute("UPDATE strategy_goal SET status='superseded' WHERE status='active'")
-            cur = c.execute(
-                "INSERT INTO strategy_goal (created_at, status, target_return_pct, "
-                "horizon_months, benchmark, benchmark_annual_pct, constraint_note, "
-                "macro_thesis_version, macro_thesis_json, active_book, as_of, "
-                "start_date, start_equity) VALUES (?, 'active', ?,?,?,?,?,?,?,?,?,?,?)",
-                (created_at, target_return_pct, horizon_months, benchmark,
-                 benchmark_annual_pct, constraint_note, macro_thesis_version,
-                 macro_thesis_json, active_book, as_of, start_date, start_equity),
-            )
-            rid = cur.lastrowid
-            if rid is None:  # never happens after a successful INSERT, but be explicit
-                raise RuntimeError("strategy_goal INSERT did not return a row id")
-            return int(rid)
+    # --- strategy layer: goal, target book, goal tracking ----------------------
+    # The goal and the target book of record. `desk-seed` writes them once from
+    # strategy.yaml; after that only a confirmed change proposal moves them.
 
     def set_strategy_goal_with_holdings(self, *, goal: dict, holdings: list) -> int:
         """ATOMIC strategy-set: supersede prior goals, insert the new active goal,
@@ -1210,48 +845,40 @@ class Ledger:
             ).fetchone()
             return dict(row) if row else None
 
-    def set_active_book(self, goal_id: int, book: str) -> None:
-        with self._conn() as c:
-            c.execute("UPDATE strategy_goal SET active_book=? WHERE id=?", (book, goal_id))
-
     def upsert_target_holding(self, *, goal_id: int, sleeve, ticker, target_weight, band,
-                              status, book, quotable, proxy_ticker, updated_at) -> None:
-        """Latest-snapshot per (goal_id, ticker), like ticker_action. Idempotent
-        re-runs via ON CONFLICT DO UPDATE (same pattern as bump_analysis)."""
-        with self._conn() as c:
+                              status, book, quotable, proxy_ticker, updated_at,
+                              entry_price_max=None, conn=None) -> None:
+        """Latest-snapshot per (goal_id, ticker). Idempotent re-runs via ON CONFLICT
+        DO UPDATE. ``entry_price_max`` NULL means the name has no entry condition."""
+        with self._use(conn) as c:
             c.execute(
                 "INSERT INTO target_portfolio (goal_id, sleeve, ticker, target_weight, "
-                "band, status, book, quotable, proxy_ticker, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "band, status, book, quotable, proxy_ticker, updated_at, entry_price_max) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(goal_id, ticker) DO UPDATE SET sleeve=excluded.sleeve, "
                 "target_weight=excluded.target_weight, band=excluded.band, "
                 "status=excluded.status, book=excluded.book, quotable=excluded.quotable, "
-                "proxy_ticker=excluded.proxy_ticker, updated_at=excluded.updated_at",
+                "proxy_ticker=excluded.proxy_ticker, updated_at=excluded.updated_at, "
+                "entry_price_max=excluded.entry_price_max",
                 (goal_id, sleeve, ticker, target_weight, band, status, book,
-                 1 if quotable else 0, proxy_ticker, updated_at),
+                 1 if quotable else 0, proxy_ticker, updated_at, entry_price_max),
             )
 
-    def set_holding_status(self, goal_id: int, ticker: str, status: str, updated_at: str) -> None:
-        with self._conn() as c:
+    def set_holding_status(self, goal_id: int, ticker: str, status: str, updated_at: str,
+                           conn=None) -> None:
+        with self._use(conn) as c:
             c.execute(
                 "UPDATE target_portfolio SET status=?, updated_at=? WHERE goal_id=? AND ticker=?",
                 (status, updated_at, goal_id, ticker),
             )
 
-    def active_target_portfolio(self, goal_id: int, statuses=("active",)) -> list:
+    def active_target_portfolio(self, goal_id: int, statuses=("active",), conn=None) -> list:
         placeholders = ",".join("?" for _ in statuses)
-        with self._conn() as c:
+        with self._use(conn) as c:
             return [dict(r) for r in c.execute(
                 f"SELECT * FROM target_portfolio WHERE goal_id=? AND status IN ({placeholders}) "
                 "ORDER BY ticker ASC",
                 (goal_id, *statuses),
-            ).fetchall()]
-
-    def all_target_tickers(self, goal_id: int) -> list:
-        with self._conn() as c:
-            return [r["ticker"] for r in c.execute(
-                "SELECT ticker FROM target_portfolio WHERE goal_id=? ORDER BY ticker ASC",
-                (goal_id,),
             ).fetchall()]
 
     def record_goal_snapshot(self, *, goal_id: int, trade_date, captured_at, portfolio_value,
@@ -1266,13 +893,6 @@ class Ledger:
                 (goal_id, trade_date, captured_at, portfolio_value, glidepath_target_value,
                  cumulative_return_pct, ahead_behind_pct, alpha_vs_benchmark_pct, active_book, regime),
             )
-
-    def goal_tracking_series(self, goal_id: int) -> list:
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT * FROM goal_tracking WHERE goal_id=? ORDER BY trade_date ASC, id ASC",
-                (goal_id,),
-            ).fetchall()]
 
     # --- external cash flows (deposits/withdrawals) — goal/digest path ONLY ------
     # These let the goal-progress math deposit-adjust the return so external capital is
@@ -1316,41 +936,13 @@ class Ledger:
                 "SELECT trade_date, amount, note FROM cash_flows ORDER BY trade_date ASC, id ASC"
             ).fetchall()]
 
-    def get_thesis_state(self, goal_id: int) -> Optional[dict]:
-        with self._conn() as c:
-            row = c.execute("SELECT * FROM thesis_state WHERE goal_id=?", (goal_id,)).fetchone()
-            return dict(row) if row else None
-
-    def upsert_thesis_state(self, *, goal_id: int, as_of, regime, active_book, last_trigger,
-                            last_macro_json, updated_at, pending_regime=None,
-                            pending_since=None, confirm_count=0, regime_since=None) -> None:
-        """Upsert the thesis/regime state. ``regime`` is the EFFECTIVE (confirmed)
-        regime; ``pending_regime``/``confirm_count``/``pending_since`` carry the
-        in-flight confirmation; ``regime_since`` stamps when the effective regime last
-        changed (min-dwell). The confirmation fields default to "no pending change"."""
-        with self._conn() as c:
-            c.execute(
-                "INSERT INTO thesis_state (goal_id, as_of, regime, active_book, last_trigger, "
-                "last_macro_json, updated_at, pending_regime, pending_since, confirm_count, "
-                "regime_since) VALUES (?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(goal_id) DO UPDATE SET as_of=excluded.as_of, regime=excluded.regime, "
-                "active_book=excluded.active_book, last_trigger=excluded.last_trigger, "
-                "last_macro_json=excluded.last_macro_json, updated_at=excluded.updated_at, "
-                "pending_regime=excluded.pending_regime, pending_since=excluded.pending_since, "
-                "confirm_count=excluded.confirm_count, regime_since=excluded.regime_since",
-                (goal_id, as_of, regime, active_book, last_trigger, last_macro_json, updated_at,
-                 pending_regime, pending_since, confirm_count, regime_since),
-            )
-
     # --- strategy change log (append-only audit trail for strategic changes) ------
-    # Written ONLY on a real diff by the tick.py glue that knows the trigger/reason/
-    # proof (regime/book in construct+learn-review, weight/status in strategy-set +
-    # universe-apply). Observability — a change-log error never blocks a tick.
+    # Every applied change proposal writes rows here (trigger='owner_confirm').
 
     def record_strategy_change(self, *, goal_id, changed_at, change_type, ticker=None,
                                from_value=None, to_value=None, trigger=None, reason=None,
-                               proof_json=None) -> int:
-        with self._conn() as c:
+                               proof_json=None, conn=None) -> int:
+        with self._use(conn) as c:
             cur = c.execute(
                 "INSERT INTO strategy_change_log (goal_id, changed_at, change_type, ticker, "
                 "from_value, to_value, trigger, reason, proof_json) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1363,37 +955,34 @@ class Ledger:
             return int(cur.lastrowid or 0)
 
     def retarget_weights(self, goal_id: int, weights: dict, changed_at: str,
-                         changes: list) -> None:
-        """ATOMIC conviction re-target: the new target weights and their `weight`
+                         changes: list, *, trigger: str = "conviction", bands=None,
+                         conn=None) -> None:
+        """ATOMIC re-target: the new target weights (and bands) and their `weight`
         change-log rows commit together or not at all.
 
         weights: {ticker: target_weight} for the rows that change (the cash row included,
-        so the book still sums to ~100). changes: [{ticker, from_value, to_value, reason,
-        proof_json}], one per engine name that moved. A crash between the two writes would
-        leave a moved target with no log row, and `conviction_retargeted_on` reads the log.
+        so the book still sums to ~100). bands: an optional {ticker: band} map.
+        changes: [{ticker, from_value, to_value, reason, proof_json}], one per name that
+        moved. ``set_weights`` passes ``trigger='owner_confirm'``.
         """
-        with self._conn() as c:
+        bands = bands or {}
+        with self._use(conn) as c:
             for tk, w in weights.items():
                 c.execute(
                     "UPDATE target_portfolio SET target_weight=?, updated_at=? "
                     "WHERE goal_id=? AND ticker=?",
                     (float(w), changed_at, goal_id, str(tk).upper()))
+            for tk, b in bands.items():
+                c.execute(
+                    "UPDATE target_portfolio SET band=?, updated_at=? WHERE goal_id=? AND ticker=?",
+                    (float(b), changed_at, goal_id, str(tk).upper()))
             for ch in changes:
                 c.execute(
                     "INSERT INTO strategy_change_log (goal_id, changed_at, change_type, ticker, "
                     "from_value, to_value, trigger, reason, proof_json) VALUES (?,?,?,?,?,?,?,?,?)",
                     (goal_id, changed_at, "weight", str(ch["ticker"]).upper(),
-                     str(ch.get("from_value")), str(ch.get("to_value")), "conviction",
+                     str(ch.get("from_value")), str(ch.get("to_value")), trigger,
                      ch.get("reason"), ch.get("proof_json")))
-
-    def conviction_retargeted_on(self, goal_id: int, day: str) -> bool:
-        """True when a conviction re-target is already logged for this date (YYYY-MM-DD)."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT 1 FROM strategy_change_log WHERE goal_id=? AND change_type='weight' "
-                "AND trigger='conviction' AND substr(changed_at,1,10)=? LIMIT 1",
-                (goal_id, str(day)[:10])).fetchone()
-            return row is not None
 
     def strategy_change_history(self, goal_id: int, *, limit: int = 50,
                                 change_type: Optional[str] = None) -> list:
@@ -1411,132 +1000,58 @@ class Ledger:
                     (goal_id, limit)).fetchall()
             return [dict(r) for r in rows]
 
-    # --- universe change log (continual learning proposals; Stage 4) ----------
+    # --- named run locks (lib/runlock) -----------------------------------------
 
-    def record_universe_proposal(self, *, goal_id: int, proposed_at, kind, ticker, sleeve,
-                                 from_book, to_book, target_weight, tier, content_hash,
-                                 reason, goal_gap_pct, change_key=None) -> Optional[int]:
-        """Append a proposed change; deduped to ONE open row per (goal_id,
-        content_hash) by the partial unique index. Returns the new id, or None when
-        an identical open proposal already exists (so re-proposing every tick is a no-op).
-        ``change_key`` (tier-free (kind,ticker)) is stored for the pooled recurrence/cooldown
-        reads; it is optional only for back-compat, callers should pass ``p.change_key()``."""
-        with self._conn() as c:
-            cur = c.execute(
-                "INSERT OR IGNORE INTO universe_change_log (goal_id, proposed_at, kind, "
-                "ticker, sleeve, from_book, to_book, target_weight, tier, content_hash, "
-                "change_key, reason, goal_gap_pct, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?, 'proposed')",
-                (goal_id, proposed_at, kind, ticker, sleeve, from_book, to_book,
-                 target_weight, tier, content_hash, change_key, reason, goal_gap_pct),
-            )
-            if cur.rowcount and cur.lastrowid is not None:
-                return int(cur.lastrowid)
-            return None
+    def try_acquire_named_lock(self, name: str, holder: str, now_iso: str, *,
+                               ttl_seconds: int, holder_dead=None) -> bool:
+        """Take the ``run_locks`` row ``name`` for ``holder``. Returns True on acquire.
 
-    def pending_universe_changes(self, goal_id: int) -> list:
-        with self._conn() as c:
-            return [dict(r) for r in c.execute(
-                "SELECT * FROM universe_change_log WHERE goal_id=? AND status='proposed' "
-                "ORDER BY proposed_at ASC, id ASC", (goal_id,)).fetchall()]
-
-    def get_universe_change(self, change_id: int) -> Optional[dict]:
-        with self._conn() as c:
-            row = c.execute("SELECT * FROM universe_change_log WHERE id=?", (change_id,)).fetchone()
-            return dict(row) if row else None
-
-    def mark_universe_change(self, change_id: int, status: str, decided_at: str, decided_by: str) -> None:
-        with self._conn() as c:
-            c.execute("UPDATE universe_change_log SET status=?, decided_at=?, decided_by=? WHERE id=?",
-                      (status, decided_at, decided_by, change_id))
-
-    def expire_old_proposals(self, goal_id: int, before_date: str) -> int:
-        with self._conn() as c:
-            cur = c.execute("UPDATE universe_change_log SET status='expired' "
-                            "WHERE goal_id=? AND status='proposed' AND proposed_at < ?",
-                            (goal_id, before_date))
-            return cur.rowcount
-
-    def last_decided_universe_change(self, goal_id: int, content_hash: str) -> Optional[dict]:
-        """Most recent DECIDED (applied|rejected) row for a specific content_hash — an
-        IDENTITY lookup keyed on the exact stored row. The GB2 legislative apply-reconcile
-        (tick.py) resolves a bill's linked proposal_hash through this, so it must stay
-        content_hash-keyed (that persisted FK carries no kind/ticker to derive a change_key
-        from). The pooled anti-oscillation cooldown uses ``last_decided_change_key`` instead."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM universe_change_log WHERE goal_id=? AND content_hash=? "
-                "AND status IN ('applied','rejected') ORDER BY decided_at DESC, id DESC LIMIT 1",
-                (goal_id, content_hash)).fetchone()
-            return dict(row) if row else None
-
-    def last_decided_change_key(self, goal_id: int, change_key: str) -> Optional[dict]:
-        """Most recent DECIDED (applied|rejected) row for a change_key — the pooled
-        anti-oscillation read (Component E1). Keyed on (kind,ticker), so a change decided
-        under ANY tier puts the change into cooldown for every source: rejecting a screener
-        ``ADD CEG`` also suppresses a legislative ``ADD CEG`` for the window. None if never
-        decided. (The per-row identity variant is ``last_decided_universe_change``.)"""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT * FROM universe_change_log WHERE goal_id=? AND change_key=? "
-                "AND status IN ('applied','rejected') ORDER BY decided_at DESC, id DESC LIMIT 1",
-                (goal_id, change_key)).fetchone()
-            return dict(row) if row else None
-
-    def count_proposal_recurrence(self, goal_id: int, change_key: str) -> int:
-        """Distinct DAYS a change_key has been proposed (across all statuses AND all tiers)
-        — the confirm-over-N read (Component E2). Keyed on (kind,ticker) so the same change
-        from two sources pools its confirm-days; a REMOVE/DERISK/ADD is actionable only once
-        it has recurred on >= universe_confirm_days distinct days, so one crossing can't
-        evict a sleeve."""
-        with self._conn() as c:
-            row = c.execute(
-                "SELECT COUNT(DISTINCT substr(proposed_at,1,10)) AS d "
-                "FROM universe_change_log WHERE goal_id=? AND change_key=?",
-                (goal_id, change_key)).fetchone()
-            return int(row["d"] or 0)
-
-    # --- run_lock: single-writer mutex (belt-and-suspenders; Stage 5) ---------
-
-    def try_acquire_run_lock(self, holder: str, now_iso: str, ttl_seconds: int = 3600) -> bool:
-        """Acquire the single-row run lock. Steals a STALE lock (held longer than
-        the TTL, which exceeds any real tick wall-clock). Returns True on acquire.
-
-        ATOMIC: the read-check-write runs inside a ``BEGIN IMMEDIATE`` transaction, so the
-        DB write lock is taken BEFORE the SELECT. Without it, two overlapping ticks could
-        both read "stale/empty" and both steal/insert the lock (a check-then-act race) —
-        exactly the double-tick the lock exists to prevent. A process that can't get the
-        write lock within busy_timeout returns False (treated as "someone else holds it")."""
+        The lock is free when no row exists, when ``holder_dead(row.holder)`` is True
+        (another boot, or no such process), or when the row is older than the TTL.
+        ATOMIC: the read-check-write runs inside ``BEGIN IMMEDIATE``, so two runners
+        can never both see a free lock."""
         conn = sqlite3.connect(self.db_path, timeout=30, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT holder, acquired_at FROM run_lock WHERE id=1").fetchone()
+            row = conn.execute("SELECT holder, acquired_at FROM run_locks WHERE name=?",
+                               (name,)).fetchone()
             if row is not None:
                 try:
-                    age = (datetime.fromisoformat(now_iso)
-                           - datetime.fromisoformat(row[1])).total_seconds()
+                    age = (_aware(now_iso) - _aware(row[1])).total_seconds()
                 except (TypeError, ValueError):
                     age = ttl_seconds + 1
-                if age < ttl_seconds:
+                dead = bool(holder_dead(row[0])) if holder_dead is not None else False
+                if age < ttl_seconds and not dead:
                     conn.execute("ROLLBACK")
                     return False
-                conn.execute("UPDATE run_lock SET holder=?, acquired_at=? WHERE id=1", (holder, now_iso))
+                conn.execute("UPDATE run_locks SET holder=?, acquired_at=? WHERE name=?",
+                             (holder, now_iso, name))
             else:
-                conn.execute("INSERT INTO run_lock (id, holder, acquired_at) VALUES (1, ?, ?)",
-                             (holder, now_iso))
+                conn.execute("INSERT INTO run_locks (name, holder, acquired_at) VALUES (?, ?, ?)",
+                             (name, holder, now_iso))
             conn.execute("COMMIT")
             return True
         except sqlite3.OperationalError:
-            # Couldn't take the write lock in time -> another tick holds it; not acquired.
             return False
         finally:
             conn.close()
 
-    def release_run_lock(self, holder: str) -> None:
+    def release_named_lock(self, name: str, holder: str) -> None:
         with self._conn() as c:
-            c.execute("DELETE FROM run_lock WHERE id=1 AND holder=?", (holder,))
+            c.execute("DELETE FROM run_locks WHERE name=? AND holder=?", (name, holder))
 
-    def run_lock_state(self) -> Optional[dict]:
+    def named_lock(self, name: str) -> Optional[dict]:
         with self._conn() as c:
-            row = c.execute("SELECT * FROM run_lock WHERE id=1").fetchone()
+            row = c.execute("SELECT * FROM run_locks WHERE name=?", (name,)).fetchone()
             return dict(row) if row else None
+
+
+def _aware(value: str) -> datetime:
+    """Parse a stored time; a naive value counts as UTC, so ET and UTC stamps compare."""
+    s = str(value)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+

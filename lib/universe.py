@@ -1,11 +1,8 @@
-"""Pure add/remove-asset transition logic + the RH allow-list / quotable gate.
+"""Pure book helpers: the tradable universe of a book and the book validator.
 
-No I/O — operates on plain dicts/lists so it is fully unit-tested offline. Enforces
-the plan's safety rules: an ADD must be allow-listed AND equities-MCP quotable; a
-REMOVE transitions a holding active -> exiting (never deleted while a position may
-exist) so the rebalancer winds it to zero before it is gone; freed weight is
-conserved into the cash sleeve and the book re-validated so a malformed book is
-never committed.
+No I/O; plain dicts and lists, unit-tested offline. ``tradable_universe`` lists the
+names a snapshot must quote (``snapshot-prepare``). ``validate_book`` refuses a book
+that does not sum to 100 or whose band is not inside its weight.
 """
 
 from __future__ import annotations
@@ -65,115 +62,13 @@ def tradable_universe(rows, cash_sleeve_ticker: str = "SGOV") -> List[str]:
     return out
 
 
-def validate_add(ticker: str, rh_tradable_confirmed, quotable_set) -> Tuple[bool, str]:
-    """An ADD must be on the RH allow-list AND equities-MCP quotable.
-
-    Spot crypto (SOL, etc.) is quotable=False -> blocked from auto-apply; it would
-    need a manual route once a crypto MCP exposes quotes."""
-    t = str(ticker).upper()
-    if t not in _upper_set(rh_tradable_confirmed):
-        return (False, f"{t} is not in rh_tradable_confirmed")
-    if t not in _upper_set(quotable_set):
-        return (False, f"{t} is not equities-MCP quotable (spot crypto blocked from auto-apply)")
-    return (True, "ok")
-
-
-def apply_remove(rows: List[dict], ticker: str) -> Tuple[List[dict], float]:
-    """Transition a holding to 'exiting' with weight 0 (wound to zero by the
-    rebalancer, never hard-deleted). Returns (new_rows, freed_weight)."""
-    t = str(ticker).upper()
-    out: List[dict] = []
-    freed = 0.0
-    for r in rows:
-        if str(r.get("ticker")).upper() == t and r.get("status") != "removed":
-            freed += float(r.get("target_weight", 0) or 0)
-            nr = dict(r)
-            nr["status"] = "exiting"
-            nr["target_weight"] = 0.0
-            out.append(nr)
-        else:
-            out.append(dict(r))
-    return (out, freed)
-
-
-def conserve_to_cash(rows: List[dict], delta: float, cash_ticker: str = "SGOV") -> List[dict]:
-    """Adjust the cash sleeve's weight by ``delta`` so the book stays summed to ~100.
-
-    One helper for both directions (DRY): ``delta > 0`` FREES weight to cash (a REMOVE
-    returns the dropped name's weight), ``delta < 0`` FUNDS a new name FROM cash (an
-    ADD). The caller is responsible for the offsetting engine-side change and for
-    re-validating (``validate_book`` rejects a resulting negative cash weight)."""
-    ct = str(cash_ticker).upper()
-    out: List[dict] = []
-    for r in rows:
-        nr = dict(r)
-        if str(nr.get("ticker")).upper() == ct:
-            nr["target_weight"] = float(nr.get("target_weight", 0) or 0) + float(delta)
-        out.append(nr)
-    return out
-
-
-def redistribute_to_cash(rows: List[dict], freed_weight: float, cash_ticker: str = "SGOV") -> List[dict]:
-    """Conserve freed weight INTO cash (REMOVE direction). Thin wrapper over
-    ``conserve_to_cash`` kept for the existing apply_remove call site + tests."""
-    return conserve_to_cash(rows, float(freed_weight), cash_ticker)
-
-
-def apply_add(rows: List[dict], ticker: str, sleeve: str, weight: float, band: float,
-              cash_ticker: str = "SGOV") -> Tuple[List[dict], float, str]:
-    """Add (or re-activate) ``ticker`` at ``weight``, FUNDING ONLY THE DELTA from cash.
-
-    The safety-critical inverse of ``apply_remove`` (returns ``(new_rows,
-    funded_delta, reason)``):
-      * REFUSES (funded 0, NO change) if ``weight <= 0``; if the ticker is ALREADY at
-        ``>= weight`` (an idempotent re-add — e.g. a re-approved catalyst proposal);
-        or if the cash sleeve has less than the incremental ``delta`` to give — never
-        creates a negative cash weight or a book that doesn't conserve to ~100.
-      * funds only ``delta = weight - existing_weight`` from cash, so re-applying a
-        name already active at ``weight`` is a NO-OP (does not re-debit cash) — closing
-        the multi-bill / re-approve cash-erosion path.
-      * if the ticker already exists (a prior ``exiting``/``removed``/``active`` row) it is
-        re-activated/adjusted to the new weight rather than duplicated.
-    The caller still runs ``validate_book`` (allow-list/quotability is ``validate_add``).
-    """
-    t = str(ticker).upper()
-    ct = str(cash_ticker).upper()
-    w = float(weight)
-    if w <= 0:
-        return (rows, 0.0, f"add weight must be > 0 (got {w})")
-    existing_w = sum(float(r.get("target_weight", 0) or 0)
-                     for r in rows if str(r.get("ticker")).upper() == t and r.get("status") != "removed")
-    delta = w - existing_w
-    if delta <= 1e-9:
-        return (rows, 0.0, f"{t} already at {existing_w:.2f}% >= requested {w:.2f}% (no funding needed)")
-    cash_w = sum(float(r.get("target_weight", 0) or 0)
-                 for r in rows if str(r.get("ticker")).upper() == ct)
-    if delta > cash_w + 1e-9:
-        return (rows, 0.0, f"insufficient cash weight to fund {t}: "
-                           f"{cash_w:.2f}% available < {delta:.2f}% needed")
-    out: List[dict] = []
-    found = False
-    for r in rows:
-        nr = dict(r)
-        if str(nr.get("ticker")).upper() == t:
-            found = True
-            nr.update(sleeve=(sleeve or nr.get("sleeve")), target_weight=w,
-                      band=float(band or 0), status="active",
-                      quotable=nr.get("quotable", 1))
-        out.append(nr)
-    if not found:
-        out.append({"sleeve": sleeve, "ticker": t, "target_weight": w, "band": float(band or 0),
-                    "status": "active", "book": None, "quotable": 1, "proxy_ticker": None})
-    out = conserve_to_cash(out, -delta, ct)   # fund only the INCREMENTAL weight FROM cash
-    return (out, delta, "ok")
-
-
-def validate_book(rows: List[dict]) -> Tuple[bool, str]:
-    """A book is valid when its non-removed weights sum to ~100 and every engine
-    holding's band is strictly inside its weight. Refuses a malformed book."""
+def validate_book(rows: List[dict], tolerance: float = _WEIGHT_SUM_TOLERANCE) -> Tuple[bool, str]:
+    """A book is valid when its non-removed weights sum to 100 within ``tolerance`` and
+    every engine holding's band is strictly inside its weight. A confirmed change passes
+    0.01; the seed book of strategy.yaml uses the default 0.5."""
     total = sum(float(r.get("target_weight", 0) or 0)
                 for r in rows if r.get("status") != "removed")
-    if abs(total - 100.0) > _WEIGHT_SUM_TOLERANCE:
+    if abs(total - 100.0) > tolerance:
         return (False, f"weights sum to {total:.2f}, expected ~100")
     # No negative weights anywhere (incl. cash) — an over-funded ADD that drove the cash
     # sleeve below zero must be rejected, never committed.

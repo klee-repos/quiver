@@ -6,12 +6,13 @@ Proves the four properties that make this a diagnostic rather than a gate:
   B. it REFUSES rather than guesses on a starved ledger, a stale sidecar, or a
      corrupt one -- always exit 0, always a stated reason, never a traceback;
   C. it emits NO verdict / threshold / p-value key, at any sample size;
-  D. it is INVISIBLE to the trading path: importing the sizing/learning modules
-     never pulls it in, `plan` output is byte-identical with and without the
+  D. it is INVISIBLE to the trading path: importing the consumers of plan §14.10
+     (lib/sizing.py, lib/memory.py, lib/desk/proposals.py, lib/desk/execution.py)
+     never pulls it in, `build_trade` output is identical with and without the
      sidecar present, and running it mutates no ledger row.
 
 Every case runs against a TEMP ledger. Nothing here may write to state/ledger.db:
-`plan` calls get_or_create_baseline(), which would insert a fabricated row into
+a snapshot writes the day's baseline, which would insert a fabricated row into
 the very equity series this feature regresses on.
 
 Offline: the factor sidecar is written directly as a fixture, so no case here
@@ -69,6 +70,36 @@ def _run(workdir: Path, db: Path, cfg: Path, *args, timeout=180):
 # state/tmp/factors.json would clobber the operator's live scratch file -- which it
 # did once during development, silently starving a real run down to one holding.
 SIDECAR = Path(tempfile.mkdtemp(prefix="quiver-attr-sidecar-")) / "factors.json"
+
+
+# The build driver for block D. It runs in a fresh interpreter (argv[1] is a label only),
+# pins the clock inside the 2026-08-05 session, builds the drift proposal and prints one JSON
+# line. ref_ids are UUIDs, so they are replaced by their position before the comparison.
+# (The seed helper imports tick, which imports attribution, so the import check of block D
+# runs on the consumers alone, not here.)
+_BUILD_DRIVER = r"""
+import json, os, sys
+sys.path.insert(0, os.getcwd()); sys.path.insert(0, os.path.join(os.getcwd(), "tests"))
+from desk_fakes import temp_root, seed_desk, snapshot, FakeClock, FakePrices
+from lib.desk import proposals
+clk = FakeClock("2026-08-05T13:40:00Z").pin_market()
+try:
+    with temp_root() as root:
+        seed_desk(root)
+        snapshot(root)
+        led, cfg = root.led(), root.cfg()
+        with led.transaction() as conn:
+            b = proposals.build_trade(led, conn, cfg=cfg, tickers=["ANET"], origin={},
+                                      rationale="ANET is outside its band.", created_by="monitor",
+                                      python_origin="drift", now_dt=clk.now, yf_price_fn=FakePrices())
+        for i, leg in enumerate(b.get("legs") or []):
+            leg["ref_id"] = f"leg{i}"
+        p = os.environ.get("QUIVER_FACTORS_PATH")
+        print(json.dumps({"build": b, "sidecar_present": bool(p and os.path.exists(p))},
+                         default=str, sort_keys=True))
+finally:
+    clk.unpin()
+"""
 
 
 def _write_sidecar(day: str, series: dict) -> Path:
@@ -285,74 +316,51 @@ def _run_cases():
            "not a gate" in str((out or {}).get("basis", "")).lower(), out.get("basis") if out else None)
 
     # ---------- D. invisible to the trading path -----------------------------
-    probe = (
-        "import sys; "
-        "import tick, lib.signals, lib.allocate, lib.calibrate, lib.memory, "
-        "lib.levers, lib.risk, lib.reflect_memory; "
-        "import analyze; "
-        "bad=[m for m in ('lib.attribution',) if m in sys.modules]; "
-        "print('LEAK' if bad else 'CLEAN')"
-    )
-    del probe  # superseded by probe2 below (tick.py legitimately owns the subcommand)
-    # tick.py itself legitimately imports attribution (it owns the subcommand), so
-    # the meaningful check is the ANALYSIS/SIZING side in its own interpreter.
-    probe2 = (
-        "import sys; "
-        "import lib.signals, lib.allocate, lib.calibrate, lib.memory, lib.levers, "
-        "lib.risk, lib.reflect_memory, lib.strategy_context; "
-        "bad=[m for m in sys.modules if m=='lib.attribution']; "
-        "print('LEAK' if bad else 'CLEAN')"
-    )
-    pr2 = subprocess.run([PY, "-c", probe2], cwd=str(REPO), capture_output=True, text=True, timeout=180)
-    ok("D: sizing/learning/analysis modules never import attribution (transitive)",
-       "CLEAN" in pr2.stdout, pr2.stdout + pr2.stderr[-300:])
+    # tick.py legitimately imports attribution (it owns the subcommand), so the check is
+    # the CONSUMER list of plan §14.10, each in its own interpreter: the sizing math, the
+    # memory scorecard, the proposal builder and the execution path.
+    consumers = ("lib.sizing", "lib.memory", "lib.desk.proposals", "lib.desk.execution")
+    for mod in consumers:
+        pr = subprocess.run([PY, "-c", f"import sys, {mod}; "
+                             "print('LEAK' if 'lib.attribution' in sys.modules else 'CLEAN')"],
+                            cwd=str(REPO), capture_output=True, text=True, timeout=180)
+        ok(f"D: {mod} never imports attribution (transitive)",
+           pr.stdout.strip() == "CLEAN", pr.stdout + pr.stderr[-300:])
+    pr2 = subprocess.run([PY, "-c", "import sys; " + "; ".join(f"import {m}" for m in consumers)
+                          + "; print('LEAK' if 'lib.attribution' in sys.modules else 'CLEAN')"],
+                         cwd=str(REPO), capture_output=True, text=True, timeout=180)
+    ok("D: all four consumers together never import attribution",
+       pr2.stdout.strip() == "CLEAN", pr2.stdout + pr2.stderr[-300:])
 
-    # plan output must be byte-identical with and without the sidecar present.
-    with tempfile.TemporaryDirectory() as td:
-        d = Path(td)
-        db = d / "ledger.db"
-        cfg = _seed_config(d)
-        Ledger(str(db))
-        plan_in = d / "plan.json"
-        # The REAL plan input shape (tick.py module docstring). An input plan
-        # rejects produces an identical {"error": ...} on both runs, which would
-        # make the byte-identity assertion below trivially true -- so the shape
-        # matters and `ok:true` is asserted before the comparison is trusted.
-        plan_in.write_text(json.dumps({
-            "equity": 1000.0,
-            "buying_power": 500.0,
-            "now_iso": "2026-06-15T10:00:00-04:00",
-            "run_id": "fixed-run-id-for-determinism",
-            "positions": {},
-            "analyses": [],
-        }))
+    # build_trade output must be identical with and without the factor sidecar. Each run is a
+    # fresh interpreter on its own temp root: the real desk-seed, the real snapshot-commit and
+    # a drift proposal for ANET (15% of the book against a 25% target, band 5).
+    def run_build(with_sidecar: bool) -> dict:
         env = dict(os.environ)
-        env["QUIVER_LEDGER_DB"] = str(db)
-        env["QUIVER_CONFIG"] = str(cfg)
-        env["RH_ACCOUNT_NUMBER"] = "12345678"
+        env.pop("QUIVER_FACTORS_PATH", None)
+        if with_sidecar:
+            _, spy, _ = _synthetic_series(30, beta=1.0)
+            _write_sidecar(day, {"SPY": spy, "ANET": spy, "CEG": spy})
+            env["QUIVER_FACTORS_PATH"] = str(SIDECAR)
+        elif SIDECAR.exists():
+            SIDECAR.unlink()
+        p = subprocess.run([PY, "-c", _BUILD_DRIVER, "1" if with_sidecar else "0"], cwd=str(REPO),
+                           env=env, capture_output=True, text=True, timeout=300)
+        lines = [ln for ln in p.stdout.splitlines() if ln.strip().startswith("{")]
+        return {"rc": p.returncode, "out": json.loads(lines[-1]) if lines else None, "err": p.stderr[-400:]}
 
-        def run_plan():
-            p = subprocess.run([PY, "tick.py", "plan", "--input", str(plan_in)],
-                               cwd=str(REPO), env=env, capture_output=True, text=True, timeout=180)
-            return p.stdout
-
-        _, spy, _ = _synthetic_series(30, beta=1.0)
-        _write_sidecar(day, {"SPY": spy})
-        with_sidecar = run_plan()
-        SIDECAR.unlink()
-        without_sidecar = run_plan()
-        # NON-VACUITY GATE FIRST. A failing plan emits the same error string on both
-        # runs, so byte-identity would hold for the wrong reason. Assert plan
-        # actually SUCCEEDED before the comparison means anything. (Caught by
-        # mutation testing: with a malformed input the comparison passed even when
-        # plan was deliberately made sidecar-dependent.)
-        _pj = [ln for ln in with_sidecar.splitlines() if ln.strip().startswith("{")]
-        _pd = json.loads(_pj[-1]) if _pj else {}
-        ok("D: plan SUCCEEDED, so the byte-identity comparison is not vacuous",
-           bool(_pd) and "error" not in _pd and _pd.get("ok") is not False, _pd)
-        ok("D: plan stdout is byte-identical with and without the factor sidecar",
-           with_sidecar == without_sidecar,
-           f"len {len(with_sidecar)} vs {len(without_sidecar)}")
+    w = run_build(True)
+    wo = run_build(False)
+    # NON-VACUITY GATE FIRST. Two refusals compare equal for the wrong reason.
+    built = (w["out"] or {}).get("build") or {}
+    ok("D: build_trade SUCCEEDED (one ANET buy leg), so the comparison is not vacuous",
+       w["rc"] == 0 and len(built.get("legs") or []) == 1 and built["legs"][0]["ticker"] == "ANET",
+       w)
+    ok("D: the sidecar run really had a sidecar on disk", (w["out"] or {}).get("sidecar_present") is True, w["out"])
+    ok("D: the other run had none", (wo["out"] or {}).get("sidecar_present") is False, wo["out"])
+    ok("D: build_trade output is identical with and without the factor sidecar",
+       (w["out"] or {}).get("build") == (wo["out"] or {}).get("build"),
+       {"with": (w["out"] or {}).get("build"), "without": (wo["out"] or {}).get("build")})
 
     # ---------- D2. the real ledger is untouched by a real run ---------------
     real = REPO / "state" / "ledger.db"
