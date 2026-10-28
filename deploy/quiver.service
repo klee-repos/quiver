@@ -1,5 +1,5 @@
 [Unit]
-Description=Quiver — one headless trading tick
+Description=Quiver — one monitor run (EDGAR, news, levels, drift, brief; no LLM, no broker)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,33 +9,19 @@ User=quiver
 Group=quiver
 WorkingDirectory=/opt/quiver
 EnvironmentFile=/etc/quiver/quiver.env
-# Clean per-tick status lines also go to this file (stdout still goes to journald),
-# so the Cloud Logging Ops Agent can tail it and the log-based metric alarms have data. It sits
-# under ReadWritePaths below; locally run_tick.py defaults to logs/tick.log instead.
+# The Ops Agent ships this file to the quiver_tick log.
 Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
-# CLAUDE_CONFIG_DIR comes from quiver.env (=/opt/quiver/state/claude-config) — a writable
-# ReadWritePath, so claude/MCP OAuth state is readable+refreshable even under ProtectHome.
-# Keep npx's cache (used by the EVE brain / claude tooling) off the read-only HOME,
-# else the in-tick run silently fails on cache writes.
-Environment=npm_config_cache=/opt/quiver/state/.npm-cache
-ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_tick.py
-# Outer guard only. STEP 3 now BLOCKS on the full-book analysis (~11 GLM runs; a slow,
-# retry-heavy day can run 60-90 min — see run_tick.py). Keep this ABOVE run_tick.py's own 4h
-# (14400s) internal backstop so run_tick's timeout fires first and pages a clean alert rather
-# than systemd SIGTERM-ing a legit slow tick. Overlapping hourly fires no-op via the run_lock.
-TimeoutStartSec=15000
-StandardOutput=journal
-StandardError=journal
-# Hardening (mirrors BRAX): the tick may only write its own state/logs. ProtectHome stays
-# read-only — all writable claude/MCP/npm state is redirected under /opt/quiver/state above.
+Environment=XDG_CACHE_HOME=/opt/quiver/state/.cache
+ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_monitor.py
+# End before the next :40 fire. The snapshot wait is at most 180 s.
+TimeoutStartSec=2400
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 ReadWritePaths=/opt/quiver/state /opt/quiver/logs /var/log/quiver
-# 2 GiB box (e2-small); the tick spawns claude + analyze.py subprocesses. A measured tick
-# holds the box near 0.9 GiB, with a spike up to about 1.3 GiB above idle in its first minute
-# (Cloud Monitoring, Sept-Oct 2026). This cap is above the physical RAM, so it does not bind
-# on this box; the 4G swapfile from deploy/gcp/setup.sh absorbs a spike. It binds on a
-# larger machine type.
-MemoryMax=2500M
+InaccessiblePaths=/opt/quiver/state/claude-config /opt/quiver/state/claude-desk /etc/quiver
+MemoryMax=512M

@@ -31,7 +31,8 @@ esac
 read -r -d '' REMOTE <<'EOS' || true
 set -eu
 ENVF=/etc/quiver/quiver.env
-val() { sudo sed -n "s/^$1=//p" "$ENVF" | tail -n 1; }
+# quiver.env may quote a value (setup.sh writes CLAUDE_BIN="..."); strip one pair of quotes.
+val() { sudo sed -n "s/^$1=//p" "$ENVF" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"; }
 BIN="$(val CLAUDE_BIN)"; BIN="${BIN:-/opt/quiver/npm-global/bin/claude}"
 CFG="$(val CLAUDE_CONFIG_DIR)"; CFG="${CFG:-/opt/quiver/state/claude-config}"
 cd /opt/quiver

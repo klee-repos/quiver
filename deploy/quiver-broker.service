@@ -1,0 +1,30 @@
+[Unit]
+Description=Quiver — broker runner (the only process with Robinhood access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quiver
+Group=quiver
+WorkingDirectory=/opt/quiver
+EnvironmentFile=/etc/quiver/quiver.env
+# The Robinhood MCP and its OAuth (deploy/gcp/rh-reauth.sh writes them here).
+Environment=CLAUDE_CONFIG_DIR=/opt/quiver/state/claude-config
+Environment=DISABLE_AUTOUPDATER=1
+Environment=QUIVER_TICK_LOG=/var/log/quiver/tick.log
+ExecStart=/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/run_broker.py
+# Each execute job has 600 s. A killed run is safe: the next run reconciles 'placing' legs
+# by symbol, side, amount and time (§11.1 step 4).
+RuntimeMaxSec=3600
+Restart=no
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/quiver/state /opt/quiver/logs /var/log/quiver
+InaccessiblePaths=/opt/quiver/state/claude-desk /etc/quiver
+MemoryMax=1024M

@@ -14,6 +14,7 @@ cd "$(dirname "$0")/../.."
 [ -f strategy.yaml ] || { echo "FATAL: no strategy.yaml (cp strategy.yaml.example strategy.yaml)"; exit 1; }
 [ -n "$PROJECT" ] || { echo "FATAL: no GCP project (gcloud config set project <id>)"; exit 1; }
 echo "project: $PROJECT  prefix: $PREFIX"
+# bash runs .env as a script. Quote a value with a space: SEC_USER_AGENT="Quiver you@example.com".
 set -a; . ./.env; set +a
 
 put() {  # $1 = key, $2 = value
@@ -24,12 +25,14 @@ put() {  # $1 = key, $2 = value
     && echo "  $name  <- set"
 }
 
+# A fixed list, not every .env key (plan §15.3). Each non-empty key gets a new version on each
+# run. terraform/main.tf `locals.secrets` must list each key the box reads, or the read is a 403.
 echo "[1] secrets from .env -> Secret Manager"
-for k in GLM_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY RH_ACCOUNT_NUMBER NOTIFY_TO RESEND_API_KEY RESEND_FROM NOTIFY_ALERTS_TO CLAUDE_CODE_OAUTH_TOKEN CONGRESS_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_CHAT_IDS; do
+for k in RH_ACCOUNT_NUMBER CLAUDE_CODE_OAUTH_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_CHAT_IDS TELEGRAM_ALERT_CHAT_IDS SEC_USER_AGENT ALPHA_VANTAGE_API_KEY; do
   v="${!k:-}"; { [ -n "$v" ] && put "$k" "$v"; } || echo "  $k: (empty in .env, skipped)"
 done
 
-echo "[2] your private strategy book -> Secret Manager"
+echo "[2] your private strategy book -> Secret Manager (tick.py desk-seed reads it once)"
 put STRATEGY_YAML "$(cat strategy.yaml)"
 
 echo

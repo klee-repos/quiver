@@ -23,9 +23,9 @@ variable "name" {
 }
 
 variable "machine_type" {
-  description = "e2-small (2 shared vCPU, 2 GiB) runs the tick with no desktop; ~$12/mo. setup.sh adds a 4G swapfile for the nightly npm update peak."
+  description = "e2-medium (2 shared vCPU, 4 GiB): the resident desk session, an analyst run and a broker run can overlap. setup.sh adds a 4G swapfile for a peak."
   type        = string
-  default     = "e2-small"
+  default     = "e2-medium"
 }
 
 variable "repo_url" {

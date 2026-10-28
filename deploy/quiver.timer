@@ -1,16 +1,9 @@
 [Unit]
-Description=Quiver tick schedule (weekday market-hours)
+Description=Quiver — monitor schedule (weekdays, hourly at :40, 11:40 to 23:40 UTC)
 
 [Timer]
-# Weekdays, hourly at :40 past the hour through the US session. Firing at :40 (not on the
-# open) makes the first useful tick ~9:40 ET — 10 min past the 9:30 ET open, so it clears
-# preflight's act_after_open_minutes gate instead of no-op'ing as `too_early` (the 9:30 ET
-# fire did). The XNYS calendar in lib/market makes preflight a cheap no-op outside the real
-# session / on holidays. Hours are UTC (the box's default TZ); 13..21 UTC covers ~9:00-17:00
-# ET across DST, and because the market open shifts with ET too, the first :40 fire after the
-# open is 9:40 ET in BOTH seasons (in winter the 13:40 UTC fire is a pre-open no-op and the
-# 14:40 UTC = 9:40 EST fire is the first to act). Serial by construction (oneshot) + run_lock.
-OnCalendar=Mon..Fri 13..21:40:00 UTC
+# 11:40 UTC = 7:40 EDT / 6:40 EST. 23:40 UTC = 19:40 EDT / 18:40 EST.
+OnCalendar=Mon..Fri *-*-* 11..23:40:00 UTC
 Persistent=false
 AccuracySec=1min
 

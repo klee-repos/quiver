@@ -1,18 +1,14 @@
-"""Last-resort Telegram sender — the bot's ONE alerting egress, ops-layer ONLY.
+"""The Telegram network path: alert pages, desk messages, cards and the bridge's Bot API calls.
 
-This is the Telegram twin of ``lib/mailer.py``: the single network path that ships the
-bot's autonomous alerts (the daily digest + the halt / auth_error / error pages) to the
-operator's Telegram chat, replacing email. Both senders use it — the in-tick path
-(``tick.py report-send``) and the headless last-resort supervisor
-(``deploy/runner/run_tick.py`` ``_maybe_alert``).
+``send_message`` ships the halt / auth_error / error pages (``runner_common._maybe_alert``
+and ``tick.py send-test``). ``api`` makes the calls ``send_message`` cannot: inline
+keyboards, replies, reactions, chat actions, callback answers, button edits and
+``getUpdates``. ``lib/desk/outbox.py`` and ``deploy/runner/chat_bridge.py`` use it.
 
 INVARIANT — read before importing this anywhere:
-  * This is a DELIBERATE, narrow exception to the project rule "the trading path never
-    sends." It is scoped to the ops/observability layer. ``lib/telegram`` MUST NEVER be
-    imported by the trading brain (``analyze.py`` / ``lib.signals`` / ``lib.memory`` / the
-    plan path); ``tick.py`` and ``run_tick.py`` import it LOCALLY inside their send funcs so
-    ``import tick`` stays clean. An e2e test (``tests/test_e2e_alerts.py`` block J) asserts
-    that import graph for BOTH ``lib.mailer`` and ``lib.telegram``.
+  * No research module imports this (``tests/test_e2e_alerts.py`` block J and the W2 wall
+    test enforce it). ``tick.py`` imports it LOCALLY inside its send function so
+    ``import tick`` stays clean.
   * ``lib/notify`` stays a pure renderer (it produces the Telegram-HTML string). This module
     is the only place that touches the Telegram network, and it is best-effort:
     ``send_message`` NEVER raises — a transport/DNS/TLS/4xx/5xx/parse failure is captured into
@@ -157,6 +153,37 @@ def post(*, token: str, chat_id: str, text: str, parse_mode: str = "HTML",
         return {"ok": False, "error": f"http {e.code}: {detail or e.reason}"}
     except Exception as e:  # noqa: BLE001 — DNS/TLS/timeout/socket: NEVER raise out of here
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def api(token: str, method: str, params: dict, timeout: float = 15.0, *, opener=None) -> dict:
+    """Call one Bot API method. BEST-EFFORT — never raises. Returns Telegram's answer
+    (``{"ok": True, "result": ...}`` or ``{"ok": False, "error_code": n, "description": ...}``);
+    a transport failure becomes ``{"ok": False, "description": <reason>}``. ``opener`` is
+    the test seam: ``opener(url, data_bytes, timeout) -> (status, body_bytes)``."""
+    if _disabled() and opener is None:
+        return {"ok": True, "result": {"message_id": 0}, "disabled": True}
+    url = _api_url((token or "").strip(), method)
+    data = json.dumps(params or {}).encode("utf-8")
+    try:
+        if opener is not None:
+            status, body = opener(url, data, timeout)
+        else:
+            req = urllib.request.Request(url, data=data, method="POST",
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status, body = resp.status, resp.read()
+            except urllib.error.HTTPError as e:
+                status, body = e.code, (e.read() if e.fp else b"")
+        try:
+            parsed = json.loads(body.decode("utf-8", "replace")) if body else {}
+        except ValueError:
+            parsed = {}
+        if not isinstance(parsed, dict) or "ok" not in parsed:
+            return {"ok": False, "error_code": status, "description": f"http {status}"}
+        return parsed
+    except Exception as e:  # noqa: BLE001 — DNS/TLS/timeout: never raise out of here
+        return {"ok": False, "description": f"{type(e).__name__}: {e}"}
 
 
 def _deliver_chunk(*, token, chat_id, chunk, parse_mode, disable_notification, timeout) -> dict:

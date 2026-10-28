@@ -1,0 +1,10 @@
+[Unit]
+Description=Quiver — start the analyst worker when a job is queued
+
+[Path]
+# run_worker.py deletes this file first. systemd checks it again when the worker exits.
+PathExists=/opt/quiver/state/triggers/worker
+Unit=quiver-worker.service
+
+[Install]
+WantedBy=paths.target

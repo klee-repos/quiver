@@ -1,226 +1,56 @@
 schema: 1
 
-# Quiver settings. Carries NO secrets — RH_ACCOUNT_NUMBER, OPENROUTER_API_KEY and
-# the Telegram keys all live in .env / the MCP registration, never here.
-# What the bot TRADES is derived from strategy.yaml's book, not this file.
+# Quiver Desk settings. This file carries NO secrets: RH_ACCOUNT_NUMBER, the Telegram keys,
+# SEC_USER_AGENT and ALPHA_VANTAGE_API_KEY live in .env (laptop) or /etc/quiver/quiver.env (box).
+# Nothing here places an order. Every order needs the owner's Telegram tap (docs/DESK_PLAN.md §0).
+# The book (names, target weights, bands) lives in the ledger. `tick.py desk-seed` reads
+# strategy.yaml once at the cutover; after that only a confirmed proposal changes the book.
 
-# --- Mode ------------------------------------------------------------------
-dry_run: false                         # false = LIVE (places orders); true = paper (review only)
-kill_switch_file: "KILL"               # `touch KILL` halts the next tick; `rm KILL` resumes
+kill_switch_file: "KILL"               # `touch KILL` stops every execution; `rm KILL` resumes
 
-# --- Risk guardrails (coded backstops around the model's own sizing) -------
-# There is NO per-trade dollar cap at all — per-name exposure is governed by the % TARGET WEIGHT
-# (capped at strategy.yaml risk_policy.per_name_max_pct inside the allocator) + per_trade_risk_pct,
-# which already scale with the account. A redundant per-order dollar/percent ceiling was removed
-# 2026-07-23. A rebalance name deploys to its target in ONE order, bounded only by available cash
-# (buying_power - min_buying_power_buffer). The only calculated budget is the daily deploy total =
-# live deployable equity (positions + idle cash), and the 20% daily-loss halt + KILL are the
-# circuit breaker. Nothing here is a fixed dollar trade cap.
+# --- Risk start values -------------------------------------------------------
+# `desk-seed` copies these into the ledger `desk_settings` table. After that a confirmed
+# `set_risk` proposal changes them, and this file is only the start value.
 risk:
-  daily_loss_halt_pct: 20.0            # equity drop >= this vs today's baseline -> halt + KILL
+  daily_loss_halt_pct: 20.0            # equity drop >= this vs the day's baseline -> halt taps for the day
   min_buying_power_buffer: 5           # never spend below this much remaining buying power
-  max_actions_per_ticker_per_day: 10   # intraday-only: repeat TRADES/ticker/day
-  max_analyses_per_ticker_per_day: 10  # intraday-only: LLM-cost circuit breaker
+  min_trade_notional: 5                # $; no leg below this (a full exit is exempt)
+  rebalance_drift_band_pct: 5.0        # default band for a book row with no band of its own
+  cash_sleeve_ticker: "SGOV"           # the residual cash sleeve; never bought or sold
 
-  # Strategy/portfolio layer (active only once `tick.py strategy-set` seeds a goal):
-  rebalance_enabled: true              # target weights drive buys + trim/exit
-  # Q1 sizing is ALWAYS ON: the pipeline's conviction (via lib/allocate, calibrated by the
-  # ledger's hit-rate, clamped by strategy.yaml risk_policy + the dollar caps) sets target
-  # weights. An all-Hold / no-conviction tick falls back to the static book exactly.
-  reconcile_unmanaged: true            # sell any HELD position not in the book down to cash
-  rebalance_drift_band_pct: 5.0        # default no-trade dead-band (per-holding `band` overrides)
-  cash_sleeve_ticker: "SGOV"           # the residual ballast; never churned like an engine name
-  # Anti-churn (F2/F3): min ECONOMIC trade size + conviction target hysteresis. A trim/buy
-  # below min_trade_notional is skipped (full exits/reconciles are exempt, wound at the $1 RH
-  # floor); the conviction allocator only moves a name's target weight on a shift >= the
-  # hysteresis (day-to-day noise keeps the prior target). Set either to 0 to disable it.
-  # The gate compares against YESTERDAY's target: construct persists each move to the ledger.
-  # 6.0 was the interim value while the anchor was the seed book. One smoothed step is
-  # at most ~3 weight-pts, so 6.0 let no target move. Replay of the production signals
-  # (2026-08-11..10-13) at 2.0: 0 target reversals, 0 buy/sell round trips.
-  # A grounded Sell skips this gate: each step of a Sell is 0.4 x the weight, so the gate
-  # stopped an exit while the name still had weight (20 -> 12 -> 7.2 -> 4.32, then no move).
-  min_trade_notional: 5                 # $; skip rebalance trims/buys under this (floored at RH's $1)
-  conviction_rebalance_min_delta_pct: 2.0  # weight-pts; material-change gate on the conviction target
-
-  # Memory-grounded strategy-consistency gate: suppress RANDOM cross-day buy/sell flips;
-  # allow reversals grounded in the recorded plan (stop/target/loss) or a named new
-  # catalyst (within budget). NOT a calendar dwell. enabled:false = byte-identical classic.
-  consistency:
-    enabled: true
-    max_discretionary_reversals: 1     # ungrounded "changed my mind" flips per window (0 = stop/target exits only)
-    flip_window: 6                     # recent COMPLETED trades the budget looks back over
-    loss_catalyst_pct: 8.0             # a sell within the window is grounded if the position is down >= this %
-
-# --- Order defaults --------------------------------------------------------
+# --- Order fields ------------------------------------------------------------
+# exec-check copies these onto each leg. broker_guard requires exactly these two values.
 order:
-  buy_type: "market"                   # "market" (fractional $) | "limit" (whole shares)
-  limit_slippage_pct: 0.3              # marketable-limit buffer over the live quote (buys)
-  sell_mode: "close_position"
   time_in_force: "gfd"
-  market_hours: "regular_hours"        # fractional/dollar orders only fill in RTH
-  protective_stop:                     # DEAD PATH — Robinhood accepts no stop order on a
-                                       # fractional quantity, and every position here is
-                                       # fractional. 62 such orders were reserved, 0 filled.
-                                       # cmd_protect / cmd_rearm_stops are no-ops. Keep false.
-    enabled: false
-    stop_pct: 8.0                      # target distance below fill; clamped to a safe band
-    time_in_force: "gtc"
+  market_hours: "regular_hours"        # fractional and dollar orders fill only in regular hours
 
-# --- Models (LEGACY config, not read by the EVE brain) ----------------------
-# This block is parsed by lib/config.py (back-compat + the "verify" fail-safe) and
-# pinned by tests, but the live EVE brain does NOT read it. The EVE brain
-# (quiver_eve/run/decide.mjs) reads its models from env: OPENROUTER_API_KEY +
-# QUIVER_REASONER_MODEL / QUIVER_CHAT_MODEL (defaults z-ai/glm-5.2 / z-ai/glm-4.7-flash).
-# Do not use GLM_API_KEY / DEEPSEEK_API_KEY here — they are rollback-only and the
-# EVE brain ignores them. Values below stay valid for the legacy config loader.
-glm:
-  chat_model: "deepseek-v4-flash"
-  chat_provider: "deepseek"
-  reasoner_model: "glm-5.2"
-  reasoner_provider: "glm"
+# --- Desk start values (plan §10.3) -----------------------------------------
+desk:
+  requote_tolerance_pct: 1.5           # a tap re-quotes; a move over this sends new numbers
+  margin_of_safety_pct: 15             # default buy-below = fair value base x (1 - this/100)
+  valuation_discount_rate: 0.09        # r in the DCF and the reverse DCF
+  valuation_terminal_growth: 0.03      # gt in the terminal value
+  valuation_years: 10                  # N, the explicit forecast years
 
-# --- Brain engine (EVE migration) ------------------------------------------
-# brain.engine selects the analysis backend. "eve" (live) = the Node/EVE
-# deep-research agent (quiver_eve/run/decide.mjs). The legacy "tradingagents"
-# engine was DELETED in the EVE migration (2026-07-06); lib/config.py fails LOUD
-# if it is ever set — there is no legacy brain to roll back to. FAIL-SAFE: a
-# missing/garbled block stays on "eve", never silently swaps the brain.
-brain:
-  engine: "eve"
-  eve_dir: "quiver_eve"
-
-# --- Self-learning tail (lib/levers) ----------------------------------------
-# The EVE agent can propose NEW evaluation levers (data sources, analysis angles).
-# A lever never touches sizing/caps/ref_ids — it only adds evaluation INPUTS, and
-# the existing reflect step scores each lever's realized alpha (skill, not beta).
-# auto_apply_levers=false (default): a lever needs human `tick.py levers-approve`
-# to activate (mirrors universe-apply). true: activate on next tick, auto-retire on
-# underperformance over lever_min_decisions decisions.
-learning:
-  auto_apply_levers: false
-  lever_min_decisions: 8              # decisions before a lever is score-eligible
-  lever_retire_alpha: -0.02           # retire if lever_alpha vs baseline <= this
-
-# --- Loop timing -----------------------------------------------------------
-loop:
-  act_after_open_minutes: 5            # wait N min after the open before acting
-  analyze_timeout_sec: 3600            # per-ticker analyze.py subprocess timeout — very high so a normal high-reasoning GLM run never hits it
-  # intraday_enabled OFF = the validated once-a-day path (the cadence code stays dormant).
-  intraday_enabled: false
-  per_ticker_cooldown_min: 60          # min minutes between repeat trades on a ticker
-  review_floor_min: 30                 # never re-analyze a ticker sooner than this
-  review_ceiling_open_min: 120         # while market OPEN, never wait longer than this
-  review_ceiling_min: 1440             # after close, may wait up to this (next session)
-
-# --- Notifications (Telegram digest + alerts) -------------------------------
-# The daily digest + halt/auth/error alerts go to Telegram (lib.telegram; sent by
-# `tick.py report-send` and run_tick.py's last-resort pager). Recipients come from
-# TELEGRAM_ALERT_CHAT_IDS / TELEGRAM_ALLOWED_CHAT_IDS in .env. Fails SAFE: OFF
-# unless enabled is exactly `true`. (`from:` here is the dormant email-renderer
-# field — not used by the Telegram sender.)
+# --- Notifications (Telegram pages) -----------------------------------------
+# The halt, auth_error and error pages. Fails SAFE: off unless enabled is exactly true.
 notify:
   enabled: true
-  from: ""                             # dormant email-renderer field; Telegram ignores it
-  subject_prefix: "[Quiver]"
-  loud_digest: true                    # daily digest pings LOUD (heartbeat) even on 0-order days; false = silent
 
-# --- Storage retention (observability housekeeping; never blocks a tick) ---
+# --- Storage retention (log directories only; no desk table is ever pruned) --
 storage:
-  retention_days: 30                   # 0 disables pruning (decision state lives in the ledger)
+  retention_days: 30                   # 0 disables pruning
   archive:
-    enabled: false                     # S3 backend deferred — keep false
+    enabled: false                     # no archive backend exists; keep false
     backend: "s3"
     bucket: ""
     prefix: "quiver/"
 
-# --- Reflective memory + deterministic risk metrics (analysis CONTEXT only) -
-# Python computes Sharpe/Sortino/vol/drawdown/hit-rate (with proof) and injects them
-# into the agents' reasoning; it NEVER feeds sizing. Read-only, defaults ON.
-memory:
-  enabled: true
-  dir: "state/memory/reflect"          # gitignored (under state/), prune-exempt
-  risk_free_rate: 0.0
-  low_confidence_min_n: 5              # N below this -> metrics flagged LOW-CONFIDENCE
-  rolling_window: 10                   # improvement trend: last N vs prior N
-  periods_per_year: 50.0               # annualized-Sharpe ESTIMATE only
-  conviction:                          # deterministic guidance bands (reduced must be <= elevated)
-    hit_rate_elevated: 0.60
-    hit_rate_reduced: 0.40
-    sharpe_elevated: 0.50
-    sharpe_reduced: 0.0
-
-# --- Goal deposit auto-capture (observability; tag external deposits/withdrawals) ---
-# The Robinhood MCP exposes no cumulative net-deposit figure, so the goal-track tail DETECTS
-# suspected external cash flows from day-over-day jumps in the equity curve and SURFACES them
-# (`tick.py flow-suggest` prints ready `flow-record` commands; goal-track logs a count each tick).
-# These feed ONLY the deposit-adjusted goal return + coarse goal-regime — NEVER sizing, order
-# placement, or the daily-loss halt (none of them read cash_flows). Fails SAFE: a garbled value
-# here never blocks a tick.
+# --- Goal deposit capture (observability only) -------------------------------
+# The goal-track step detects suspected external cash flows from day-over-day jumps in the
+# equity curve. These feed only the deposit-adjusted goal return in the close brief.
 goal:
-  auto_capture_flows: false   # true = the tail also AUTO-WRITES settled/persisted jumps to
-                              # cash_flows (idempotent). OFF = detect+surface only; the operator
-                              # confirms via `tick.py flow-record`. Turn ON only for a book where a
-                              # >flow_min_pct single-day move is unambiguously a deposit, not a
-                              # volatile concentrated book (a false positive shifts the coarse
-                              # goal-regime word injected into the analysis prompt).
-  flow_min_pct: 25.0          # a day-over-day equity jump >= this % AND >= flow_min_abs $ is
-  flow_min_abs: 30.0          # flagged as a suspected external flow (both legs required)
-  flow_confirm_days: 2        # auto-write only after the jump SETTLES this many baseline days AND
-                              # the new level persists past the midpoint (blocks a transient spike)
-
-# --- Legislative catalyst (bill-driven universe proposals; opt-in, fail-safe OFF) ---
-# Ingests changed US Congress bills (Congress.gov API, key in .env: CONGRESS_API_KEY),
-# runs an LLM impact analysis + an adversarial N-of-M judge, and for a bill clearing BOTH
-# a Python-owned passage-probability gate AND the judge PROPOSES a universe change that
-# rides the EXISTING confirm/validate_add/human `universe-apply --approve` machinery. It
-# NEVER trades directly and NEVER auto-applies (legislative proposals are always human-
-# gated). Runs in the best-effort learning loop, ~once/trading day. Ships OFF; flip
-# `enabled: true` (and seed the "Legislative Catalyst" allow-list via `strategy-set`) only
-# after live validation. Analysis path reads no limits/broker (a wall test enforces this).
-legislative:
-  # OFF since 2026-10-13. Two faults, repair both before you set `true`:
-  # 1. The phase did not review a bill after 2026-07-13. The first poll stored a date-only
-  #    cursor (`bill_cursor.last_update_date`). Congress.gov rejects that value (HTTP 400),
-  #    so each later tick returned "poll failed". The tick log does not print the reason.
-  # 2. The passage gate cannot pass: the heuristic gives at most 0.50 below
-  #    passed-both-chambers, and `passage_prob_min` is 0.55.
-  # `intel` below is a separate service with its own flag.
-  enabled: false                       # true = run `bills-review` at the end of a tick (propose-only)
-  passage_prob_min: 0.55               # HIGH-passage gate (Python heuristic number), (0,1]
-  impact_min: 0.5                      # HIGH-impact advisory pre-filter on magnitude, (0,1]
-  judge_enabled: true                  # LLM-judge veto (keep true)
-  judge_votes: 3                       # N independent judge calls (1 framed to refute)
-  judge_pass_min: 2                    # require >= this many PASS votes (1 <= this <= judge_votes)
-  max_proposals_per_review: 3          # cap ADD/REMOVE mints per review
-  max_bills_analyzed_per_review: 15    # cap the analyze+judge LLM loop per review
-  lookback_days: 3                     # cold-start cursor backstop
-  add_weight: 4.0                      # default sleeve target weight for a catalyst ADD (%)
-  passage_source: heuristic            # heuristic | kalshi_blend (blend is a fast-follow, not built)
-  model: claude                        # analysis/judge backend label (default = headless claude CLI)
-  review_deadline_sec: 300             # internal wall-clock budget (< the 600s systemd margin)
-  remove_enabled: false                # suffer->REMOVE OFF by default; needs ticker_policy_areas
-  # ticker_policy_areas: map a held ticker to the Congress policyArea/legislativeSubjects codes
-  # that make a bill RELEVANT to it — the ONLY structured (non-attacker-controlled) signal used
-  # to bind a REMOVE to a bill. Required (non-empty) when remove_enabled: true.
-  ticker_policy_areas: {}
-
-# Strategy-intelligence service (section-level power map -> ADDITIVE strategy proposals + per-key-
-# player markdown profiles). Runs on its OWN schedule (deploy/quiver-intel.timer), NOT in the tick.
-# Reads legislation (Congress.gov) + regulation (Federal Register), splits into sections, prefilters
-# to the book's vocabulary, chains each kept section -> book hits, aggregates per key player, and
-# proposes ADDITIVE strategy.yaml changes (tier 'intel' = ALWAYS human --approve). It never trades
-# and never overwrites the seeded book: it can only ADD, funded from cash, capped by intel_max_total_pct.
-intel:
-  enabled: true                          # LIVE (propose-only, human --approve; scheduled run is shadow-only)
-  min_score: 0.5                         # posture-score floor to act on a key-player tailwind
-  add_weight: 4.0                        # default target weight for an intel-proposed ADD (%)
-  intel_max_total_pct: 20.0              # aggregate cap on ADDs: seeded book can't be diluted below (100-this)%
-  new_sleeve_min_names: 2                # >= this many clustered tailwind names to propose a NEW sleeve
-  # THREAT-driven REDUCE: a strong, confirmed key-player threat can propose EXITING a held name to
-  # cash (human --approve, winds via the shared exiting path). Conservation is a higher bar, not a
-  # wall: a PROTECTED seeded sleeve needs the stronger bar (so noise can't churn the core book).
-  threat_score: 0.6                      # threat magnitude to propose reducing an ordinary held name
-  protected_threat_score: 1.5            # STRONGER threat to propose reducing a protected seeded name (>= threat_score)
-  max_sections_per_run: 120              # HARD per-run cap on sections sent to the LLM chain (cost bound;
-                                         # a big omnibus rule's extra sections are kept + chained a later run)
+  auto_capture_flows: false   # true = also auto-write settled jumps to cash_flows
+  flow_min_pct: 25.0          # a jump >= this % AND >= flow_min_abs $ is a suspected flow
+  flow_min_abs: 30.0
+  flow_confirm_days: 2        # auto-write only after the jump settles this many baseline days

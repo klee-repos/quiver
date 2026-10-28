@@ -1,16 +1,13 @@
-"""Long-horizon trend/risk guideposts for the deep-research brain.
+"""Long-horizon trend/risk facts for the desk: regime, ADX, drawdown, Sharpe, momentum.
 
-PURPOSE: feed the EVE brain a long-horizon, risk-adjusted view of a NAME so it
-can follow big multi-month/multi-year trends instead of daily noise. This is
-CONTEXT for the model's reasoning ONLY — it is pure data + deterministic math
-and NEVER feeds ``lib.signals`` sizing/clamps (a boundary test in
-tests/test_units.py enforces that). The wall: this module reads prices only;
-never the broker, the ledger, or trading limits.
+PURPOSE: give the desk a long-horizon, risk-adjusted view of a NAME as facts it can
+cite (``get_technicals``, the metrics row). Technicals never create an event and never
+feed ``lib.sizing`` (a boundary test in tests/test_units.py enforces that). The wall:
+this module reads prices only; never the broker, the ledger, or trading limits.
 
-Everything here is PURE (side-effect-free) so it is unit-tested directly on
-hand-built price series. ``fetch_trend`` (in quiver_eve/run/quill_data.py) is
-the thin I/O wrapper that pulls a yfinance series and calls these helpers, then
-renders the metrics as markdown text the model reads.
+Everything here is PURE (side-effect-free) so it is unit-tested directly on hand-built
+price series. ``lib/dataflows/stockstats_utils.get_technicals`` is the thin I/O wrapper
+that loads the 5-year yfinance frame and calls ``trend_metrics``.
 
 Metrics (each auditable, with N):
   - multi-horizon total return (1y, 2y, 3y) + 6m + 12-1 momentum
@@ -119,9 +116,7 @@ def downside_deviation(returns: Sequence[float], *, periods_per_year: float = 25
                        rf: float = 0.0) -> Optional[float]:
     """Annualized downside deviation = sqrt(mean(min(excess,0)^2)) * sqrt(ppy).
 
-    The denominator of Sortino, exposed on its own so the PTJ vol-aware sizing floor
-    (F3/P5, ``signals.downside_vol_scalar``) can consume it as a plain float argument.
-    Only DOWNSIDE moves count (upside vol is not risk — PTJ: "losses out the window").
+    The denominator of Sortino. Only DOWNSIDE moves count (upside vol is not risk).
     None when there is no history or no downside move. Pure; reads no limit/broker.
     """
     if not returns:
@@ -531,10 +526,8 @@ def _di_pressure_note(b: TrendBundle) -> str:
 
 
 def render_trend_report(b: TrendBundle) -> str:
-    """Render the bundle as markdown. Uses ``###`` subheadings + bullets ONLY
-    (NEVER ``##`` — analyze.py:_split_eve_markdown keys on ``^##\\s+<word>`` and
-    a ``## Drawdown`` subheading would flip the section key and silently drop
-    the whole trend_report body; enforced by a unit test)."""
+    """Render the bundle as markdown. Uses ``###`` subheadings + bullets only, never
+    ``##`` (a unit test enforces it)."""
     ma = b.ma
     # Coverage label from the ACTUAL row count, not a hard-coded "~3y" — the fetch
     # window is 3y but a newly-listed/spun-off name has far less history, and

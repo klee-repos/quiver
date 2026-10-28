@@ -15,6 +15,11 @@ QUIVER_USER="${QUIVER_USER:-quiver}"
 asq()   { sudo -u "$QUIVER_USER" "$@"; }
 git_q() { asq git -C "$QUIVER_HOME" -c safe.directory="$QUIVER_HOME" "$@"; }
 
+# The deploy lock, held for the whole run. claude-update.sh takes the same lock, so the
+# Claude binary never changes while this script installs code or units.
+exec 9>/run/quiver-deploy.lock
+flock -w 900 9 || { echo "ERROR: another deploy holds /run/quiver-deploy.lock — try again later."; exit 1; }
+
 echo "=== quiver update — $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
 
 BR="$(git_q rev-parse --abbrev-ref HEAD)"
@@ -27,9 +32,25 @@ OLD="$(git_q rev-parse --short HEAD)"
 REMOTE="origin/$BR"
 if [ "$(git_q rev-parse HEAD)" = "$(git_q rev-parse "$REMOTE")" ]; then
   echo "Already up to date at $OLD — nothing to do."
+  # A run that failed its healthcheck left the broker path stopped. After a box-side fix,
+  # a re-run starts it again, but only when the healthcheck passes.
+  if ! systemctl is-active --quiet quiver-broker.path; then
+    if asq bash -c "cd '$QUIVER_HOME' && set -a; . /etc/quiver/quiver.env 2>/dev/null; set +a; exec .venv/bin/python deploy/runner/healthcheck.py"; then
+      systemctl start quiver-broker.path && echo "broker path started"
+    else
+      echo "broker paused: healthcheck failed"; exit 1
+    fi
+  fi
   echo "timer: $(systemctl is-active quiver.timer 2>/dev/null || echo unknown)"
   exit 0
 fi
+
+# The broker path unit stays stopped for the whole update, so no broker run starts against
+# half-installed code or a guard that fails its healthcheck. It starts again only in [6/6].
+echo "[0/6] pause the broker"
+systemctl stop quiver-broker.path 2>/dev/null || true
+while systemctl is-active --quiet quiver-broker.service; do sleep 5; done   # never stop it mid-order
+trap 'systemctl is-active --quiet quiver-broker.path || echo "broker paused: fix and re-run update.sh"' EXIT
 
 # A ff-only pull would refuse on a dirty tree anyway; check first so we can give a clear
 # message and protect a box-side config.yaml edit (the one tracked file someone might tweak
@@ -63,88 +84,56 @@ NEW="$(git_q rev-parse --short HEAD)"
 
 echo "[4/6] dependencies"
 if grep -qE '^(requirements\.lock\.txt|pyproject\.toml)$' <<<"$CHANGED"; then
-  echo "  deps changed -> reinstalling (locked env, then the package, mirroring setup.sh)"
   # Run pip FROM the project dir: requirements.lock.txt ends with `-e .` (an editable self-ref),
-  # which only resolves when CWD is the repo. `sudo -u` doesn't reliably set CWD, so cd inside
-  # the quiver shell explicitly. The lock's `-e .` already installs the package; the second
-  # line is a harmless idempotent mirror of setup.sh.
+  # which only resolves when CWD is the repo. The second line mirrors setup.sh.
   asq sh -c "cd '$QUIVER_HOME' && .venv/bin/pip install -q -r requirements.lock.txt"
   asq sh -c "cd '$QUIVER_HOME' && .venv/bin/pip install -q -e . --no-deps"
-else
-  echo "  no dependency changes — skipping pip"
+fi
+# git deleted quiver_eve/, but its gitignored node_modules/ stays on disk.
+if [ -d "$QUIVER_HOME/quiver_eve" ] && [ -z "$(git_q ls-files quiver_eve)" ]; then
+  rm -rf "$QUIVER_HOME/quiver_eve" && echo "  removed quiver_eve/"
 fi
 
-# EVE brain (Node/TypeScript). Idempotent Node-24 upgrade for an ALREADY-provisioned
-# box (setup.sh only runs at provision; the live box shipped with Node 20). NOT gated
-# on `command -v node` — that would keep an old Node 20. npm ci when the EVE package
-# or any agent source changed (mirrors the conditional pip block above).
-_ensure_node24() {
-  if command -v node >/dev/null && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 24 ] 2>/dev/null; then return 0; fi
-  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-  apt-get install -y nodejs
-}
-if grep -qE '^quiver_eve/(package\.json|package-lock\.json|agent/)' <<<"$CHANGED"; then
-  echo "  EVE brain changed -> ensuring Node 24 + npm ci"
-  _ensure_node24
-  asq sh -c "cd '$QUIVER_HOME/quiver_eve' && { npm ci 2>/dev/null || npm install --omit=dev; }"
-elif ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 24 ] 2>/dev/null; then
-  echo "  EVE brain unchanged but Node <24 -> upgrading Node only"
-  _ensure_node24
-else
-  echo "  no EVE brain changes — skipping npm"
-fi
-
-echo "[5/6] systemd units"
-if grep -qE '^deploy/(quiver(-intel|-chat|-claude-update|-backup)?\.(service|timer)|claude-update\.sh)$' <<<"$CHANGED"; then
-  echo "  unit files changed -> reinstalling + daemon-reload"
-  cp "$QUIVER_HOME/deploy/quiver.service"        /etc/systemd/system/quiver.service
-  cp "$QUIVER_HOME/deploy/quiver.timer"          /etc/systemd/system/quiver.timer
-  cp "$QUIVER_HOME/deploy/quiver-intel.service"  /etc/systemd/system/quiver-intel.service
-  cp "$QUIVER_HOME/deploy/quiver-intel.timer"    /etc/systemd/system/quiver-intel.timer
-  cp "$QUIVER_HOME/deploy/quiver-chat.service"   /etc/systemd/system/quiver-chat.service
-  cp "$QUIVER_HOME/deploy/quiver-claude-update.service" /etc/systemd/system/quiver-claude-update.service
-  cp "$QUIVER_HOME/deploy/quiver-claude-update.timer"   /etc/systemd/system/quiver-claude-update.timer
-  cp "$QUIVER_HOME/deploy/quiver-backup.service" /etc/systemd/system/quiver-backup.service
-  cp "$QUIVER_HOME/deploy/quiver-backup.timer"   /etc/systemd/system/quiver-backup.timer
-  install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
-  systemctl daemon-reload
-  # the intel timer is separate from the trading timer; enable it so the daily refresh runs.
-  systemctl enable --now quiver-intel.timer 2>/dev/null || true
-  # keeps every claude install current; a stale orchestrator binary is invisible.
-  systemctl enable --now quiver-claude-update.timer 2>/dev/null || true
-  # the nightly ledger backup; with no timer the newest backup goes stale and nothing says so.
-  systemctl enable --now quiver-backup.timer 2>/dev/null || true
-else
-  echo "  no unit changes — skipping"
-fi
-
-# The read-only chat bridge is a long-running daemon (not spawned fresh per tick), so its code
-# changes need an explicit restart to take effect. Only restart if it's already enabled (opt-in);
-# never START it here — that's setup.sh's job, gated on TELEGRAM_BOT_TOKEN.
-if grep -qE '^(deploy/quiver-chat\.service|deploy/runner/chat_(bridge|guard)\.py|deploy/runner/chat_(settings|mcp)\.json|prompts/chat\.md)$' <<<"$CHANGED"; then
-  if systemctl is-enabled quiver-chat.service >/dev/null 2>&1; then
-    echo "  chat bridge code changed -> restarting quiver-chat.service"
-    systemctl restart quiver-chat.service 2>/dev/null || true
+echo "[5/6] directories + systemd units"
+# Every unit lists these paths. A missing one stops the unit.
+install -d -m 755 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/logs"
+for d in state/claude-config state/claude-desk state/triggers state/tmp state/.cache logs/desk; do
+  [ -d "$QUIVER_HOME/$d" ] || install -d -m 700 -o "$QUIVER_USER" -g "$QUIVER_USER" "$QUIVER_HOME/$d"
+done
+for u in quiver-intel.timer quiver-intel.service; do
+  if [ -e "/etc/systemd/system/$u" ]; then
+    systemctl disable --now "$u" 2>/dev/null || true; rm -f "/etc/systemd/system/$u"; echo "  removed $u"
   fi
+done
+UNITS="quiver.service quiver.timer quiver-chat.service quiver-worker.path quiver-worker.service
+quiver-broker.path quiver-broker.service quiver-claude-update.service quiver-claude-update.timer
+quiver-backup.service quiver-backup.timer"
+if grep -qE '^deploy/(quiver[a-z-]*\.(service|timer|path)|claude-update\.sh)$' <<<"$CHANGED"; then
+  for u in $UNITS; do cp "$QUIVER_HOME/deploy/$u" "/etc/systemd/system/$u"; done
+  install -m 0755 -o root -g root "$QUIVER_HOME/deploy/claude-update.sh" /usr/local/bin/quiver-claude-update
 fi
+systemctl daemon-reload
+systemctl reset-failed quiver-intel.service 2>/dev/null || true
+systemctl enable quiver-worker.path quiver-broker.path quiver-claude-update.timer quiver-backup.timer
+systemctl start quiver-worker.path quiver-claude-update.timer quiver-backup.timer
+# A changed path unit must restart to watch again. The broker path starts only after the
+# healthcheck. NEVER restart quiver-broker.service here.
+grep -qE '^deploy/quiver-worker\.path$' <<<"$CHANGED" && systemctl restart quiver-worker.path
 
-# Gate the restart on the offline HEALTHCHECK — the purpose-built box self-test (config + XNYS
-# calendar + ledger schema + every decision import load cleanly; no network/broker). This is the
-# exact gate setup.sh runs at provision ([9/9]). The full unit suite is a LOCAL/pre-push gate, not
-# a box gate — a couple of its cases are env/ordering-sensitive on the box and false-fail there.
-# Run with the box env sourced so config validation sees RH_ACCOUNT_NUMBER etc. If it can't go
-# green, leave the timer alone: the new code is on disk but the next tick keeps the old behavior.
+# The offline HEALTHCHECK gates every restart: config, the XNYS calendar, the ledger schema,
+# every import, the guard self-test. No network, no broker. setup.sh runs the same gate at
+# [9/9]. If it fails, the new code is on disk, but the broker path stays stopped.
 echo "[6/6] offline healthcheck (restart gate)"
 if ! asq bash -c "cd '$QUIVER_HOME' && set -a; . /etc/quiver/quiver.env 2>/dev/null; set +a; exec .venv/bin/python deploy/runner/healthcheck.py"; then
-  echo
-  echo "HEALTHCHECK FAILED on $NEW — NOT restarting the timer. Investigate before trusting a tick."
-  exit 1
+  echo "HEALTHCHECK FAILED on $NEW — NOT restarting the chat bridge, the timer, or the broker path."; exit 1
 fi
-
-# Each tick is a fresh python process spawned by the timer, so new code is picked up on the next
-# tick regardless; restarting the timer just reloads the (possibly changed) unit cleanly. It does
-# NOT kill an in-flight quiver.service tick.
+systemctl start quiver-broker.path
+# The bridge is long-running and imports most of lib/: restart it on ANY change outside docs/
+# and tests/. Worker, broker, and monitor start a fresh process each run.
+if grep -qvE '^(docs/|tests/)' <<<"$CHANGED" && systemctl is-enabled --quiet quiver-chat.service; then
+  systemctl restart quiver-chat.service && echo "  chat bridge restarted"
+fi
 systemctl restart quiver.timer
 
 echo
-echo "DONE — updated $OLD -> $NEW on $BR. timer: $(systemctl is-active quiver.timer). Next tick runs the new code."
+echo "DONE — updated $OLD -> $NEW on $BR. timer: $(systemctl is-active quiver.timer). broker path: $(systemctl is-active quiver-broker.path). The next run uses the new code."

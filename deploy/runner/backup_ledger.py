@@ -43,7 +43,7 @@ LOG = os.environ.get("QUIVER_BACKUP_LOG", str(_REPO / "logs" / "backup.log"))
 _METADATA = "http://metadata.google.internal/computeMetadata/v1/"
 _UPLOAD = "https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?{query}"
 # The tables a restore must hold. The snapshot reports their row counts in the log line.
-_COUNT_TABLES = ("decisions", "outcomes", "orders", "ticker_action", "target_portfolio",
+_COUNT_TABLES = ("decisions", "outcomes", "orders", "proposals", "documents", "target_portfolio",
                  "day_baseline", "strategy_change_log")
 
 

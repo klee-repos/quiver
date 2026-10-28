@@ -2,8 +2,8 @@
 
 WHAT THIS IS FOR. ``outcomes.benchmark_return`` is the market leg that turns a raw
 directional return into ``alpha`` -- the excess that ``lib.memory.score_return``
-prefers, and therefore the number the conviction calibration actually learns from.
-It used to be supplied by the LLM orchestrator, which is why it was NULL on most
+prefers. The track record reads it; no order path does. It used to be supplied by
+the LLM orchestrator, which is why it was NULL on most
 rows and wrong on the rest. This module is the deterministic replacement: given a
 benchmark's daily closes and the trading calendar, it returns the fractional move
 over one decision's own holding window, or refuses with a reason.
