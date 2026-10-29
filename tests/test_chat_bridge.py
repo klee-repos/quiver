@@ -37,7 +37,7 @@ from claude_agent_sdk import (AssistantMessage, ProcessError, ResultMessage, Sys
                               TextBlock, ToolUseBlock)
 
 from lib import market  # noqa: E402
-from lib.desk import agent, approvals, outbox, proposals, reactions, store, tools  # noqa: E402
+from lib.desk import agenda, agent, approvals, outbox, proposals, reactions, store, tools  # noqa: E402
 
 r = Results("chat-bridge")
 
@@ -1555,6 +1555,370 @@ def case_session():
         r.eq("session: three turns", len(w.sdk.prompts), 3)
 
 
+# --- the agenda: one thing at a time (§4.8) ---------------------------------------------------
+
+def thesis_card(w, ticker="ANET"):
+    """A set_thesis change card the analyst built (the real build_change; no card sent)."""
+    led, cfg = w.root.led(), w.root.cfg()
+    change = {"kind": "set_thesis", "ticker": ticker, "premise_link": "AI needs networking and power.",
+              "summary": f"{ticker} sells what AI clusters need.", "drivers": ["AI demand"],
+              "falsifiers": ["a hyperscaler cuts its spending"],
+              "valuation": {"method": "price_levels", "reason": "owner levels", "buy_below": 100.0,
+                            "trim_above": 400.0}, "evidence": []}
+    with led.transaction() as conn:
+        built = proposals.build_change(conn, cfg, change=change, rationale=f"Save why we own {ticker}.",
+                                       created_by="analyst", now_dt=w.fc.now)
+    return built["proposal_id"]
+
+
+def add_item(w, *, priority=agenda.NEXT, title="An item.", body="The report.", pids=(), kind="report"):
+    with w.root.led().connect() as c:
+        return agenda.add(c, kind=kind, priority=priority, title=title, body=body, proposal_ids=list(pids),
+                          now=store.now_iso())
+
+
+def item(w, iid):
+    with w.root.led().connect() as c:
+        return agenda.get(c, iid)
+
+
+def prop_row(w, pid):
+    with w.root.led().connect() as c:
+        return proposals.get_proposal(c, pid)
+
+
+def script(*steps):
+    """A model turn that runs the given tool calls in order. ``("react",)`` reacts to every
+    owner message. Each result lands in ``sdk.tool_log``."""
+    async def run(sdk, prompt):
+        yield init_msg(sdk.sid())
+        for step in steps:
+            if step == ("react",):
+                await react_all(sdk)
+                continue
+            name, args = step
+            yield tool_msg(name, args)
+            await sdk.tool(name, args)
+        yield result_msg(sdk.sid())
+    return run
+
+
+def tool_result(w, name):
+    return [res for n, _a, res in w.sdk.tool_log if n == name]
+
+
+def card_sends(w):
+    return [c for c in w.tg.of("sendMessage") if c["params"].get("reply_markup")]
+
+
+async def turns(br):
+    await br.maybe_turn()
+    await settle()
+
+
+def owner_turn(w, mid, text, *steps):
+    """One owner message and one model turn that runs ``steps``, in one event loop."""
+    msg_update(w, mid, text)
+    w.sdk.turns = [script(*steps)]
+
+    async def go():
+        await poll_and_turn(w.bridge)
+        await settle()
+    asyncio.run(go())
+
+
+def case_agenda_one_at_a_time():
+    with world(seeded=True) as w:
+        br = w.bridge
+        pa, pb = thesis_card(w, "ANET"), thesis_card(w, "CEG")
+        a = add_item(w, title="The ANET review.", body="Arista is strong.\n\nI'd keep it.", pids=[pa])
+        b = add_item(w, title="The CEG review.", pids=[pb])
+        fyi = add_item(w, priority=agenda.FYI, title="AAPL news, no change.")
+        w.sdk.turns = [script(("say", {"text": "Arista had a strong quarter, so I'd keep it at the plan."}))]
+        asyncio.run(turns(br))
+        asyncio.run(turns(br))
+        prompt = w.sdk.prompts[0] if w.sdk.prompts else ""
+        r.eq("agenda: one turn brings up one item, then nothing while it is open", len(w.sdk.prompts), 1)
+        r.ok("agenda: the input has item A's bring_up block with its report",
+             f'<bring_up item="{a}"' in prompt and "Arista is strong." in prompt, prompt[-700:])
+        r.ok("agenda: the agenda block lists B waiting and the fyi item",
+             "<agenda>" in prompt and "waiting: 1" in prompt and "The CEG review." in prompt
+             and "AAPL news, no change." in prompt, prompt[:900])
+        r.ok("agenda: an agenda turn has no owner message", "<owner " not in prompt, prompt[-300:])
+        sends = w.tg.of("sendMessage")
+        r.eq("agenda: two messages: the desk's words, then the card", len(sends), 2)
+        r.ok("agenda: the card comes last, with its buttons",
+             len(sends) == 2 and not sends[0]["params"].get("reply_markup") and sends[1]["params"].get("reply_markup")
+             and f"Proposal #{pa}." in sends[1]["params"]["text"], [x["params"].get("text", "")[:50] for x in sends])
+        r.eq("agenda: A open, B waiting, the fyi item never brought up",
+             [item(w, x)["status"] for x in (a, b, fyi)], ["open", "waiting", "waiting"])
+        r.ok("agenda: A's card has its Telegram message id", prop_row(w, pa)["tg_message_id"] is not None)
+        r.eq("agenda: B's card is not sent yet", prop_row(w, pb)["tg_message_id"], None)
+
+        # The owner taps Confirm on A's card: A closes; B waits AGENDA_AFTER_TAP_S, then comes up.
+        fresh_poll_mark(w)
+        tap_update(w, prop_row(w, pa), "a", qid="qa")
+        w.sdk.turns = [script(("say", {"text": "Next is Constellation. Its nuclear contracts look solid."}))]
+
+        async def tap_go():
+            await br.poll_once()
+            await settle()
+        asyncio.run(tap_go())
+        r.eq("agenda: the Confirm applied A's card", prop_row(w, pa)["state"], "applied")
+        r.eq("agenda: the tap on A's last card closes A", item(w, a)["status"], "done")
+        r.eq("agenda: no new item right after the tap", (br.agenda_next(), len(w.sdk.prompts)), (None, 1))
+        w.mono.advance(chat_bridge.AGENDA_AFTER_TAP_S + 0.5)
+        asyncio.run(turns(br))
+        r.eq("agenda: after the settle time B comes up", (len(w.sdk.prompts), item(w, b)["status"]), (2, "open"))
+        r.ok("agenda: B's card follows the desk's words", card_sends(w) and f"Proposal #{pb}." in
+             card_sends(w)[-1]["params"]["text"], [c["params"]["text"][:40] for c in card_sends(w)])
+        with w.root.led().connect() as c:
+            r.eq("/status counts the agenda", "Agenda: 1 open, 0 waiting, 1 fyi." in br.status_text(), True)
+
+
+def case_agenda_owner_turn():
+    with world(seeded=True) as w:
+        br = w.bridge
+        pa, pb = thesis_card(w, "ANET"), thesis_card(w, "CEG")
+        a = add_item(w, title="The ANET review.", pids=[pa])
+        b = add_item(w, title="The CEG review.", body="Constellation is fine.", pids=[pb])
+        # An agenda turn cannot close its own item or bring up another: the owner has not spoken.
+        w.sdk.turns = [script(("say", {"text": "Arista looks strong."}), ("close_item", {"item_id": a}),
+                              ("bring_up_next", {}), ("defer_item", {"item_id": a, "hours": 2}),
+                              ("hold_agenda", {"hours": 1}))]
+        asyncio.run(turns(br))
+        errs = [tool_text(x) for n in ("close_item", "bring_up_next", "defer_item", "hold_agenda")
+                for x in tool_result(w, n)]
+        r.ok("agenda: an agenda turn may not move the agenda", len(errs) == 4 and all(
+            "needs an owner message" in e for e in errs), errs)
+        r.eq("agenda: A is still open", item(w, a)["status"], "open")
+        # The owner says next: close A and bring up B in the same turn; B's card goes out after it.
+        w.mono.advance(60)
+        owner_turn(w, 6001, "next", ("react",), ("close_item", {"item_id": a, "reason": "the owner said next"}),
+                   ("bring_up_next", {}),
+                   ("say", {"text": "Next is Constellation, and I think it is fine as planned."}))
+        nxt = tool_result(w, "bring_up_next")[-1]
+        body = json.loads(tool_text(nxt)) if not is_err(nxt) else {}
+        r.eq("agenda: close_item in an owner turn closes A, with the reason",
+             (item(w, a)["status"], item(w, a)["close_reason"]), ("done", "the owner said next"))
+        r.eq("agenda: bring_up_next opens B and returns its report and card",
+             (body.get("item"), body.get("report"), [x["id"] for x in body.get("cards", [])]),
+             (b, "Constellation is fine.", [pb]))
+        r.eq("agenda: B is open", item(w, b)["status"], "open")
+        r.ok("agenda: A's card is still pending (closing an item does not touch its card)",
+             prop_row(w, pa)["state"] == "pending")
+        last = w.tg.of("sendMessage")[-1]["params"]
+        r.ok("agenda: B's card is sent after the turn", last.get("reply_markup") and f"Proposal #{pb}." in last["text"],
+             last.get("text", "")[:80])
+        # show_card: the card again at the bottom; the old copy loses its buttons; only the new one taps.
+        old_mid = prop_row(w, pb)["tg_message_id"]
+        owner_turn(w, 6002, "show me the card again", ("react",), ("show_card", {"proposal_id": pb}))
+        new_mid = prop_row(w, pb)["tg_message_id"]
+        r.ok("show_card: a new card message", new_mid and new_mid != old_mid, (old_mid, new_mid))
+        labels = [(e["params"]["message_id"], e["params"]["reply_markup"]["inline_keyboard"][0][0]["text"])
+                  for e in w.tg.of("editMessageReplyMarkup")]
+        r.ok("show_card: the old card says Moved down", (old_mid, "Moved down") in labels, labels)
+        stale = dict(prop_row(w, pb), tg_message_id=old_mid)
+        fresh_poll_mark(w)
+        tap_update(w, stale, "a", qid="qold")
+
+        async def tap_go():
+            await br.poll_once()
+            await settle()
+        asyncio.run(tap_go())
+        r.eq("show_card: a tap on the old copy is refused", answers(w, "qold")[0].get("text"), "This button is not valid.")
+        r.eq("show_card: the card is still pending", prop_row(w, pb)["state"], "pending")
+        # hold_agenda: nothing comes up by itself until the hold ends.
+        c_ = add_item(w, title="The brief.", kind="brief")
+        owner_turn(w, 6003, "I'm busy for an hour, hold the rest", ("react",), ("close_item", {"item_id": b}),
+                   ("hold_agenda", {"hours": 1}),
+                   ("say", {"text": "Sure. One more thing waits; I'll hold it for an hour."}))
+        w.mono.advance(chat_bridge.AGENDA_QUIET_S + 1)
+        r.eq("hold: nothing comes up during the hold", (br.agenda_next(), item(w, c_)["status"]), (None, "waiting"))
+        w.fc.advance(3601)
+        asyncio.run(turns(br))
+        r.eq("hold: the next item comes up after the hold", item(w, c_)["status"], "open")
+
+
+def case_agenda_quiet_and_busy():
+    with world(seeded=True) as w:
+        br = w.bridge
+        owner_turn(w, 7001, "how is the account doing?", ("react",), ("say", {"text": "It is up a little today."}))
+        a = add_item(w, title="The ANET review.")
+        w.mono.advance(10)
+        r.eq("quiet: no item comes up 10 s after an owner message", br.agenda_next(), None)
+        w.mono.advance(chat_bridge.AGENDA_QUIET_S)
+        with w.root.led().connect() as c:
+            c.execute("INSERT INTO broker_jobs (kind, proposal_id, recovery, status, requested_by, created_at) "
+                      "VALUES ('execute', 1, 0, 'running', 'tap', ?)", (store.now_iso(),))
+        r.eq("busy: no item comes up while a tapped trade is at the broker", br.agenda_next(), None)
+        with w.root.led().connect() as c:
+            c.execute("UPDATE broker_jobs SET status='done'")
+        asyncio.run(turns(br))
+        r.eq("quiet: the item comes up once the owner is quiet and the broker is done", item(w, a)["status"], "open")
+
+
+def case_agenda_fallback():
+    with world(seeded=True) as w:
+        br = w.bridge
+        pa = thesis_card(w, "ANET")
+        a = add_item(w, title="The ANET review.",
+                     body='Arista grew 38%.\n\n<a href="https://evil.example">Tap here</a>, margin <40%.', pids=[pa])
+
+        async def boom(sdk, prompt):
+            yield init_msg(sdk.sid())
+            raise ProcessError("Command failed with exit code 1", exit_code=1, stderr="boom")
+        w.sdk.turns = [boom]
+        asyncio.run(turns(br))
+        texts = w.tg.texts()
+        r.eq("fallback: the report as written, then the card", len(texts), 2)
+        r.ok("fallback: no 'I hit an error' text in an agenda turn", not any("I hit an error" in t for t in texts), texts)
+        r.ok("fallback: model HTML reaches the owner as text, with its URL", texts and "&lt;a href=" in texts[0]
+             and "https://evil.example" in texts[0] and "&lt;40%" in texts[0], texts[:1])
+        r.ok("fallback: the card follows", card_sends(w) and f"Proposal #{pa}." in card_sends(w)[-1]["params"]["text"])
+        r.eq("fallback: the item stays open for the owner", item(w, a)["status"], "open")
+        rows_ = rows(w, "SELECT source, delivered_to_session FROM chat_messages WHERE role='desk' ORDER BY id")
+        r.eq("fallback: the report is mirrored as analyst, the card as proposal, both for the next turn",
+             [(x["source"], x["delivered_to_session"]) for x in rows_], [("analyst", 0), ("proposal", 0)])
+
+
+def case_agenda_follow_up():
+    with world(seeded=True) as w:
+        br = w.bridge
+        snapshot(w.root, at="2026-08-05T13:59:00Z")
+        led, cfg = w.root.led(), w.root.cfg()
+        with led.transaction() as conn:
+            built = proposals.build_change(conn, cfg, change={"kind": "set_weights", "changes": [
+                {"ticker": "ANET", "target_weight": 27}, {"ticker": "SGOV", "target_weight": 58}]},
+                rationale="Own a little more Arista.", created_by="analyst", now_dt=w.fc.now)
+        pid = built["proposal_id"]
+        a = add_item(w, title="The ANET review.", pids=[pid])
+        asyncio.run(turns(br))
+        fresh_poll_mark(w)
+        tap_update(w, prop_row(w, pid), "a", qid="qc")
+
+        async def go():
+            await br.poll_once()
+            await settle()
+        asyncio.run(go())
+        it = item(w, a)
+        fu = [p for p in it["proposal_ids"] if p != pid]
+        r.eq("follow_up: the Confirm applied the change", prop_row(w, pid)["state"], "applied")
+        r.ok("follow_up: the trade card joins the item", len(fu) == 1 and prop_row(w, fu[0])["kind"] == "trade",
+             it["proposal_ids"])
+        r.eq("follow_up: the item stays open until the trade is tapped", it["status"], "open")
+        r.ok("follow_up: the trade card is in the chat", fu and prop_row(w, fu[0])["tg_message_id"] is not None)
+        fresh_poll_mark(w)
+        tap_update(w, prop_row(w, fu[0]), "r", qid="qr")
+        asyncio.run(go())
+        r.eq("follow_up: rejecting the trade closes the item", item(w, a)["status"], "done")
+
+
+
+def case_agenda_review_fixes():
+    # 1. An item with no card closes once the owner writes after it came up; a card item stays.
+    with world(seeded=True) as w:
+        br = w.bridge
+        brief = add_item(w, kind="brief", title="The close brief.", body="The account rose $7.")
+        w.sdk.turns = [script(("say", {"text": "The account rose $7 today."}))]
+        asyncio.run(turns(br))
+        r.eq("auto_close: the brief is open and marked seen", (item(w, brief)["status"],
+             rows(w, "SELECT value FROM bridge_state WHERE key='agenda_presented'")[0]["value"]),
+             ("open", str(brief)))
+        w.fc.advance(30)
+        owner_turn(w, 8001, "thanks", ("react",), ("say", {"text": "Anytime."}))
+        r.eq("auto_close: the owner wrote after it came up -> done", (item(w, brief)["status"],
+             item(w, brief)["close_reason"]), ("done", "the owner wrote after it came up; it needed no decision"))
+        pc = thesis_card(w, "ANET")
+        card_item = add_item(w, title="The ANET review.", pids=[pc])
+        w.mono.advance(chat_bridge.AGENDA_QUIET_S + 1)
+        w.sdk.turns = [script(("say", {"text": "Arista looks fine."}))]
+        asyncio.run(turns(br))
+        w.fc.advance(30)
+        owner_turn(w, 8002, "ok", ("react",), ("say", {"text": "Tap Confirm if that sounds right."}))
+        r.eq("auto_close: an item with a pending card stays open", item(w, card_item)["status"], "open")
+        # 2. A now item takes over the unanswered next item after AGENDA_PREEMPT_S.
+        trade_like = add_item(w, priority=agenda.NOW, title="The account drifted: CEG.", body="Drift.")
+        w.mono.advance(chat_bridge.AGENDA_QUIET_S + 1)
+        r.eq("preempt: not before the preempt time", br.agenda_next(), None)
+        w.fc.advance(chat_bridge.AGENDA_PREEMPT_S)
+        r.eq("preempt: not while the owner acted after the item came up", br.agenda_next(), None)
+        with w.root.led().connect() as c:
+            c.execute("UPDATE agenda SET opened_at=? WHERE id=?",
+                      (store.iso(w.fc.now - timedelta(seconds=chat_bridge.AGENDA_PREEMPT_S + 60)), card_item))
+        br.last_owner_wall = store.iso(w.fc.now - timedelta(seconds=chat_bridge.AGENDA_PREEMPT_S + 120))
+        got = br.agenda_next()
+        r.eq("preempt: the now item comes up", got["id"] if got else None, trade_like)
+        r.eq("preempt: the open card item goes back in line, its card still in the chat",
+             (item(w, card_item)["status"], prop_row(w, pc)["tg_message_id"] is not None), ("waiting", True))
+
+    # 3. Recovery at start; 4. one card send at a time; 5. the fresh-card hold; 6. the tap guard.
+    with world(seeded=True) as w:
+        br = w.bridge
+        pa = thesis_card(w, "ANET")
+        a = add_item(w, title="The ANET review.", pids=[pa])
+        with w.root.led().connect() as c:
+            agenda.take_next(c, store.now_iso())
+        r.eq("recover: an open item never shown goes back in line", (br.agenda_recover(), item(w, a)["status"]),
+             (a, "waiting"))
+
+        async def twice():
+            await asyncio.gather(br.send_card_once(pa), br.send_card_once(pa))
+        asyncio.run(twice())
+        r.eq("send_once: two sends at once make one card", len([x for x in card_sends(w)
+                                                               if f"Proposal #{pa}." in x["params"]["text"]]), 1)
+        asyncio.run(br.send_card_once(pa))
+        r.eq("send_once: a card already in the chat is not sent again", len(card_sends(w)), 1)
+        r.eq("card_hold: a fresh card in the chat holds the line", br.agenda_next(), None)
+        w.fc.advance(chat_bridge.AGENDA_CARD_HOLD_S + 1)
+        with w.root.led().connect() as c:
+            c.execute("UPDATE proposals SET state='expired' WHERE id=?", (pa,))
+        b = add_item(w, title="The CEG review.")
+        fresh_poll_mark(w)
+        u = tap_update(w, prop_row(w, pa), "a", qid="qg")
+
+        async def guard():
+            await br.handle_update(u, offline=False)
+            busy = br.taps_busy
+            await br.maybe_turn()
+            started = br.turn_task is not None
+            await settle()
+            return busy, started
+        busy, started = asyncio.run(guard())
+        r.eq("tap_guard: the tap counts at once and no turn starts before it runs", (busy >= 1, started), (True, False))
+        w.mono.advance(chat_bridge.AGENDA_AFTER_TAP_S + 1)
+        asyncio.run(turns(br))
+        # A's card expired before it came up: A stays as a report (no silent drop) and, older, comes first.
+        r.eq("tap_guard: after the tap the next item comes up (A, kept with a note, before B)",
+             (item(w, a)["status"], item(w, b)["status"], "ended before it came up" in item(w, a)["body"]),
+             ("open", "waiting", True))
+
+    # 7. /stop during an agenda turn: nothing is sent, the item goes back in line, the agenda holds.
+    with world(seeded=True) as w:
+        br = w.bridge
+        pa = thesis_card(w, "ANET")
+        a = add_item(w, title="The ANET review.", body="Arista grew.", pids=[pa])
+
+        async def wait_stop(sdk, prompt):
+            yield init_msg(sdk.sid())
+            await sdk.interrupted.wait()
+            yield result_msg(sdk.sid())
+        w.sdk.turns = [wait_stop]
+
+        async def go():
+            await br.maybe_turn()
+            await until(lambda: len(w.sdk.prompts) == 1)
+            msg_update(w, 9001, "/stop")
+            await br.poll_once()
+            await settle()
+        asyncio.run(go())
+        r.eq("stop: the owner sees only the stop reply", w.tg.texts(), ["Stopped. I'll hold the rest of the list for 1 hour."])
+        r.eq("stop: the item goes back in line, its card unsent", (item(w, a)["status"], prop_row(w, pa)["tg_message_id"]),
+             ("waiting", None))
+        with w.root.led().connect() as c:
+            r.ok("stop: the agenda holds", agenda.hold_until(c, store.now_iso()) is not None)
+
+
 CASES = [
     ("allowlist", case_allowlist),
     ("offset_crash", case_offset_crash),
@@ -1577,6 +1941,12 @@ CASES = [
     ("tap_in_turn", case_tap_in_turn),
     ("failures", case_failures),
     ("session", case_session),
+    ("agenda_one_at_a_time", case_agenda_one_at_a_time),
+    ("agenda_owner_turn", case_agenda_owner_turn),
+    ("agenda_quiet_and_busy", case_agenda_quiet_and_busy),
+    ("agenda_fallback", case_agenda_fallback),
+    ("agenda_follow_up", case_agenda_follow_up),
+    ("agenda_review_fixes", case_agenda_review_fixes),
 ]
 
 

@@ -274,8 +274,8 @@ def case_order(r: Results):
         r.ok("order: the status line is the last line of the run", bool(lines) and lines[-1].get("event") == "monitor_ok"
              and set(("names", "filings", "events", "proposals")) <= set(lines[-1]), lines[-3:])
         # The status line comes after the brief and the after-close calls.
-        brief_rows = h.q("SELECT id FROM chat_messages WHERE source='brief'")
-        r.ok("order: the brief was sent before the status line", len(brief_rows) >= 1, brief_rows)
+        brief_rows = h.q("SELECT id FROM agenda WHERE kind='brief'")
+        r.ok("order: the brief was filed before the status line", len(brief_rows) >= 1, brief_rows)
 
         # The lock: main() takes run_lock("monitor") around the run and releases it after.
         seen = {}
@@ -536,6 +536,14 @@ def case_misc(r: Results):
         r.eq("misc: run 1 made one pending drift proposal", [p["state"] for p in props], ["pending"])
         pid, mid = props[0]["id"], props[0]["tg_message_id"]
         r.eq("misc: P expires at the next session close", props[0]["expires_at"], store.iso(et("2026-10-29 16:00")))
+        # The drift card waits on the agenda; the bridge sends it when the owner is free.
+        r.eq("misc: P's card is not sent by the monitor", mid, None)
+        items = h.q("SELECT kind, priority, status, proposal_ids, cards_json FROM agenda WHERE kind='drift'")
+        r.eq("misc: one drift agenda item, priority now, waiting, holding P",
+             [(i["kind"], i["priority"], i["status"], json.loads(i["proposal_ids"])) for i in items],
+             [("drift", 0, "waiting", [pid])])
+        r.ok("misc: the item keeps P's build-time legs (with the weights)",
+             items and "weight_now" in json.dumps(json.loads(items[0]["cards_json"]).get(str(pid))), items)
         # After-close ticks: once, after the brief, with the plan's arguments.
         ticks = h.run_ticks()
         reflect_path = h.root.path / "state" / "tmp" / "reflect_input.json"
@@ -567,7 +575,10 @@ def case_misc(r: Results):
         h.run(et("2026-10-29 16:05"), snap_on_wait=True)
         r.ok("misc: the worker trigger is touched (run 3)", h.trig("worker").exists())
         r.eq("misc: passed expires_at -> expired", h.one("SELECT state FROM proposals WHERE id=?", (pid,)), "expired")
-        r.ok("misc: passed expires_at -> the card label is Expired", (mid, "Expired") in h.tr.labels(), h.tr.labels())
+        r.eq("misc: passed expires_at -> the unsent drift item is dropped",
+             [(i["status"], i["close_reason"]) for i in h.q("SELECT status, close_reason FROM agenda WHERE kind='drift'")],
+             [("dropped", f"its cards ended before it came up (#{pid} expired)")])
+        r.eq("misc: no card message to relabel", h.tr.labels(), [])
         legs = h.q("SELECT state, finalized FROM orders WHERE proposal_id=?", (pid,))
         r.ok("misc: the expired legs are finalized", legs and all(l["state"] == "expired" and l["finalized"] == 1
                                                                    for l in legs), legs)

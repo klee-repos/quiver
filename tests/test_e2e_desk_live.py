@@ -25,6 +25,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -165,10 +166,11 @@ def case_desk_turn(R):
              emoji)
         R.ok("desk_turn: the reaction is on the owner's message",
              bool(reacts) and int(reacts[0].get("message_id", 0)) == 7001, reacts[:1])
-        R.ok("desk_turn: two or more say calls", tools.count("mcp__desk__say") >= 2, tools)
+        R.ok("desk_turn: one to three say calls (the voice rule)", 1 <= tools.count("mcp__desk__say") <= 3, tools)
         R.ok("desk_turn: one or more search_research calls", "mcp__desk__search_research" in tools, tools)
         sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
-        R.ok("desk_turn: two or more messages reach the owner chat", len(sent) >= 2, len(sent))
+        R.ok("desk_turn: one or more messages reach the owner chat", len(sent) >= 1, len(sent))
+        R.eq("desk_turn: no report labels or counters", labels(p.get("text") for p in sent), [])
         R.eq("desk_turn: one message per say (no recap after the last say)", len(sent),
              tools.count("mcp__desk__say"))
         R.ok("desk_turn: no error result", all(not r["is_error"] for r in rec["c"].results) if "c" in rec
@@ -267,9 +269,18 @@ def case_deep_dive(R):
             R.ok("deep_dive: the thesis scenarios cite findings", bool(cited), scen)
             R.eq("deep_dive: every cited finding exists", sorted(cited - ids), [])
         sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
-        R.ok("deep_dive: 3 to 6 messages to the owner", 3 <= len(sent) <= 6, len(sent))
-        for p in sent:
-            print("    msg>", str(p.get("text"))[:300].replace("\n", " "))
+        R.eq("deep_dive: the worker sends nothing to the owner (plan §4.8)", len(sent), 0)
+        it = job_item(led, job["id"])
+        print("  agenda item:", {k: it.get(k) for k in ("id", "kind", "priority", "status", "title", "proposal_ids")})
+        print("    report>", str(it.get("body"))[:1500].replace("\n", " / "))
+        R.eq("deep_dive: the job's item waits on the agenda, priority next", (it.get("status"), it.get("priority")),
+             ("waiting", 1))
+        R.ok("deep_dive: the item holds the report", 200 <= len(it.get("body") or "") <= 3000,
+             len(it.get("body") or ""))
+        R.ok("deep_dive: the item holds the pending set_thesis card",
+             any(p["id"] in (it.get("proposal_ids") or []) for p in thesis), (it.get("proposal_ids"), thesis))
+        R.eq("deep_dive: the report has no report labels or counters", labels([it.get("body")]), [])
+        R.eq("deep_dive: the report uses no finance jargon", jargon([it.get("body")]), [])
 
 
 RESEARCH_Q = "Can you research NVDA for me? I want to know if it is a good buy right now."
@@ -279,6 +290,22 @@ JARGON = ("bear case", "bull case", "base case", "fair value", "yoy", "adx", "th
 
 def jargon(texts) -> list:
     return sorted({w for t in texts for w in JARGON if w in str(t).lower()})
+
+
+# Report-style labels and counters the voice rules (prompts/desk.md, prompts/analyst.md) forbid.
+LABELS = re.compile(r"(?m)(^|\n|\. )(Good|Bad|Value|Verdict|Card|Risks?|Answer)\s*:|\(\d/\d\)|\b\d of \d\b")
+
+
+def labels(texts) -> list:
+    return sorted({m.group(0).strip() for t in texts for m in LABELS.finditer(str(t))})
+
+
+def job_item(led, job_id) -> dict:
+    """The agenda item of one analyst job (plan §4.8)."""
+    from lib.desk import agenda
+    with led.connect() as c:
+        row = c.execute("SELECT id FROM agenda WHERE job_id=?", (int(job_id),)).fetchone()
+        return agenda.get(c, row[0]) if row else {}
 
 
 def case_research(R):
@@ -349,9 +376,9 @@ def case_research(R):
             cards = [dict(r) for r in c.execute("SELECT id, state, payload_json FROM proposals WHERE kind='change' "
                                                 "AND state='pending' AND payload_json LIKE '%\"NVDA\"%'")]
         sent = [p for p in tg2.sent() if str(p.get("chat_id")) == str(OWNER)]
+        it = job_item(led, job["id"])
         print(f"  research deep-dive: {secs}s, job={j}, findings={len(finds)}, cards={[c_['id'] for c_ in cards]}")
-        for p in sent:
-            print("    msg>", str(p.get("text"))[:400].replace("\n", " "))
+        print("    report>", str(it.get("body"))[:1500].replace("\n", " / "))
         R.eq("research: the NVDA deep-dive is done", j["status"], "done")
         R.ok("research: 8 or more NVDA findings", len(finds) >= 8, len(finds))
         bad = [f["id"] for f in finds
@@ -359,9 +386,37 @@ def case_research(R):
                != f["quote"]]
         R.eq("research: every NVDA quote is in its document", bad, [])
         R.ok("research: a pending NVDA card", len(cards) >= 1, cards)
-        R.ok("research: 3 to 6 analyst messages plus the card", len(sent) >= 3, len(sent))
-        analyst = [str(p.get("text")) for p in sent if not p.get("reply_markup")]
-        R.eq("research: the analyst's messages use no finance jargon", jargon(analyst), [])
+        R.eq("research: the worker sends nothing to the owner", len(sent), 0)
+        R.eq("research: the owner's deep-dive waits with priority now", (it.get("status"), it.get("priority")),
+             ("waiting", 0))
+        R.eq("research: the report has no report labels or counters", labels([it.get("body")]), [])
+        R.eq("research: the report uses no finance jargon", jargon([it.get("body")]), [])
+
+        # The desk brings the item up in its own words; the card follows (plan §4.8).
+        before = len(tg.sent())
+        bridge.last_owner_at = bridge.last_tap_at = bridge.last_owner_turn_end = None
+
+        async def present():
+            await bridge.maybe_turn()
+            if bridge.turn_task is not None:
+                await bridge.turn_task
+            await bridge.disconnect()
+        t2 = time.monotonic()
+        asyncio.run(present())
+        up = [p for p in tg.sent()[before:] if str(p.get("chat_id")) == str(OWNER)]
+        words = [str(p.get("text")) for p in up if not p.get("reply_markup")]
+        print(f"  agenda turn: {round(time.monotonic() - t2, 1)}s")
+        for p in up:
+            print("    up>", str(p.get("text"))[:500].replace("\n", " / "))
+        with led.connect() as c:
+            status = c.execute("SELECT status FROM agenda WHERE id=?", (it.get("id"),)).fetchone()
+        R.eq("research: the item is open", status and status[0], "open")
+        R.ok("research: one to three messages from the desk, then the card",
+             1 <= len(words) <= 3 and up and up[-1].get("reply_markup"), [str(p.get("text"))[:60] for p in up])
+        R.eq("research: the desk's words use no report labels", labels(words), [])
+        R.eq("research: the desk's words use no finance jargon", jargon(words), [])
+        R.ok("research: the desk does not paste the report", not any(len(w) > 1200 for w in words),
+             [len(w) for w in words])
 
 
 CASES = {"desk_turn": case_desk_turn, "deep_dive": case_deep_dive, "research": case_research}

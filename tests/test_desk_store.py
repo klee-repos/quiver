@@ -73,11 +73,14 @@ PLAN_TABLES = {
     "chat_sessions": ('chat_id', 'session_id', 'started_at', 'last_turn_at'),
     "bridge_state": ('key', 'value'),
     "run_locks": ('name', 'holder', 'acquired_at'),
+    "agenda": ('id', 'kind', 'priority', 'status', 'ticker', 'title', 'body', 'job_id', 'event_id', 'proposal_ids',
+               'cards_json', 'not_before', 'created_at', 'opened_at', 'closed_at', 'close_reason'),
 }
 PLAN_FTS = {"documents_fts": "documents", "findings_fts": "findings", "notes_fts": "notes",
             "chat_messages_fts": "chat_messages"}
 PLAN_INDEXES = {"idx_filings_ticker": "filings", "idx_documents_ticker": "documents",
-                "idx_proposals_state": "proposals", "idx_chat_tg": "chat_messages"}
+                "idx_proposals_state": "proposals", "idx_chat_tg": "chat_messages", "idx_agenda_job": "agenda",
+                "idx_agenda_open": "agenda", "idx_agenda_status": "agenda"}
 
 # §6.1: every CHECK enum and its allowed values.
 PLAN_ENUMS = {
@@ -182,9 +185,9 @@ def case_schema_all():
         root.led()
         c = raw(root.db)
         names = table_names(c)
-        r.eq("schema_all store.DESK_TABLES has 30 names", len(store.DESK_TABLES), 30)
+        r.eq("schema_all store.DESK_TABLES has 31 names", len(store.DESK_TABLES), 31)
         r.eq("schema_all store.DESK_TABLES is the plan list", set(store.DESK_TABLES), set(PLAN_TABLES))
-        r.eq("schema_all the plan lists 30 tables", len(PLAN_TABLES), 30)
+        r.eq("schema_all the plan lists 31 tables", len(PLAN_TABLES), 31)
         r.eq("schema_all every plan table exists", sorted(set(PLAN_TABLES) - names), [])
         for t, want in PLAN_TABLES.items():
             r.eq(f"schema_all columns of {t}", tuple(cols(c, t)), want)

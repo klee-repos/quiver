@@ -89,6 +89,14 @@ def _event_phrase(ev: dict) -> str:
     return f"{t} had a {ev['type']} event"
 
 
+def _event_line(ev: dict) -> str:
+    """The event phrase; a failed analysis says so."""
+    text = _event_phrase(ev)
+    if ev.get("status") == "failed":
+        text += ", but I could not finish reading it"
+    return text
+
+
 def build_model(conn, *, day: str, now_dt, goal_progress: Optional[dict] = None,
                 earnings_fn=None) -> dict:
     """The brief's data for ``day`` (YYYY-MM-DD, ET). ``earnings_fn(ticker) -> 'YYYY-MM-DD'|None``
@@ -98,12 +106,17 @@ def build_model(conn, *, day: str, now_dt, goal_progress: Optional[dict] = None,
     base = conn.execute("SELECT baseline_equity FROM day_baseline WHERE trade_date=?", (day,)).fetchone()
     model = {"day": day, "equity": _f(snap.get("equity")), "baseline": _f(base[0]) if base else None,
              "goal": goal_progress, "movers": movers(snap) if snap else []}
-    # The day's events: detected on the ET calendar date.
+    # The events since the last brief (its agenda item), or the day's events (the ET calendar
+    # date) when no brief came before. The agenda's fyi items close with this brief, so an
+    # event from the evening after the last brief is said here.
+    last = conn.execute("SELECT MAX(created_at) FROM agenda WHERE kind='brief'").fetchone()
+    last = last[0] if last else None
     evs = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY detected_at, id").fetchall()]
     # One phrase once: a news group's events share one verdict, so they read the same.
     model["events"] = list(dict.fromkeys(
-        _event_phrase(e) for e in evs
-        if (store.parse_ts(e["detected_at"]).astimezone(market.ET).strftime("%Y-%m-%d") == day)))
+        _event_line(e) for e in evs
+        if (e["detected_at"] > last if last else
+            store.parse_ts(e["detected_at"]).astimezone(market.ET).strftime("%Y-%m-%d") == day)))
     model["watch_filings"] = json.loads(store.get_state(conn, f"watch_filings:{day}", "[]"))
     # Waiting on the owner.
     pend = []

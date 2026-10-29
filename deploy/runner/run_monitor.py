@@ -11,6 +11,9 @@ stage of its own name. The steps, in order:
   after the close: reflect, benchmark, goal, prune. The last line is one JSON status line.
 
 Under KILL the monitor still detects events and queues analysis: research is harmless.
+
+The drift card and the close brief go on the agenda (``lib/desk/agenda.py``), not straight
+to the owner. The chat bridge brings each up when the owner is free.
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ import runner_common as rc  # noqa: E402
 from lib import goal as goal_mod  # noqa: E402
 from lib import market, notify, portfolio, runlock  # noqa: E402
 from lib.config import load_config  # noqa: E402
-from lib.desk import brief, edgar, events, levels, news, outbox, proposals, quotes  # noqa: E402
+from lib.desk import agenda, brief, edgar, events, levels, news, outbox, proposals, quotes  # noqa: E402
 from lib.desk import settings as desk_settings, store, transcripts  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 
@@ -251,9 +254,20 @@ class Monitor:
                     built = None
                     res["refused"] = str(e)
             if built:
-                outbox.send_trade_card(self.led, self.box, self.led.connect, built, now_dt=self.now)
+                pid = built["proposal_id"]
+                names = ", ".join(out)
+                with self.led.transaction() as conn:
+                    res["agenda"] = agenda.add(
+                        conn, kind="drift", priority=agenda.NOW, now=store.iso(self.now),
+                        title=f"The account drifted outside its planned shares: {names}.",
+                        body=(f"The drift check found that {names} moved outside the share of the account we "
+                              "planned. The card holds the trades that move them back."),
+                        ticker=out[0] if len(out) == 1 else None, proposal_ids=[pid],
+                        cards={str(pid): {"legs": built["legs"], "skipped": built["skipped"],
+                                          "scaled": built["scaled"]}})
+                outbox.label_superseded(self.led, self.box, built["superseded"], pid)
                 self.status["proposals"] += 1
-                res["proposal_id"] = built["proposal_id"]
+                res["proposal_id"] = pid
         self.set_state(f"drift_done:{self.day}", store.iso(self.now))
         return res
 
@@ -262,6 +276,8 @@ class Monitor:
         with self.led.transaction() as conn:
             moved = proposals.expire_due(conn, self.now)
             replaced = proposals.supersede_duplicate_changes(conn, store.iso(self.now))
+            # An agenda item whose cards all ended closes (open) or drops (still waiting).
+            agenda_ended = agenda.refresh(conn, store.iso(self.now))
         for m in moved:
             if m.get("tg_message_id"):
                 self.box.set_label(m["tg_message_id"], "Expired")
@@ -277,7 +293,8 @@ class Monitor:
             text = proposals.close_from_legs(self.led, pid, self.now, reason="it expired before it ran")
             if text:
                 self.box.send(text, source="execution")
-        return {"expired": len(moved), "replaced": [m["id"] for m in replaced], "closed": stale}
+        return {"expired": len(moved), "replaced": [m["id"] for m in replaced], "closed": stale,
+                "agenda": agenda_ended}
 
     # --- §9.1 step 9 ---------------------------------------------------------------
     def queue(self):
@@ -320,13 +337,16 @@ class Monitor:
             model = brief.build_model(conn, day=self.day, now_dt=self.now, goal_progress=goal,
                                       earnings_fn=self.earnings_fn)
         msgs = notify.render_brief(model)
-        sent = 0
-        for m in msgs:
-            if self.box.send(m, source="brief").get("ok"):
-                sent += 1
-        if sent:
-            brief.mark_sent(self.led, self.day, self.box.chat_id, store.iso(self.now))
-        return {"messages": len(msgs), "sent": sent}
+        if not msgs:
+            return {"messages": 0}
+        now = store.iso(self.now)
+        # The brief is one agenda item. It covers the day's fyi items, so they close here.
+        with self.led.transaction() as conn:
+            iid = agenda.add(conn, kind="brief", priority=agenda.NEXT, now=now,
+                             title=f"The close brief for {self.day}.", body="\n\n".join(msgs))
+            closed = agenda.close_fyi(conn, now=now, reason="the close brief covers it")
+        brief.mark_sent(self.led, self.day, self.box.chat_id, now)
+        return {"messages": len(msgs), "agenda": iid, "fyi_closed": closed}
 
     # --- §9.1 step 11 --------------------------------------------------------------
     def after_close(self):

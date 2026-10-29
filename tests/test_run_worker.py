@@ -32,7 +32,7 @@ import run_worker as rw  # noqa: E402
 import runner_common as rc  # noqa: E402
 from lib import runlock  # noqa: E402
 from lib.dataflows.yfinance_news import fetch_news_items  # noqa: E402
-from lib.desk import agent, events, levels, news, outbox, proposals, store, tools  # noqa: E402
+from lib.desk import agenda, agent, events, levels, news, outbox, proposals, store, tools  # noqa: E402
 from lib.desk import settings as desk_settings  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
@@ -321,8 +321,13 @@ def case_retry_fail(r: Results):
         r.eq("retry_fail: two errors -> failed, attempts 2", (j["status"], j["attempts"]), ("failed", 2))
         r.eq("retry_fail: two errors -> event failed", h.one("SELECT status FROM events WHERE id=?", (evs[0],)),
              "failed")
-        r.eq("retry_fail: the owner message (plan text)", h.sent(), [FAIL_TEXT.format("boom")])
-        r.eq("retry_fail: one Telegram message", len(h.tr.texts()), 1)
+        # The worker sends nothing: the failure waits on the agenda as one item.
+        r.eq("retry_fail: no Telegram message", len(h.tr.texts()), 0)
+        items = h.q("SELECT kind, priority, status, title, body, event_id FROM agenda WHERE status != 'done'")
+        r.eq("retry_fail: one failure item (next: a failure always comes up)",
+             [(i["kind"], i["priority"], i["status"], i["event_id"]) for i in items],
+             [("failure", 1, "waiting", evs[0])])
+        r.eq("retry_fail: the item text (plan text)", [i["body"] for i in items], [FAIL_TEXT.format("boom")])
 
     with_root("2026-10-28 16:45", twice, new_10q=True)
 
@@ -351,7 +356,9 @@ def case_no_verdict(r: Results):
              ("failed", 2, "no verdict"))
         r.eq("no_verdict: the runner ran twice", script.attempts.get(jobs[0]), 2)
         r.eq("no_verdict: the event is failed", h.one("SELECT status FROM events WHERE id=?", (evs[0],)), "failed")
-        r.eq("no_verdict: the owner is told", h.sent(), [FAIL_TEXT.format("no verdict")])
+        r.eq("no_verdict: the failure item holds the plan text",
+             [i["body"] for i in h.q("SELECT body FROM agenda WHERE kind='failure'")], [FAIL_TEXT.format("no verdict")])
+        r.eq("no_verdict: nothing is sent", h.sent(), [])
 
     with_root("2026-10-28 16:45", body, new_10q=True)
 
@@ -545,9 +552,78 @@ def case_review(r: Results):
     with_root("2026-10-28 16:45", body)
 
 
+def case_agenda(r: Results):
+    """Each analyst job ends as one agenda item; the worker sends nothing (plan §4.8)."""
+    def body(h: Harness):
+        with h.led.connect() as c:
+            c.execute("UPDATE jobs SET status='done' WHERE kind='deep_dive'")   # the seed's two deep-dives
+            dd = store.enqueue_job(c, kind="deep_dive", payload={"ticker": "CEG", "focus": "is it a buy?"},
+                                   requested_by="desk", now=store.now_iso())
+        h.level_event("ANET", "buy_below", 200.0, "2026-10-28 13:10")
+        h.queue()
+        h.level_event("CEG", "trim_above", 250.0, "2026-10-28 13:20")
+        h.queue()
+        thesis = {"kind": "set_thesis", "ticker": "ANET", "premise_link": "AI networking is a bottleneck.",
+                  "summary": "Arista sells the back-end network of AI clusters.", "drivers": ["AI back-end share"],
+                  "falsifiers": ["a hyperscaler moves to white box"],
+                  "valuation": {"method": "price_levels", "reason": "owner levels", "buy_below": 140.0,
+                                "trim_above": 260.0}, "evidence": []}
+
+        def fn(h, kind, prompt, js, ctx, attempt):
+            if kind == "analyze_event":
+                t = h.one("SELECT ticker FROM events WHERE id=?", (js.event_id,))
+                verdict(ctx, js)
+                if t == "ANET":
+                    ok_call(ctx, "propose_change", {"change": thesis, "rationale": "Save why we own Arista.",
+                                                    "evidence": []})
+                    ok_call(ctx, "report", {"text": "Arista crossed our buy price, and nothing broke."})
+                else:
+                    ok_call(ctx, "report", {"text": "Constellation crossed our sell price. Nothing changed."})
+            elif kind == "deep_dive":
+                ok_call(ctx, "report", {"text": "Constellation runs the largest US nuclear fleet. I'd wait."})
+        w = h.worker(Script(h, fn))
+        w.drain()
+        r.eq("agenda: the worker sends nothing to Telegram", h.tr.texts(), [])
+        items = {(i["ticker"], i["event_id"] is not None): i for i in h.q("SELECT * FROM agenda WHERE status='waiting'")}
+        anet, ceg_ev, ceg_dd = items.get(("ANET", True)), items.get(("CEG", True)), items.get(("CEG", False))
+        r.ok("agenda: three waiting items", anet and ceg_ev and ceg_dd, sorted(items))
+        if not (anet and ceg_ev and ceg_dd):
+            return
+        pid = json.loads(anet["proposal_ids"])
+        r.eq("agenda: the ANET item holds its change card, priority next",
+             (anet["kind"], anet["priority"], anet["body"], len(pid)),
+             ("report", 1, "Arista crossed our buy price, and nothing broke.", 1))
+        r.eq("agenda: the change card is not sent", h.one("SELECT tg_message_id FROM proposals WHERE id=?", (pid[0],)),
+             None)
+        r.ok("agenda: the title names the event and the verdict", anet["title"].startswith("ANET crossed its buy below")
+             and anet["title"].endswith("Verdict: intact."), anet["title"])
+        r.eq("agenda: a check that changed nothing is fyi", (ceg_ev["priority"], ceg_ev["body"]),
+             (2, "Constellation crossed our sell price. Nothing changed."))
+        r.eq("agenda: the deep-dive the owner asked for is now, with its focus in the title",
+             (ceg_dd["priority"], ceg_dd["title"]), (0, "The CEG deep-dive you asked for (is it a buy?)."))
+        with h.led.connect() as c:
+            r.eq("agenda: the owner's deep-dive comes up first, then the card; the fyi item never",
+                 [x["id"] for x in agenda.due(c, store.now_iso())], [ceg_dd["id"], anet["id"]])
+        r.ok("agenda: the worker line names the item", any(ln.get("agenda") for ln in log_lines()
+                                                            if ln.get("stage") == "worker" and ln.get("ok")))
+        # A worker stop between a job's end and its filing leaves a draft; the next start files it.
+        with h.led.connect() as c:
+            jid = store.enqueue_job(c, kind="deep_dive", payload={"ticker": "ANET", "focus": "x"},
+                                    requested_by="desk", now=store.now_iso())
+            c.execute("UPDATE jobs SET status='done' WHERE id=?", (jid,))
+            agenda.set_report(c, jid, "Arista is strong, so I'd keep it.", now=store.now_iso())
+        r.eq("agenda: recover_drafts files the orphan draft", w.recover_drafts(), [jid])
+        r.eq("agenda: the recovered item waits as now (the owner asked)",
+             [(i["status"], i["priority"]) for i in h.q("SELECT status, priority FROM agenda WHERE job_id=?", (jid,))],
+             [("waiting", 0)])
+        r.eq("agenda: a second recover files nothing", w.recover_drafts(), [])
+
+    with_root("2026-10-28 09:00", body)
+
+
 def main() -> int:
     r = Results("run-worker")
-    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt, case_review):
+    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt, case_review, case_agenda):
         try:
             case(r)
         except Exception as e:  # noqa: BLE001

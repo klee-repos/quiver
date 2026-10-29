@@ -37,8 +37,9 @@ _MD_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 def render_model_text(text: str) -> str:
     """Convert the model's markdown to the small subset Telegram renders (<b>, <code>,
     <pre>). Everything else is HTML-escaped or flattened. Links become `text (url)`, so a
-    URL is never hidden behind text. The desk's `say` and the analyst's `notify_owner` both
-    use it: raw HTML from a model (a planted `<a href>`) reaches the owner as plain text."""
+    URL is never hidden behind text. The desk's `say` and the bridge's plain send of an agenda
+    item (the analyst's report) both use it: raw HTML from a model (a planted `<a href>`)
+    reaches the owner as plain text."""
     text = str(text or "").replace("\x00", "")  # NUL marks the stash below
     stash: list = []
 
@@ -198,6 +199,48 @@ def send_trade_card(led, box: Outbox, conn_factory, built: dict, *, now_dt=None)
     for o in old:
         if o and o.get("tg_message_id"):
             box.set_label(o["tg_message_id"], f"Replaced by #{prop['id']}")
+    return res
+
+
+def label_superseded(led, box: Outbox, superseded, new_id: int) -> None:
+    """Edit the cards that a new proposal replaced to "Replaced by #N". A card that is not
+    in the chat yet (an agenda item still waits) has no message to edit."""
+    from lib.desk import proposals
+    with led.connect() as conn:
+        old = [proposals.get_proposal(conn, s) for s in superseded or ()]
+    for o in old:
+        if o and o.get("tg_message_id"):
+            box.set_label(o["tg_message_id"], f"Replaced by #{new_id}")
+
+
+def legs_for_card(led, proposal_id: int) -> list:
+    """The card inputs of a trade's legs, rebuilt from its ``orders`` rows (no weights)."""
+    return [{"ticker": l["ticker"], "side": l["side"], "dollars": l["dollar_amount"], "quantity": l["quantity"],
+             "quote": l["quote_at_proposal"]} for l in led.legs(proposal_id)]
+
+
+def send_card(led, box: Outbox, cfg, proposal_id: int, *, card=None, now_dt=None) -> dict:
+    """Send a pending proposal's card at the bottom of the chat, the first time or again.
+    ``card`` holds a trade card's build-time inputs (the agenda keeps them); without it the
+    legs come from ``orders``. The tap check accepts only the newest card message, so an
+    older card message of the same proposal loses its buttons ("Moved down")."""
+    from lib.desk import proposals
+    with led.connect() as conn:
+        p = proposals.get_proposal(conn, proposal_id)
+    if p is None or p["state"] != "pending":
+        return {"ok": False, "error": f"#{proposal_id} is not pending"}
+    old = p.get("tg_message_id")
+    if p["kind"] == "trade":
+        payload = store.loads(p["payload_json"], {}) or {}
+        card = card or {}
+        built = {"proposal_id": p["id"], "legs": card.get("legs") or legs_for_card(led, p["id"]),
+                 "skipped": card.get("skipped", payload.get("skipped", [])),
+                 "scaled": card.get("scaled", payload.get("scaled")), "superseded": []}
+        res = send_trade_card(led, box, led.connect, built, now_dt=now_dt)
+    else:
+        res = send_change_card(led, box, cfg, p["id"], now_dt=now_dt)
+    if old and res.get("ok") and res.get("message_id") != old:
+        box.set_label(old, "Moved down")
     return res
 
 

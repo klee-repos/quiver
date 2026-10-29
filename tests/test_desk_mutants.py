@@ -163,7 +163,7 @@ def _drop_ceg_exit(c):
     assert res.get("ok") and res.get("cards"), res
     fu = res["cards"][0]
     payload = json.loads(c.prop(fu)["payload_json"])
-    built = {"proposal_id": fu, "legs": chat_bridge._legs_for_card(c.led, fu, payload),
+    built = {"proposal_id": fu, "legs": outbox.legs_for_card(c.led, fu),
              "skipped": payload.get("skipped", []), "scaled": payload.get("scaled"), "superseded": []}
     c.clk.advance(20)
     c.approve(built)

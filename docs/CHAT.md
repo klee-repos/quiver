@@ -52,25 +52,62 @@ never uses a fixed emoji.
 - The first message of a turn replies to your newest message.
 - Text the model writes after its last `say` is not sent: it is a recap. A turn with no `say`
   sends its text as the answer.
-- The bridge converts markdown to Telegram HTML. The analyst's messages use the same
+- The bridge converts markdown to Telegram HTML. An agenda item sent as written uses the same
   converter: HTML from a model reaches you as text, and a link always shows its URL. If
   Telegram rejects the HTML, the bridge sends the message again as plain text.
 
+### One thing at a time (the agenda)
+
+Background work never blasts you. The analyst's reports and cards, the drift check and the
+close brief wait on the agenda (`lib/desk/agenda.py`, plan §4.8). The desk brings them up
+one at a time, like an assistant with a list.
+
+- When you are free, the bridge opens the next item and the desk tells you about it in its
+  own words. The item's card comes right below. You are free when nothing is open, no turn
+  runs, no trade you tapped is still at the broker, no fresh card waits on you, and your last
+  act is old enough: 4 s after a tap, 2 minutes after the desk's last reply.
+- The next item comes up only after you deal with the open one. A tap on its last card
+  closes it. "Next", "skip" or a decision in chat closes it too, and the desk can bring up
+  the next one in the same reply. An item with no card (the brief, a report) closes when you
+  answer it.
+- Urgent things do not wait forever: a trade card, research you asked for, or a weaker thesis
+  on a holding takes over an item you left unanswered for 20 minutes.
+- Nothing is lost quietly. If a card expires before its item comes up, the report still comes
+  up, with a note. A failed analysis comes up too.
+- "Later" puts one item back in line for some hours. "Hold the rest for an hour" stops new
+  items until then.
+- Ask "what's left?" and the desk answers from the agenda: how many things wait, and the
+  next one or two.
+- Order: a trade card, research you asked for, and a thesis that got weaker on a holding come
+  first. Then the change cards, the other reviews and the close brief. A news check that
+  changes nothing is not brought up: the close brief covers it.
+- Ask to see a card again and the desk sends it as the newest message. The old copy says
+  "Moved down" and its buttons stop working.
+- These still come at once, because they answer what you just did: a tap answer, the fills,
+  a new card after a price move, and the trade card after you confirm a change.
+- `/stop` during the desk's telling of an item stops it, puts the item back in line and holds
+  the list for an hour.
+- `/status` shows how many items are open, waiting and fyi.
+
 ### Plain English
 
-The desk and the analyst write for a reader with no finance training. Their prompts
-(`prompts/desk.md`, `prompts/analyst.md`) hold the ASD-STE100 rules: short sentences, the
-active voice, and common words. A finance term gets a plain explanation the first time it
-appears in a message, and the prompts name one word for each idea (for example "what one
-share is worth", not "fair value"). The cards (`lib/notify.py`) use the same words.
+The desk and the analyst write for a reader with no finance training, and they talk like a
+partner, not a report. Their prompts (`prompts/desk.md`, `prompts/analyst.md`) follow the
+agent-persona skill's written voice: lead with the view, give the one or two facts that
+explain it and what they mean for you, use full connected sentences, and end with the one
+thing the desk needs from you. No labels ("Good:", "Value:"), no counters, no recaps. Words
+stay common and sentences short, but a thought is never chopped into fragments. A finance
+term gets a plain explanation the first time it appears in a message, and the prompts name
+one word for each idea (for example "what one share is worth", not "fair value"). The cards
+(`lib/notify.py`) use the same words; a thesis card is short paragraphs.
 
 ### Research on request
 
 Ask about a ticker ("look into NVDA"). The desk gives the facts it has, then calls
 `load_company` (when the name is not loaded) and `start_deep_dive` with your question as the
 focus. The analyst reads the annual and quarterly reports, the latest results release and the
-results call, records the facts with exact quotes, values the company, and reports back in
-the chat with a thesis card. A name with no SEC filings cannot be loaded. The desk runs at most
+results call, records the facts with exact quotes, values the company, and files its report
+with a thesis card. Research you asked for comes up first on the agenda. A name with no SEC filings cannot be loaded. The desk runs at most
 6 deep-dives a day.
 
 To review each holding at once, run `tick.py desk-review` on the box. It queues one deep-dive
@@ -122,7 +159,7 @@ Python answers these without a model turn:
 
 | Command | Effect |
 |---|---|
-| `/status` | Snapshot age, pending proposals, the last monitor run, the halt state, and the Robinhood login state. |
+| `/status` | Snapshot age, pending proposals, the agenda counts, the last monitor run, the halt state, and the Robinhood login state. |
 | `/clear` (also `/reset`, `/new`) | Starts a new SDK session. The research memory and `chat_messages` stay. |
 | `/stop` | Stops the running turn. |
 
@@ -152,7 +189,12 @@ rows), `screen_companies`.
 |---|---|---|
 | `react` | D | Sets the reaction on an owner message. |
 | `say` | D | Sends one message. |
-| `notify_owner` | A | Sends one message through the outbox. |
+| `report` | A | Files the analyst's report on the job's agenda item. Sends nothing. |
+| `bring_up_next` | D | Opens the next agenda item and returns its report and cards. Only after you spoke in the turn. |
+| `close_item` | D | Closes the agenda item you dealt with. Its card stays open until you tap it or it expires. |
+| `defer_item` | D | Puts an agenda item back in line for 1 to 72 hours. |
+| `hold_agenda` | D | Stops new agenda items for 0 to 24 hours (0 lifts the hold). |
+| `show_card` | D | Sends a pending card again as the newest message. |
 | `load_company` | D, A | Loads a company or an ETF: filings, sections, XBRL, metrics, transcript. A new name gets `status='candidate'`. |
 | `fetch_document` | D, A | Fetches a web page and stores its text, so the desk can quote it later. |
 | `record_finding` | D, A | Stores a fact only if its quote is in a stored document. |

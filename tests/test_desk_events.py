@@ -479,7 +479,12 @@ def case_queue():
             r.eq("queue a second failure -> failed", (job_row(led, job_of[ev_fail])["status"],
                                                       one(led, "SELECT status FROM events WHERE id=?", ev_fail)),
                  ("failed", "failed"))
-            r.eq("queue the owner hears of the failure once", len(transport.calls) - sends, 1)
+            r.eq("queue the worker sends nothing on a failure", len(transport.calls) - sends, 0)
+            fail_items = q(led, "SELECT kind, priority, status, title FROM agenda WHERE event_id=?", ev_fail)
+            r.eq("queue the failure is one agenda item that comes up (next)",
+                 [(k, p, s) for k, p, s, _t in fail_items], [("failure", 1, "waiting")])
+            r.ok("queue the failure item says what failed", fail_items and fail_items[0][3].startswith("I could not"),
+                 fail_items)
             # A finished event takes no new verdict.
             from lib.desk import tools
             ctx = w.make_ctx(None)

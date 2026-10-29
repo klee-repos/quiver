@@ -37,6 +37,7 @@ SUITES=(
   "broker-guard|tests/test_broker_guard.py"    "desk-agent-hook|tests/test_desk_agent_hook.py"
   "desk-tools-static|tests/test_desk_tools_static.py" "chat-bridge|tests/test_chat_bridge.py"
   "desk-outbox|tests/test_desk_outbox.py"      "desk-brief|tests/test_desk_brief.py"
+  "desk-agenda|tests/test_desk_agenda.py"
   "run-monitor|tests/test_run_monitor.py"      "run-worker|tests/test_run_worker.py"
   "e2e-desk|tests/test_e2e_desk.py"
   "desk-mutants|tests/test_desk_mutants.py"   "desk-gateb|tests/test_desk_gateb.py"

@@ -30,8 +30,9 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
         "run_valuation", "get_technicals", "get_transcript", "get_etf_lookthrough", "get_events", "get_proposals",
         "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
-           "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change"]
-A_WRITE = ["notify_owner", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
+           "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card"]
+A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
 W3_NAMES = {"approvals", "execution", "handle_tap", "apply_change", "subprocess", "Popen", "shutil",
             "write_text", "write_bytes",
@@ -546,7 +547,9 @@ ARGS = {
     "get_proposals": {}, "get_track_record": {}, "get_attribution": {}, "get_settings": {},
     "ledger_query": {"sql": "SELECT 1 AS one"}, "screen_companies": {},
     "react": {"message_id": 1, "emoji": "👍"}, "say": {"text": "Hello."},
-    "notify_owner": {"text": "The ANET 10-Q is in."}, "load_company": {"ticker": "ZZZZQ"},
+    "report": {"text": "The ANET 10-Q is in."}, "load_company": {"ticker": "ZZZZQ"},
+    "bring_up_next": {}, "close_item": {"item_id": 1}, "defer_item": {"item_id": 1, "hours": 2},
+    "hold_agenda": {"hours": 1}, "show_card": {"proposal_id": 1},
     "fetch_document": {"url": "http://127.0.0.1/x"},
     "record_finding": {"ticker": "ANET", "kind": "growth", "claim": "x", "quote": "y", "document_id": 1},
     "add_note": {"text": "The owner prefers short messages."},
@@ -576,7 +579,7 @@ def case_smoke():
     crashes, non_json, leaks, kinds = [], [], [], []
     try:
         for name in sorted(tools.SPECS):
-            role = "analyst" if name in ("notify_owner", "record_verdict") else "desk"
+            role = "analyst" if name in ("report", "record_verdict") else "desk"
             with temp_root() as root:
                 led = root.led()
                 with led.connect() as c:

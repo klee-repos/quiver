@@ -39,8 +39,9 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
         "run_valuation", "get_technicals", "get_transcript", "get_etf_lookthrough", "get_events", "get_proposals",
         "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
-           "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change"]
-A_WRITE = ["notify_owner", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
+           "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card"]
+A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
 D_TOOLS = READ + D_WRITE
 A_TOOLS = READ + A_WRITE
@@ -155,11 +156,12 @@ def case_roles(root, clock):
     dh, ah = hook_of(d_opts), hook_of(a_opts)
     d_pass = [t for t in D_TOOLS if call_hook(dh, f"mcp__desk__{t}")[0]]
     r.eq("roles: desk: every D tool passes", sorted(d_pass), sorted(D_TOOLS))
-    for t in ("notify_owner", "record_verdict"):
+    for t in ("report", "record_verdict"):
         r.ok(f"roles: desk: {t} is denied", not call_hook(dh, f"mcp__desk__{t}")[0])
     a_pass = [t for t in A_TOOLS if call_hook(ah, f"mcp__desk__{t}")[0]]
     r.eq("roles: analyst: every A tool passes", sorted(a_pass), sorted(A_TOOLS))
-    for t in ("react", "say", "start_deep_dive", "set_research_status"):
+    for t in ("react", "say", "start_deep_dive", "set_research_status", "bring_up_next", "close_item",
+              "defer_item", "hold_agenda", "show_card"):
         r.ok(f"roles: analyst: {t} is denied", not call_hook(ah, f"mcp__desk__{t}")[0])
     r.eq("roles: desk allowed_tools = the D tools + the 4 built-ins", sorted(d_opts.allowed_tools),
          sorted([f"mcp__desk__{t}" for t in D_TOOLS] + BUILTINS))

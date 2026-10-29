@@ -7,10 +7,15 @@ run lock, and drains ``jobs``: ``classify_news`` first, then ``analyze_event`` (
 first), then ``deep_dive``, one at a time. It checks the queue again before it exits, so a
 job queued during the drain runs too.
 
-A job that fails runs once more; the second failure marks it ``failed`` and tells the owner.
-An ``analyze_event`` job must end with ``record_verdict``. The analyst has no broker access
+A job that fails runs once more; the second failure marks it ``failed``. An
+``analyze_event`` job must end with ``record_verdict``. The analyst has no broker access
 (the unit hides the Robinhood config) and no shell: its tools are the A set of
 ``lib/desk/tools.py``.
+
+The worker sends nothing to the owner. Each analyst job ends as one agenda item: the
+analyst's report, its cards, a title and a priority (``lib/desk/agenda.py``). A job that
+fails twice ends as a ``failure`` item. The chat bridge brings each item up when the owner
+is free.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import runner_common as rc  # noqa: E402
 from lib import market, runlock  # noqa: E402
-from lib.desk import agent, documents, news, outbox, store, tools  # noqa: E402
+from lib.desk import agenda, agent, documents, events, news, outbox, store, tools  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 from lib.prompts import load_prompt  # noqa: E402
 
@@ -245,6 +250,66 @@ class Worker:
             return f"finish the deep-dive on {payload.get('ticker', '?')}"
         return "classify the news"
 
+    def file_item(self, job, *, error=None):
+        """Put the job's report and cards on the agenda as one item (or a ``failure`` item).
+        The title and the priority come from Python (``agenda.job_priority``)."""
+        payload = store.loads(job["payload_json"], {}) or {}
+        what = self.describe(job) if error else ""
+        now = store.now_iso()
+        with self.led.transaction() as conn:
+            draft = agenda.job_draft(conn, job["id"], now=now)
+            pids = draft["proposal_ids"]
+            body_if_empty, event_id = "", None
+            if job["kind"] == "analyze_event":
+                ev = store.get_event(conn, int(payload.get("event_id") or 0)) or {}
+                ticker, verdict, event_id = ev.get("ticker"), ev.get("verdict"), ev.get("id")
+                title = events.describe_event(ev) if ev else "An event."
+                if verdict:
+                    title += f" Verdict: {verdict}."
+                prio = agenda.job_priority(conn, proposal_ids=pids, verdict=verdict, ticker=ticker)
+                body_if_empty = ev.get("analysis") or ""
+            else:
+                ticker, by = payload.get("ticker"), job.get("requested_by")
+                if payload.get("review"):
+                    title = f"The review of your {ticker} position."
+                elif by == "desk":
+                    focus = str(payload.get("focus") or "").strip()
+                    title = f"The {ticker} deep-dive you asked for" + (f" ({focus[:160]})." if focus else ".")
+                else:
+                    title = f"The {ticker} deep-dive."
+                prio = agenda.job_priority(conn, proposal_ids=pids, deep_dive=True, requested_by=by)
+                if by == "desk":  # the owner waits for it: never end in silence
+                    body_if_empty = f"I finished the {ticker} deep-dive, but I wrote no report. Ask me to run it again."
+            kind = "report"
+            if error:
+                # A failure always comes up: before the agenda the owner heard of each one.
+                kind, prio = "failure", min(prio, agenda.NEXT)
+                title = f"I could not {what}."
+                note = f"I could not {what} (error: {str(error)[:200]}). I stopped trying."
+                agenda.set_report(conn, job["id"], (draft["body"].strip() + "\n\n" + note).strip(), now=now)
+            return agenda.finish_job(conn, job["id"], kind=kind, priority=prio, title=title, now=now,
+                                     ticker=ticker, event_id=event_id, body_if_empty=body_if_empty)
+
+    def recover_drafts(self) -> list:
+        """At start: a draft whose job already ended (the worker stopped between the job's end
+        and its filing) is filed now, so its report and cards still come up."""
+        with self.led.connect() as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT j.* FROM agenda a JOIN jobs j ON j.id=a.job_id WHERE a.status='draft' "
+                "AND j.status IN ('done','failed')").fetchall()]
+        out = []
+        for job in rows:
+            if self._file(job, error=job["error"] if job["status"] == "failed" else None) is not None:
+                out.append(job["id"])
+        return out
+
+    def _file(self, job, *, error=None):
+        try:
+            return self.file_item(job, error=error)
+        except Exception as e:  # noqa: BLE001 — a filing bug must not undo the job's result
+            rc._emit({"stage": "worker", "job": job["id"], "event": "agenda_error", "error": f"{type(e).__name__}: {e}"})
+            return None
+
     def run_one(self, job):
         attempts = self.start(job)
         try:
@@ -255,8 +320,9 @@ class Worker:
             else:
                 res = self.run_deep_dive(job)
             self.finish(job, "done")
+            item = self._file(job) if job["kind"] != "classify_news" else None
             rc._emit({"stage": "worker", "job": job["id"], "kind": job["kind"], "ok": True,
-                      "result": res if isinstance(res, dict) else None})
+                      "result": res if isinstance(res, dict) else None, **({"agenda": item} if item else {})})
         except Exception as e:  # noqa: BLE001
             err = str(e) or type(e).__name__
             if attempts < MAX_ATTEMPTS:
@@ -269,8 +335,7 @@ class Worker:
                         for eid in [payload.get("event_id")] + list(payload.get("also") or []):
                             conn.execute("UPDATE events SET status='failed' WHERE id=?", (int(eid or 0),))
                 if job["kind"] != "classify_news":
-                    self.box.send(f"I could not {self.describe(job)} (error: {err[:200]}). I stopped trying.",
-                                  source="analyst")
+                    self._file(job, error=err)
             rc._emit({"stage": "worker", "job": job["id"], "kind": job["kind"], "ok": False, "attempts": attempts,
                       "error": err[:300]})
 
@@ -299,6 +364,9 @@ def main() -> int:
         with runlock.run_lock(w.led, "worker", holder, store.now_iso(), LOCK_TTL_S):
             # Inside the lock: a second worker that exits on the lock never requeues a live job.
             w.requeue_running()
+            filed = w.recover_drafts()
+            if filed:
+                rc._emit({"stage": "worker", "event": "drafts_recovered", "jobs": filed})
             n = w.drain()
             rc._emit({"stage": "worker", "event": "worker_ok", "jobs": n})
     except runlock.RunLockError as e:

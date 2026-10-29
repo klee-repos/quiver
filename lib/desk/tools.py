@@ -24,10 +24,11 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from lib import market, memory
-from lib.desk import (documents, edgar, etf, events, findings, news, outbox, proposals, quotes,
+from lib.desk import (agenda, documents, edgar, etf, events, findings, news, outbox, proposals, quotes,
                       reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
 
 SAY_LIMIT = 1200
+REPORT_LIMIT = 3000
 DEEP_DIVES_PER_DAY = 6
 REFRESH_MAX_WAIT_S = 120
 
@@ -40,8 +41,9 @@ READ_TOOLS = (
     "get_events", "get_proposals", "get_track_record", "get_attribution", "get_settings",
     "ledger_query", "screen_companies",
 )
-DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive")
-ANALYST_ONLY = ("notify_owner", "record_verdict")
+DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
+             "defer_item", "hold_agenda", "show_card")
+ANALYST_ONLY = ("report", "record_verdict")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
 
@@ -577,16 +579,22 @@ def t_say(ctx: ToolContext, args: dict) -> dict:
     return {"sent": bool(res.get("ok")), "message_id": res.get("message_id")}
 
 
-def t_notify_owner(ctx: ToolContext, args: dict) -> dict:
+def t_report(ctx: ToolContext, args: dict) -> dict:
+    """The analyst's report goes to its job's agenda item, not to the owner. The desk brings
+    it up when the owner is free. A second call replaces the first."""
     text = str(args.get("text") or "").strip()
     if not text:
-        raise ToolError("notify_owner needs text")
-    if len(text) > SAY_LIMIT:
-        raise ToolError(f"that message is {len(text)} characters; the limit is 1200, so split it")
-    res = ctx.box.send(ctx.render(text), source="analyst")
-    if ctx.job is not None:
-        ctx.job.messages += 1
-    return {"sent": bool(res.get("ok"))}
+        raise ToolError("report needs text")
+    if len(text) > REPORT_LIMIT:
+        raise ToolError(f"that report is {len(text)} characters; the limit is {REPORT_LIMIT}, so cut it")
+    if ctx.job is None or ctx.job.job_id is None:
+        raise ToolError("report works inside a job only")
+    with ctx.conn() as c:
+        if not agenda.set_report(c, ctx.job.job_id, text, now=store.now_iso()):
+            raise ToolError("this job's report already went to the desk")
+    ctx.job.messages += 1
+    return {"saved": True, "chars": len(text),
+            "note": "The desk brings this up with the owner when they are free, with your cards."}
 
 
 def t_load_company(ctx: ToolContext, args: dict) -> dict:
@@ -684,6 +692,101 @@ def t_start_deep_dive(ctx: ToolContext, args: dict) -> dict:
     return {"job_id": jid, "ticker": t}
 
 
+def _owner_turn(ctx: ToolContext, name: str) -> None:
+    """The agenda moves on only after the owner speaks: a turn with no owner message (the
+    bridge brought an item up) cannot close, defer, hold or bring up an item."""
+    if ctx.turn is None or not ctx.turn.owner_message_ids:
+        raise ToolError(f"{name} needs an owner message in this turn; wait for the owner to answer")
+
+
+def _agenda_item_out(conn, it: dict) -> dict:
+    return {"item": it["id"], "priority": agenda.PRIORITY_TEXT.get(it["priority"]), "kind": it["kind"],
+            "ticker": it["ticker"], "title": it["title"], "report": it["body"],
+            "cards": agenda.card_facts(conn, it)}
+
+
+def t_bring_up_next(ctx: ToolContext, args: dict) -> dict:
+    _owner_turn(ctx, "bring_up_next")
+    now = store.now_iso()
+    with ctx.conn() as c:
+        agenda.refresh(c, now)
+        op = agenda.open_item(c)
+        if op is not None:
+            raise ToolError(f"item {op['id']} is still open; call close_item or defer_item first")
+        agenda.hold(c, None)
+        it = agenda.take_next(c, now)
+        if it is None:
+            return {"item": None, "note": "Nothing waits on the agenda."}
+        out = _agenda_item_out(c, it)
+    out["note"] = ("Tell the owner about it now, in your own words. The bridge sends its cards after your "
+                   "last message; call show_card to place a card sooner.")
+    return out
+
+
+def t_close_item(ctx: ToolContext, args: dict) -> dict:
+    _owner_turn(ctx, "close_item")
+    iid = int(args.get("item_id"))
+    reason = str(args.get("reason") or "").strip() or "the owner dealt with it"
+    with ctx.conn() as c:
+        it = agenda.get(c, iid)
+        if it is None or it["status"] not in ("waiting", "open"):
+            raise ToolError(f"item {iid} is not open or waiting")
+        agenda.close(c, iid, reason=reason, now=store.now_iso())
+        pending = [x["id"] for x in agenda.card_facts(c, it) if x["state"] == "pending"]
+    out = {"item": iid, "closed": True}
+    if pending:
+        out["note"] = ("Its cards stay open until the owner taps them or they expire: "
+                       + ", ".join(f"#{p}" for p in pending) + ".")
+    return out
+
+
+def t_defer_item(ctx: ToolContext, args: dict) -> dict:
+    _owner_turn(ctx, "defer_item")
+    iid = int(args.get("item_id"))
+    try:
+        hours = float(args.get("hours"))
+    except (TypeError, ValueError):
+        raise ToolError("hours must be a number from 1 to 72")
+    if not 1 <= hours <= 72:
+        raise ToolError("hours must be a number from 1 to 72")
+    with ctx.conn() as c:
+        until = agenda.defer(c, iid, hours=hours, now=store.now_iso())
+    if until is None:
+        raise ToolError(f"item {iid} is not open or waiting")
+    return {"item": iid, "not_before": until}
+
+
+def t_hold_agenda(ctx: ToolContext, args: dict) -> dict:
+    _owner_turn(ctx, "hold_agenda")
+    try:
+        hours = float(args.get("hours"))
+    except (TypeError, ValueError):
+        raise ToolError("hours must be a number from 0 to 24 (0 lifts the hold)")
+    if not 0 <= hours <= 24:
+        raise ToolError("hours must be a number from 0 to 24 (0 lifts the hold)")
+    until = store.iso(ctx.now() + timedelta(hours=hours)) if hours else None
+    with ctx.conn() as c:
+        agenda.hold(c, until)
+        n = agenda.counts(c)
+    return {"hold_until": until, "waiting": n["waiting"], "open": n["open"]}
+
+
+def t_show_card(ctx: ToolContext, args: dict) -> dict:
+    """Send a pending card again at the bottom of the chat (or for the first time)."""
+    pid = int(args.get("proposal_id"))
+    with ctx.conn() as c:
+        p = proposals.get_proposal(c, pid)
+        it = agenda.item_of_proposal(c, pid)
+    if p is None:
+        raise ToolError(f"proposal #{pid} does not exist")
+    if p["state"] != "pending":
+        raise ToolError(f"#{pid} is {p['state']}; only a pending card has buttons")
+    card = (it or {}).get("cards", {}).get(str(pid))
+    res = outbox.send_card(ctx.led, ctx.box, ctx.cfg, pid, card=card)
+    return {"proposal_id": pid, "sent": bool(res.get("ok")),
+            "note": "The card is now the newest message with buttons. The older copy says Moved down."}
+
+
 def t_record_verdict(ctx: ToolContext, args: dict) -> dict:
     eid = int(args.get("event_id"))
     verdict = str(args.get("verdict") or "")
@@ -718,6 +821,19 @@ def t_withdraw_proposal(ctx: ToolContext, args: dict) -> dict:
     return {"proposal_id": pid, "withdrawn": moved}
 
 
+def _file_with_job(ctx: ToolContext, proposal_id: int, superseded, *, card=None) -> bool:
+    """An analyst job's card waits on the job's agenda item (the bridge sends it when the
+    item comes up). The cards it replaced lose their buttons now. False outside a job: the
+    caller sends the card at once."""
+    if ctx.role != "analyst" or ctx.job is None or ctx.job.job_id is None:
+        return False
+    with ctx.conn() as c:
+        it = agenda.job_draft(c, ctx.job.job_id, now=store.now_iso())
+        agenda.attach(c, it["id"], proposal_id, card=card)
+    outbox.label_superseded(ctx.led, ctx.box, superseded, proposal_id)
+    return True
+
+
 def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
     origin = args.get("origin") or {}
     if not isinstance(origin, dict):
@@ -739,14 +855,20 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
                 yf_price_fn=yf)
     except proposals.ProposalError as e:
         raise ToolError(str(e))
-    outbox.send_trade_card(ctx.led, ctx.box, ctx.led.connect, built)
+    card = {"legs": built["legs"], "skipped": built["skipped"], "scaled": built["scaled"]}
+    if _file_with_job(ctx, built["proposal_id"], built["superseded"], card=card):
+        note = ("The card waits with your report. The desk brings both up with the owner when they are free. "
+                "Only the owner's tap approves it.")
+    else:
+        outbox.send_trade_card(ctx.led, ctx.box, ctx.led.connect, built)
+        note = "The card with Approve and Reject is sent. Only the owner's tap approves it."
     if ctx.job is not None:
         ctx.job.proposal_ids.append(built["proposal_id"])
     return {"proposal_id": built["proposal_id"], "fraction": built["fraction"],
             "legs": [{"ticker": l["ticker"], "side": l["side"], "dollars": l.get("dollars"),
                       "quantity": l.get("quantity"), "quote": l["quote"]} for l in built["legs"]],
             "skipped": built["skipped"], "superseded": built["superseded"], "expires_at": built["expires_at"],
-            "note": "The card with Approve and Reject is sent. Only the owner's tap approves it."}
+            "note": note}
 
 
 def t_propose_change(ctx: ToolContext, args: dict) -> dict:
@@ -759,10 +881,14 @@ def t_propose_change(ctx: ToolContext, args: dict) -> dict:
                                            evidence=args.get("evidence") or [], created_by=ctx.role)
     except proposals.ProposalError as e:
         raise ToolError(str(e))
-    outbox.send_change_card(ctx.led, ctx.box, ctx.cfg, built["proposal_id"], superseded=built["superseded"])
+    if _file_with_job(ctx, built["proposal_id"], built["superseded"]):
+        note = ("The card waits with your report. The desk brings both up with the owner when they are free. "
+                "Only the owner's tap applies it.")
+    else:
+        outbox.send_change_card(ctx.led, ctx.box, ctx.cfg, built["proposal_id"], superseded=built["superseded"])
+        note = "The card with Confirm and Reject is sent. Only the owner's tap applies it."
     if ctx.job is not None:
         ctx.job.proposal_ids.append(built["proposal_id"])
-    note = "The card with Confirm and Reject is sent. Only the owner's tap applies it."
     if built["superseded"]:
         note += (" It replaces the older open card(s) " + ", ".join(f"#{s}" for s in built["superseded"]) +
                  " on the same subject; those buttons now say Replaced.")
@@ -822,7 +948,18 @@ SPECS = {
     "react": ("Put one reaction emoji on an owner message. Pick it for what the message says.",
               _obj({"message_id": I, "emoji": S}, ["message_id", "emoji"])),
     "say": ("Send one short Telegram message (at most 1,200 characters).", _obj({"text": S}, ["text"])),
-    "notify_owner": ("Send the owner one short message (at most 1,200 characters).", _obj({"text": S}, ["text"])),
+    "report": ("File your report for the desk (at most 3,000 characters). The desk brings it up with the owner "
+               "when they are free, with your cards. A second call replaces the first.", _obj({"text": S}, ["text"])),
+    "bring_up_next": ("Open the next item of the agenda and get its report and cards, to tell the owner about it "
+                      "now. Only after the owner spoke in this turn, and only when no item is open.", _obj({})),
+    "close_item": ("Close an agenda item the owner dealt with (tapped, decided, said next or skip). Its cards stay "
+                   "open until tapped or expired.", _obj({"item_id": I, "reason": S}, ["item_id"])),
+    "defer_item": ("Put an agenda item back in line; it does not come up for `hours` (1 to 72).",
+                   _obj({"item_id": I, "hours": N}, ["item_id", "hours"])),
+    "hold_agenda": ("No agenda item comes up by itself for `hours` (0 to 24; 0 lifts the hold).",
+                    _obj({"hours": N}, ["hours"])),
+    "show_card": ("Send a pending card again as the newest message, so the owner need not scroll. The old copy "
+                  "loses its buttons.", _obj({"proposal_id": I}, ["proposal_id"])),
     "load_company": ("Load a company or ETF: filings, sections, XBRL, metrics, transcript.", _obj({"ticker": S}, ["ticker"])),
     "fetch_document": ("Fetch a web page and store its text so it can be quoted.", _obj({"url": S, "ticker": S}, ["url"])),
     "record_finding": ("Store a fact with an exact quote from a stored document. kind: market_size, growth, guidance, "

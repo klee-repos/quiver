@@ -441,10 +441,10 @@ def analyst_script(state):
         with ctx.conn() as c:
             state["event_after_propose"] = store.get_event(c, eid)["status"]
         state["propose2"] = call("propose_trade", args)
-        state["notify1"] = call("notify_owner", {"text": "I read the ANET Q2 10-Q. FCF grew and a new risk "
-                                                         "factor names AI demand. I proposed a buy."})
-        state["notify2"] = call("notify_owner", {"text": "At $150 the market prices ANET for &lt;12% growth "
-                                                         "a year, below what the filing supports."})
+        state["report"] = call("report", {"text": "I read the ANET Q2 10-Q. Free cash flow grew, and a new risk "
+                                                  "factor names AI demand, so I proposed a buy.\n\nAt $150 the market "
+                                                  "prices ANET for <12% growth a year, below what the filing "
+                                                  "supports."})
 
     return runner
 
@@ -638,7 +638,7 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     names = [c[1] for c in astate.get("calls", [])]
     r.eq("4 tool order", names, ["get_company", "get_filing_sections", "get_document", "record_finding",
                                  "record_finding", "record_finding", "get_metrics", "run_valuation",
-                                 "record_verdict", "propose_trade", "propose_trade", "notify_owner", "notify_owner"])
+                                 "record_verdict", "propose_trade", "propose_trade", "report"])
     f1, f2, f3 = astate.get("findings", ({}, {}, {}))
     r.ok("4 exact quote stored", "finding_id" in f1, f1)
     r.ok("4 straight-quote sentence stored", "finding_id" in f2, f2)
@@ -660,9 +660,48 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     r.eq("4 one trade proposal", one(led, "SELECT COUNT(*) FROM proposals"), 1)
     r.eq("4 event proposed at the job end", one(led, "SELECT status FROM events WHERE id=1"), "proposed")
     r.eq("4 the analyze_event job is done", one(led, "SELECT status FROM jobs WHERE kind='analyze_event'"), "done")
-    r.eq("4 two analyst messages", one(led, "SELECT COUNT(*) FROM chat_messages WHERE source='analyst'"), 2)
+    # The worker sends nothing: the report and card #1 wait on the agenda as one item.
+    items4 = rows(led, "SELECT * FROM agenda WHERE status != 'done'")
+    r.eq("4 one agenda item: the report with card #1, priority now, waiting",
+         [(i["kind"], i["priority"], i["status"], json.loads(i["proposal_ids"]), i["event_id"]) for i in items4],
+         [("report", 0, "waiting", [1], 1)])
+    r.eq("4 the worker sent no message and no card",
+         (one(led, "SELECT COUNT(*) FROM chat_messages WHERE source IN ('analyst','proposal')"),
+          [p for p in tp.sends() if p.get("reply_markup")]), (0, []))
+
+    # The bridge (no CLI): the agenda turn, the tap path and, at step 13, the turn input.
+    fclient = FakeClient()
+
+    async def factory(options):
+        return fclient
+
+    async def qpick(text):
+        return "\U0001F44D"
+    bridge = chat_bridge.Bridge(runtime=rt, secrets=sec_obj, led=led, transport=tp, client_factory=factory,
+                                quick_pick=qpick)
+
+    def present():
+        """One agenda turn (the owner has been quiet): the bridge opens the next item."""
+        bridge.last_owner_at = bridge.last_tap_at = bridge.last_owner_turn_end = None
+
+        async def go():
+            await bridge.maybe_turn()
+            if bridge.turn_task is not None:
+                await bridge.turn_task
+            for t in [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                t.cancel()
+        asyncio.run(go())
 
     # ------------------------------------------------------------------ step 5: the card
+    before5 = len(tp.calls)
+    present()
+    r.ok("5 the agenda turn brings up item 1", fclient.prompts and '<bring_up item="1"' in fclient.prompts[-1],
+         fclient.prompts[-1:])
+    r.eq("5 item 1 is open", one(led, "SELECT status FROM agenda WHERE id=1"), "open")
+    sent5 = tp.sends(before5)
+    # The fake model said nothing, so the bridge sent the report as written, then the card.
+    r.ok("5 the report as written, then the card", len(sent5) == 2 and "I read the ANET Q2 10-Q." in sent5[0]["text"]
+         and not sent5[0].get("reply_markup") and sent5[1].get("reply_markup"), [p.get("text", "")[:60] for p in sent5])
     prop1 = rows(led, "SELECT * FROM proposals WHERE id=1")[0]
     card = [p for p in tp.sends() if p.get("reply_markup")]
     r.eq("5 one card with buttons", len(card), 1)
@@ -674,17 +713,6 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     card_ix = next((i for i, (m, p) in enumerate(tp.calls) if m == "sendMessage" and p.get("reply_markup")), None)
     r.eq("5 tg_message_id stored (the card's message id)", (prop1["tg_message_id"], str(prop1["tg_chat_id"])),
          (901 + card_ix if card_ix is not None else None, OWNER))
-
-    # The bridge (no CLI): the tap path and, at step 13, the turn input.
-    fclient = FakeClient()
-
-    async def factory(options):
-        return fclient
-
-    async def qpick(text):
-        return "\U0001F44D"
-    bridge = chat_bridge.Bridge(runtime=rt, secrets=sec_obj, led=led, transport=tp, client_factory=factory,
-                                quick_pick=qpick)
 
     def tap(prop, action="a", qid="q1"):
         cbq = {"id": qid, "from": {"id": int(OWNER), "is_bot": False, "first_name": "Kevin"},
@@ -711,6 +739,7 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     r.eq("6 the tap message", sent6, ["On it. Checking the price now."])
     r.ok("6 the callback answer", any(m == "answerCallbackQuery" and p.get("text") == "Approved" for m, p in calls6),
          calls6)
+    r.eq("6 the tap on its last card closes item 1", one(led, "SELECT status FROM agenda WHERE id=1"), "done")
 
     # ------------------------------------------------------------------ step 7: requote
     clk.set("2026-08-05T14:50:20Z")
@@ -859,14 +888,17 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     for u in updates:
         if u["source"] not in srcs:
             srcs.append(u["source"])
-    for s in ("monitor", "analyst", "proposal", "execution"):
+    # The step-5 agenda turn saw the monitor line; what went out after it is new here.
+    for s in ("analyst", "proposal", "execution"):
         r.ok(f"13 a {s} line", s in srcs, srcs)
+    r.ok("13 the agenda turn took the monitor line", "monitor" not in srcs and one(
+        led, "SELECT MIN(delivered_to_session) FROM chat_messages WHERE source='monitor'") == 1, srcs)
     r.ok("13 lines carry the source", all(f"· {u['source']}]" in ln for u, ln in zip(updates, body)), body[:3])
     esc = [ln for ln in body if "&lt;12%" in ln]
     r.ok("13 '<' in an update is escaped", esc and "<12%" not in prompt, [ln for ln in body if "12%" in ln])
     r.ok("13 the owner tag", lines[-1].startswith('<owner message_id="501"'), lines[-1:])
     asyncio.run(bridge.run_turn())
-    r.eq("13 the turn input is build_input", fclient.prompts, [prompt])
+    r.eq("13 the turn input is build_input", fclient.prompts[-1:], [prompt])
     r.eq("13 all updates delivered after", one(led, "SELECT COUNT(*) FROM chat_messages WHERE role='desk' AND "
                                                 "source != 'chat' AND delivered_to_session=0"), 0)
     r.eq("13 the owner message delivered", one(led, "SELECT delivered_to_session FROM chat_messages WHERE "
@@ -889,18 +921,25 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     r.eq("14 the drift step ran", one(led, "SELECT COUNT(*) FROM bridge_state WHERE key='drift_done:2026-08-05'"), 1)
     r.eq("14 no drift proposal", (one(led, "SELECT COUNT(*) FROM proposals WHERE origin='drift'"),
                                   one(led, "SELECT COUNT(*) FROM events WHERE type='drift'")), (0, 0))
-    brief = [p["text"] for p in tp.sends(before14)]
+    r.eq("14 the monitor sends no brief: it waits on the agenda", (tp.sends(before14), one(
+        led, "SELECT status FROM agenda WHERE kind='brief'")), ([], "waiting"))
+    present()
+    r.ok("14 the agenda turn brings up the brief", '<bring_up item="' in fclient.prompts[-1] and 'kind="brief"'
+         in fclient.prompts[-1], fclient.prompts[-1][:300])
+    sent14 = [p["text"] for p in tp.sends(before14)]
+    r.eq("14 the brief goes out as one message", len(sent14), 1)
+    brief = (sent14[0] if sent14 else "").split("\n\n")
     if os.environ.get("E2E_DESK_DEBUG"):
         print("DEBUG prompt\n" + prompt)
         print("DEBUG brief", json.dumps(brief, indent=1))
         print("DEBUG monitor14", st14)
-    r.eq("14 brief of 3 messages", len(brief), 3)
+    r.eq("14 brief of 3 paragraphs", len(brief), 3)
     b = brief + ["", "", ""]
     r.ok("14 brief 1: $2,005.60, +$5.60, +0.28%", "$2,005.60" in b[0] and "up $5.60" in b[0] and "+0.28%" in b[0], b[0])
     r.ok("14 brief 2: ANET leads the movers", b[1].startswith("What moved the account: ANET"), b[1])
     r.ok("14 brief 3: the 10-Q and its verdict", "ANET filed its quarterly report (10-Q), and our reason to own it got stronger." in b[2], b[2])
     r.eq("14 one brief notifications row", one(led, "SELECT COUNT(*) FROM notifications WHERE kind='brief'"), 1)
-    r.eq("14 brief rows are source brief", one(led, "SELECT COUNT(*) FROM chat_messages WHERE source='brief'"), 3)
+    r.eq("14 the brief row is source brief", one(led, "SELECT COUNT(*) FROM chat_messages WHERE source='brief'"), 1)
     r.ok("14 the monitor run is clean", not st14.get("failed"), st14)
 
     # ------------------------------------------------------------------ step 15 (17:40)

@@ -323,19 +323,39 @@ def render_trade_card(model: dict) -> list:
 
 
 def _pack(text: str, limit: int = 3500, max_messages: int = 3) -> list:
-    """Split a long card into at most three messages on sentence boundaries."""
+    """Split a long card into at most three messages on sentence boundaries. A paragraph
+    break stays a paragraph break."""
     if len(text) <= limit:
         return [text]
+    pieces = re.split(r"(?<=[.!?])(\s+)", text)
     out, cur = [], ""
-    for sentence in re.split(r"(?<=[.!?])\s+", text):
-        if cur and len(cur) + 1 + len(sentence) > limit and len(out) < max_messages - 1:
-            out.append(cur)
-            cur = sentence
+    for i in range(0, len(pieces), 2):
+        sentence, gap = pieces[i], (pieces[i + 1] if i + 1 < len(pieces) else "")
+        if cur.strip() and len(cur.rstrip()) + 1 + len(sentence) > limit and len(out) < max_messages - 1:
+            out.append(cur.rstrip())
+            cur = sentence + gap
         else:
-            cur = f"{cur} {sentence}".strip()
-    if cur:
-        out.append(cur)
+            cur += sentence + gap
+    if cur.strip():
+        out.append(cur.rstrip())
     return out
+
+
+_PARA = "\x00"  # a paragraph break inside a card; _join_parts turns it into a blank line
+
+
+def _semi_join(items) -> str:
+    """'a; b; and c': long clauses that may hold commas of their own."""
+    items = [str(x).strip().rstrip(".;") for x in items or [] if str(x).strip()]
+    if len(items) <= 2:
+        return " and ".join(items)
+    return "; ".join(items[:-1]) + "; and " + items[-1]
+
+
+def _join_parts(parts) -> str:
+    """Join card sentences with a space; a part that ends in ``_PARA`` ends a paragraph."""
+    text = " ".join(p for p in parts if p)
+    return re.sub(r"\s*\x00\s*", "\n\n", text).strip()
 
 
 def render_change_card(model: dict) -> list:
@@ -376,11 +396,13 @@ def render_change_card(model: dict) -> list:
                      f"in {g['horizon_months']} months.")
         parts.append(f"<i>{_te(summarize(ch['text'], 3000))}</i>")
     elif kind == "set_thesis":
-        parts.append(f"Our reason to own {_te(ch['ticker'])} (the thesis): {_te(_sentence(ch['summary']))}")
+        # Short paragraphs: the reason, what it depends on, what would make us rethink it,
+        # and the prices. A long list joined into one sentence is hard to read on a phone.
+        parts.append(f"Our reason to own {_te(ch['ticker'])} (the thesis): {_te(_sentence(ch['summary']))}{_PARA}")
         if ch.get("drivers"):
-            parts.append("It depends on " + _te(_plain_join(ch["drivers"])) + ".")
+            parts.append("It depends on " + _te(_semi_join(ch["drivers"])) + "." + _PARA)
         if ch.get("falsifiers"):
-            parts.append("We should rethink it if " + _te(_plain_join(ch["falsifiers"])) + ".")
+            parts.append("We should rethink it if " + _te(_semi_join(ch["falsifiers"])) + "." + _PARA)
         fv = [ch.get("fair_value_low"), ch.get("fair_value_base"), ch.get("fair_value_high")]
         if all(v is not None for v in fv):
             parts.append(f"I think one share is worth about {_fmt_money(fv[1])}. It is {_fmt_money(fv[0])} if "
@@ -395,6 +417,7 @@ def render_change_card(model: dict) -> list:
                          "price to sell some.")
         if ch.get("buy_below") is None and ch.get("trim_above") is None:
             parts.append("It sets no alert prices.")
+        parts[-1] += _PARA
     elif kind == "resume_trading":
         why = ch.get("halt_reason")
         parts.append("Trading is stopped for today" + (f" (the reason: {_te(why)})" if why else "") +
@@ -407,7 +430,7 @@ def render_change_card(model: dict) -> list:
     if ev:
         parts.append(ev)
     parts.append("Tap Confirm to apply it. " + _until(model["expires_at"], model.get("now")))
-    return _pack(" ".join(p for p in parts if p))
+    return _pack(_join_parts(parts))
 
 
 # --- execution results (§11.1 step 9) ---------------------------------------------

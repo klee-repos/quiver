@@ -18,7 +18,7 @@ from desk_fakes import REPO, Results, SecFixtures, fx, seams, seed_desk, temp_ro
 sys.path.insert(0, str(REPO / "deploy" / "runner"))
 
 from lib import notify  # noqa: E402
-from lib.desk import agent, events, outbox, store, tools  # noqa: E402
+from lib.desk import agenda, agent, events, outbox, store, tools  # noqa: E402
 from lib.desk import settings as desk_settings  # noqa: E402
 
 r = Results("desk-gateb")
@@ -72,10 +72,18 @@ with temp_root() as root:
     seed_desk(root, load=False)
     ctx, tp = ctx_for(root, "analyst", job=agent.JobState(job_id=1, kind="deep_dive"))
     r.ok("SEC-2: the analyst context renders with render_model_text", ctx.render is outbox.render_model_text)
-    out = result(tools.call(ctx, "notify_owner", {"text": '<a href="https://evil.example">Tap here</a> to log in. '
-                                                          "Gross margin <40% vs the guide of >42%."}))
-    sent = tp.texts()[-1] if tp.texts() else ""
-    r.ok("SEC-2: notify_owner sends", out.get("sent") is True, out)
+    raw = '<a href="https://evil.example">Tap here</a> to log in. Gross margin <40% vs the guide of >42%.'
+    out = result(tools.call(ctx, "report", {"text": raw}))
+    r.ok("SEC-2: report files the text on the job's agenda item", out.get("saved") is True, out)
+    r.eq("SEC-2: report sends nothing to Telegram", tp.texts(), [])
+    with root.led().connect() as c:
+        iid = agenda.finish_job(c, 1, kind="report", priority=agenda.NEXT, title="t", now=store.now_iso())
+        item = agenda.get(c, iid)
+    r.eq("SEC-2: the item keeps the model text as data", item["body"], raw)
+    # The bridge sends an item as written through the one renderer (chat_bridge.send_item_plain).
+    import chat_bridge
+    r.ok("SEC-2: the bridge renders with render_model_text", chat_bridge._to_telegram_html is outbox.render_model_text)
+    sent = " ".join(chat_bridge._to_telegram_html(m) for m in agenda.plain_messages(item))
     r.ok("SEC-2: a raw <a href> reaches the owner as text, with its URL visible",
          "&lt;a href=" in sent and "https://evil.example" in sent and "<a " not in sent, sent)
     r.ok("SEC-2: a bare < and > survive as text", "&lt;40%" in sent and "&gt;42%" in sent, sent)

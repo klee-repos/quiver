@@ -327,12 +327,24 @@ def case_dedup():
 
             early = monitor("2026-08-05T20:10:00Z")        # 10 min after the close
             r.eq("dedup: a run under 15 min after the close sends nothing", (early, tg.calls), ("not due", []))
+            with led.connect() as conn:
+                conn.execute("INSERT INTO agenda (kind, priority, status, title, created_at) VALUES "
+                             "('report', 2, 'waiting', 'an fyi news check', ?)", (store.now_iso(),))
             first = monitor("2026-08-05T20:40:00Z")
             sends = [p for mth, p in tg.calls if mth == "sendMessage"]
-            r.eq("dedup: the first run sends the brief", (first.get("messages") if isinstance(first, dict) else first,
-                                                          len(sends)), (4, 4))
-            r.ok("dedup: the monitor's message 1 names the 15% goal", sends and "The goal is 15%." in sends[0]["text"],
-                 sends[:1])
+            # The brief waits on the agenda: the bridge brings it up when the owner is free.
+            r.eq("dedup: the first run files the brief and sends nothing",
+                 (first.get("messages") if isinstance(first, dict) else first, len(sends)), (4, 0))
+            with led.connect() as conn:
+                items = [dict(x) for x in conn.execute(
+                    "SELECT kind, priority, status, title, body FROM agenda WHERE kind='brief'").fetchall()]
+                fyi = conn.execute("SELECT status, close_reason FROM agenda WHERE kind='report'").fetchone()
+            r.eq("dedup: one brief item, next in line", [(i["kind"], i["priority"], i["status"]) for i in items],
+                 [("brief", 1, "waiting")])
+            paras = items[0]["body"].split("\n\n") if items else []
+            r.eq("dedup: the item holds the 4 brief messages as paragraphs", len(paras), 4)
+            r.ok("dedup: the brief's message 1 names the 15% goal", paras and "The goal is 15%." in paras[0], paras[:1])
+            r.eq("dedup: the brief closes the waiting fyi items", tuple(fyi or ()), ("done", "the close brief covers it"))
             n = len(tg.calls)
             second = monitor("2026-08-05T21:40:00Z")
             r.eq("dedup: a second call for one trade_date sends nothing", (second, len(tg.calls)), ("not due", n))
@@ -341,7 +353,10 @@ def case_dedup():
                     "SELECT trade_date, kind, stage FROM notifications WHERE kind='brief'").fetchall()]
                 mirrored = conn.execute("SELECT COUNT(*) FROM chat_messages WHERE source='brief'").fetchone()[0]
             r.eq("dedup: one notifications row (trade_date, brief, brief)", rows, [(DAY, "brief", "brief")])
-            r.eq("dedup: each brief message is mirrored once", mirrored, 4)
+            r.eq("dedup: nothing is mirrored before the bridge sends it", mirrored, 0)
+            with led.connect() as conn:
+                n_items = conn.execute("SELECT COUNT(*) FROM agenda WHERE kind='brief'").fetchone()[0]
+            r.eq("dedup: the second run files no second brief", n_items, 1)
             r.ok("dedup: already_sent is true for the day", brief.already_sent(led, DAY), DAY)
         finally:
             fc.unpin()

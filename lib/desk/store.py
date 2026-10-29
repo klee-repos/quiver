@@ -232,6 +232,22 @@ CREATE TABLE IF NOT EXISTS bridge_state (key TEXT PRIMARY KEY, value TEXT NOT NU
 CREATE TABLE IF NOT EXISTS run_locks (
   name TEXT PRIMARY KEY, holder TEXT NOT NULL, acquired_at TEXT NOT NULL
 );
+-- The agenda (lib/desk/agenda.py): what the desk brings up with the owner, one item at a time.
+-- priority: 0 now, 1 next, 2 fyi (never brought up by itself). proposal_ids: a JSON list.
+-- cards_json: {proposal id: the build-time inputs of a trade card}. At most one row is open.
+CREATE TABLE IF NOT EXISTS agenda (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('report','failure','drift','brief')),
+  priority INTEGER NOT NULL CHECK (priority IN (0, 1, 2)),
+  status TEXT NOT NULL CHECK (status IN ('draft','waiting','open','done','dropped')),
+  ticker TEXT, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+  job_id INTEGER, event_id INTEGER,
+  proposal_ids TEXT NOT NULL DEFAULT '[]', cards_json TEXT NOT NULL DEFAULT '{}',
+  not_before TEXT, created_at TEXT NOT NULL, opened_at TEXT, closed_at TEXT, close_reason TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_job ON agenda(job_id) WHERE job_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_open ON agenda(status) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_agenda_status ON agenda(status, priority, id);
 """
 
 # FTS5 table -> (content table, indexed columns). One external-content index per table.
@@ -242,13 +258,14 @@ FTS_TABLES = {
     "chat_messages_fts": ("chat_messages", ("text",)),
 }
 
-# The tables of §6.1 (the 30 a fresh schema creates; FTS shadow tables not counted).
+# The tables of §6.1 (the 31 a fresh schema creates; FTS shadow tables not counted).
 DESK_TABLES = (
     "companies", "sec_ticker_map", "sec_overrides", "filings", "documents", "documents_fts",
     "xbrl_facts", "metrics", "findings", "findings_fts", "notes", "notes_fts", "premise",
     "theses", "level_state", "news_items", "transcripts", "api_budget", "etf_holdings",
     "events", "jobs", "broker_jobs", "broker_snapshots", "proposals", "desk_settings",
     "chat_messages", "chat_messages_fts", "chat_sessions", "bridge_state", "run_locks",
+    "agenda",
 )
 
 
