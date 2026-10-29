@@ -534,6 +534,13 @@ async def desk_init_tools(query_fn, opts):
         close = getattr(gen, "aclose", None)
         if close is not None:
             await close()
+        # Free the CLI's subprocess transport while the loop runs: freed after
+        # asyncio.run closes the loop, it prints "Event loop is closed".
+        import asyncio
+        import gc
+        gen = None
+        gc.collect()
+        await asyncio.sleep(0.2)
     return None
 
 
