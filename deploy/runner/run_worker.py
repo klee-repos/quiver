@@ -138,9 +138,11 @@ class Worker:
             raise JobFailed(error)
         return res
 
-    def event_prompt(self, job_state, event: dict) -> str:
+    def event_prompt(self, job_state, event: dict, also=()) -> str:
         """The analyze_event prompt (§9.2): the event, the dossier, the new documents, the
-        last three verdicts for the name, and its open proposals."""
+        last three verdicts for the name, and its open proposals. ``also`` holds the other
+        news events of the same group (events.queue_analysis); their articles join the
+        new documents."""
         ctx = self.make_ctx(job_state)
         t = event["ticker"]
         detail = store.loads(event["detail_json"], {}) or {}
@@ -156,9 +158,17 @@ class Worker:
                     (detail["accession"],)).fetchall()]
             if detail.get("document_id"):
                 docs.append({"document_id": detail["document_id"], "section_key": "news", "char_len": None})
+            also_events = []
+            for a in also:
+                d = store.loads(a["detail_json"], {}) or {}
+                also_events.append({"id": a["id"], "type": a["type"], "detail": d, "detected_at": a["detected_at"]})
+                if d.get("document_id"):
+                    docs.append({"document_id": d["document_id"], "section_key": "news", "char_len": None})
+            # A news group's events share one verdict: count it once.
             verdicts = [dict(r) for r in conn.execute(
-                "SELECT id, type, verdict, analysis, analyzed_at FROM events WHERE ticker=? AND verdict IS NOT NULL "
-                "AND id != ? ORDER BY analyzed_at DESC LIMIT 3", (t, event["id"])).fetchall()]
+                "SELECT MIN(id) AS id, type, verdict, analysis, analyzed_at FROM events WHERE ticker=? "
+                "AND verdict IS NOT NULL AND id != ? GROUP BY analyzed_at, verdict, analysis "
+                "ORDER BY analyzed_at DESC LIMIT 3", (t, event["id"])).fetchall()]
             props = [dict(r) for r in conn.execute(
                 "SELECT DISTINCT p.id, p.kind, p.state, p.rationale FROM proposals p LEFT JOIN orders o "
                 "ON o.proposal_id=p.id WHERE p.state IN ('pending','approved','executing') AND "
@@ -167,8 +177,13 @@ class Worker:
                                                   "created_by": event["created_by"], "detail": detail,
                                                   "detected_at": event["detected_at"]},
                 "new_documents": docs, "last_verdicts": verdicts, "open_proposals": props, "dossier": dossier}
-        return ("Analyze this event. Follow the analyst instructions. End with record_verdict for event "
-                f"{event['id']}.\n\n```json\n" + json.dumps(body, default=str)[:60000] + "\n```")
+        if also_events:
+            body["also_events"] = also_events
+        lead = "Analyze this event. Follow the analyst instructions. End with record_verdict for event "
+        if also_events:
+            lead = ("Analyze this event and the also_events: more headlines on the same name, one analysis for "
+                    "all of them. Follow the analyst instructions. End with ONE record_verdict for event ")
+        return (lead + f"{event['id']}.\n\n```json\n" + json.dumps(body, default=str)[:60000] + "\n```")
 
     def deep_dive_prompt(self, payload: dict) -> str:
         t = payload["ticker"]
@@ -191,10 +206,11 @@ class Worker:
         payload = store.loads(job["payload_json"], {}) or {}
         with self.led.connect() as conn:
             ev = store.get_event(conn, int(payload["event_id"]))
+            also = [a for a in (store.get_event(conn, int(i)) for i in payload.get("also") or []) if a]
         if ev is None:
             raise JobFailed(f"event {payload.get('event_id')} does not exist")
         js = agent.JobState(job_id=job["id"], event_id=ev["id"], role="analyst", kind="analyze_event")
-        self.job_runner("analyze_event", self.event_prompt(js, ev), js)
+        self.job_runner("analyze_event", self.event_prompt(js, ev, also), js)
         with self.led.connect() as conn:
             row = store.get_event(conn, ev["id"])
         # The job's own event decides: a verdict on another event never counts (the tool refuses it).
@@ -202,9 +218,14 @@ class Worker:
             raise JobFailed("no verdict")
         with self.led.connect() as conn:
             named = conn.execute("SELECT 1 FROM proposals WHERE event_id=? LIMIT 1", (ev["id"],)).fetchone()
-            conn.execute("UPDATE events SET status=? WHERE id=? AND status='analyzed'",
-                         ("proposed" if named or js.proposal_ids else "noted", ev["id"]))
-        return {"event_id": ev["id"], "proposals": js.proposal_ids}
+            status = "proposed" if named or js.proposal_ids else "noted"
+            conn.execute("UPDATE events SET status=? WHERE id=? AND status='analyzed'", (status, ev["id"]))
+            # The other headlines of the group share the one verdict.
+            for a in also:
+                conn.execute("UPDATE events SET status=?, verdict=?, analysis=?, analyzed_at=? "
+                             "WHERE id=? AND status='queued'",
+                             (status, row["verdict"], row["analysis"], row["analyzed_at"], a["id"]))
+        return {"event_id": ev["id"], "also": [a["id"] for a in also], "proposals": js.proposal_ids}
 
     def run_deep_dive(self, job):
         payload = store.loads(job["payload_json"], {}) or {}
@@ -245,7 +266,8 @@ class Worker:
                 if job["kind"] == "analyze_event":
                     payload = store.loads(job["payload_json"], {}) or {}
                     with self.led.connect() as conn:
-                        conn.execute("UPDATE events SET status='failed' WHERE id=?", (int(payload.get("event_id") or 0),))
+                        for eid in [payload.get("event_id")] + list(payload.get("also") or []):
+                            conn.execute("UPDATE events SET status='failed' WHERE id=?", (int(eid or 0),))
                 if job["kind"] != "classify_news":
                     self.box.send(f"I could not {self.describe(job)} (error: {err[:200]}). I stopped trying.",
                                   source="analyst")

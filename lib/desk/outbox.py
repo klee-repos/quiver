@@ -201,14 +201,21 @@ def send_trade_card(led, box: Outbox, conn_factory, built: dict, *, now_dt=None)
     return res
 
 
-def send_change_card(led, box: Outbox, cfg, proposal_id: int, *, now_dt=None) -> dict:
+def send_change_card(led, box: Outbox, cfg, proposal_id: int, *, now_dt=None, superseded=()) -> dict:
+    """Render and send a change proposal's card, then edit the cards it superseded to
+    "Replaced by #N"."""
     from lib import notify
     from lib.desk import proposals
     with led.connect() as conn:
         prop = proposals.get_proposal(conn, proposal_id)
         norm = (store.loads(prop["payload_json"], {}) or {}).get("change") or {}
         preview = proposals.change_preview(conn, cfg, norm, now_dt=now_dt)
+        old = [proposals.get_proposal(conn, s) for s in superseded or ()]
     model = {"id": prop["id"], "change": norm, "rationale": prop["rationale"],
              "evidence": store.loads(prop["evidence_json"], []), "expires_at": prop["expires_at"],
              "now": store.iso(now_dt or store.utc_now()), "preview": preview}
-    return box.send_card(prop["id"], notify.render_change_card(model), kind="change", nonce=prop["nonce"])
+    res = box.send_card(prop["id"], notify.render_change_card(model), kind="change", nonce=prop["nonce"])
+    for o in old:
+        if o and o.get("tg_message_id"):
+            box.set_label(o["tg_message_id"], f"Replaced by #{prop['id']}")
+    return res

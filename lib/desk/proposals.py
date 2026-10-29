@@ -937,6 +937,9 @@ def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
     elif kind == "resume_trading":
         if not _is_halted_conn(conn, today()):
             raise ProposalError("trading is not halted today")
+        # The card names the halt: a daily-loss halt and an audit halt set the same flag.
+        row = conn.execute("SELECT halt_reason FROM day_baseline WHERE trade_date=?", (today(),)).fetchone()
+        out["halt_reason"] = str(row[0] or "") if row else ""
     return out
 
 
@@ -980,7 +983,59 @@ def build_change(conn, cfg: Config, *, change: dict, rationale: str, evidence=No
          json.dumps([f"{k}:{v}" for k, v in ev_items]),
          created_by if created_by in ("desk", "analyst", "monitor", "system") else "system",
          store.iso(now_dt), store.iso(close_dt), secrets.token_hex(5)))
-    return {"proposal_id": int(cur.lastrowid), "change": norm}
+    pid = int(cur.lastrowid)
+    superseded = supersede_changes(conn, pid, norm, store.iso(now_dt))
+    return {"proposal_id": pid, "change": norm, "superseded": superseded}
+
+
+def _change_subject(conn, norm: dict) -> set:
+    """What a change acts on: its ticker, the risk key, or the tickers of a set_weights
+    other than the cash fund (nearly every set_weights moves the cash fund, so it never
+    joins two cards). A set_premise or resume_trading acts on one thing: its kind."""
+    kind = norm.get("kind")
+    if kind in ("set_thesis", "add_company", "drop_company"):
+        return {norm.get("ticker")}
+    if kind == "set_weights":
+        names = {c.get("ticker") for c in norm.get("changes") or []}
+        cash = {t for t in names if (store.get_company(conn, t) or {}).get("kind") == "cash"}
+        return (names - cash) or names
+    if kind == "set_risk":
+        return {norm.get("key")}
+    return {kind}
+
+
+def supersede_changes(conn, proposal_id: int, norm: dict, now: str) -> list:
+    """End each older pending change of the same kind and subject as ``superseded`` by
+    ``proposal_id``. Only the newest card stays open, so an old card cannot undo a newer
+    one. Returns the ids moved."""
+    subject = _change_subject(conn, norm)
+    moved = []
+    for r in conn.execute("SELECT id, payload_json FROM proposals WHERE kind='change' AND state='pending' "
+                          "AND id < ? ORDER BY id", (int(proposal_id),)).fetchall():
+        old = (store.loads(r[1], {}) or {}).get("change") or {}
+        if old.get("kind") != norm.get("kind") or not (_change_subject(conn, old) & subject):
+            continue
+        if end_pending(conn, r[0], "superseded", now, superseded_by=int(proposal_id)):
+            moved.append(int(r[0]))
+    return moved
+
+
+def supersede_duplicate_changes(conn, now: str) -> list:
+    """Apply the one-open-card rule to the pending change cards: the newest card of each
+    kind and subject stays, and it supersedes the older ones. Returns the rows moved
+    (id, tg_message_id, superseded_by) so the caller relabels their buttons."""
+    rows = conn.execute("SELECT id, payload_json FROM proposals WHERE kind='change' AND state='pending' "
+                        "ORDER BY id DESC").fetchall()
+    gone, out = set(), []
+    for r in rows:
+        if r[0] in gone:
+            continue
+        norm = (store.loads(r[1], {}) or {}).get("change") or {}
+        for old in supersede_changes(conn, r[0], norm, now):
+            gone.add(old)
+            row = conn.execute("SELECT tg_message_id FROM proposals WHERE id=?", (old,)).fetchone()
+            out.append({"id": old, "tg_message_id": row[0] if row else None, "superseded_by": int(r[0])})
+    return out
 
 
 def change_preview(conn, cfg: Config, norm: dict, *, now_dt=None, yf_price_fn=None) -> str:

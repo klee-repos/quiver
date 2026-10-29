@@ -15,6 +15,7 @@ Subcommands:
   flow-record / flow-suggest / attribution / factors-fetch / strategy-history /
   decision-proof / send-test                operator tools
   desk-seed                                 the one-time cutover seed (plan §16)
+  desk-review                               queue a deep-dive review of each holding
 """
 
 from __future__ import annotations
@@ -836,6 +837,18 @@ def cmd_desk_seed(args) -> dict:
                           skip_intro=bool(getattr(args, "skip_intro", False)))
 
 
+def cmd_desk_review(args) -> dict:
+    """Queue a deep-dive review of each holding of the newest snapshot (or of --tickers),
+    then start the worker. The analyst reports each one in the chat, with a card."""
+    from lib.desk import seed
+    _cfg, led = _cfg_and_ledger()
+    tickers = [t for t in str(getattr(args, "tickers", "") or "").split(",") if t.strip()]
+    out = seed.queue_reviews(led, now=store.now_iso(), tickers=tickers)
+    if out["queued"]:
+        store.touch_trigger(REPO, "worker")
+    return out
+
+
 def cmd_prune(_args) -> dict:
     cfg = load_config(CONFIG_PATH)
     arch = storage.get_archiver(cfg.storage)
@@ -911,6 +924,8 @@ def main(argv) -> int:
     p_ds = sub.add_parser("desk-seed")
     p_ds.add_argument("--skip-load", dest="skip_load", action="store_true")
     p_ds.add_argument("--skip-intro", dest="skip_intro", action="store_true")
+    p_dr = sub.add_parser("desk-review")
+    p_dr.add_argument("--tickers", default="")
     args = ap.parse_args(argv)
 
     handlers = {
@@ -922,7 +937,7 @@ def main(argv) -> int:
         "decision-proof": cmd_decision_proof, "auth-stop": cmd_auth_stop,
         "exec-prepare": cmd_exec_prepare, "exec-check": cmd_exec_check, "exec-commit": cmd_exec_commit,
         "snapshot-prepare": cmd_snapshot_prepare, "snapshot-commit": cmd_snapshot_commit,
-        "desk-seed": cmd_desk_seed,
+        "desk-seed": cmd_desk_seed, "desk-review": cmd_desk_review,
     }
     try:
         out = handlers[args.cmd](args)

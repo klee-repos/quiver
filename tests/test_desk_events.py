@@ -429,7 +429,9 @@ def case_queue():
                 drift = store.create_event(conn, dedup_key="drift:2026-10-27", ticker="BOOK", type="drift",
                                            detail={"legs": []}, now="2026-10-27T20:30:00Z")
                 for i, (typ, at) in enumerate(spec):
-                    ticker = "ANET" if i % 2 == 0 else "CEG"
+                    # The two news events name two tickers: one ticker's news is one job
+                    # (case_queue_news_group).
+                    ticker = "TSM" if i == 6 else ("ANET" if i % 2 == 0 else "CEG")
                     ids[at] = store.create_event(conn, dedup_key=f"{typ}:{i}", ticker=ticker, type=typ,
                                                  detail={"i": i}, now=at)
             oldest = [ids[at] for at in sorted(ids)]
@@ -494,7 +496,79 @@ def case_queue():
         clock.unpin()
 
 
-CASES = [case_dedup, case_holding, case_lookthrough, case_others, case_queue]
+def case_queue_news_group():
+    """One ticker's new news events are one analyze_event job (three outlets, one story)."""
+    clock = FakeClock(NOW).pin_market()
+    try:
+        with temp_root() as root:
+            seed_desk(root)
+            led = root.led()
+            with led.connect() as conn:
+                ceg = [store.create_event(conn, dedup_key=f"news:CEG:{i}", ticker="CEG", type="news",
+                                          detail={"title": f"DOE loan story {i}", "document_id": None},
+                                          now=f"2026-10-28T13:0{i}:00Z") for i in (1, 3, 5)]
+                anet = store.create_event(conn, dedup_key="news:ANET:1", ticker="ANET", type="news",
+                                          detail={"title": "ANET story"}, now="2026-10-28T13:02:00Z")
+                filing = store.create_event(conn, dedup_key="filing:CEG:1", ticker="CEG", type="filing",
+                                            detail={"form": "8-K"}, now="2026-10-28T13:04:00Z")
+            jobs = events.queue_analysis(led, now=NOW)
+            pays = [json.loads(job_row(led, j)["payload_json"]) for j in jobs]
+            r.eq("group: 5 new events -> 3 jobs, oldest first", pays,
+                 [{"event_id": ceg[0], "also": ceg[1:]}, {"event_id": anet}, {"event_id": filing}])
+            r.eq("group: every event of the group is queued",
+                 sorted(x[0] for x in q(led, "SELECT id FROM events WHERE status='queued'")),
+                 sorted(ceg + [anet, filing]))
+            lines = [x[0] for x in q(led, "SELECT text FROM chat_messages WHERE source='monitor' ORDER BY id")]
+            r.ok("group: one desk line names the extra headlines",
+                 any("2 more headlines on CEG go with it." in t for t in lines), lines)
+            r.eq("group: a second run queues nothing", events.queue_analysis(led, now=NOW), [])
+            # The worker: one verdict for the group; the others share it.
+            w, transport = make_worker(root, led, {ceg[0]: "noted"})
+            prompts = []
+            inner = w.job_runner
+
+            def runner(kind, prompt, js):
+                prompts.append(prompt)
+                return inner(kind, prompt, js)
+            w.job_runner = runner
+            w.run_one(job_row(led, jobs[0]))
+            body = prompts[0] if prompts else ""
+            r.ok("group: the prompt asks for ONE record_verdict", f"ONE record_verdict for event {ceg[0]}" in body,
+                 body[:300])
+            r.ok("group: the prompt lists the also_events", all(f'"id": {e}' in body for e in ceg[1:]), body[-600:])
+            r.eq("group: all three events share the verdict",
+                 q(led, "SELECT status, verdict, analysis IS NOT NULL FROM events WHERE id IN (%s) ORDER BY id"
+                   % ",".join(map(str, ceg))), [("noted", "intact", 1)] * 3)
+            r.eq("group: the ANET event is untouched", one(led, "SELECT status FROM events WHERE id=?", anet), "queued")
+            # The next CEG event sees the group's one verdict once, not three copies.
+            with led.connect() as conn:
+                nxt = store.create_event(conn, dedup_key="news:CEG:next", ticker="CEG", type="news",
+                                         detail={"title": "next"}, now="2026-10-28T15:00:00Z")
+                ev = store.get_event(conn, nxt)
+            body = json.loads(w.event_prompt(None, ev).split("```json\n", 1)[1].rsplit("\n```", 1)[0])
+            r.eq("group: last_verdicts counts the group once", [v["id"] for v in body["last_verdicts"]], [ceg[0]])
+            # The brief names the story once.
+            from lib.desk import brief
+            with led.connect() as conn:
+                phrases = brief.build_model(conn, day="2026-10-28", now_dt=clock.now, earnings_fn=lambda t: None)["events"]
+            r.eq("group: the brief names the CEG story once",
+                 phrases.count("CEG had important news, and our reason to own it did not change"), 1)
+            # A group whose job fails twice fails every event of the group.
+            with led.connect() as conn:
+                more = [store.create_event(conn, dedup_key=f"news:TSM:{i}", ticker="TSM", type="news",
+                                           detail={"title": "TSM"}, now=f"2026-10-28T14:0{i}:00Z") for i in (1, 2)]
+            jobs2 = events.queue_analysis(led, now=NOW)
+            w2, _t = make_worker(root, led, {more[0]: "fail"})
+            for _ in range(2):
+                w2.run_one(job_row(led, jobs2[0]))
+            r.eq("group: a failed group fails every event",
+                 [x[0] for x in q(led, "SELECT status FROM events WHERE id IN (?, ?) ORDER BY id", *more)],
+                 ["failed", "failed"])
+    finally:
+        clock.unpin()
+
+
+CASES = [case_dedup, case_holding, case_lookthrough, case_others, case_queue, case_queue_news_group]
 
 if __name__ == "__main__":
     for case in CASES:

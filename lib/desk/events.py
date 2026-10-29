@@ -402,22 +402,41 @@ def _xbrl_retry(led, client, *, settings, seams) -> None:
 
 
 def queue_analysis(led, *, now: str, limit: int = 6) -> list:
-    """Move up to ``limit`` ``new`` events (oldest first) to ``queued`` and insert one
-    ``analyze_event`` job for each (§9.1 step 9). A ``drift`` event is never queued."""
+    """Move up to ``limit`` groups of ``new`` events (oldest first) to ``queued`` and insert
+    one ``analyze_event`` job for each group (§9.1 step 9). The new ``news`` events of one
+    ticker are one group: three outlets with the same story get one analysis. The job's
+    ``event_id`` is the oldest event of the group and ``also`` lists the others. Every other
+    event is a group of one. A ``drift`` event is never queued."""
     with led.transaction() as conn:
-        rows = conn.execute("SELECT id FROM events WHERE status='new' AND type != 'drift' "
-                            "ORDER BY detected_at, id LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("SELECT id, ticker, type FROM events WHERE status='new' AND type != 'drift' "
+                            "ORDER BY detected_at, id").fetchall()
+        groups, news_group = [], {}
+        for eid, ticker, typ in rows:
+            if typ == "news" and ticker in news_group:
+                news_group[ticker].append(eid)
+                continue
+            groups.append([eid])
+            if typ == "news":
+                news_group[ticker] = groups[-1]
         jobs = []
         owner = conn.execute("SELECT chat_id FROM chat_messages WHERE role='owner' ORDER BY id DESC LIMIT 1").fetchone()
-        for r in rows:
-            cur = conn.execute("UPDATE events SET status='queued' WHERE id=? AND status='new'", (r[0],))
-            if cur.rowcount == 1:
-                jobs.append(store.enqueue_job(conn, kind="analyze_event", payload={"event_id": r[0]},
-                                              requested_by="monitor", now=now))
-                # A desk line (not sent): the desk's next turn sees it in <desk_updates>.
-                store.insert_desk_message(conn, chat_id=owner[0] if owner else "", source="monitor",
-                                          text=describe_event(store.get_event(conn, r[0])) + " Analysis queued.",
-                                          now=now)
+        for group in groups[:limit]:
+            moved = [eid for eid in group if conn.execute(
+                "UPDATE events SET status='queued' WHERE id=? AND status='new'", (eid,)).rowcount == 1]
+            if not moved:
+                continue
+            payload = {"event_id": moved[0]}
+            if len(moved) > 1:
+                payload["also"] = moved[1:]
+            jobs.append(store.enqueue_job(conn, kind="analyze_event", payload=payload,
+                                          requested_by="monitor", now=now))
+            text = describe_event(store.get_event(conn, moved[0]))
+            if len(moved) > 1:
+                n = len(moved) - 1
+                text += f" {n} more headline{'s' if n > 1 else ''} on {store.get_event(conn, moved[0])['ticker']} go with it."
+            # A desk line (not sent): the desk's next turn sees it in <desk_updates>.
+            store.insert_desk_message(conn, chat_id=owner[0] if owner else "", source="monitor",
+                                      text=text + " Analysis queued.", now=now)
         return jobs
 
 

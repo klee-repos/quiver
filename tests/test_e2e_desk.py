@@ -897,8 +897,8 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     r.eq("14 brief of 3 messages", len(brief), 3)
     b = brief + ["", "", ""]
     r.ok("14 brief 1: $2,005.60, +$5.60, +0.28%", "$2,005.60" in b[0] and "up $5.60" in b[0] and "+0.28%" in b[0], b[0])
-    r.ok("14 brief 2: ANET leads the movers", b[1].startswith("What moved the book: ANET"), b[1])
-    r.ok("14 brief 3: the 10-Q and its verdict", "ANET filed a 10-Q (verdict: strengthened)" in b[2], b[2])
+    r.ok("14 brief 2: ANET leads the movers", b[1].startswith("What moved the account: ANET"), b[1])
+    r.ok("14 brief 3: the 10-Q and its verdict", "ANET filed its quarterly report (10-Q), and our reason to own it got stronger." in b[2], b[2])
     r.eq("14 one brief notifications row", one(led, "SELECT COUNT(*) FROM notifications WHERE kind='brief'"), 1)
     r.eq("14 brief rows are source brief", one(led, "SELECT COUNT(*) FROM chat_messages WHERE source='brief'"), 3)
     r.ok("14 the monitor run is clean", not st14.get("failed"), st14)

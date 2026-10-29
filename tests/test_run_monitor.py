@@ -610,6 +610,33 @@ def case_misc(r: Results):
 
     with_root(et("2026-10-28 09:00"), metrics_seq)
 
+    def duplicate_seq(h: Harness):
+        # Two pending min_trade_notional cards from the old producer (it superseded no change).
+        from lib.desk import proposals
+        h.clock.set(et("2026-10-28 15:00"))
+        keep = proposals.supersede_changes
+        proposals.supersede_changes = lambda *a, **k: []
+        try:
+            ids = []
+            for v in (10, 12):
+                with h.led.transaction() as c:
+                    ids.append(proposals.build_change(c, h.cfg, change={"kind": "set_risk", "key": "min_trade_notional",
+                                                                         "value": v},
+                                                      rationale="A test card.", created_by="desk",
+                                                      now_dt=h.clock.now)["proposal_id"])
+        finally:
+            proposals.supersede_changes = keep
+        with h.led.connect() as c:
+            for i, pid in enumerate(ids):
+                c.execute("UPDATE proposals SET tg_message_id=? WHERE id=?", (6100 + i, pid))
+        st, m = h.run(et("2026-10-28 15:40"), snap_on_wait=True)
+        r.eq("misc: the expire step supersedes the older duplicate card",
+             [h.one("SELECT state FROM proposals WHERE id=?", (pid,)) for pid in ids], ["superseded", "pending"])
+        r.ok("misc: the older card is relabeled Replaced by #N", (6100, f"Replaced by #{ids[1]}") in h.tr.labels(),
+             h.tr.labels())
+
+    with_root(et("2026-10-28 09:00"), duplicate_seq)
+
 
 # --- path units (§9.1 step 9b) ---------------------------------------------------------
 

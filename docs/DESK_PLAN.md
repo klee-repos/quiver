@@ -1103,8 +1103,11 @@ from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,40
    statement, legs finalized), and edit their buttons to "Expired". Also close each `approved`
    or `executing` proposal whose `expires_at` has passed and that has no leg in `placing`,
    `placed` or `partially_filled`, by §11.1 step 9.
-9. **Queue analysis.** Move up to 6 `new` events (oldest first) to `queued`, and insert one
-   `analyze_event` job for each. A `drift` event is never queued. Touch the worker trigger.
+9. **Queue analysis.** Move up to 6 groups of `new` events (oldest first) to `queued`, and insert
+   one `analyze_event` job for each group. The new `news` events of one ticker are one group, so
+   three outlets with one story get one analysis: the job's `event_id` is the oldest event and
+   `also` lists the others, which share its verdict or its failure. Every other event is a group
+   of one. A `drift` event is never queued. Touch the worker trigger.
 
    **9b. Path units.** Run `systemctl is-failed quiver-worker.path quiver-broker.path`. If either
    is `failed`, page once a day (stage `path_unit`). Also run
@@ -1148,7 +1151,8 @@ from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,40
 
 The `analyze_event` prompt holds: the event, the company dossier (`get_company`), the new
 document ids with their section keys and sizes, the last three verdicts for the name, and
-the open proposals for the name.
+the open proposals for the name. A group adds `also_events` (the other headlines and their
+article documents) and asks for one `record_verdict` on the job's own event.
 
 A `deep_dive` reads the annual report (Business, the risk factors or their diff, MD&A),
 the latest 10-Q MD&A, the latest earnings release, and the transcript. It records at least
@@ -1182,12 +1186,15 @@ on Approve is refused. Change proposals still work.
    refuses a ticker that has a leg in `approved`, `checked`, `placing`, `placed` or
    `partially_filled` in any trade proposal: "CEG has an order in flight. Wait for the fill."
    A leg in `requoted`, `skipped` or an end state does not block its ticker. `apply_change` supersedes every pending trade
-   proposal on a ticker whose target it changes.
+   proposal on a ticker whose target it changes. A new change proposal supersedes each older pending change
+   of the same kind on the same subject (the ticker, a shared `set_weights` ticker, the `set_risk` key, or the
+   premise), so an old card cannot undo a newer one. The monitor's expire step applies the same rule to the
+   pending cards (`proposals.supersede_duplicate_changes`) and relabels the old card "Replaced by #N".
 5. `lib/notify` renders each card in prose (deterministic, no LLM). Example:
    > Proposal #41. Buy \$412 of CEG, about 1.6 shares at \$257.03. That takes CEG from 7.4%
-   > of the book to its 9.0% target. Why: the Q3 10-Q raised data-center PPA backlog and
-   > the price is under the agreed buy-below of \$260. Evidence: finding #212 (10-Q MD&A),
-   > reverse DCF now implies 8.1% FCF growth against 14% in the thesis. Open until 4:00 PM ET.
+   > of the account to the 9.0% we planned. Why: the Q3 quarterly report (10-Q) shows more
+   > signed power contracts with data centers, and the price is under the \$260 we agreed is a
+   > good price to buy more. Evidence: finding #212. Open until 4:00 PM ET.
 
    An owner-origin card quotes the cited owner message word for word ("You asked: 'trim CEG
    a bit' (3:10 PM)"). A card that rests on a desk-found news event names the source URL and
@@ -1719,12 +1726,14 @@ as two to four messages:
 1. The day: equity, the change in \$ and % against the day's baseline, and the
    deposit-adjusted return toward the goal (`lib/goal`).
 2. What moved: the three names with the largest dollar effect on the book, with their % moves.
-3. What happened: the day's events in one sentence, with names. It also lists filings by
-   watched names.
+3. What happened: one sentence for each of the day's events, with names and the analyst's
+   verdict in plain words. A phrase that repeats (a news group shares one verdict) is said
+   once. It also lists filings by watched names.
 4. What waits on you: pending proposals with their expiry, and earnings in the next five
    trading days.
 
-A message with nothing to say is left out. The brief replaces today's digest (`tick.py
+The brief uses the plain words of the cards: "the account", "a good price to buy more", "our
+reason to own it got stronger". A message with nothing to say is left out. The brief replaces today's digest (`tick.py
 report` / `report-send`). The `halt`, `auth_error` and `error` pages stay as they are.
 
 ## 13. Security walls
@@ -3240,7 +3249,7 @@ set the fake yfinance price to \$177.20 (the Robinhood market cap \$223.49B of 2
 | origin_owner | the desk role with an id from this turn passes; an id from another turn, the analyst role, or `change`/`drift` from a tool is refused |
 | supersede | a new ANET proposal supersedes the pending [ANET, CEG] one: `superseded_by`, old legs `skipped`, card "Replaced by \#N" |
 | expiry | 2026-08-05 10:00 → 16:00 ET; 2026-11-27 10:00 → 13:00 ET; 2026-11-26 → 2026-11-27 13:00 ET; Fri 2026-10-30 17:00 → Mon 2026-11-02 16:00 ET (21:00 UTC) |
-| card | prose, no bullet or " / "; "Buy \$200 of ANET, about 1.3 shares at \$150.00.", "from 15.0% of the book to its 25.0% target", "Open until 4:00 PM ET."; Approve `success`, Reject `danger`; `callback_data` < 64 bytes at a 10-digit id; nonce 10 hex; `payload_sha256` = SHA-256 of `json.dumps(p, sort_keys=True, separators=(",", ":"))` |
+| card | prose, no bullet or " / "; "Buy \$200 of ANET, about 1.3 shares at \$150.00.", "from 15.0% of the account to the 25.0% we planned", "Open until 4:00 PM ET."; Approve `success`, Reject `danger`; `callback_data` < 64 bytes at a 10-digit id; nonce 10 hex; `payload_sha256` = SHA-256 of `json.dumps(p, sort_keys=True, separators=(",", ":"))` |
 | drift | the monitor's proposal: origin `drift`, `created_by='monitor'`, supersedes a pending drift one, names weight/target/band per leg |
 | quote_source | an `exec-check` row with ANET only: a CEG leg takes CEG from the older full row (< 60 min), else from yfinance; `quote_at_proposal` is `last_trade_price` |
 | verdict_table | each row of §10.2 step 7: `price_level buy_below` + `intact` → buy, fraction 1.0; `filing` + `strengthened` → buy, fraction 0.5 (a passed 1.0 is ignored); `filing` + `intact` → refused; `weakened` at target → refused, above target → sell; `broken` → refused with "propose drop_company"; no recorded verdict → refused |

@@ -260,12 +260,12 @@ def _leg_sentence(leg: dict, first: bool) -> str:
     now_w, after_w, target_w = leg.get("weight_now"), leg.get("weight_after"), leg.get("target_weight")
     if now_w is not None and after_w is not None and target_w is not None:
         if abs(after_w - target_w) < 0.05:
-            s += f" That takes {t} from {now_w:.1f}% of the book to its {target_w:.1f}% target."
+            s += f" That takes {t} from {now_w:.1f}% of the account to the {target_w:.1f}% we planned."
         elif leg.get("exit"):
-            s += f" That takes {t} from {now_w:.1f}% of the book to {after_w:.1f}%, on its way out."
+            s += f" That takes {t} from {now_w:.1f}% of the account to {after_w:.1f}%, on its way out."
         else:
-            s += (f" That takes {t} from {now_w:.1f}% of the book to {after_w:.1f}%, on the way to its "
-                  f"{target_w:.1f}% target.")
+            s += (f" That takes {t} from {now_w:.1f}% of the account to {after_w:.1f}%, on the way to the "
+                  f"{target_w:.1f}% we planned.")
     return s
 
 
@@ -299,10 +299,10 @@ def render_trade_card(model: dict) -> list:
     if model.get("drift"):
         for leg in legs:
             band = leg.get("band")
-            band_txt = f" and outside its {float(band):.1f}-point band" if band is not None else ""
+            band_txt = (f", more than the {float(band):.1f} points it may drift" if band is not None else "")
             side = "above" if (leg.get("weight_now") or 0) > (leg.get("target_weight") or 0) else "below"
-            parts.append(f"{_te(leg['ticker'])} is at {float(leg.get('weight_now') or 0):.1f}% of the book, "
-                         f"{side} its {float(leg.get('target_weight') or 0):.1f}% target{band_txt}.")
+            parts.append(f"{_te(leg['ticker'])} is {float(leg.get('weight_now') or 0):.1f}% of the account, "
+                         f"{side} the {float(leg.get('target_weight') or 0):.1f}% we planned{band_txt}.")
     if model.get("scaled"):
         parts.append("Cash covers only part of the buys, so I scaled each buy down by the same share.")
     for s in model.get("skipped") or []:
@@ -347,52 +347,58 @@ def render_change_card(model: dict) -> list:
     parts = [f"<b>Proposal #{pid}.</b>"]
     if kind == "add_company":
         entry = ch["entry"]
-        e = ("Entry is now." if entry["mode"] == "now"
-             else f"Entry waits until the price is at or below {_fmt_money(entry['price'])}.")
-        parts.append(f"Add {_te(ch['ticker'])} to the book at a {ch['target_weight']:.1f}% target with a "
-                     f"{ch['band']:.1f}-point band. {e}")
+        e = ("The first buy is now." if entry["mode"] == "now"
+             else f"The first buy waits until the price is at or below {_fmt_money(entry['price'])}.")
+        parts.append(f"Add {_te(ch['ticker'])} to the plan as {ch['target_weight']:.1f}% of the account. I suggest "
+                     f"a trade when it drifts more than {ch['band']:.1f} points from that. {e}")
         if ch.get("funding"):
-            parts.append("The weight comes from " + _te(_plain_join(
+            parts.append("That share comes from " + _te(_plain_join(
                 f"{f['ticker']} (to {f['target_weight']:.1f}%)" for f in ch["funding"])) + ".")
     elif kind == "drop_company":
         ex = ch["exit"]
-        e = ("Exit now." if ex["mode"] == "now"
-             else f"Exit when the price is at or above {_fmt_money(ex['price'])}.")
-        what = "the unmanaged position" if ch.get("unmanaged") else "the book"
-        parts.append(f"Drop {_te(ch['ticker'])} from {what}. {e}")
+        e = ("Sell now." if ex["mode"] == "now"
+             else f"Sell when the price is at or above {_fmt_money(ex['price'])}.")
+        what = (f"Sell all of {_te(ch['ticker'])}. It is not part of the plan." if ch.get("unmanaged")
+                else f"Sell all of {_te(ch['ticker'])} and take it out of the plan.")
+        parts.append(f"{what} {e}")
         if ch.get("redistribute"):
-            parts.append("Its weight goes to " + _te(_plain_join(
+            parts.append("Its share goes to " + _te(_plain_join(
                 f"{f['ticker']} (to {f['target_weight']:.1f}%)" for f in ch["redistribute"])) + ".")
     elif kind == "set_weights":
-        parts.append("New target weights: " + _te(_plain_join(
-            f"{c['ticker']} to {c['target_weight']:.1f}%" + (f" with a {c['band']:.1f}-point band" if c.get("band") is not None else "")
+        parts.append("New planned shares of the account: " + _te(_plain_join(
+            f"{c['ticker']} to {c['target_weight']:.1f}%" + (f", with {c['band']:.1f} points of drift allowed" if c.get("band") is not None else "")
             for c in ch["changes"])) + ".")
     elif kind == "set_risk":
         parts.append(f"Change the setting {_te(ch['key'])} from {_te(ch.get('old'))} to {_te(ch['value'])}.")
     elif kind == "set_premise":
         g = ch["goal"]
-        parts.append(f"A new premise, with a goal of {g['target_return_pct']:g}% in {g['horizon_months']} months.")
+        parts.append(f"A new premise (the big idea the account follows), with a goal of {g['target_return_pct']:g}% "
+                     f"in {g['horizon_months']} months.")
         parts.append(f"<i>{_te(summarize(ch['text'], 3000))}</i>")
     elif kind == "set_thesis":
-        parts.append(f"A thesis for {_te(ch['ticker'])}: {_te(ch['summary'])}")
+        parts.append(f"Our reason to own {_te(ch['ticker'])} (the thesis): {_te(_sentence(ch['summary']))}")
         if ch.get("drivers"):
-            parts.append("It rests on " + _te(_plain_join(ch["drivers"])) + ".")
+            parts.append("It depends on " + _te(_plain_join(ch["drivers"])) + ".")
         if ch.get("falsifiers"):
-            parts.append("It breaks if " + _te(_plain_join(ch["falsifiers"])) + ".")
+            parts.append("We should rethink it if " + _te(_plain_join(ch["falsifiers"])) + ".")
         fv = [ch.get("fair_value_low"), ch.get("fair_value_base"), ch.get("fair_value_high")]
         if all(v is not None for v in fv):
-            parts.append(f"Fair value is {_fmt_money(fv[0])} in the bear case, {_fmt_money(fv[1])} in the base "
-                         f"case and {_fmt_money(fv[2])} in the bull case.")
+            parts.append(f"I think one share is worth about {_fmt_money(fv[1])}. It is {_fmt_money(fv[0])} if "
+                         f"things go badly and {_fmt_money(fv[2])} if things go very well.")
         else:
-            parts.append("This one has no fair value; it uses price levels only.")
-        lv = []
+            parts.append("I give it no single worth per share.")
         if ch.get("buy_below") is not None:
-            lv.append(f"buy below {_fmt_money(ch['buy_below'])}")
+            parts.append(f"If the price falls below {_fmt_money(ch['buy_below'])}, I'll tell you: that is a good "
+                         "price to buy more.")
         if ch.get("trim_above") is not None:
-            lv.append(f"trim above {_fmt_money(ch['trim_above'])}")
-        parts.append(("The levels are " + _plain_join(lv) + ".") if lv else "It sets no price levels.")
+            parts.append(f"If the price rises above {_fmt_money(ch['trim_above'])}, I'll tell you: that is a good "
+                         "price to sell some.")
+        if ch.get("buy_below") is None and ch.get("trim_above") is None:
+            parts.append("It sets no alert prices.")
     elif kind == "resume_trading":
-        parts.append("Lift today's daily-loss halt so Approve taps work again. The KILL file is not touched.")
+        why = ch.get("halt_reason")
+        parts.append("Trading is stopped for today" + (f" (the reason: {_te(why)})" if why else "") +
+                     ". This starts it again, so Approve taps work. The KILL file is not touched.")
     if model.get("preview"):
         parts.append(_te(model["preview"]))
     if model.get("rationale"):
@@ -489,36 +495,38 @@ def render_brief(model: dict) -> list:
     if eq is not None and base:
         chg = float(eq) - float(base)
         pct = chg / float(base) * 100.0
-        s = (f"The book closed at {_fmt_money(eq)}, {'up' if chg >= 0 else 'down'} "
+        s = (f"The account closed at {_fmt_money(eq)}, {'up' if chg >= 0 else 'down'} "
              f"{_fmt_money(abs(chg))} ({_fmt_pct(pct)}) on the day.")
         g = model.get("goal")
         if g and g.get("cumulative_return_pct") is not None:
-            s += (f" Since the start, the deposit-adjusted return is {_fmt_pct(g['cumulative_return_pct'])} "
-                  f"against the {float(g.get('target_return_pct') or 0):g}% goal.")
+            s += (f" Since the start, it is {_fmt_pct(g['cumulative_return_pct'])}, not counting money you added. "
+                  f"The goal is {float(g.get('target_return_pct') or 0):g}%.")
         out.append(s)
     movers = model.get("movers") or []
     if movers:
         bits = [f"{m['ticker']} {_fmt_pct(m['pct'])} ({'+' if m['dollars'] >= 0 else '-'}{_fmt_money(abs(m['dollars']))})"
                 for m in movers]
-        out.append("What moved the book: " + _te(_plain_join(bits)) + ".")
+        out.append("What moved the account: " + _te(_plain_join(bits)) + ".")
     events = model.get("events") or []
     filings = model.get("watch_filings") or []
     if events or filings:
         s = ""
         if events:
-            s = "Today " + _te(_plain_join(events)) + "."
+            # One sentence for each event: a phrase can hold a comma of its own.
+            s = " ".join(_te(_sentence(("Today " + e) if i == 0 else (e[:1].upper() + e[1:])))
+                         for i, e in enumerate(events))
         if filings:
-            s += (" " if s else "") + "Watched names filed: " + _te(_plain_join(filings)) + "."
+            s += (" " if s else "") + "Names we watch filed: " + _te(_plain_join(filings)) + "."
         out.append(s)
     pending = model.get("pending") or []
     earnings = model.get("earnings") or []
     if pending or earnings:
         s = ""
         if pending:
-            s = "Waiting on you: " + _te(_plain_join(
-                f"proposal #{p['id']} ({p['what']}, open until {p['until']})" for p in pending)) + "."
+            s = "Waiting on your tap: " + _te(_plain_join(
+                f"card #{p['id']} ({p['what']}, open until {p['until']})" for p in pending)) + "."
         if earnings:
-            s += (" " if s else "") + "Earnings in the next five trading days: " + _te(_plain_join(
+            s += (" " if s else "") + "Results coming in the next five trading days: " + _te(_plain_join(
                 f"{e['ticker']} on {e['date']}" for e in earnings)) + "."
         out.append(s)
     return out

@@ -43,22 +43,49 @@ def movers(snapshot: dict, n: int = 3) -> list:
     return out[:n]
 
 
+# The analyst's verdict on the thesis, in plain words.
+_VERDICT_TEXT = {"intact": "our reason to own it did not change",
+                 "strengthened": "our reason to own it got stronger",
+                 "weakened": "our reason to own it got weaker",
+                 "broken": "our reason to own it no longer holds"}
+_FORM_TEXT = {"10-K": "its annual report (10-K)", "10-Q": "its quarterly report (10-Q)",
+              "8-K": "a news filing (8-K)"}
+
+
+_CHANGE_TEXT = {"set_thesis": "our reason to own it", "add_company": "a new name", "drop_company": "sell all",
+                "set_weights": "new planned shares", "set_risk": "a setting", "set_premise": "a new premise",
+                "resume_trading": "restart trading"}
+
+
+def _form_text(form) -> str:
+    form = str(form or "filing")
+    return _FORM_TEXT.get(form, f"a {form}")
+
+
 def _event_phrase(ev: dict) -> str:
     d = store.loads(ev.get("detail_json"), {}) or {}
     t = ev["ticker"]
-    verdict = f" (verdict: {ev['verdict']})" if ev.get("verdict") and ev["verdict"] != "n/a" else ""
+    v = _VERDICT_TEXT.get(ev.get("verdict") or "")
+    verdict = f", and {v}" if v else ""
     if ev["type"] in ("filing", "earnings"):
-        what = "reported results" if ev["type"] == "earnings" else f"filed a {d.get('form', 'filing')}"
+        what = "reported results" if ev["type"] == "earnings" else f"filed {_form_text(d.get('form'))}"
         return f"{t} {what}{verdict}"
     if ev["type"] == "lookthrough":
-        return f"{t}, a look-through holding, filed a {d.get('form', 'filing')}{verdict}"
+        return f"{t}, a company inside one of our funds, filed {_form_text(d.get('form'))}{verdict}"
     if ev["type"] == "price_level":
-        lvl = str(d.get("level", "level")).replace("_", " ")
-        return f"{t} crossed its {lvl} level at ${float(d.get('price') or 0):,.2f}{verdict}"
+        price = f"${float(d.get('price') or 0):,.2f}"
+        lvl = d.get("level")
+        if lvl == "buy_below":
+            return f"{t} fell below {price}, a good price to buy more{verdict}"
+        if lvl == "trim_above":
+            return f"{t} rose above {price}, a good price to sell some{verdict}"
+        if lvl == "entry":
+            return f"{t} reached its first-buy price of {price}{verdict}"
+        return f"{t} crossed {price}{verdict}"
     if ev["type"] == "news":
-        return f"{t} had material news{verdict}"
+        return f"{t} had important news{verdict}"
     if ev["type"] == "drift":
-        return "the book drifted past its bands"
+        return "some holdings moved too far from their planned share of the account"
     return f"{t} had a {ev['type']} event"
 
 
@@ -73,8 +100,10 @@ def build_model(conn, *, day: str, now_dt, goal_progress: Optional[dict] = None,
              "goal": goal_progress, "movers": movers(snap) if snap else []}
     # The day's events: detected on the ET calendar date.
     evs = [dict(r) for r in conn.execute("SELECT * FROM events ORDER BY detected_at, id").fetchall()]
-    model["events"] = [_event_phrase(e) for e in evs
-                       if (store.parse_ts(e["detected_at"]).astimezone(market.ET).strftime("%Y-%m-%d") == day)]
+    # One phrase once: a news group's events share one verdict, so they read the same.
+    model["events"] = list(dict.fromkeys(
+        _event_phrase(e) for e in evs
+        if (store.parse_ts(e["detected_at"]).astimezone(market.ET).strftime("%Y-%m-%d") == day)))
     model["watch_filings"] = json.loads(store.get_state(conn, f"watch_filings:{day}", "[]"))
     # Waiting on the owner.
     pend = []
@@ -84,7 +113,10 @@ def build_model(conn, *, day: str, now_dt, goal_progress: Optional[dict] = None,
         if r[1] == "trade":
             what = "trade " + ", ".join(sorted({l["ticker"] for l in payload.get("legs", [])}))
         else:
-            what = str((payload.get("change") or {}).get("kind", "change")).replace("_", " ")
+            ch = payload.get("change") or {}
+            what = _CHANGE_TEXT.get(ch.get("kind"), "a change")
+            if ch.get("ticker"):
+                what += f" for {ch['ticker']}"
         exp = store.parse_ts(r[3]).astimezone(market.ET)
         until = market.fmt_et(exp) + " ET"
         if exp.strftime("%Y-%m-%d") != day:

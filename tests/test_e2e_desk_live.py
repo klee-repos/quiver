@@ -1,8 +1,8 @@
 """The live desk e2e (plan §18.7). Gated: the cases run only with ``QUIVER_LIVE_E2E=1``.
 
-Without the gate it prints ``0 passed, 0 failed, 2 skipped``. With the gate it needs
+Without the gate it prints ``0 passed, 0 failed, 3 skipped``. With the gate it needs
 ``CLAUDE_CODE_OAUTH_TOKEN`` and ``CLAUDE_BIN``; a missing one FAILS the case, it does not skip.
-Both cases bill the subscription token. Run ``tests/run_e2e.sh --live`` before a cutover and
+Every case bills the subscription token. Run ``tests/run_e2e.sh --live`` before a cutover and
 after a prompt change.
 
 Each case uses a temp root made by the real ``desk-seed`` (ANET and CEG loaded from the
@@ -12,6 +12,9 @@ answers, and a temp ``CLAUDE_CONFIG_DIR``. No broker. ``WebSearch`` is not a des
   * desk_turn: one real desk turn (``QUIVER_DESK_MODEL``) through ``chat_bridge.Bridge``.
   * deep_dive: the seed's ANET ``deep_dive`` job (``QUIVER_ANALYST_MODEL``) through
     ``run_worker.Worker.run_one``.
+  * research: the owner asks about NVDA, a name that is not loaded. The desk loads it from the
+    real SEC EDGAR (it needs ``SEC_USER_AGENT``) and queues a deep-dive with the question as its
+    focus; then the worker runs that deep-dive. Every message must be in plain English.
 
 Run one case: ``QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_e2e_desk_live.py desk_turn``.
 """
@@ -269,7 +272,99 @@ def case_deep_dive(R):
             print("    msg>", str(p.get("text"))[:300].replace("\n", " "))
 
 
-CASES = {"desk_turn": case_desk_turn, "deep_dive": case_deep_dive}
+RESEARCH_Q = "Can you research NVDA for me? I want to know if it is a good buy right now."
+# Words the plain-English rules (prompts/desk.md, prompts/analyst.md) replace.
+JARGON = ("bear case", "bull case", "base case", "fair value", "yoy", "adx", "the book", "bps")
+
+
+def jargon(texts) -> list:
+    return sorted({w for t in texts for w in JARGON if w in str(t).lower()})
+
+
+def case_research(R):
+    if not need_env(R, "research"):
+        return
+    R.ok("research: SEC_USER_AGENT is set", bool(os.environ.get("SEC_USER_AGENT")))
+    import chat_bridge
+    import run_worker
+    from lib.desk import agent, findings as findings_mod, outbox, store
+    with temp_root() as root:
+        seed_desk(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        rec = {}
+
+        async def factory(options):
+            from claude_agent_sdk import ClaudeSDKClient
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            rec["c"] = Recorder(client)
+            return rec["c"]
+
+        led = root.led()
+        bridge = chat_bridge.Bridge(runtime=runtime, secrets=secrets, led=led, transport=tg, client_factory=factory)
+
+        async def go():
+            await bridge.handle_update(owner_update(1, 7101, RESEARCH_Q), offline=False)
+            await bridge.maybe_turn()
+            await bridge.turn_task
+            await bridge.disconnect()
+
+        t0 = time.monotonic()
+        asyncio.run(go())
+        tools = rec["c"].tools if "c" in rec else []
+        print(f"  research turn: {round(time.monotonic() - t0, 1)}s, tools={tools}")
+        said = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        for p in said:
+            print("    say>", str(p.get("text"))[:300].replace("\n", " "))
+        R.ok("research: the first tool call is react", tools[:1] == ["mcp__desk__react"], tools)
+        R.ok("research: the desk loads NVDA", "mcp__desk__load_company" in tools, tools)
+        R.ok("research: the desk starts a deep-dive", "mcp__desk__start_deep_dive" in tools, tools)
+        R.ok("research: the desk answers in the chat", len(said) >= 1, len(said))
+        R.eq("research: the desk's messages use no finance jargon", jargon(p.get("text") for p in said), [])
+        with led.connect() as c:
+            comp = store.get_company(c, "NVDA")
+            job = c.execute("SELECT * FROM jobs WHERE kind='deep_dive' AND status='queued' "
+                            "AND payload_json LIKE '%\"NVDA\"%'").fetchone()
+        R.ok("research: NVDA is loaded as a candidate", bool(comp) and comp["status"] == "candidate", comp)
+        R.ok("research: a queued NVDA deep-dive", job is not None)
+        if job is None:
+            return
+        job = dict(job)
+        focus = (store.loads(job["payload_json"], {}) or {}).get("focus")
+        R.ok("research: the deep-dive carries the owner's question as its focus", bool(focus), focus)
+        # The analyst runs it.
+        tg2 = FakeTelegram()
+        box = outbox.Outbox(led, transport=tg2, chat_id=str(OWNER))
+        worker = run_worker.Worker(runtime=runtime, secrets=secrets, led=led, box=box)
+        t1 = time.monotonic()
+        worker.run_one(job)
+        secs = round(time.monotonic() - t1, 1)
+        with led.connect() as c:
+            j = dict(c.execute("SELECT status, error, attempts FROM jobs WHERE id=?", (job["id"],)).fetchone())
+            finds = [dict(r) for r in c.execute(
+                "SELECT f.*, d.text AS doc_text FROM findings f JOIN documents d ON d.id=f.document_id "
+                "WHERE f.ticker='NVDA' AND f.created_by='analyst'").fetchall()]
+            cards = [dict(r) for r in c.execute("SELECT id, state, payload_json FROM proposals WHERE kind='change' "
+                                                "AND state='pending' AND payload_json LIKE '%\"NVDA\"%'")]
+        sent = [p for p in tg2.sent() if str(p.get("chat_id")) == str(OWNER)]
+        print(f"  research deep-dive: {secs}s, job={j}, findings={len(finds)}, cards={[c_['id'] for c_ in cards]}")
+        for p in sent:
+            print("    msg>", str(p.get("text"))[:400].replace("\n", " "))
+        R.eq("research: the NVDA deep-dive is done", j["status"], "done")
+        R.ok("research: 8 or more NVDA findings", len(finds) >= 8, len(finds))
+        bad = [f["id"] for f in finds
+               if findings_mod.normalize(f["doc_text"])[f["quote_start"]:f["quote_start"] + len(f["quote"])]
+               != f["quote"]]
+        R.eq("research: every NVDA quote is in its document", bad, [])
+        R.ok("research: a pending NVDA card", len(cards) >= 1, cards)
+        R.ok("research: 3 to 6 analyst messages plus the card", len(sent) >= 3, len(sent))
+        analyst = [str(p.get("text")) for p in sent if not p.get("reply_markup")]
+        R.eq("research: the analyst's messages use no finance jargon", jargon(analyst), [])
+
+
+CASES = {"desk_turn": case_desk_turn, "deep_dive": case_deep_dive, "research": case_research}
 
 
 def main(argv) -> int:

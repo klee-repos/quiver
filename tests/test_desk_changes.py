@@ -459,6 +459,15 @@ def case_resume():
         c.halt()
         c.root.kill.write_text("stop")
         reason0 = c.one("SELECT halt_reason FROM day_baseline WHERE trade_date=?", (market.trading_day_et(),))["halt_reason"]
+        # The card names the real reason: an audit halt sets the same flag as a loss halt.
+        card = propose(c, {"kind": "resume_trading"})
+        r.eq("resume: the change carries the halt reason", card["change"]["halt_reason"], reason0)
+        c.tg.calls.clear()
+        outbox.send_change_card(c.led, c.box, c.cfg, card["proposal_id"])
+        text = html.unescape(" ".join(p["text"] for m, p in c.tg.calls if m == "sendMessage"))
+        r.ok("resume: the card shows the halt reason", f"Trading is stopped for today (the reason: {reason0})." in text,
+             text)
+        r.ok("resume: the card does not claim a loss of its own", "loss reached" not in text, text)
         pid, res = confirm(c, {"kind": "resume_trading"})
         row = c.one("SELECT halted, halt_reason FROM day_baseline WHERE trade_date=?", (market.trading_day_et(),))
         r.ok("resume: applied", res["ok"] and c.prop(pid)["state"] == "applied", res)
@@ -743,8 +752,117 @@ def case_preview():
              "then i'll propose buying about $200 of anet from cash" in pv.lower(), pv)
 
 
+# --- one open card per subject -------------------------------------------------------------
+
+def case_one_open_card():
+    with case() as c:
+        c.snap()
+        val = {"method": "price_levels", "reason": "test levels"}
+        a = propose(c, thesis("ANET", val, buy_below=120.0))
+        other = propose(c, thesis("CEG", val, buy_below=250.0))
+        outbox.send_change_card(c.led, c.box, c.cfg, a["proposal_id"])
+        mid_a = c.prop(a["proposal_id"])["tg_message_id"]
+        b = propose(c, thesis("ANET", val, buy_below=125.0))
+        r.eq("one_open: a new ANET thesis supersedes the older pending one", b["superseded"], [a["proposal_id"]])
+        pa = c.prop(a["proposal_id"])
+        r.eq("one_open: the old card is superseded by the new one", (pa["state"], pa["superseded_by"]),
+             ("superseded", b["proposal_id"]))
+        r.eq("one_open: the CEG thesis stays pending", c.prop(other["proposal_id"])["state"], "pending")
+        c.tg.calls.clear()
+        outbox.send_change_card(c.led, c.box, c.cfg, b["proposal_id"], superseded=b["superseded"])
+        labels = [p["reply_markup"]["inline_keyboard"][0][0]["text"] for m, p in c.tg.calls
+                  if m == "editMessageReplyMarkup" and p.get("message_id") == mid_a]
+        r.eq("one_open: the old card's buttons say Replaced by #N", labels, [f"Replaced by #{b['proposal_id']}"])
+        t = tap(c, a["proposal_id"])
+        r.eq("one_open: a tap on the old card applies nothing", (t["ok"], t["answer"]),
+             (False, f"Replaced by #{b['proposal_id']}"))
+        r.eq("one_open: no thesis from the old card", c.q("SELECT * FROM theses WHERE ticker='ANET'"), [])
+        res = tap(c, b["proposal_id"])
+        th = c.one("SELECT buy_below FROM theses WHERE ticker='ANET' ORDER BY version DESC LIMIT 1")
+        r.ok("one_open: the new card applies", res["ok"] and th and th["buy_below"] == 125.0, (res, th))
+        # A different kind on the same ticker is a separate card.
+        d = propose(c, {"kind": "drop_company", "ticker": "CEG", "exit": {"mode": "now"},
+                        "redistribute": [{"ticker": "SGOV", "target_weight": 75}]})
+        r.eq("one_open: a drop_company leaves the CEG thesis open", (d["superseded"],
+             c.prop(other["proposal_id"])["state"]), ([], "pending"))
+        # set_risk: the same key supersedes; another key does not.
+        k1 = propose(c, {"kind": "set_risk", "key": "min_trade_notional", "value": 10})
+        k2 = propose(c, {"kind": "set_risk", "key": "margin_of_safety_pct", "value": 20})
+        k3 = propose(c, {"kind": "set_risk", "key": "min_trade_notional", "value": 12})
+        r.eq("one_open: set_risk on the same key supersedes", (k2["superseded"], k3["superseded"]),
+             ([], [k1["proposal_id"]]))
+        # set_weights: a shared ticker supersedes; no shared ticker does not.
+        w1 = propose(c, weights(("ANET", 30), ("SGOV", 55)))
+        w2 = propose(c, weights(("CEG", 10), ("SGOV", 65)))
+        r.eq("one_open: set_weights that share only the cash fund (SGOV) stay apart", w2["superseded"], [])
+        w3 = propose(c, weights(("ANET", 28), ("SGOV", 57)))
+        r.eq("one_open: set_weights with a shared name (ANET) supersedes", w3["superseded"], [w1["proposal_id"]])
+        r.eq("one_open: the CEG weights card stays open", c.prop(w2["proposal_id"])["state"], "pending")
+        # set_premise has one subject.
+        g = {"target_return_pct": 20, "horizon_months": 12, "benchmark": "SPY"}
+        p1 = propose(c, {"kind": "set_premise", "text": "AI and energy need each other. " * 10, "goal": g})
+        p2 = propose(c, {"kind": "set_premise", "text": "AI, energy and the grid need each other. " * 8, "goal": g})
+        r.eq("one_open: a new premise supersedes the old one", p2["superseded"], [p1["proposal_id"]])
+    with case() as c:
+        # A ledger from before the rule: two pending ANET theses (the old producer, which
+        # superseded nothing). The monitor's sweep keeps the newest.
+        c.snap()
+        val = {"method": "price_levels", "reason": "test levels"}
+        keep = proposals.supersede_changes
+        proposals.supersede_changes = lambda *a, **k: []
+        try:
+            a = propose(c, thesis("ANET", val, buy_below=120.0))
+            b = propose(c, thesis("ANET", val, buy_below=125.0))
+        finally:
+            proposals.supersede_changes = keep
+        r.eq("one_open: setup has two pending ANET cards",
+             [c.prop(x["proposal_id"])["state"] for x in (a, b)], ["pending", "pending"])
+        with c.led.connect() as conn:
+            conn.execute("UPDATE proposals SET tg_message_id=? WHERE id=?", (777, a["proposal_id"]))
+        with c.led.transaction() as conn:
+            moved = proposals.supersede_duplicate_changes(conn, c.now())
+        r.eq("one_open: the sweep supersedes the older card", moved,
+             [{"id": a["proposal_id"], "tg_message_id": 777, "superseded_by": b["proposal_id"]}])
+        r.eq("one_open: the newer card stays pending", c.prop(b["proposal_id"])["state"], "pending")
+        with c.led.transaction() as conn:
+            r.eq("one_open: a second sweep moves nothing", proposals.supersede_duplicate_changes(conn, c.now()), [])
+
+
+# --- plain-English card text ------------------------------------------------------------------
+
+def case_plain_card():
+    with case() as c:
+        c.snap()
+        f = c.finding()
+        built = propose(c, thesis("ANET", dcf([f], [f], [f])))
+        outbox.send_change_card(c.led, c.box, c.cfg, built["proposal_id"])
+        text = html.unescape(re.sub(r"<[^>]+>", "", " ".join(p["text"] for m, p in c.tg.calls
+                                                            if m == "sendMessage")))
+        for phrase in ("Our reason to own ANET (the thesis):", "I think one share is worth about",
+                       "if things go badly", "if things go very well", "a good price to buy more",
+                       "a good price to sell some", "We should rethink it if"):
+            r.ok(f"plain_card: says '{phrase}'", phrase in text, text)
+        for word in ("bear", "bull", "fair value", "the book", "trim above", "base case"):
+            r.ok(f"plain_card: no '{word}'", word not in text.lower(), text)
+        # A company valued by price levels is not called a fund, and the card does not contradict itself.
+        c.tg.calls.clear()
+        built = propose(c, thesis("CEG", {"method": "price_levels", "reason": "no clean cash flow"}))
+        outbox.send_change_card(c.led, c.box, c.cfg, built["proposal_id"])
+        text = " ".join(p["text"] for m, p in c.tg.calls if m == "sendMessage")
+        r.ok("plain_card: a price_levels thesis says no single worth, then no alert prices",
+             "I give it no single worth per share. It sets no alert prices." in text, text)
+        r.ok("plain_card: a company is not called a fund", "fund" not in text.lower(), text)
+        c.tg.calls.clear()
+        built = propose(c, add("TSM", 10, [{"ticker": "SGOV", "target_weight": 50}]))
+        outbox.send_change_card(c.led, c.box, c.cfg, built["proposal_id"])
+        text = " ".join(p["text"] for m, p in c.tg.calls if m == "sendMessage")
+        r.ok("plain_card: add_company says the planned share and the drift",
+             "Add TSM to the plan as 10.0% of the account. I suggest a trade when it drifts more than 5.0 points"
+             in text, text)
+
+
 CASES = [case_add, case_drop, case_weights_risk, case_premise, case_thesis, case_resume, case_revalidate, case_log,
-         case_follow_up, case_supersede_on_change, case_preview]
+         case_follow_up, case_supersede_on_change, case_preview, case_one_open_card, case_plain_card]
 
 if __name__ == "__main__":
     for fn in CASES:

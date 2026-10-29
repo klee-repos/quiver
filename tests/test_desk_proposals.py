@@ -702,7 +702,7 @@ def case_card():
         r.ok("card: one message of prose", len(msgs) == 1 and "\n" not in txt, msgs)
         r.ok("card: no bullet", not re.search(r"(^|\s)[•·\-\*]\s", plain) and not re.search(r"^\s*\d+[.)]\s", plain), plain)
         r.ok("card: no ' / '", " / " not in plain, plain)
-        for s in ("Buy $200 of ANET, about 1.3 shares at $150.00.", "from 15.0% of the book to its 25.0% target",
+        for s in ("Buy $200 of ANET, about 1.3 shares at $150.00.", "from 15.0% of the account to the 25.0% we planned",
                   "Open until 4:00 PM ET."):
             r.ok(f"card: says {s!r}", s in plain, plain)
         btn = outbox.trade_buttons(p["id"], p["nonce"])[0]
@@ -742,7 +742,7 @@ def case_drift():
              ("superseded", second["proposal_id"]))
         txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, second)))
         r.ok("drift: the card names weight, target and band per leg",
-             "ANET is at 17.6% of the book, below its 25.0% target and outside its 5.0-point band." in txt, txt)
+             "ANET is 17.6% of the account, below the 25.0% we planned, more than the 5.0 points it may drift." in txt, txt)
 
 
 # --- quote_source ---------------------------------------------------------------------------

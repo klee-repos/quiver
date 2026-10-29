@@ -759,11 +759,15 @@ def t_propose_change(ctx: ToolContext, args: dict) -> dict:
                                            evidence=args.get("evidence") or [], created_by=ctx.role)
     except proposals.ProposalError as e:
         raise ToolError(str(e))
-    outbox.send_change_card(ctx.led, ctx.box, ctx.cfg, built["proposal_id"])
+    outbox.send_change_card(ctx.led, ctx.box, ctx.cfg, built["proposal_id"], superseded=built["superseded"])
     if ctx.job is not None:
         ctx.job.proposal_ids.append(built["proposal_id"])
+    note = "The card with Confirm and Reject is sent. Only the owner's tap applies it."
+    if built["superseded"]:
+        note += (" It replaces the older open card(s) " + ", ".join(f"#{s}" for s in built["superseded"]) +
+                 " on the same subject; those buttons now say Replaced.")
     return {"proposal_id": built["proposal_id"], "change": built["change"],
-            "note": "The card with Confirm and Reject is sent. Only the owner's tap applies it."}
+            "superseded": built["superseded"], "note": note}
 
 
 # --- schemas ---------------------------------------------------------------------------

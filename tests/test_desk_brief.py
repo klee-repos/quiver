@@ -117,8 +117,9 @@ def full_day(root, fc, *, deposit=True, events=True, pending=True):
                                         rationale="Raise the minimum trade.", created_by="desk", now_dt=fc.now)
             ids["change"] = ch["proposal_id"]
             # A withdrawn proposal is not waiting on the owner.
-            gone = proposals.build_change(conn, cfg, change={"kind": "set_risk", "key": "min_trade_notional",
-                                                             "value": 12},
+            # Another key: a second min_trade_notional card would supersede the first.
+            gone = proposals.build_change(conn, cfg, change={"kind": "set_risk", "key": "margin_of_safety_pct",
+                                                             "value": 20},
                                           rationale="Another try.", created_by="desk", now_dt=fc.now)
             proposals.withdraw(conn, gone["proposal_id"], created_by="desk", now=store.iso(fc.now))
     return ids
@@ -169,7 +170,7 @@ def case_full():
             chg = eq - base
             r.eq("full: the model's equity and baseline are the ledger's", (model["equity"], model["baseline"]),
                  (eq, base))
-            want1 = (f"The book closed at ${eq:,.2f}, up ${abs(chg):,.2f} ({fmt_pct(chg / base * 100)}) on the day.")
+            want1 = (f"The account closed at ${eq:,.2f}, up ${abs(chg):,.2f} ({fmt_pct(chg / base * 100)}) on the day.")
             r.ok("full: message 1 names equity and the change vs the baseline", msgs and msgs[0].startswith(want1),
                  msgs[:1])
             r.eq("full: the change is $50.00, +2.00%", (round(chg, 2), round(chg / base * 100, 2)), (50.0, 2.0))
@@ -182,8 +183,8 @@ def case_full():
             r.ok("full: the deposit-adjusted return is 0.00%, not the naive +25.00%",
                  abs(gp["cumulative_return_pct"]) < 1e-9 and abs(naive - 25.0) < 1e-9, gp)
             r.ok("full: message 1 carries the deposit-adjusted return toward the goal",
-                 msgs and f"deposit-adjusted return is {fmt_pct(gp['cumulative_return_pct'])}" in msgs[0]
-                 and "15% goal" in msgs[0], msgs[:1])
+                 msgs and f"Since the start, it is {fmt_pct(gp['cumulative_return_pct'])}, not counting money you "
+                 "added." in msgs[0] and "The goal is 15%." in msgs[0], msgs[:1])
             r.ok("full: message 1 never shows the deposit as a gain", msgs and "+25.00%" not in msgs[0], msgs[:1])
             # 2. What moved: the three largest dollar movers, with their % moves.
             exp = sorted(((t, q * (p - c), (p / c - 1) * 100) for t, (q, p, c) in CLOSE_BOOK.items()),
@@ -191,21 +192,21 @@ def case_full():
             r.eq("full: the 3 largest dollar movers (DLR, ANET, CEG; SGOV left out)",
                  [(m["ticker"], round(m["dollars"], 2), round(m["pct"], 2)) for m in model["movers"]],
                  [(t, round(d, 2), round(p, 2)) for t, d, p in exp])
-            want2 = "What moved the book: " + ", ".join(
+            want2 = "What moved the account: " + ", ".join(
                 f"{t} {fmt_pct(p)} ({'+' if d >= 0 else '-'}${abs(d):,.2f})" for t, d, p in exp[:2]) + \
                 f" and {exp[2][0]} {fmt_pct(exp[2][2])} ({'+' if exp[2][1] >= 0 else '-'}${abs(exp[2][1]):,.2f})."
             r.eq("full: message 2 text", msgs[1] if len(msgs) > 1 else None, want2)
             # 3. What happened: the day's events (ET date) with names, and the watched-name filings.
             m3 = msgs[2] if len(msgs) > 2 else ""
-            r.ok("full: message 3 names the day's events", "ANET filed a 10-Q" in m3 and
-                 "CEG crossed its buy below level at $290.50" in m3 and "ANET had material news" in m3, m3)
-            r.ok("full: message 3 leaves out an event of another ET day", "CEG had material news" not in m3, m3)
-            r.ok("full: message 3 is one sentence of events, then the watched filings",
-                 m3.startswith("Today ") and "Watched names filed: TSM 6-K." in m3, m3)
+            r.ok("full: message 3 names the day's events", "Today ANET filed its quarterly report (10-Q)." in m3 and
+                 "CEG fell below $290.50, a good price to buy more." in m3 and "ANET had important news." in m3, m3)
+            r.ok("full: message 3 leaves out an event of another ET day", "CEG had important news" not in m3, m3)
+            r.ok("full: message 3 is one sentence per event, then the watched filings",
+                 m3.startswith("Today ") and m3.endswith("Names we watch filed: TSM 6-K."), m3)
             # 4. What waits on you: pending proposals with their expiry; earnings in 5 trading days.
             m4 = msgs[3] if len(msgs) > 3 else ""
             r.ok("full: message 4 names the pending change and its expiry day",
-                 f"proposal #{ids['change']} (set risk, open until 4:00 PM ET on Thursday, August 6)" in m4, m4)
+                 f"card #{ids['change']} (a setting, open until 4:00 PM ET on Thursday, August 6)" in m4, m4)
             r.eq("full: only the pending proposal waits", [p["id"] for p in model["pending"]], [ids["change"]])
             # The brief runs after the close, so a pending proposal expires on a later day
             # (2026-08-06 16:00 ET here). "Its expiry" must name that day, as the card does
@@ -259,21 +260,22 @@ def case_omit():
             msgs = notify.render_brief(model)
             r.eq("omit: no events -> no message 3; nothing pending, no earnings -> no message 4", len(msgs), 2)
             r.ok("omit: the two left are the day and the movers",
-                 len(msgs) == 2 and msgs[0].startswith("The book closed") and msgs[1].startswith("What moved"), msgs)
-            r.ok("omit: no 'Today' and no 'Waiting on you'",
-                 all("Today " not in m and "Waiting on you" not in m and "Earnings" not in m for m in msgs), msgs)
+                 len(msgs) == 2 and msgs[0].startswith("The account closed") and msgs[1].startswith("What moved"), msgs)
+            r.ok("omit: no 'Today' and no 'Waiting on your tap'",
+                 all("Today " not in m and "Waiting on your tap" not in m and "Results coming" not in m for m in msgs),
+                 msgs)
             # Earnings only: message 4 is there, with no pending part.
             model = model_for(root, fc, earnings={"ANET": "2026-08-07"})
             msgs = notify.render_brief(model)
             r.ok("omit: earnings only -> message 4 with no pending part",
-                 len(msgs) == 3 and msgs[2].startswith("Earnings in the next five trading days: ANET on 2026-08-07"),
+                 len(msgs) == 3 and msgs[2].startswith("Results coming in the next five trading days: ANET on 2026-08-07"),
                  msgs)
             # Watched filings only: message 3 is there, with no events part.
             with root.led().connect() as conn:
                 store.set_state(conn, f"watch_filings:{DAY}", json.dumps(["TSM 6-K", "AVGO 10-Q"]))
             msgs = notify.render_brief(model_for(root, fc, earnings={}))
             r.ok("omit: watched filings only -> message 3 with no events part",
-                 len(msgs) == 3 and msgs[2] == "Watched names filed: TSM 6-K and AVGO 10-Q.", msgs)
+                 len(msgs) == 3 and msgs[2] == "Names we watch filed: TSM 6-K and AVGO 10-Q.", msgs)
         finally:
             fc.unpin()
 
@@ -329,7 +331,7 @@ def case_dedup():
             sends = [p for mth, p in tg.calls if mth == "sendMessage"]
             r.eq("dedup: the first run sends the brief", (first.get("messages") if isinstance(first, dict) else first,
                                                           len(sends)), (4, 4))
-            r.ok("dedup: the monitor's message 1 names the 15% goal", sends and "15% goal" in sends[0]["text"],
+            r.ok("dedup: the monitor's message 1 names the 15% goal", sends and "The goal is 15%." in sends[0]["text"],
                  sends[:1])
             n = len(tg.calls)
             second = monitor("2026-08-05T21:40:00Z")

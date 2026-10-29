@@ -207,7 +207,7 @@ cards, and the research memory.
 Use the venv interpreter (`.venv/bin/python`). On the box, run each command as the `quiver`
 user with `/etc/quiver/quiver.env` loaded ([docs/DEPLOY.md](docs/DEPLOY.md)).
 
-`tick.py` has 21 subcommands. Each prints one JSON line.
+`tick.py` has 22 subcommands. Each prints one JSON line.
 
 | Subcommand | Who calls it |
 |---|---|
@@ -221,9 +221,11 @@ user with `/etc/quiver/quiver.env` loaded ([docs/DEPLOY.md](docs/DEPLOY.md)).
 | `strategy-history`, `decision-proof` | You (the change log and the proof of one decision) |
 | `send-test` | You (the deploy gate: sends one real Telegram page) |
 | `desk-seed` | You, once at the cutover (idempotent) |
+| `desk-review` | You (queue a deep-dive review of each holding) |
 
 ```bash
 .venv/bin/python tick.py desk-seed                         # seed the premise, the book, the companies
+.venv/bin/python tick.py desk-review                       # review each holding (or --tickers A,B)
 .venv/bin/python tick.py send-test --kind auth_error       # send one real page to Telegram
 .venv/bin/python tick.py strategy-history --limit 20       # the change log
 .venv/bin/python tick.py decision-proof --id <decision_id> # the proof of one placed leg

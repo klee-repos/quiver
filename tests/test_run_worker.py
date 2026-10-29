@@ -512,9 +512,42 @@ def case_prompt(r: Results):
     with_root("2026-10-26 10:00", body, new_10q=True)
 
 
+# --- desk-review ------------------------------------------------------------------------
+
+def case_review(r: Results):
+    from lib.desk import seed
+
+    def body(h: Harness):
+        snapshot(h.root, at=store.iso(h.clock.now))
+        out = seed.queue_reviews(h.led, now=store.now_iso())
+        r.eq("review: a holding with a queued seed deep-dive is skipped", (out["queued"], sorted(out["skipped"])),
+             ([], ["ANET", "CEG", "SGOV"]))
+        r.eq("review: SGOV is a cash fund", out["skipped"].get("SGOV"), "a cash fund")
+        with h.led.connect() as c:
+            c.execute("UPDATE jobs SET status='done' WHERE kind='deep_dive'")
+        out = seed.queue_reviews(h.led, now=store.now_iso())
+        held = json.loads(h.q("SELECT positions_json FROM broker_snapshots ORDER BY id DESC LIMIT 1")[0]["positions_json"])
+        by_size = [t for t in sorted(held, key=lambda t: -held[t]["market_value"]) if t != "SGOV"]
+        r.eq("review: one review per holding, largest first", out["queued"], by_size)
+        jobs = h.q("SELECT payload_json, requested_by FROM jobs WHERE kind='deep_dive' AND status='queued' ORDER BY id")
+        r.eq("review: each job carries the review focus",
+             [(json.loads(j["payload_json"])["ticker"], json.loads(j["payload_json"])["focus"], j["requested_by"])
+              for j in jobs], [(t, seed.REVIEW_FOCUS, "desk-review") for t in by_size])
+        again = seed.queue_reviews(h.led, now=store.now_iso())
+        r.eq("review: a second run queues nothing", again["queued"], [])
+        only = seed.queue_reviews(h.led, now=store.now_iso(), tickers=["nvda"])
+        r.eq("review: a ticker not held is reported", only, {"ok": True, "queued": [], "skipped":
+                                                               {"NVDA": "not held in the newest snapshot"}})
+        w = h.worker(Script(h, lambda *a: None))
+        prompt = w.deep_dive_prompt(json.loads(jobs[0]["payload_json"]))
+        r.ok("review: the deep-dive prompt carries the focus", seed.REVIEW_FOCUS in prompt, prompt)
+
+    with_root("2026-10-28 16:45", body)
+
+
 def main() -> int:
     r = Results("run-worker")
-    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt):
+    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt, case_review):
         try:
             case(r)
         except Exception as e:  # noqa: BLE001

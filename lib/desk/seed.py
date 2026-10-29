@@ -206,6 +206,45 @@ def desk_seed(led, cfg, *, root: Path, run_strategy_set, seams=None, send=None,
     return out
 
 
+REVIEW_FOCUS = ("A review of the position the owner holds now: keep it as planned, buy more, sell some, "
+                "or sell all, and why, in plain words.")
+
+
+def queue_reviews(led, *, now: str, tickers=None) -> dict:
+    """Queue one deep-dive review for each holding of the newest snapshot, largest
+    position first (``tick.py desk-review``). ``tickers`` limits the list. A name with a
+    deep-dive queued or running, a cash fund, or a name that is not loaded is skipped,
+    with the reason. Returns ``{"ok", "queued", "skipped"}``."""
+    want = {str(t).strip().upper() for t in tickers or [] if str(t).strip()}
+    queued, skipped = [], {}
+    with led.connect() as conn:
+        row = conn.execute("SELECT positions_json FROM broker_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        held = store.loads(row[0], {}) if row else {}
+        names = sorted(held, key=lambda t: -float((held[t] or {}).get("market_value") or 0.0))
+        for t in sorted(want - {n.upper() for n in names}):
+            skipped[t] = "not held in the newest snapshot"
+        for t in names:
+            t = t.upper()
+            if want and t not in want:
+                continue
+            comp = store.get_company(conn, t)
+            if comp is None:
+                skipped[t] = "not loaded"
+                continue
+            if comp["kind"] == "cash":
+                skipped[t] = "a cash fund"
+                continue
+            busy = conn.execute("SELECT id FROM jobs WHERE kind='deep_dive' AND status IN ('queued','running') "
+                                "AND payload_json LIKE ?", (f'%"ticker": "{t}"%',)).fetchone()
+            if busy:
+                skipped[t] = f"deep-dive job {busy[0]} is already queued or running"
+                continue
+            store.enqueue_job(conn, kind="deep_dive", payload={"ticker": t, "focus": REVIEW_FOCUS, "review": True},
+                              requested_by="desk-review", now=now)
+            queued.append(t)
+    return {"ok": True, "queued": queued, "skipped": skipped}
+
+
 def _default_send(led):
     from lib import telegram
     from lib.desk import outbox

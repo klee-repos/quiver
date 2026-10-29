@@ -261,9 +261,13 @@ class Monitor:
     def expire(self):
         with self.led.transaction() as conn:
             moved = proposals.expire_due(conn, self.now)
+            replaced = proposals.supersede_duplicate_changes(conn, store.iso(self.now))
         for m in moved:
             if m.get("tg_message_id"):
                 self.box.set_label(m["tg_message_id"], "Expired")
+        for m in replaced:
+            if m.get("tg_message_id"):
+                self.box.set_label(m["tg_message_id"], f"Replaced by #{m['superseded_by']}")
         with self.led.connect() as conn:
             stale = [r[0] for r in conn.execute(
                 "SELECT p.id FROM proposals p WHERE p.kind='trade' AND p.state IN ('approved','executing') "
@@ -273,7 +277,7 @@ class Monitor:
             text = proposals.close_from_legs(self.led, pid, self.now, reason="it expired before it ran")
             if text:
                 self.box.send(text, source="execution")
-        return {"expired": len(moved), "closed": stale}
+        return {"expired": len(moved), "replaced": [m["id"] for m in replaced], "closed": stale}
 
     # --- §9.1 step 9 ---------------------------------------------------------------
     def queue(self):

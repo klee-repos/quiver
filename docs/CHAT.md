@@ -56,6 +56,27 @@ never uses a fixed emoji.
   converter: HTML from a model reaches you as text, and a link always shows its URL. If
   Telegram rejects the HTML, the bridge sends the message again as plain text.
 
+### Plain English
+
+The desk and the analyst write for a reader with no finance training. Their prompts
+(`prompts/desk.md`, `prompts/analyst.md`) hold the ASD-STE100 rules: short sentences, the
+active voice, and common words. A finance term gets a plain explanation the first time it
+appears in a message, and the prompts name one word for each idea (for example "what one
+share is worth", not "fair value"). The cards (`lib/notify.py`) use the same words.
+
+### Research on request
+
+Ask about a ticker ("look into NVDA"). The desk gives the facts it has, then calls
+`load_company` (when the name is not loaded) and `start_deep_dive` with your question as the
+focus. The analyst reads the annual and quarterly reports, the latest results release and the
+results call, records the facts with exact quotes, values the company, and reports back in
+the chat with a thesis card. A name with no SEC filings cannot be loaded. The desk runs at most
+6 deep-dives a day.
+
+To review each holding at once, run `tick.py desk-review` on the box. It queues one deep-dive
+for each position in the newest snapshot, largest first, with the 6-a-day limit off. Each
+review ends with keep, buy more, sell some, or sell all, and a card when a change is due.
+
 ### Turns
 
 One turn runs at a time. Messages that arrive during a turn wait. The next turn takes all of
@@ -138,7 +159,7 @@ rows), `screen_companies`.
 | `add_note` | D, A | Stores a note, for example an owner preference. |
 | `set_research_status` | D | Sets `candidate`, `watch`, or `rejected` with a reason. Never `holding` or `dropped`. |
 | `log_news_event` | D, A | Creates a `news` event from a stored news document with a feed date in the last 7 days. |
-| `start_deep_dive` | D | Queues a deep-dive for the analyst. One at a time per ticker, at most 6 a day. |
+| `start_deep_dive` | D | Queues a deep-dive for the analyst, with an optional `focus` (the owner's question). One at a time per ticker, at most 6 a day. |
 | `record_verdict` | A | Closes an event's analysis: `intact`, `strengthened`, `weakened`, or `broken`. |
 | `withdraw_proposal` | D, A | Withdraws a pending proposal that the desk made. |
 
