@@ -300,7 +300,7 @@ r.eq("healthcheck: every live check has a function", set(hc.LIVE_ORDER), {n for 
 r.eq("healthcheck: desk_tools runs last (it scrubs os.environ)", hc.LIVE[-1][0], "desk_tools")
 
 # desk_tools ran a whole desk turn with live tools: the model's say("OK") reached the owner's
-# chat (2026-10-29). Now the check denies every tool and stops at the init message.
+# chat (2026-10-29). Now the check denies every tool and allows one turn.
 import asyncio as _aio  # noqa: E402
 import claude_agent_sdk as _sdk  # noqa: E402
 _opts = hc.deny_all_tools(_sdk.ClaudeAgentOptions(max_turns=40), str(REPO))
@@ -321,7 +321,7 @@ async def _fake_query(prompt, options):
 
 r.eq("healthcheck: desk_init_tools returns the init tool list",
      _aio.run(hc.desk_init_tools(_fake_query, _opts)), ["Read", "mcp__desk__say"])
-r.eq("healthcheck: desk_init_tools stops at the init message", _seen, ["init"])
+r.eq("healthcheck: desk_init_tools drains the query to its end", _seen, ["init", "past init"])
 r.eq("healthcheck: version parse", hc._version_tuple("2.1.312 (Claude Code)"), (2, 1, 312))
 r.ok("healthcheck: 2.1.294 is below the minimum", hc._version_tuple("2.1.294") < hc.MIN_CLAUDE)
 
