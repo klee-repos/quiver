@@ -298,6 +298,30 @@ r.eq("healthcheck: live check names", list(hc.LIVE_ORDER),
       "edgar", "telegram", "alphavantage"])
 r.eq("healthcheck: every live check has a function", set(hc.LIVE_ORDER), {n for n, _ in hc.LIVE})
 r.eq("healthcheck: desk_tools runs last (it scrubs os.environ)", hc.LIVE[-1][0], "desk_tools")
+
+# desk_tools ran a whole desk turn with live tools: the model's say("OK") reached the owner's
+# chat (2026-10-29). Now the check denies every tool and stops at the init message.
+import asyncio as _aio  # noqa: E402
+import claude_agent_sdk as _sdk  # noqa: E402
+_opts = hc.deny_all_tools(_sdk.ClaudeAgentOptions(max_turns=40), str(REPO))
+_hook = _opts.hooks["PreToolUse"][0].hooks[0]
+_dec = _aio.run(_hook({"tool_name": "mcp__desk__say", "tool_input": {"text": "OK"}}, "t1", None))
+r.eq("healthcheck: desk_tools denies the say tool", _dec["hookSpecificOutput"]["permissionDecision"], "deny")
+_dec = _aio.run(_hook({"tool_name": "Read", "tool_input": {"file_path": str(REPO / "README.md")}}, "t2", None))
+r.eq("healthcheck: desk_tools denies a built-in tool too", _dec["hookSpecificOutput"]["permissionDecision"], "deny")
+r.eq("healthcheck: desk_tools runs one turn at most", _opts.max_turns, 1)
+_seen = []
+
+
+async def _fake_query(prompt, options):
+    _seen.append("init")
+    yield _sdk.SystemMessage(subtype="init", data={"tools": ["Read", "mcp__desk__say"]})
+    _seen.append("past init")
+    yield _sdk.SystemMessage(subtype="other", data={})
+
+r.eq("healthcheck: desk_init_tools returns the init tool list",
+     _aio.run(hc.desk_init_tools(_fake_query, _opts)), ["Read", "mcp__desk__say"])
+r.eq("healthcheck: desk_init_tools stops at the init message", _seen, ["init"])
 r.eq("healthcheck: version parse", hc._version_tuple("2.1.312 (Claude Code)"), (2, 1, 312))
 r.ok("healthcheck: 2.1.294 is below the minimum", hc._version_tuple("2.1.294") < hc.MIN_CLAUDE)
 

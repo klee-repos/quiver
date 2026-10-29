@@ -511,6 +511,32 @@ def _make(agent, cls_name: str, loaders: tuple):
     raise CheckFailed(f"lib.desk.agent has no loader for {cls_name}")
 
 
+def deny_all_tools(opts, root: str):
+    """Make the desk options safe for a check: one turn, and a PreToolUse hook with an
+    empty allowlist, so the model can call no tool (no ``say`` reaches the owner's chat)."""
+    from claude_agent_sdk import HookMatcher
+    from lib.desk import agent
+    opts.hooks = {"PreToolUse": [HookMatcher(matcher=None, hooks=[agent.make_hook(frozenset(), root)])]}
+    opts.max_turns = 1
+    return opts
+
+
+async def desk_init_tools(query_fn, opts):
+    """The tool list of the system init message. It stops at that message, before the
+    model answers, so the check runs no desk turn."""
+    import claude_agent_sdk
+    gen = query_fn(prompt="Do not call any tool. Reply with the word OK.", options=opts)
+    try:
+        async for msg in gen:
+            if isinstance(msg, claude_agent_sdk.SystemMessage) and msg.subtype == "init":
+                return list(msg.data.get("tools") or [])
+    finally:
+        close = getattr(gen, "aclose", None)
+        if close is not None:
+            await close()
+    return None
+
+
 def check_desk_tools(env: dict):
     import asyncio
     import claude_agent_sdk
@@ -518,20 +544,13 @@ def check_desk_tools(env: dict):
     runtime = _make(agent, "Runtime", ("load_runtime",))
     secrets = _make(agent, "Secrets", ("load_secrets",))
     turn_state = agent.TurnState()
-    opts = agent.desk_options(runtime, secrets, turn_state)
+    opts = deny_all_tools(agent.desk_options(runtime, secrets, turn_state), runtime.root)
     # The SDK copies os.environ into the CLI. Scrub it, as each runner does at start.
     scrub = getattr(agent, "scrub_process_env", None)
     if callable(scrub):
         scrub()
 
-    async def _init_tools():
-        tools = None
-        async for msg in claude_agent_sdk.query(prompt="reply OK", options=opts):
-            if isinstance(msg, claude_agent_sdk.SystemMessage) and msg.subtype == "init":
-                tools = list(msg.data.get("tools") or [])
-        return tools
-
-    tools = asyncio.run(asyncio.wait_for(_init_tools(), timeout=180))
+    tools = asyncio.run(asyncio.wait_for(desk_init_tools(claude_agent_sdk.query, opts), timeout=180))
     if tools is None:
         raise CheckFailed("no system init message")
     have = set(tools)
