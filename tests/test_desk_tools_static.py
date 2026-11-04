@@ -34,7 +34,7 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
            "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
-           "add_rule", "retire_rule", "retire_lesson"]
+           "add_rule", "retire_rule", "retire_lesson", "plan_trade"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
 # The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.
@@ -349,6 +349,12 @@ STATE_WRITE_GRANTS = {
     ("lib.desk.proposals:end_pending",
      "UPDATE orders SET state=?, finalized=1, skip_reason=COALESCE(skip_reason, ?) WHERE proposal_id=? "
      "AND state='proposed'"),
+    # §10.6: a plan change the owner asked for in this turn is stored as an applied change
+    # (kind 'change', origin 'owner'). It is never a trade and moves no order.
+    ("lib.desk.proposals:apply_owner_change",
+     "INSERT INTO proposals (kind, origin, owner_message_id, payload_json, payload_sha256, rationale, "
+     "evidence_json, created_by, created_at, expires_at, state, nonce, decided_at, decided_by) "
+     "VALUES ('change', 'owner', ?, ?, ?, ?, ?, 'desk', ?, ?, 'applied', ?, ?, 'chat')"),
 }
 END_PENDING_STATES = {"expired", "superseded", "withdrawn"}
 # A function whose SQL names its tables from a module constant. The case checks that the
@@ -442,6 +448,8 @@ def write_verdict(node: str, w: tuple):
             return None if (node, stmt) in STATE_WRITE_GRANTS else \
                 f"UPDATE of {sorted(set(cols or {}) & guard) or 'unnamed columns'} on {table}"
         return None
+    if (node, stmt) in STATE_WRITE_GRANTS:
+        return None
     col, want = INSERT_STATE[table]
     if cols is None or cols.get(col) != want:
         return f"INSERT into {table} with {col} {cols.get(col) if cols else 'unnamed'}"
@@ -527,6 +535,23 @@ def case_closure():
     g, reached = tool_graph()
     r.ok("closure: no call path from a tool reaches proposals.apply_change",
          "lib.desk.proposals:apply_change" not in reached)
+    # §10.6: a tool reaches the plan changes (apply_owner_change -> _apply_plan) but never a
+    # risk setting or the halt. Those stay behind the Confirm tap.
+    r.ok("closure (sanity): a tool reaches the owner-turn plan apply",
+         {"lib.desk.proposals:apply_owner_change", "lib.desk.proposals:_apply_plan"} <= reached)
+    r.ok("closure: no call path from a tool reaches settings.write (a risk setting)",
+         "lib.desk.settings:write" not in reached)
+    names_halt = sorted(n for n in reached if any(isinstance(x, ast.Attribute) and x.attr == "clear_halt"
+                                                  for x in ast.walk(g.funcs[n])))
+    r.eq("closure: no function a tool reaches lifts a halt (clear_halt)", names_halt, [])
+    fn = g.funcs.get("lib.desk.proposals:_apply_plan")
+    consts = {x.value for x in ast.walk(fn) if isinstance(x, ast.Constant)} if fn else set()
+    r.eq("closure: _apply_plan has no code for set_risk or resume_trading",
+         sorted(consts & {"set_risk", "resume_trading"}), [])
+    g3 = Graph()
+    g3.load("lib.desk.approvals")
+    r.ok("closure (sanity): the scan finds approvals.handle_tap -> settings.write",
+         "lib.desk.settings:write" in g3.reach(["lib.desk.approvals:handle_tap"]))
     r.ok("closure: no call path from a tool reaches approvals.handle_tap",
          not any(x.startswith("lib.desk.approvals:") for x in reached), sorted(x for x in reached if "approvals" in x))
     r.ok("closure: no call path from a tool reaches an execution function",
@@ -575,6 +600,7 @@ ARGS = {
     "retire_lesson": {"lesson_id": 1},
     "propose_trade": {"tickers": ["ANET"], "origin": {"owner_message_id": 1}, "fraction": 1.0, "rationale": "x",
                       "evidence": []},
+    "plan_trade": {"origin": {"owner_message_id": 1}, "orders": [{"ticker": "ANET", "buy_dollars": 50}]},
     "propose_change": {"change": {"kind": "set_risk", "changes": {"min_trade_notional": 6}}, "rationale": "x",
                        "evidence": []},
 }

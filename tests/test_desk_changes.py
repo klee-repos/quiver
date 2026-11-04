@@ -31,7 +31,7 @@ from desk_fakes import (REPO, TEST_BOOK, FakeClock, FakePrices, Results, seams, 
                         temp_root)
 
 from lib import market
-from lib.desk import approvals, events, findings, outbox, proposals, store, valuation
+from lib.desk import agent, approvals, events, findings, outbox, proposals, store, tools, valuation
 from lib.desk import settings as desk_settings
 from lib.desk.proposals import ProposalError
 
@@ -332,7 +332,11 @@ PLAN_RANGES = {   # §10.3 set_risk table: key -> (min, max, step just outside)
 def case_weights_risk():
     with case() as c:
         c.snap()
-        for name, ch, why in (("sum", weights(("ANET", 26)), "sum"),
+        # A change that leaves the cash sleeve out is balanced on it (§10.6): ANET 26 -> SGOV 59.
+        r.ok("weights_risk: set_weights without the cash sleeve is balanced on it",
+             (lambda b: [(x["ticker"], x["target_weight"]) for x in b["change"]["changes"]])(
+                 propose(c, weights(("ANET", 26)))) == [("ANET", 26.0), ("SGOV", 59.0)])
+        for name, ch, why in (("sum", weights(("ANET", 26), ("SGOV", 60)), "sum"),
                               ("cap", weights(("ANET", 31), ("SGOV", 54)), "per-name limit")):
             e = refusal(lambda: propose(c, ch))
             r.ok(f"weights_risk: set_weights refused: {name}", e is not None and why in e, e)
@@ -900,8 +904,155 @@ def case_plain_card():
              in text, text)
 
 
+# --- owner_chat (§10.6: a plan change the owner asks for applies at once) ---------------------
+
+_MID = [700]
+
+
+def owner_msg(c: Ctx, text: str) -> int:
+    _MID[0] += 1
+    with c.led.connect() as conn:
+        store.insert_owner_message(conn, chat_id=CHAT, tg_message_id=_MID[0], text=text, created_at=c.now())
+    return _MID[0]
+
+
+def desk_ctx(c: Ctx, turn_ids, role="desk"):
+    turn = agent.TurnState()
+    turn.start(chat_id=CHAT, owner_message_ids=turn_ids, started_at=c.now())
+    return tools.ToolContext(role=role, runtime=None, secrets=None, led=c.led, cfg=c.cfg, turn=turn, box=c.box,
+                             yf_price_fn=PX(), touch=lambda name: None)
+
+
+def sent_texts(c: Ctx) -> list:
+    return [html.unescape(re.sub(r"<[^>]+>", "", p["text"])) for m, p in c.tg.calls if m == "sendMessage"]
+
+
+def tool_err(fn):
+    try:
+        fn()
+    except tools.ToolError as e:
+        return str(e)
+    return None
+
+
+def case_owner_chat():
+    with case() as c:
+        # Cash $1,160 of $2,000 (58%, plan 60%); ANET $510 (25.5%, plan 25%).
+        c.snap(positions={"ANET": 3.4, "CEG": 1.1}, buying_power=1160.0, equity=2000.0)
+        mid = owner_msg(c, "I'm ok with a higher ANET holding, make it 28%")
+        desk = desk_ctx(c, [mid])
+        out = tools.t_propose_change(desk, {"change": weights(("ANET", 28)), "origin": {"owner_message_id": mid},
+                                            "rationale": "You asked for more ANET.", "evidence": []})
+        pid = out["proposal_id"]
+        p = c.prop(pid)
+        r.ok("owner_chat: the change applies at once", out["applied"] is True and p["state"] == "applied", out)
+        r.eq("owner_chat: the row: a change, origin owner, the owner's message, decided in chat",
+             (p["kind"], p["origin"], p["owner_message_id"], p["decided_by"]), ("change", "owner", mid, "chat"))
+        bk = c.book()
+        r.eq("owner_chat: ANET 28%, and Python balances the plan on cash (60% -> 57%)",
+             (bk["ANET"][0], bk["SGOV"][0]), (28.0, 57.0))
+        r.eq("owner_chat: the change log says owner_chat",
+             sorted((x["ticker"], x["to_value"]) for x in c.q("SELECT * FROM strategy_change_log WHERE "
+                                                              "trigger='owner_chat'")),
+             [("ANET", "28.0"), ("SGOV", "57.0")])
+        texts = sent_texts(c)
+        r.ok("owner_chat: Python sends one short note with the exact numbers",
+             any("I changed the plan as you asked: ANET from 25.0% to 28.0% and SGOV from 60.0% to 57.0% of the "
+                 "account." in t for t in texts), texts)
+        changes_cards = [prm for m, prm in c.tg.calls if m == "sendMessage" and "Confirm" in json.dumps(
+            prm.get("reply_markup") or {})]
+        r.eq("owner_chat: no Confirm card is sent", changes_cards, [])
+        fu = out.get("follow_up") or {}
+        fp = c.prop(fu["proposal_id"]) if isinstance(fu, dict) and fu.get("proposal_id") else None
+        r.ok("owner_chat: the follow-up trade card is built and sent", fp is not None and fp["state"] == "pending"
+             and fp["parent_change_id"] == pid and fp["tg_message_id"] is not None, out)
+        if fp:
+            lg = c.led.legs(fp["id"])
+            # The owner's money rule: cash may go under the plan's 57%: the whole $50 gap is bought.
+            r.eq("owner_chat: the follow-up buys the whole gap ($560 less $510)",
+                 [(x["ticker"], x["side"], x["dollar_amount"]) for x in lg], [("ANET", "buy", 50.0)])
+            r.eq("owner_chat: no trade is approved without the tap", fp["state"], "pending")
+    with case() as c:
+        c.snap(positions={"ANET": 3.4, "CEG": 1.1}, buying_power=1160.0, equity=2000.0)
+        # The same change on a card and a Confirm tap (the analyst's way) keeps the plan's cash rule.
+        ch, res = confirm(c, weights(("ANET", 28)))
+        legs = c.led.legs(res["cards"][0]) if res.get("cards") else []
+        r.eq("owner_chat: the Confirm path keeps the plan's cash: the buy is cut to the $20 above 57%",
+             [(x["ticker"], x["dollar_amount"]) for x in legs], [("ANET", 20.0)])
+    with case() as c:
+        c.snap(positions={"ANET": 3.4, "CEG": 1.1}, buying_power=1160.0, equity=2000.0)
+        mid = owner_msg(c, "move ANET to 25.6%")
+        out = tools.t_propose_change(desk_ctx(c, [mid]), {"change": weights(("ANET", 25.6)),
+                                                          "origin": {"owner_message_id": mid},
+                                                          "rationale": "A small step.", "evidence": []})
+        r.ok("owner_chat: no trade follows -> the tool says why, for the owner",
+             out["follow_up"] and "within $5.00" in out["follow_up"].get("none", "") and "No trade follows now" in out["note"],
+             out)
+        mid = owner_msg(c, "add TSM at 10%")
+        out = tools.t_propose_change(desk_ctx(c, [mid]), {"change": add("TSM", 10, []), "origin": {"owner_message_id": mid},
+                                                          "rationale": "You asked to add TSM.", "evidence": []})
+        r.eq("owner_chat: add_company with no funding takes it from cash",
+             (c.book()["TSM"][0], c.book()["SGOV"][0]), (10.0, 49.4))
+        r.ok("owner_chat: add_company: its buy card follows", isinstance(out["follow_up"], dict)
+             and out["follow_up"].get("proposal_id"), out)
+        mid = owner_msg(c, "make CEG 14%")
+        res = tools.call(desk_ctx(c, [mid]), "propose_change", {
+            "change": weights(("CEG", 14)), "origin": {"owner_message_id": mid}, "rationale": "You asked.",
+            "evidence": ["Owner request, message %d" % mid]})
+        body = json.loads(res["content"][0]["text"]) if not res.get("is_error") else {}
+        r.ok("owner_chat: an evidence item that is no id is dropped, not a refusal (the owner is the reason)",
+             body.get("applied") is True and "dropped" in body.get("evidence_note", ""), res)
+        res = tools.call(desk_ctx(c, [mid]), "propose_change", {
+            "change": weights(("CEG", 13)), "origin": {"owner_message_id": mid}, "rationale": "You asked."})
+        r.ok("owner_chat: evidence may be left out", not res.get("is_error"), res)
+    with case() as c:
+        c.snap()
+        mid = owner_msg(c, "raise the per-name limit to 40")
+        out = tools.t_propose_change(desk_ctx(c, [mid]), {"change": {"kind": "set_risk", "key": "per_name_max_pct",
+                                                                     "value": 40}, "origin": {"owner_message_id": mid},
+                                                          "rationale": "You asked.", "evidence": []})
+        p = c.prop(out["proposal_id"])
+        r.ok("owner_chat: a safety limit still goes on a Confirm card", p["state"] == "pending" and p["kind"] == "change"
+             and "safety limit" in out["note"], (p["state"], out["note"]))
+        row = c.one("SELECT value_json FROM desk_settings WHERE key='per_name_max_pct'")
+        r.ok("owner_chat: ... and nothing changed before the tap", row is None or json.loads(row["value_json"]) != 40.0,
+             row)
+        other = owner_msg(c, "an older message")
+        e = tool_err(lambda: tools.t_propose_change(desk_ctx(c, [mid]), {
+            "change": weights(("ANET", 26)), "origin": {"owner_message_id": other}, "rationale": "x", "evidence": []}))
+        r.ok("owner_chat: a message from another turn is refused", e is not None and "not part of this turn" in e, e)
+        e = tool_err(lambda: tools.t_propose_change(desk_ctx(c, []), {
+            "change": weights(("ANET", 26)), "origin": {"owner_message_id": mid}, "rationale": "x", "evidence": []}))
+        r.ok("owner_chat: a turn with no owner message (a bring-up) is refused", e is not None, e)
+        e = tool_err(lambda: tools.t_propose_change(desk_ctx(c, [mid], role="analyst"), {
+            "change": weights(("ANET", 26)), "origin": {"owner_message_id": mid}, "rationale": "x", "evidence": []}))
+        r.ok("owner_chat: the analyst cannot apply a change", e is not None and "only the desk" in e, e)
+        e = tool_err(lambda: tools.t_propose_change(desk_ctx(c, [mid]), {
+            "change": weights(("ANET", 26)), "origin": {"event_id": 3}, "rationale": "x", "evidence": []}))
+        r.ok("owner_chat: an origin other than the owner's message is refused", e is not None, e)
+        r.eq("owner_chat: the refusals changed nothing", c.book()["ANET"][0], 25.0)
+        e = refusal(lambda: proposals.apply_owner_change(
+            c.led, c.led.connect(), c.cfg, change={"kind": "resume_trading"}, rationale="x",
+            owner_message_id=mid, turn_owner_ids=[mid], role="desk"))
+        r.ok("owner_chat: apply_owner_change refuses resume_trading", e is not None and "Confirm tap" in e, e)
+
+
+def case_follow_up_says_why():
+    with case() as c:
+        # Cash $1,170 of $1,980 (59.1%): a Confirm moves ANET to 26% and cash to 59%, and the plan's
+        # cash rule leaves $1.80. The tap answer says so; the owner never waits for a card that will not come.
+        c.snap(positions={"ANET": 3.2, "CEG": 1.1}, buying_power=1170.0, equity=1980.0)
+        ch, res = confirm(c, weights(("ANET", 26), ("SGOV", 59)))
+        r.ok("follow_up_says_why: the change applies", res["ok"] and c.prop(ch)["state"] == "applied", res)
+        r.eq("follow_up_says_why: no card", res.get("cards"), [])
+        r.ok("follow_up_says_why: one message with the reason in plain words",
+             len(res["messages"]) == 1 and "No trade follows now" in res["messages"][0]
+             and "no cash to spend" in res["messages"][0] and "$1,170.00" in res["messages"][0], res["messages"])
+
+
 CASES = [case_add, case_drop, case_weights_risk, case_premise, case_thesis, case_ladder, case_resume, case_revalidate, case_log,
-         case_follow_up, case_supersede_on_change, case_preview, case_one_open_card, case_plain_card]
+         case_follow_up, case_supersede_on_change, case_preview, case_one_open_card, case_plain_card,
+         case_owner_chat, case_follow_up_says_why]
 
 if __name__ == "__main__":
     for fn in CASES:

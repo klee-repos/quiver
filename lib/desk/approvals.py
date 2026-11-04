@@ -12,8 +12,9 @@ Checks, in order; the first failure answers the tap and stops:
   4. Approve on a trade only: no KILL file, today not halted, the session open, and at
      least 5 minutes before the close. A failure keeps the proposal ``pending``.
   5. One conditional UPDATE claims it. A second tap changes zero rows.
-  6. A trade: in the same transaction the legs become ``approved`` and one ``execute``
-     broker job is queued. A change: it is applied in the same transaction.
+  6. A trade: in the same transaction the plan move of a sized owner trade is checked
+     (§10.6), the legs become ``approved``, and one ``execute`` broker job is queued. A change: it is
+     applied in the same transaction.
 
 The caller sends what the result names: the callback answer, the new button label, the
 messages, the follow-up cards, and the broker trigger.
@@ -113,7 +114,7 @@ def handle_tap(led, cfg: Config, *, callback_data: str, from_id, chat_id, messag
         why = trade_gate(led, cfg, prop, now_dt)
         if why:
             return _result(why, label=None, proposal_id=pid)
-        return _approve_trade(led, prop, from_id, now)
+        return _approve_trade(led, cfg, prop, from_id, now)
     return _confirm_change(led, cfg, prop, from_id, now_dt, yf_price_fn)
 
 
@@ -128,17 +129,39 @@ def _current(led, pid: int) -> dict:
         return _state_answer(proposals.get_proposal(conn, pid))
 
 
-def _approve_trade(led, prop: dict, from_id, now: str) -> dict:
+def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str) -> dict:
+    """Claim the trade, approve its legs and queue the execute job in one transaction. A
+    sized owner trade's plan move is checked here (§10.6); the plan moves only for the
+    orders that fill (``proposals.close_from_legs``), so a card that sends nothing leaves the
+    plan as it was."""
     pid = prop["id"]
-    with led.transaction() as conn:
-        if not _claim(conn, pid, prop["nonce"], str(from_id), now):
-            claimed = False
-        else:
-            claimed = True
-            conn.execute("UPDATE orders SET state='approved' WHERE proposal_id=? AND state='proposed'",
-                         (pid,))
-            conn.execute("INSERT INTO broker_jobs (kind, proposal_id, recovery, status, requested_by, "
-                         "created_at) VALUES ('execute', ?, 0, 'queued', 'tap', ?)", (pid, now))
+    error, claimed = None, False
+    try:
+        with led.transaction() as conn:
+            if not _claim(conn, pid, prop["nonce"], str(from_id), now):
+                claimed = False
+            else:
+                claimed = True
+                proposals.check_trade_plan(conn, cfg, prop)
+                conn.execute("UPDATE orders SET state='approved' WHERE proposal_id=? AND state='proposed'",
+                             (pid,))
+                conn.execute("INSERT INTO broker_jobs (kind, proposal_id, recovery, status, requested_by, "
+                             "created_at) VALUES ('execute', ?, 0, 'queued', 'tap', ?)", (pid, now))
+    except proposals.ProposalError as e:
+        error = str(e)
+    if error is not None:
+        # The plan check failed and the claim rolled back with it. End the card: nothing was sent.
+        with led.transaction() as conn:
+            cur = conn.execute("UPDATE proposals SET state='failed', decided_at=?, decided_by=?, result_json=? "
+                               "WHERE id=? AND state='pending'",
+                               (now, str(from_id), store.canonical_json({"error": error}), pid))
+            if cur.rowcount == 1:
+                conn.execute("UPDATE orders SET state='skipped', finalized=1, skip_reason='plan_changed' "
+                             "WHERE proposal_id=? AND state='proposed'", (pid,))
+        return _result(f"I did not send #{pid}: the plan changed after this card", label="Failed",
+                       proposal_id=pid,
+                       messages=[f"I did not send #{pid}, because the plan changed after I made the card "
+                                 f"({error}). Nothing was bought or sold. Ask me and I'll make a fresh one."])
     if not claimed:
         return _current(led, pid)
     return _result("Approved", label="Approved", ok=True, proposal_id=pid, touch=["broker"],
@@ -212,4 +235,7 @@ def _confirm_change(led, cfg: Config, prop: dict, from_id, now_dt, yf_price_fn) 
                                "I'll send them as soon as it lands.")
     elif fu.get("refused"):
         out["messages"].append(f"I could not build the follow-up trade: {fu['refused']}.")
+    elif fu.get("why"):
+        # The plan changed and no trade follows. Say why, so the owner never waits for a card.
+        out["messages"].append(f"The plan is changed. No trade follows now: {fu['why']}.")
     return out

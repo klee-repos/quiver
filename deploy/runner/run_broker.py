@@ -366,6 +366,8 @@ class Broker:
                 outbox.send_trade_card(self.led, self.box, self.led.connect, fu["built"], now_dt=self.now_fn())
             elif fu.get("refused"):
                 self.say(f"I could not build the follow-up trade of #{prop['id']}: {fu['refused']}.")
+            elif fu.get("why"):
+                self.say(f"The plan change #{prop['id']} is in. No trade follows now: {fu['why']}.")
 
     def sweep_closes(self):
         """Close every proposal whose legs ended, and send every queued message (the

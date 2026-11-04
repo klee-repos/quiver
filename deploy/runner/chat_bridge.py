@@ -440,6 +440,7 @@ class Bridge:
         reacted = [o["tg_message_id"] for o in owners if o.get("reaction")]
         self.turn.start(chat_id=self.chat_id, owner_message_ids=[o["tg_message_id"] for o in owners],
                         started_at=store.now_iso(), reacted=reacted)
+        self.turn.hold_cards = True
         self.turn_item, self.turn_stopped = item, False
         prompt = self.build_input(owners, updates, item=item)
         typing = asyncio.create_task(self.typing_loop())
@@ -495,6 +496,10 @@ class Bridge:
             else:
                 # The quick pick failed, so `say` checks forbid the send. Log it: the owner got no reply.
                 self.log({"event": "trailing_unsent", "reason": "unreacted", "chars": len(last_text)})
+        # The cards and Python notes the desk's tools made go after its last message, so the
+        # card is the newest message (plan §10.6). They go even after an error or a /stop: a
+        # proposed card the owner never sees could never be tapped.
+        await self.send_held()
         stopped = item is not None and self.turn_stopped
         if stopped:
             # /stop in an agenda turn: the item goes back in line, and the agenda holds.
@@ -544,6 +549,16 @@ class Bridge:
         for m in agenda.plain_messages(item, tools.SAY_LIMIT):
             await self.send_text(_to_telegram_html(m), source=source)
         self.log({"event": "agenda_plain", "item": item["id"]})
+
+    async def send_held(self):
+        """Send what the desk's tools held for the end of the turn, in order: a Python note
+        (``text``) or a card (once; a card already in the chat is skipped)."""
+        held, self.turn.after = list(self.turn.after), []
+        for kind, value, card in held:
+            if kind == "text":
+                await asyncio.to_thread(self.box.send, value, source="system", delivered=1)
+            else:
+                await self.send_card_once(value, card)
 
     async def send_open_cards(self):
         """Send each pending card of the open item that is not in the chat yet. The desk may

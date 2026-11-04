@@ -21,7 +21,8 @@ These are the owner's answers (2026-10-27). The design below follows each one.
 | What counts as "something changed" | All four: a new filing or earnings release, a price that crosses an agreed level, drift past a band, material news. |
 | Model billing | Keep the subscription token (`CLAUDE_CODE_OAUTH_TOKEN`). |
 | A tap after the price moved | Python re-quotes. If the price moved more than 1.5%, it sends new numbers with new buttons and places nothing. A proposal expires at the market close. |
-| Non-trade changes that need a tap | All four: add or drop a company, target weights, risk settings, the premise or a thesis. |
+| Non-trade changes that need a tap | All four: add or drop a company, target weights, risk settings, the premise or a thesis. **Changed 2026-11-04 (§10.6):** a plan change that the owner asks for in chat applies at once, with no card. Only a risk setting and lifting a halt keep the Confirm tap. A change that the analyst proposes is still a card with Confirm. |
+| A trade the owner asks for (2026-11-04) | The plan follows the trade (§10.6). The owner names a size or the desk works one out with them; Python sizes it and moves the plan on the Approve tap. The owner's words: "this is a collab not a fucking app experience." |
 | Scheduled messages | A daily close brief. |
 | Models | Sonnet 5.5 for the chat. Opus 5.5 for filing deep-dives and event analysis. |
 | Small jobs (plan choice, not asked) | Haiku 5.5 does two small jobs. It marks each headline material or not (JSON only, no tools). It picks the reaction for a message that arrives while a turn runs. Opus 5.5 analyzes each material item. To use Sonnet 5.5 for the two small jobs, set `QUIVER_CLASSIFIER_MODEL=claude-sonnet-5-5`. |
@@ -1555,6 +1556,9 @@ Input: tickers, `fraction`, origin, the latest snapshot, the book, the settings.
      `min(buying_power − min_buying_power_buffer, buying_power + cash_sleeve_value − cash_floor_dollars)`,
      where `cash_sleeve_value` is the market value of any SGOV shares held and
      `cash_floor_dollars = cash_floor_pct% × deployable`. Nothing below `min_trade_notional`.
+     The owner's money rule (§10.6): for an owner trade, and for the follow-up of a change the
+     owner made in chat, `cash_floor_pct` is the set value only (0 when it is `null`). So the
+     plan's cash share never blocks a trade the owner asks for; the buffer and a set floor still do.
      Skip the leg if `entry_price_max` is set and the quote is above it.
    - The cash sleeve (SGOV) gets no leg. As today, `construct_target_book` treats it as
      residual cash. Its weight is held as cash, and the cash floor protects it.
@@ -1579,8 +1583,9 @@ Input: tickers, `fraction`, origin, the latest snapshot, the book, the settings.
      the event's ticker, or one of the ETFs in a `lookthrough` event's detail. The evidence
      holds at least one finding or document created at or after the event's `detected_at`,
      or one of the event's own documents.
-   - Anti-flip: if a trade on this ticker in the opposite direction was approved in the
-     last 30 days, the evidence must hold a finding created after that approval.
+   - Anti-flip (event trades only): if a trade on this ticker in the opposite direction was
+     approved in the last 30 days, the evidence must hold a finding created after that
+     approval. An owner trade is exempt: the owner's own request is the reason (§10.6).
    - An event with `created_by='desk'` (from `log_news_event`) can back a trade only while
      its document's feed `published_at` is within 7 days. A `news` document counts as evidence
      only under the same rule. A `web` document never counts toward the 7-day rule: a page
@@ -1604,14 +1609,17 @@ Input: tickers, `fraction`, origin, the latest snapshot, the book, the settings.
    | any | `weakened` | sell toward target, only if the name is above target | 1.0 |
    | any | `broken` | none (the analyst proposes `drop_company`) | |
 
-   A change proposal is the way to own more or less of a name than its target. An owner
-   trade (`origin='owner'`) keeps the fraction that the owner asked for.
+   An owner trade (`origin='owner'`) keeps the fraction that the owner asked for, or gives
+   `orders` with a size. Then Python moves the plan to fit the trade (§10.6).
 
 ### 10.3 Change proposals (`proposals.build_change` and `apply_change`)
 
 Every change is validated when it is proposed and again when it is applied. Every applied
-change writes `strategy_change_log` rows (`trigger='owner_confirm'`,
-`proof_json={"proposal_id": n}`).
+change writes `strategy_change_log` rows (`trigger='owner_confirm'` for a Confirm tap,
+`'owner_chat'` for a change from the owner's message (§10.6), `proof_json={"proposal_id": n}`).
+When an `add_company`, `drop_company` or `set_weights` leaves the cash sleeve out and the
+plan no longer sums to 100%, Python moves the cash sleeve by the difference and adds it to
+the change. A change that names the cash sleeve must sum to 100% itself.
 
 | Kind | Payload | Validation | Apply |
 |---|---|---|---|
@@ -1654,6 +1662,10 @@ proposal (`origin='change'`, `parent_change_id`) and sends it `pending`, with it
 trading is halted or stopped by `KILL`, the card stays `pending`. Python refuses an Approve tap
 on it until trading resumes (§10.5 check 4).
 
+When no trade follows (each gap is under `min_trade_notional`, or no cash is left under the
+plan's cash rule), the tap answer says so in one message with the reason: "The plan is
+changed. No trade follows now: ...". The owner never waits for a card that will not come.
+
 If `build_trade` refuses the follow-up because the snapshot is stale, Python writes
 `{"follow_up": "waiting"}` into the change proposal's `result_json`, queues a `snapshot` broker
 job, and touches the broker trigger. After the next `snapshot-commit`, `run_broker.py` builds the
@@ -1662,7 +1674,9 @@ snapshot job tries again. Python sends any other refusal to you in one message, 
 
 ### 10.5 The tap (`lib/desk/approvals.handle_tap`)
 
-This is the only code that moves a proposal to `approved` or `applied`. No tool can reach it.
+This is the only code that moves a proposal to `approved`, and the only code that writes a
+risk setting or lifts a halt. No tool can reach it. A plan change from the owner's own
+message is stored as `applied` by `proposals.apply_owner_change` (§10.6).
 Checks run in this order. The first failure answers the tap and stops:
 
 1. `callback_data` parses as `p:<id>:<nonce>:<a|r>`. `from.id` is in the owner list. The
@@ -1681,7 +1695,8 @@ Checks run in this order. The first failure answers the tap and stops:
    Python fills \<open> and \<close> for the session from `lib/market`.
 5. One statement: `UPDATE proposals SET state='approved', decided_at=?, decided_by=? WHERE id=? AND state='pending' AND nonce=?`.
    It must change exactly one row. A second tap changes zero rows and gets "Already approved".
-6. Trade: in one transaction, set the legs' `orders.state='approved'` and insert an
+6. Trade: in one transaction, set the legs' `orders.state='approved'`, move the plan of a
+   sized owner trade (`proposals.check_trade_plan`, §10.6: checked here, applied on fill), and insert an
    `execute` broker job. Use the new `Ledger.transaction()` context manager (§14.7): one
    connection, `BEGIN IMMEDIATE`. Each ledger method it calls takes `conn=`. After the
    commit, touch the broker trigger and send "On it. Checking the price now."
@@ -1693,6 +1708,59 @@ decided_at=?, decided_by=? WHERE id=? AND state='pending' AND nonce=?`. It must 
 one row; otherwise answer with the current state. In the same transaction, set the legs to
 `skipped` with `finalized=1`. Then mirror a line "You rejected #41." The desk sees it in its
 next turn.
+
+### 10.6 The plan follows the conversation (2026-11-04)
+
+The owner works with the desk as a partner. A request in chat moves the plan; only an order
+waits for a tap. The cause: on 2026-11-04 the owner said "If you think we should buy more buy
+please" about VRT. The desk answered that a trade only moves a holding toward its target,
+sent a change card, and after the Confirm tap the follow-up built nothing: cash was 17.5% of
+the account and the plan kept 18%, so no money was left, and no message said so.
+
+1. **A trade with a size.** `propose_trade` with `origin={"owner_message_id": n}` takes
+   `orders`: each `{ticker, buy_dollars | sell_dollars | sell_fraction | target_weight | sell_all}`
+   (exactly one size; `target_weight` 0 sells all; `sell_all` only as `true`), and
+   `fund_from` (the holdings that pay for the buys, in proportion to their values; default
+   cash). Python sizes the legs (`_size_orders`). The money is
+   `min(buying_power − buffer, buying_power + cash_sleeve_value − set_floor) + sell proceeds`.
+   A short request is refused with the numbers and the way out ("the buys need \$400.00, but
+   \$322.93 can be spent ... Ask the owner which holding to sell").
+2. **The plan move** (`_trade_plan`). A buy raises the name's planned share to its weight
+   after the buy, when that is above the plan. A sale lowers it to its weight after the sale,
+   when that is below the plan. `sell_all` takes the name out (status `exiting`). The cash
+   sleeve takes the difference, so the plan sums to 100%. A raise is held to the per-name
+   limit (a sale never is), and a set `cash_floor_pct` binds the cash sleeve. The card says how
+   the plan moves and the cash before and after.
+3. **On Approve** (`check_trade_plan`), in the claim's transaction: the plan move is checked
+   (each name moves by the difference the card showed, so a change made after the card still
+   holds). A failure ends the card `failed`, skips its legs, and sends "I did not send #N,
+   because the plan changed after I made the card". Approve writes no plan.
+4. **On fill** (`apply_plan_moves`, from `close_from_legs`): the plan moves for each name whose
+   order filled, once (`result_json.plan_applied`), and the cash sleeve takes the matching
+   part. A card that sends nothing (a refused exec-prepare, a guard failure, a requote the
+   owner skips, a broker rejection), a Reject or an expiry moves nothing.
+5. **Execution keeps the size.** The payload marks the trade `sized`. `exec-check` caps a
+   sized leg by the money and the shares held only, not by the plan's room or target (the
+   plan moves on fill), and it uses the owner money rule (`money_rule`). A requote
+   (`build_requote` → `build_trade(requote_of=...)`) rebuilds the same sizes
+   (`_orders_from_legs`: the same dollars, the same share of the holding, a full exit) and
+   carries the plan move of its names (`_plan_subset`).
+6. **A plan change from chat.** `propose_change` with `origin={"owner_message_id": n}` of
+   this turn applies a plan kind (`add_company`, `drop_company`, `set_weights`,
+   `set_premise`, `set_thesis`) at once (`apply_owner_change`): an `applied` change row
+   (origin `owner`, `decided_by='chat'`), the change log (`trigger='owner_chat'`), a short
+   Python note with the exact numbers (`notify.render_change_applied`), then the follow-up
+   trade card under the owner's money rule. Refused for the analyst, for a message from
+   another turn, and in a turn with no owner message.
+7. **What keeps a tap.** Every order (Approve). `set_risk` and `resume_trading` (Confirm):
+   `apply_change` is the only code that writes a risk setting or lifts a halt, and no tool
+   reaches it. `_apply_plan` (shared by both paths) has no code for either kind. The static
+   test proves both (`tests/test_desk_tools_static.py`).
+8. **Cards go last.** In a bridge turn the desk's tools hold each card and Python note
+   (`TurnState.hold_cards`, `after`); the bridge sends them after the desk's last message
+   (`Bridge.send_held`), so the card is the newest message.
+9. **`plan_trade`** runs the same build in a transaction that rolls back, so the desk can
+   settle a size with the owner on Python's numbers and send nothing.
 
 ## 11. Execution (`quiver-broker`)
 
@@ -2082,7 +2150,10 @@ report` / `report-send`). The `halt`, `auth_error` and `error` pages stay as the
    structural: no leg is placeable until Python has checked its fresh quote.
 3. **Approval only by a tap.** `approvals.handle_tap` is the only code that sets `approved`.
    It checks `from.id`, the chat, the message, the nonce, the state, and the expiry, and it
-   claims in one conditional `UPDATE`. A test proves that no tool can reach it.
+   claims in one conditional `UPDATE`. A test proves that no tool can reach it. Since
+   2026-11-04 (§10.6) a plan change from the owner's own message applies without a tap; a
+   risk setting and lifting a halt still need the Confirm tap, and a test proves that no tool
+   reaches the code that writes them.
 4. **No shell and no file writes for the desk or the analyst.** They have typed tools,
    read-only file tools confined to the repo, and web search (`tools=` removes every other
    built-in). A `PreToolUse` hook enforces the allowlist; it catches its own errors and

@@ -244,7 +244,7 @@ def _until(expires_at, now) -> str:
 
 # --- proposal cards (§10.1 rule 5) -------------------------------------------------
 
-def _leg_sentence(leg: dict, first: bool) -> str:
+def _leg_sentence(leg: dict, first: bool, plan_moves: bool = False) -> str:
     t = _te(leg["ticker"])
     verb = ("Buy" if leg["side"] == "buy" else "Sell") if first else ("then buy" if leg["side"] == "buy" else "then sell")
     if leg["side"] == "buy":
@@ -259,7 +259,10 @@ def _leg_sentence(leg: dict, first: bool) -> str:
         s = s[0].upper() + s[1:]
     now_w, after_w, target_w = leg.get("weight_now"), leg.get("weight_after"), leg.get("target_weight")
     if now_w is not None and after_w is not None and target_w is not None:
-        if abs(after_w - target_w) < 0.05:
+        if plan_moves:
+            # The plan moves when the order fills (§10.6): the next sentence says how.
+            s += f" That takes {t} from {now_w:.1f}% of the account to {target_w:.1f}%."   # the plan's number
+        elif abs(after_w - target_w) < 0.05:
             s += f" That takes {t} from {now_w:.1f}% of the account to the {target_w:.1f}% we planned."
         elif leg.get("exit"):
             s += f" That takes {t} from {now_w:.1f}% of the account to {after_w:.1f}%, on its way out."
@@ -294,8 +297,9 @@ def render_trade_card(model: dict) -> list:
     pid = model["id"]
     parts = [f"<b>Proposal #{pid}.</b>"]
     legs = model.get("legs") or []
+    moved = {str(c.get("ticker")) for c in ((model.get("plan") or {}).get("changes") or [])}
     for i, leg in enumerate(legs):
-        parts.append(_leg_sentence(leg, i == 0))
+        parts.append(_leg_sentence(leg, i == 0, plan_moves=str(leg.get("ticker")) in moved))
     if model.get("drift"):
         for leg in legs:
             band = leg.get("band")
@@ -303,8 +307,21 @@ def render_trade_card(model: dict) -> list:
             side = "above" if (leg.get("weight_now") or 0) > (leg.get("target_weight") or 0) else "below"
             parts.append(f"{_te(leg['ticker'])} is {float(leg.get('weight_now') or 0):.1f}% of the account, "
                          f"{side} the {float(leg.get('target_weight') or 0):.1f}% we planned{band_txt}.")
+    plan = model.get("plan")
+    if plan:
+        moves = [f"{_te(c['ticker'])} leaves the plan" if c.get("exit") else
+                 f"{_te(c['ticker'])} goes from {float(c['from']):.1f}% to {float(c['target_weight']):.1f}% of the account"
+                 for c in plan.get("changes") or []]
+        cash = plan.get("cash")
+        if cash and abs(float(cash["target_weight"]) - float(cash["from"])) >= 0.05:
+            moves.append(f"cash goes from {float(cash['from']):.1f}% to {float(cash['target_weight']):.1f}%")
+        if moves:
+            parts.append("When the order fills, the plan moves with it: " + _plain_join(moves) + ".")
     if model.get("scaled"):
         parts.append("Cash covers only part of the buys, so I scaled each buy down by the same share.")
+    cash_now = model.get("cash")
+    if cash_now and any(l.get("side") == "buy" for l in legs) and cash_now.get("after") is not None:
+        parts.append(f"Cash goes from {_fmt_money(cash_now['before'])} to {_fmt_money(cash_now['after'])}.")
     for s in model.get("skipped") or []:
         parts.append(f"I left out {_te(s['ticker'])}: {_te(s['reason'])}.")
     oq = model.get("owner_quote")
@@ -431,6 +448,55 @@ def render_change_card(model: dict) -> list:
         parts.append(ev)
     parts.append("Tap Confirm to apply it. " + _until(model["expires_at"], model.get("now")))
     return _pack(_join_parts(parts))
+
+
+def render_change_applied(model: dict) -> str:
+    """The short note Python sends when a plan change applies from the owner's own message
+    (§10.6): what changed, in one or two sentences. It names the exact numbers, so a change
+    the owner did not ask for is seen at once. Prose only, no buttons."""
+    ch = model["change"]
+    before = {str(k).upper(): float(v) for k, v in (model.get("before") or {}).items()}
+    kind = ch["kind"]
+
+    def move(t, to):
+        t = str(t).upper()
+        frm = before.get(t)
+        if frm is None:
+            return f"{_te(t)} at {float(to):.1f}%"
+        return f"{_te(t)} from {frm:.1f}% to {float(to):.1f}%"
+
+    if kind == "set_weights":
+        text = "I changed the plan as you asked: " + _plain_join(
+            move(c["ticker"], c["target_weight"]) for c in ch["changes"]) + " of the account."
+    elif kind == "add_company":
+        text = f"I added {_te(ch['ticker'])} to the plan at {float(ch['target_weight']):.1f}% of the account"
+        if ch.get("funding"):
+            text += ", taken from " + _plain_join(move(f["ticker"], f["target_weight"]) for f in ch["funding"])
+        text += "."
+        if ch["entry"]["mode"] == "at_or_below":
+            text += f" The first buy waits until the price is at or below {_fmt_money(ch['entry']['price'])}."
+    elif kind == "drop_company":
+        text = f"I took {_te(ch['ticker'])} out of the plan"
+        if ch.get("redistribute"):
+            text += "; its share goes to " + _plain_join(move(f["ticker"], f["target_weight"]) for f in ch["redistribute"])
+        text += "."
+        if ch["exit"]["mode"] == "at_or_above":
+            text += f" I'll sell when the price is at or above {_fmt_money(ch['exit']['price'])}."
+    elif kind == "set_thesis":
+        text = f"I saved our new reason to own {_te(ch['ticker'])} (the thesis)."
+        if ch.get("fair_value_base") is not None:
+            text += f" I think one share is worth about {_fmt_money(ch['fair_value_base'])}."
+        if ch.get("buy_below") is not None:
+            text += f" A good price to buy more is below {_fmt_money(ch['buy_below'])}."
+        if ch.get("trim_above") is not None:
+            text += f" A good price to sell some is above {_fmt_money(ch['trim_above'])}."
+    elif kind == "set_premise":
+        g = ch["goal"]
+        text = (f"I saved the new premise (the big idea the account follows), with a goal of "
+                f"{g['target_return_pct']:g}% in {g['horizon_months']} months.")
+    else:
+        text = "I changed the plan."
+    return text + " Tell me to undo it any time."
 
 
 # --- execution results (§11.1 step 9) ---------------------------------------------

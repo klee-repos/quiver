@@ -118,6 +118,10 @@ class TurnState:
     session_id: Optional[str] = None
     said: list = field(default_factory=list)
     first_reply_to: Optional[int] = None
+    # The bridge sets hold_cards: the cards and Python notes a tool makes in the turn wait in
+    # ``after`` and go out after the desk's last message, so a card is the newest message.
+    hold_cards: bool = False
+    after: list = field(default_factory=list)
 
     def start(self, *, chat_id, owner_message_ids, started_at, reacted=()):
         self.chat_id = str(chat_id)
@@ -125,6 +129,7 @@ class TurnState:
         self.reacted_ids = {int(x) for x in reacted}
         self.turn_started_at = started_at
         self.said = []
+        self.after = []
         self.first_reply_to = max(self.owner_message_ids) if self.owner_message_ids else None
 
     def unreacted(self) -> list:

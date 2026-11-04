@@ -2,13 +2,17 @@
 changes; close a proposal from its legs (plan §10, §11.1 step 9).
 
 A proposal is one ``proposals`` row plus, for a trade, one reserved ``orders`` row per leg.
-Python sizes every leg here. A model only names tickers, an origin and its evidence; it
-never picks a dollar amount, and for an event trade it never picks the fraction either
-(§10.2 step 7). The ``ref_id`` of each leg is fixed when the proposal is built, so a retry
-can never mint a second order.
+Python sizes every leg here. A model names tickers, an origin and its evidence. For an
+event trade it never picks a dollar amount or the fraction (§10.2 step 7). For an owner
+trade the owner's own request may give a size (``orders``), and Python moves the plan to
+fit the trade (§10.6). The ``ref_id`` of each leg is fixed when the proposal is built, so a
+retry can never mint a second order.
 
 ``apply_change`` runs only inside the tap code of ``lib.desk.approvals`` (a Confirm tap).
-No desk tool can call it (the W3 test enforces this).
+It is the only code that writes a risk setting or lifts a halt. No desk tool can call it
+(the W3 test enforces this). ``apply_owner_change`` applies a plan change (PLAN_KINDS) from
+the owner's own message in a desk turn, with no tap (§10.6). It cannot reach a risk
+setting or the halt.
 """
 
 from __future__ import annotations
@@ -35,6 +39,12 @@ END_FILL_STATES = ("filled", "cancelled", "broker_rejected", "outcome_unknown")
 EVENT_TRADE_TYPES = ("filing", "earnings", "price_level", "news", "lookthrough")
 CHANGE_KINDS = ("add_company", "drop_company", "set_weights", "set_risk", "set_premise",
                 "set_thesis", "resume_trading")
+# The plan kinds: a desk turn applies one at once from the owner's own message (§10.6).
+PLAN_KINDS = ("add_company", "drop_company", "set_weights", "set_premise", "set_thesis")
+# A risk setting and the halt change only by a Confirm tap.
+TAP_ONLY_KINDS = ("set_risk", "resume_trading")
+# The keys of one sized owner order (§10.6). Exactly one per order.
+ORDER_KEYS = ("buy_dollars", "sell_dollars", "sell_fraction", "target_weight", "sell_all")
 
 
 class ProposalError(ValueError):
@@ -349,21 +359,276 @@ def in_flight_ticker(conn, ticker) -> Optional[str]:
 
 # --- trades (§10.2) ------------------------------------------------------------------
 
+def _fund_names(fund_from, cash_ticker) -> list:
+    """The holdings named to pay for a sized buy. "cash" and the cash sleeve mean cash."""
+    out = []
+    for f in fund_from or []:
+        t = str(f or "").upper().strip()
+        if t and t not in ("CASH", str(cash_ticker or "").upper()) and t not in out:
+            out.append(t)
+    return out
+
+
+def _size_orders(rows: dict, base: dict, orders: list, fund_from, *, cash_ticker, price_of, min_notional,
+                 money: float, money_text: str, cap: float) -> tuple:
+    """The legs of a sized owner request (§10.6): each order buys or sells the dollars the
+    owner asked for, sells ``sell_fraction`` of the holding, or moves the name to
+    ``target_weight``. When the buys need more than
+    the sales bring in and ``fund_from`` names holdings, Python sells the rest from them,
+    in proportion to their values. Returns ``(sells, buys)``. Each refusal holds the numbers
+    the desk needs to settle it with the owner."""
+    dep = base["deployable"]
+    legs = {}
+
+    def held_of(t):
+        return base["quantities"].get(t, 0.0)
+
+    def value_of(t):
+        return base["values"].get(t, 0.0)
+
+    def quote(t):
+        price, src = price_of(t)
+        if price is None:
+            raise ProposalError(f"no quote for {t}; refresh the portfolio first")
+        return price, src
+
+    def weight_now(t):
+        return value_of(t) / dep * 100.0 if dep > 0 else 0.0
+
+    def sell_leg(t, qty, price, src, exit_):
+        r = rows[t]
+        return {"ticker": t, "side": "sell", "quantity": qty, "quote": price, "quote_source": src,
+                "weight_now": weight_now(t), "target_weight": float(r["target_weight"] or 0.0), "exit": exit_,
+                "band": r.get("band")}
+
+    for o in orders:
+        o = o or {}
+        t = str(o.get("ticker") or "").upper().strip()
+        # A key counts when it is present with a value. 0 is a value (target_weight 0 sells
+        # all), and sell_all counts only as the boolean true.
+        given = [k for k in ORDER_KEYS if o.get(k) is not None and not (k == "sell_all" and o.get(k) is False)]
+        if not t or len(given) != 1:
+            raise ProposalError(f"{t or 'each order'}: give the ticker and exactly one of buy_dollars, sell_dollars, "
+                                "sell_fraction, target_weight or sell_all")
+        if "sell_all" in given and o.get("sell_all") is not True:
+            raise ProposalError(f"{t}: sell_all is true or left out")
+        if t == cash_ticker:
+            raise ProposalError(f"{t} is the cash sleeve. It is held as cash and gets no order; Python moves its "
+                                "planned share for you")
+        if t in legs:
+            raise ProposalError("each ticker once, please")
+        if t not in rows:
+            raise ProposalError(f"{t} is not in the book; propose add_company (from the owner's message it applies "
+                                "at once, and its buy card follows)")
+        price, src = quote(t)
+        held, v = held_of(t), value_of(t)
+        key = given[0]
+        if key == "sell_all":
+            side, dollars = "sell", v
+        elif key == "sell_fraction":
+            frac = _f(o["sell_fraction"])
+            if frac is None or not 0 < frac <= 1:
+                raise ProposalError(f"{t}: sell_fraction is the share of the holding to sell, above 0 and at most 1")
+            if held <= 0:
+                raise ProposalError(f"{t}: nothing is held, so there is nothing to sell")
+            if frac >= 1:
+                key, side, dollars = "sell_all", "sell", v
+            else:
+                qty, why = sizing.resolve_sell_quantity_min_notional(held, round(held * frac, 6), price,
+                                                                     min_notional=min_notional, bump_to_min=False)
+                if qty <= 0:
+                    raise ProposalError(f"{t}: {frac:g} of the holding is too small to send ({why})")
+                legs[t] = sell_leg(t, qty, price, src, False)
+                continue
+        elif key == "target_weight":
+            w = _f(o["target_weight"])
+            if w is None or w < 0:
+                raise ProposalError(f"{t}: target_weight is a percent of the account, 0 or more")
+            if w > cap + 1e-9:
+                raise ProposalError(f"{t}: {w:g}% of the account is over the {cap:g}% limit per name")
+            dollars = w / 100.0 * dep - v
+            side, dollars = ("buy" if dollars > 0 else "sell"), abs(dollars)
+            if w == 0:
+                key = "sell_all"
+        else:
+            d = _f(o[key])
+            if d is None or d <= 0:
+                raise ProposalError(f"{t}: {key} is a dollar amount above 0")
+            side, dollars = ("buy" if key == "buy_dollars" else "sell"), d
+        if side == "sell" and (key == "sell_all" or dollars >= v - 0.01):
+            if held <= 0:
+                raise ProposalError(f"{t}: nothing is held, so there is nothing to sell")
+            legs[t] = sell_leg(t, round(held, 6), price, src, True)
+            continue
+        if side == "buy":
+            if rows[t]["status"] != "active":
+                raise ProposalError(f"{t} is on its way out of the plan. Add it back with propose_change "
+                                    "add_company first; from the owner's message it applies at once")
+            dollars = round(dollars, 2)
+            if dollars < min_notional:
+                raise ProposalError(f"{t}: a buy of ${dollars:,.2f} is under the ${min_notional:.2f} minimum order")
+            legs[t] = {"ticker": t, "side": "buy", "want": dollars, "gap": dollars, "dollars": dollars,
+                       "quote": price, "quote_source": src, "weight_now": weight_now(t),
+                       "target_weight": float(rows[t]["target_weight"] or 0.0), "band": rows[t].get("band")}
+            continue
+        if held <= 0:
+            raise ProposalError(f"{t}: nothing is held, so there is nothing to sell")
+        raw = round(min(held, dollars / price), 6)
+        qty, why = sizing.resolve_sell_quantity_min_notional(held, raw, price, min_notional=min_notional,
+                                                             bump_to_min=False)
+        if qty <= 0:
+            raise ProposalError(f"{t}: a sale of ${dollars:,.2f} is too small to send ({why})")
+        legs[t] = sell_leg(t, qty, price, src, False)
+
+    def totals():
+        b = sum(l["dollars"] for l in legs.values() if l["side"] == "buy")
+        s = sum(l["quantity"] * l["quote"] for l in legs.values() if l["side"] == "sell")
+        return b, s
+
+    buys_total, proceeds = totals()
+    need = round(buys_total - proceeds, 2)
+    names = _fund_names(fund_from, cash_ticker)
+    if names and need > 0:
+        for f in names:
+            if f in legs:
+                raise ProposalError(f"{f} already has an order here, so it cannot also pay for the buys")
+            if f not in rows or held_of(f) <= 0:
+                raise ProposalError(f"{f} is not a holding in the plan, so it cannot pay for the buys")
+        pool = sum(value_of(f) for f in names)
+        if pool + 0.01 < need:
+            raise ProposalError(f"{' and '.join(names)} hold ${pool:,.2f}, less than the ${need:,.2f} the buys need")
+        for f in names:
+            price, src = quote(f)
+            share = need * value_of(f) / pool
+            held = held_of(f)
+            if share >= value_of(f) - 0.01:
+                legs[f] = sell_leg(f, round(held, 6), price, src, True)
+                continue
+            raw = min(held, round(share / price + 5e-7, 6))   # round up: the sale covers its share
+            qty, why = sizing.resolve_sell_quantity_min_notional(held, raw, price, min_notional=min_notional,
+                                                                 bump_to_min=True)
+            if qty <= 0:
+                raise ProposalError(f"{f}: a sale of ${share:,.2f} is too small to send ({why})")
+            legs[f] = sell_leg(f, qty, price, src, False)
+        buys_total, proceeds = totals()
+    available = max(0.0, money) + proceeds
+    if buys_total > available + 0.01:
+        raise ProposalError(f"the buys need ${buys_total:,.2f}, but ${available:,.2f} can be spent ({money_text}). "
+                            "Ask the owner which holding to sell to pay for it (fund_from), or buy less")
+    return ([l for l in legs.values() if l["side"] == "sell"], [l for l in legs.values() if l["side"] == "buy"])
+
+
+def _trade_plan(rows: dict, all_rows: list, legs: list, base: dict, deployable: float, *, cash_ticker: str,
+                cap: float, hard_floor) -> Optional[dict]:
+    """How the plan moves with a sized owner trade (§10.6). A name's planned share moves only
+    as far as the trade takes it past the plan: a buy raises it to the weight after the buy,
+    a sale lowers it to the weight after the sale, and a sale of all of it takes it out. The
+    cash sleeve takes the difference, so the plan still sums to 100%. Only a raise is held to
+    the per-name limit. None when the plan does not move. Each leg's ``target_weight``
+    becomes the new planned share."""
+    changes, delta = [], 0.0
+    for leg in legs:
+        t = leg["ticker"]
+        frm = float(rows[t]["target_weight"] or 0.0)
+        after = _weight_after(leg, base, deployable)
+        if leg.get("exit"):
+            to = 0.0
+        elif leg["side"] == "buy":
+            to = max(frm, round(after, 4))
+        else:
+            to = min(frm, round(after, 4))
+        if to > frm + 1e-9 and to > cap + 1e-9:     # only a raise is held to the limit; a sale never is
+            room = max(0.0, cap / 100.0 * deployable - base["values"].get(t, 0.0))
+            raise ProposalError(f"{t} would be {after:.1f}% of the account, over the {cap:g}% limit per name. "
+                                f"The most it can take now is about ${room:,.2f} more")
+        leg["target_weight"] = to
+        if abs(to - frm) > 1e-9 or leg.get("exit"):
+            changes.append({"ticker": t, "from": frm, "target_weight": to, "exit": bool(leg.get("exit"))})
+            delta += to - frm
+    if not changes:
+        return None
+    cash_row = next((r for r in all_rows if r["ticker"] == cash_ticker and r["status"] == "active"), None)
+    if cash_row is None:
+        raise ProposalError(f"the plan has no cash sleeve ({cash_ticker}) to balance this trade")
+    c_from = float(cash_row["target_weight"] or 0.0)
+    c_to = round(c_from - delta, 4)
+    if c_to < -1e-6:
+        raise ProposalError(f"the plan keeps only {c_from:g}% of the account in cash, and this trade needs "
+                            f"{delta:.1f} points of it. Sell something to pay for it (fund_from), or buy less")
+    if hard_floor is not None and c_to + 1e-9 < float(hard_floor):
+        raise ProposalError(f"the plan's cash would be {c_to:.1f}% of the account, under the "
+                            f"{float(hard_floor):g}% cash floor")
+    return {"changes": changes, "cash": {"ticker": cash_ticker, "from": c_from, "target_weight": max(0.0, c_to)}}
+
+
+def _orders_from_legs(old_payload: dict, tickers, base: dict) -> list:
+    """The sized orders of a requoted sized trade (§10.6): each requoted leg keeps the size the
+    owner approved. A buy keeps its dollars; a sale keeps its share of the holding; a sale of
+    all of it stays a sale of all of it."""
+    exits = {c["ticker"] for c in ((old_payload.get("plan") or {}).get("changes") or []) if c.get("exit")}
+    out = []
+    for leg in old_payload.get("legs") or []:
+        t = str(leg["ticker"]).upper()
+        if t not in tickers:
+            continue
+        if leg["side"] == "buy":
+            out.append({"ticker": t, "buy_dollars": float(leg["dollar_amount"])})
+        elif t in exits:
+            out.append({"ticker": t, "sell_all": True})
+        else:
+            held = base["quantities"].get(t, 0.0)
+            frac = min(1.0, float(leg["quantity"]) / held) if held > 0 else 1.0
+            out.append({"ticker": t, "sell_fraction": round(frac, 9)})
+    return out
+
+
+def _plan_subset(plan: Optional[dict], tickers) -> Optional[dict]:
+    """The part of a card's plan move that belongs to ``tickers``; the cash sleeve takes the
+    matching difference. None when no name of ``tickers`` moves."""
+    if not plan:
+        return None
+    changes = [c for c in plan.get("changes") or [] if c["ticker"] in set(tickers)]
+    if not changes:
+        return None
+    delta = sum(float(c["target_weight"]) - float(c["from"]) for c in changes)
+    cash = dict(plan["cash"])
+    cash["target_weight"] = round(float(cash["from"]) - delta, 4)
+    return {"changes": changes, "cash": cash}
+
+
 def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None, rationale: str,
                 evidence=None, created_by: str, now_dt=None, role: Optional[str] = None,
                 turn_owner_ids=None, python_origin: Optional[str] = None,
                 parent_change_id: Optional[int] = None, requote_of: Optional[dict] = None,
                 snap_override: Optional[dict] = None, yf_price_fn=None,
-                only_side: Optional[str] = None) -> dict:
+                only_side: Optional[str] = None, orders=None, fund_from=None,
+                money_rule: Optional[str] = None) -> dict:
     """Build one pending trade proposal and reserve its legs. Runs inside the caller's
     transaction (``conn``). Raises ProposalError on any refusal; nothing is written then.
 
     ``origin`` is ``{"event_id": n}`` or ``{"owner_message_id": n}`` from a tool, or the
     ``python_origin`` (``change``, ``drift``) that only Python passes. ``requote_of`` is the
     replaced proposal row: its origin, rationale and evidence are copied, and the origin
-    checks are skipped (§10.2 step 6)."""
+    checks are skipped (§10.2 step 6).
+
+    ``orders`` (an owner trade only) sizes the trade from the owner's request, and the
+    payload's ``plan`` moves the planned shares to fit it when its orders fill (§10.6). A
+    requote of such a trade keeps the sizes and the plan move (``sized`` in the payload).
+
+    The money rule: an owner trade, and the follow-up of a change the owner made in chat
+    (``money_rule="owner"``), may spend the cash that the plan keeps; the buffer and a set
+    ``cash_floor_pct`` still bind. Every other trade keeps the plan's cash share."""
     now_dt = now_dt or _now_dt()
     now = store.iso(now_dt)
+    orders = list(orders or [])
+    if orders:
+        if requote_of is not None or python_origin is not None:
+            raise ProposalError("a sized order comes from the owner only")
+        if not all(isinstance(o, dict) for o in orders):
+            raise ProposalError("each order is {ticker, buy_dollars | sell_dollars | sell_fraction | target_weight | "
+                                "sell_all}")
+        names = [str(o.get("ticker") or "").upper().strip() for o in orders]
+        tickers = names + [f for f in _fund_names(fund_from, cfg.risk.cash_sleeve_ticker) if f not in names]
     tickers = [str(t).upper().strip() for t in (tickers or []) if str(t).strip()]
     if not tickers:
         raise ProposalError("name at least one ticker")
@@ -378,6 +643,7 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
     # Origin resolution.
     event_id = owner_message_id = None
     side_rule = None
+    old_payload = {}
     if requote_of is not None:
         kind_origin = requote_of["origin"]
         event_id = requote_of["event_id"]
@@ -405,6 +671,15 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
             owner_message_id = int(origin["owner_message_id"])
         else:
             raise ProposalError('origin must be {"event_id": n} or {"owner_message_id": n}')
+    if orders and kind_origin != "owner":
+        raise ProposalError("only an owner trade takes a sized order")
+    # The money rule (see the docstring). Only Python passes money_rule, for a follow-up.
+    if requote_of is not None:
+        money_rule = "owner" if old_payload.get("money_rule") == "owner" else "plan"
+    elif kind_origin == "owner" or (kind_origin == "change" and money_rule == "owner"):
+        money_rule = "owner"
+    else:
+        money_rule = "plan"
 
     if not rationale:
         raise ProposalError("give a rationale")
@@ -429,7 +704,8 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
     rows = {r["ticker"]: r for r in book_rows(conn, goal["id"])}
     for t in tickers:
         if t not in rows:
-            raise ProposalError(f"{t} is not in the book; propose add_company")
+            raise ProposalError(f"{t} is not in the book; propose add_company (from the owner's message it applies "
+                                "at once, and its buy card follows)")
         hold = in_flight_ticker(conn, t)
         if hold:
             raise ProposalError(f"{t} has an order in flight. Wait for the fill.")
@@ -445,8 +721,10 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
             raise ProposalError("only the desk can propose an owner trade")
         if owner_message_id not in set(turn_owner_ids or ()):
             raise ProposalError("that owner message is not part of this turn")
-        if fraction is None or float(fraction) not in FRACTIONS:
-            raise ProposalError("fraction must be 0.25, 0.5 or 1.0")
+        if orders:
+            fraction = 1.0          # the orders give the size
+        elif fraction is None or float(fraction) not in FRACTIONS:
+            raise ProposalError("fraction must be 0.25, 0.5 or 1.0 (or give orders with a dollar size)")
         fraction = float(fraction)
     fraction = float(fraction if fraction is not None else 1.0)
     if fraction not in FRACTIONS:
@@ -459,12 +737,47 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
     min_notional = max(float(sett["min_trade_notional"]), sizing.MIN_SELL_NOTIONAL_USD)
     all_rows = book_rows(conn, goal["id"], statuses=("active", "exiting", "removed"))
     cash_value = base["values"].get(cash_ticker, 0.0)
-    floor_pct = desk_settings.cash_floor_pct(sett, all_rows, cash_ticker)
+    hard_floor = sett.get("cash_floor_pct")
+    if money_rule == "owner":
+        floor_pct = float(hard_floor) if hard_floor is not None else 0.0
+    else:
+        floor_pct = desk_settings.cash_floor_pct(sett, all_rows, cash_ticker)
     cash_floor_dollars = floor_pct / 100.0 * deployable
-    money = min(bp - float(sett["min_buying_power_buffer"]), bp + cash_value - cash_floor_dollars)
+    buffer = float(sett["min_buying_power_buffer"])
+    money = min(bp - buffer, bp + cash_value - cash_floor_dollars)
+    if money_rule == "owner" and hard_floor is None:
+        money_text = f"cash is ${bp:,.2f}, and ${buffer:,.2f} stays as a buffer"
+    elif money_rule == "owner":
+        money_text = (f"cash is ${bp:,.2f}, ${buffer:,.2f} stays as a buffer, and the cash floor keeps "
+                      f"{floor_pct:g}% of the account (${cash_floor_dollars:,.2f})")
+    else:
+        money_text = (f"cash is ${bp:,.2f}, and the plan keeps {floor_pct:g}% of the account "
+                      f"(${cash_floor_dollars:,.2f}) in cash")
 
-    sells, buy_wants, skipped = [], [], []
-    for t in tickers:
+    sells, buy_wants, skipped, buys = [], [], [], []
+    plan = None
+    # A requote of a sized trade keeps the owner's sizes and carries the card's plan move
+    # (the plan moves only when an order fills, so nothing of it is applied yet).
+    sized = bool(orders) or (requote_of is not None and bool(old_payload.get("sized")))
+    if sized:
+        price_of = (lambda t: _leg_quote(conn, t, now_dt, yf_price_fn, snap_override))
+        if orders:
+            sells, buys = _size_orders(rows, base, orders, fund_from, cash_ticker=cash_ticker, price_of=price_of,
+                                       min_notional=min_notional, money=money, money_text=money_text,
+                                       cap=float(sett["per_name_max_pct"]))
+            plan = _trade_plan(rows, all_rows, sells + buys, base, deployable, cash_ticker=cash_ticker,
+                               cap=float(sett["per_name_max_pct"]), hard_floor=hard_floor)
+        else:
+            sells, buys = _size_orders(rows, base, _orders_from_legs(old_payload, tickers, base), None,
+                                       cash_ticker=cash_ticker, price_of=price_of, min_notional=min_notional,
+                                       money=money, money_text=money_text, cap=float(sett["per_name_max_pct"]))
+            plan = _plan_subset(old_payload.get("plan"), {l["ticker"] for l in sells + buys})
+            for leg in sells + buys:
+                for ch in (plan or {}).get("changes") or []:
+                    if ch["ticker"] == leg["ticker"]:
+                        leg["target_weight"] = float(ch["target_weight"])
+        tickers = [t for t in tickers if t in {l["ticker"] for l in sells + buys}]
+    for t in ([] if sized else tickers):
         r = rows[t]
         if t == cash_ticker:
             skipped.append({"ticker": t, "reason": "the cash sleeve is held as cash; it gets no leg"})
@@ -529,12 +842,12 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
                           "target_weight": float(r["target_weight"] or 0.0), "exit": False,
                           "band": r.get("band")})
 
-    # Step 4: buys may use the estimated sell proceeds; scale pro rata when short.
+    # Step 4: buys may use the estimated sell proceeds; scale pro rata when short. The
+    # sized orders of an owner trade are already checked against the money (no scaling).
     proceeds = sum(s["quantity"] * s["quote"] for s in sells)
     available = max(0.0, money) + proceeds
     total_want = sum(b["want"] for b in buy_wants)
     scaled = False
-    buys = []
     if buy_wants:
         if total_want > available + 1e-9:
             scaled = True
@@ -545,17 +858,25 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
             dollars, _src = sizing.resolve_buy_dollars(amount, 1.0, available=amount,
                                                        min_notional=min_notional)
             if dollars <= 0:
-                skipped.append({"ticker": b["ticker"], "reason": "the scaled buy is under the minimum"})
+                why = ("there is no cash to spend: " + money_text if available < min_notional
+                       else f"the buy scaled to the cash left is under the ${min_notional:.2f} minimum ({money_text})")
+                skipped.append({"ticker": b["ticker"], "reason": why})
                 continue
             b["dollars"] = dollars
             buys.append(b)
     legs = sells + buys
     if not legs:
         reasons = "; ".join(f"{s['ticker']}: {s['reason']}" for s in skipped) or "nothing to do"
-        raise ProposalError(f"no order to propose ({reasons})")
-    if requote_of is None and kind_origin in ("event", "owner"):
+        hint = (". To own more or less than the plan, give orders with a dollar size or a new planned share: "
+                "Python moves the plan to fit" if kind_origin == "owner" else "")
+        raise ProposalError(f"no order to propose ({reasons}){hint}")
+    # A trade against a recent one needs new evidence. The owner's own request is the reason
+    # for an owner trade, so the rule binds the event trades only.
+    if requote_of is None and kind_origin == "event":
         for leg in legs:
             _check_anti_flip(conn, leg["ticker"], leg["side"], ev_items, now_dt)
+    buys_total = sum(float(b.get("dollars") or 0.0) for b in buys)
+    cash_info = {"before": round(bp, 2), "after": round(bp - buys_total + proceeds, 2)}
 
     # Expiry and the leg trade date (the session date of expires_at, G7).
     session_date, close_dt = market.session_close_et(now_dt.astimezone(market.ET))
@@ -570,7 +891,10 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
                              "quantity": leg.get("quantity"), "quote": leg["quote"]})
     payload = {"kind": "trade", "fraction": fraction, "tickers": tickers, "snapshot_id": snap["id"],
                "deployable": round(deployable, 2), "legs": payload_legs, "scaled": scaled,
-               "skipped": skipped, "side_rule": side_rule}
+               "skipped": skipped, "side_rule": side_rule, "money_rule": money_rule, "cash": cash_info,
+               "sized": sized}
+    if plan is not None:
+        payload["plan"] = plan
     payload_json = store.canonical_json(payload)
     created_by = created_by if created_by in ("desk", "analyst", "monitor", "system") else "system"
     cur = conn.execute(
@@ -608,7 +932,30 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
         leg["weight_after"] = _weight_after(leg, base, deployable)
     return {"proposal_id": pid, "legs": legs, "skipped": skipped, "scaled": scaled,
             "fraction": fraction, "deployable": deployable, "expires_at": expires_at,
-            "superseded": superseded, "origin": kind_origin, "snapshot_id": snap["id"]}
+            "superseded": superseded, "origin": kind_origin, "snapshot_id": snap["id"],
+            "plan": plan, "cash": cash_info, "money_rule": money_rule}
+
+
+class _PreviewDone(Exception):
+    """Ends a preview: the transaction rolls back and nothing stays written."""
+
+
+def preview_trade(led, cfg: Config, **kw) -> dict:
+    """The trade that ``build_trade`` would propose, with nothing written (§10.6). The build
+    runs in a transaction that always rolls back, so the numbers are the card's numbers:
+    the legs, the plan move and the cash after. The desk talks a size through with the
+    owner from these, never from its own arithmetic. Raises ProposalError like the build."""
+    out = {}
+    try:
+        with led.transaction() as conn:
+            out.update(build_trade(led, conn, cfg=cfg, **kw))
+            raise _PreviewDone()
+    except _PreviewDone:
+        pass
+    out.pop("proposal_id", None)
+    out.pop("superseded", None)
+    out.pop("expires_at", None)
+    return out
 
 
 def _weight_after(leg: dict, base: dict, deployable: float) -> float:
@@ -745,6 +1092,10 @@ def close_from_legs(led, proposal_id: int, now, *, reason: Optional[str] = None)
                            "('approved','executing')", (final, json.dumps(merged), proposal_id))
         if cur.rowcount != 1:
             return ""
+        if final != "failed":
+            # A sized owner trade: the plan moves for the names whose orders filled (§10.6).
+            done = {l["ticker"] for l in legs if l["state"] == "filled" or float(l.get("fill_quantity") or 0.0) > 0}
+            apply_plan_moves(led, conn, {**prop, "result_json": json.dumps(merged)}, done, now_s)
         return notify.render_execution_result(_result_model({**prop, "state": final}, legs, reason))
 
 
@@ -765,10 +1116,13 @@ def _result_model(prop: dict, legs: list, reason: Optional[str], open_now: bool 
 def trade_card_model(conn, built: dict, *, now_dt=None) -> dict:
     """The data ``notify.render_trade_card`` needs for a freshly built trade."""
     prop = get_proposal(conn, built["proposal_id"])
+    payload = store.loads(prop.get("payload_json"), {}) or {}
     model = {"id": prop["id"], "origin": prop["origin"], "rationale": prop["rationale"],
              "legs": built["legs"], "skipped": built["skipped"], "scaled": built["scaled"],
              "expires_at": prop["expires_at"], "now": store.iso(now_dt or _now_dt()),
-             "evidence": store.loads(prop["evidence_json"], []), "drift": prop["origin"] == "drift"}
+             "evidence": store.loads(prop["evidence_json"], []), "drift": prop["origin"] == "drift",
+             "plan": payload.get("plan"),
+             "cash": payload.get("cash") if payload.get("money_rule") == "owner" else None}
     if prop["owner_message_id"] is not None:
         row = conn.execute("SELECT text, created_at FROM chat_messages WHERE role='owner' "
                            "AND tg_message_id=? ORDER BY id DESC LIMIT 1",
@@ -796,6 +1150,12 @@ def _validate_book(rows: list, sett: dict, cash_ticker: str, tolerance: float = 
     total = _book_sum(rows)
     if abs(total - 100.0) > tolerance:
         raise ProposalError(f"the book must sum to 100% (it sums to {total:g}%)")
+    for r in rows:
+        if r["status"] == "active" and float(r["target_weight"] or 0) < -1e-9:
+            if r["ticker"] == cash_ticker:
+                raise ProposalError(f"the plan keeps too little cash for this: the cash sleeve would be "
+                                    f"{float(r['target_weight']):.2f}%. Lower another name to pay for it")
+            raise ProposalError(f"{r['ticker']} at {float(r['target_weight']):g}% is under 0%")
     cap = float(sett["per_name_max_pct"])
     for r in rows:
         if r["status"] == "active" and r["ticker"] != cash_ticker and float(r["target_weight"] or 0) > cap + 1e-9:
@@ -819,6 +1179,22 @@ def _apply_weights(rows: list, changes: list) -> list:
         if ch.get("band") is not None:
             by[t]["band"] = float(ch["band"])
     return list(by.values())
+
+
+def _balance_on_cash(rows: list, named, cash_ticker: str) -> Optional[dict]:
+    """Close the plan on the cash sleeve. When a change does not name the cash sleeve and
+    the plan no longer sums to 100%, the cash sleeve takes the difference, so the desk never
+    does the sum. Returns the cash entry to add to the change, or None."""
+    if cash_ticker in {str(t).upper() for t in named}:
+        return None
+    gap = round(100.0 - _book_sum(rows), 6)
+    if abs(gap) <= 1e-6:
+        return None
+    for r in rows:
+        if r["ticker"] == cash_ticker and r["status"] == "active":
+            r["target_weight"] = round(float(r["target_weight"] or 0.0) + gap, 4)
+            return {"ticker": cash_ticker, "target_weight": r["target_weight"]}
+    return None
 
 
 def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
@@ -861,6 +1237,9 @@ def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
         new_rows = [dict(r) for r in rows if r["ticker"] != t]
         new_rows = _apply_weights(new_rows, funding)
         new_rows.append({"ticker": t, "target_weight": w, "band": band, "status": "active"})
+        cash_entry = _balance_on_cash(new_rows, [t] + [f.get("ticker") for f in funding], cash_ticker)
+        if cash_entry:
+            funding.append(cash_entry)
         _validate_book(new_rows, sett, cash_ticker)
         out.update(ticker=t, sleeve=change.get("sleeve") or comp.get("sleeve"), target_weight=w,
                    band=band, entry={"mode": mode, "price": price},
@@ -882,6 +1261,9 @@ def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
         redistribute = list(change.get("redistribute") or [])
         new_rows = [dict(r) for r in rows if r["ticker"] != t]
         new_rows = _apply_weights(new_rows, redistribute)
+        cash_entry = _balance_on_cash(new_rows, [t] + [f.get("ticker") for f in redistribute], cash_ticker)
+        if cash_entry:
+            redistribute.append(cash_entry)
         _validate_book(new_rows, sett, cash_ticker)
         out.update(ticker=t, exit={"mode": mode, "price": price}, unmanaged=t not in by,
                    redistribute=[{"ticker": str(f["ticker"]).upper(),
@@ -891,6 +1273,9 @@ def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
         if not changes:
             raise ProposalError("set_weights needs at least one change")
         new_rows = _apply_weights([dict(r) for r in rows], changes)
+        cash_entry = _balance_on_cash(new_rows, [c.get("ticker") for c in changes], cash_ticker)
+        if cash_entry:
+            changes.append(cash_entry)
         _validate_book(new_rows, sett, cash_ticker)
         out["changes"] = [{"ticker": str(c["ticker"]).upper(), "target_weight": float(c["target_weight"]),
                            "band": _f(c.get("band"))} for c in changes]
@@ -1094,21 +1479,54 @@ def change_preview(conn, cfg: Config, norm: dict, *, now_dt=None, yf_price_fn=No
 def apply_change(led, conn, cfg: Config, proposal: dict, *, now_dt=None) -> dict:
     """Apply a confirmed change inside the tap's transaction (§10.3 apply column). Re-
     validates first; a failure raises ProposalError and the caller rolls back. Writes the
-    ``strategy_change_log`` rows (``trigger='owner_confirm'``). Returns the applied change."""
+    ``strategy_change_log`` rows (``trigger='owner_confirm'``). Returns the applied change.
+
+    This is the only code that writes a risk setting (``set_risk``) or lifts a halt
+    (``resume_trading``). Only the Confirm tap reaches it."""
     now_dt = now_dt or _now_dt()
     now = store.iso(now_dt)
     payload = store.loads(proposal["payload_json"], {}) or {}
     norm = validate_change(conn, cfg, payload.get("change") or {}, now_dt=now_dt)
     pid = int(proposal["id"])
+    kind = norm["kind"]
+    if kind not in TAP_ONLY_KINDS:
+        return _apply_plan(led, conn, cfg, norm, pid, now, trigger="owner_confirm")
+    goal = active_goal(conn)
+    gid = goal["id"] if goal else None
+    proof = json.dumps({"proposal_id": pid})
+
+    def log(change_type, frm, to, reason):
+        led.record_strategy_change(goal_id=gid, changed_at=now, change_type=change_type, ticker=None,
+                                   from_value=frm, to_value=to, trigger="owner_confirm", reason=reason,
+                                   proof_json=proof, conn=conn)
+
+    if kind == "set_risk":
+        desk_settings.write(conn, norm["key"], norm["value"], now, pid)
+        log("risk", norm.get("old"), norm["value"], f"set_risk {norm['key']}")
+    elif kind == "resume_trading":
+        n = led.clear_halt(today(), f"resumed by owner, proposal {pid}", conn=conn)
+        if n != 1:
+            raise ProposalError("trading is not halted today")
+        log("status", "halted", "resumed", kind)
+    return {"change": norm, "superseded": []}
+
+
+def _apply_plan(led, conn, cfg: Config, norm: dict, pid: int, now: str, *, trigger: str) -> dict:
+    """Apply one validated plan change (PLAN_KINDS) in the caller's transaction and write
+    its ``strategy_change_log`` rows with ``trigger``. The Confirm tap (``owner_confirm``)
+    and an owner turn (``owner_chat``, §10.6) share it. It has no code for a risk setting
+    or the halt, so the owner-turn path cannot reach them."""
+    kind = norm["kind"]
+    if kind not in PLAN_KINDS:
+        raise ProposalError(f"{kind} is not a plan change")
     proof = json.dumps({"proposal_id": pid})
     goal = active_goal(conn)
     gid = goal["id"] if goal else None
-    kind = norm["kind"]
 
     def log(change_type, ticker=None, frm=None, to=None, reason=None):
         led.record_strategy_change(goal_id=gid, changed_at=now, change_type=change_type,
                                    ticker=ticker, from_value=frm, to_value=to,
-                                   trigger="owner_confirm", reason=reason or kind,
+                                   trigger=trigger, reason=reason or kind,
                                    proof_json=proof, conn=conn)
 
     rows = {r["ticker"]: r for r in book_rows(conn, gid, statuses=("active", "exiting", "removed"))} if gid else {}
@@ -1157,11 +1575,8 @@ def apply_change(led, conn, cfg: Config, proposal: dict, *, now_dt=None) -> dict
         bands = {c["ticker"]: c["band"] for c in norm["changes"] if c.get("band") is not None}
         changes = [{"ticker": t, "from_value": (rows.get(t) or {}).get("target_weight"), "to_value": w,
                     "reason": "set_weights", "proof_json": proof} for t, w in weights.items()]
-        led.retarget_weights(gid, weights, now, changes, trigger="owner_confirm", bands=bands, conn=conn)
+        led.retarget_weights(gid, weights, now, changes, trigger=trigger, bands=bands, conn=conn)
         touched = list(weights)
-    elif kind == "set_risk":
-        desk_settings.write(conn, norm["key"], norm["value"], now, pid)
-        log("risk", None, norm.get("old"), norm["value"], reason=f"set_risk {norm['key']}")
     elif kind == "set_premise":
         row = conn.execute("SELECT MAX(version) FROM premise").fetchone()
         version = int(row[0] or 0) + 1
@@ -1189,11 +1604,6 @@ def apply_change(led, conn, cfg: Config, proposal: dict, *, now_dt=None) -> dict
             else:
                 levels.delete_level(conn, t, lvl)
         log("thesis", t, version - 1, version)
-    elif kind == "resume_trading":
-        n = led.clear_halt(today(), f"resumed by owner, proposal {pid}", conn=conn)
-        if n != 1:
-            raise ProposalError("trading is not halted today")
-        log("status", None, "halted", "resumed")
     # A target change supersedes every pending trade proposal on the tickers it touched.
     superseded = []
     if touched:
@@ -1204,6 +1614,143 @@ def apply_change(led, conn, cfg: Config, proposal: dict, *, now_dt=None) -> dict
             if end_pending(conn, r[0], "superseded", now, superseded_by=pid):
                 superseded.append(r[0])
     return {"change": norm, "superseded": superseded}
+
+
+def apply_owner_change(led, conn, cfg: Config, *, change: dict, rationale: str, evidence=None,
+                       owner_message_id, turn_owner_ids, role: str, now_dt=None) -> dict:
+    """Apply a plan change at once from the owner's own message in a desk turn (§10.6). No
+    Confirm card: the owner already said it. Runs in the caller's transaction and stores
+    the change as an ``applied`` proposal row (origin ``owner``) for the audit trail and the
+    follow-up trade. Refused for the analyst, for a message outside this turn, and for a
+    risk setting or the halt (TAP_ONLY_KINDS keep their Confirm tap). Returns
+    ``{proposal_id, change, before, superseded}``: ``before`` holds the planned shares
+    before the change, ``superseded`` the cards it replaced."""
+    now_dt = now_dt or _now_dt()
+    now = store.iso(now_dt)
+    if role != "desk":
+        raise ProposalError("only the desk applies a change from the owner's message")
+    try:
+        mid = int(owner_message_id)
+    except (TypeError, ValueError):
+        raise ProposalError("give owner_message_id: the id of the owner message that asks for the change")
+    if mid not in {int(x) for x in (turn_owner_ids or ())}:
+        raise ProposalError("that owner message is not part of this turn")
+    kind = (change or {}).get("kind")
+    if kind in TAP_ONLY_KINDS:
+        raise ProposalError(f"{kind} changes a safety limit, so it needs the owner's Confirm tap: "
+                            "propose it without an owner origin")
+    if kind not in PLAN_KINDS:
+        raise ProposalError(f"change kind must be one of {', '.join(CHANGE_KINDS)}")
+    rationale = str(rationale or "").strip()
+    if not rationale or len(rationale) > 280:
+        raise ProposalError("give a rationale of 280 characters or fewer")
+    ev_items = evidence_items(evidence)
+    goal = active_goal(conn)
+    before = {str(r["ticker"]).upper(): float(r["target_weight"] or 0.0)
+              for r in (book_rows(conn, goal["id"]) if goal else [])}
+    norm = validate_change(conn, cfg, change, now_dt=now_dt)
+    payload_json = store.canonical_json({"kind": "change", "change": norm})
+    cur = conn.execute(
+        "INSERT INTO proposals (kind, origin, owner_message_id, payload_json, payload_sha256, rationale, "
+        "evidence_json, created_by, created_at, expires_at, state, nonce, decided_at, decided_by) "
+        "VALUES ('change', 'owner', ?, ?, ?, ?, ?, 'desk', ?, ?, 'applied', ?, ?, 'chat')",
+        (mid, payload_json, store.sha256_hex(payload_json), rationale,
+         json.dumps([f"{k}:{v}" for k, v in ev_items]), now, now, secrets.token_hex(5), now))
+    pid = int(cur.lastrowid)
+    cards = supersede_changes(conn, pid, norm, now)
+    res = _apply_plan(led, conn, cfg, norm, pid, now, trigger="owner_chat")
+    return {"proposal_id": pid, "change": norm, "before": before, "superseded": cards + res["superseded"]}
+
+
+def _plan_moves(plan: dict, tickers=None) -> list:
+    """The moves of a card's plan for ``tickers`` (all when None), with the cash sleeve's
+    matching difference last: ``[{ticker, delta, exit}]``."""
+    changes = [c for c in plan.get("changes") or [] if tickers is None or c["ticker"] in tickers]
+    if not changes:
+        return []
+    moves = [{"ticker": str(c["ticker"]).upper(), "delta": float(c["target_weight"]) - float(c["from"]),
+              "exit": bool(c.get("exit"))} for c in changes]
+    moves.append({"ticker": str(plan["cash"]["ticker"]).upper(), "delta": -sum(m["delta"] for m in moves),
+                  "exit": False})
+    return moves
+
+
+def check_trade_plan(conn, cfg: Config, proposal: dict) -> None:
+    """At the Approve tap: can the card's plan move still apply (§10.6)? Each name moves by
+    the difference the card showed. Raises ProposalError when a name left the plan, a raised
+    name would pass the per-name limit, or the cash sleeve would fall under 0% or under a
+    set ``cash_floor_pct``. Writes nothing: the plan moves only when an order fills."""
+    plan = (store.loads(proposal.get("payload_json"), {}) or {}).get("plan")
+    if not plan:
+        return
+    goal = active_goal(conn)
+    if goal is None:
+        raise ProposalError("no active book")
+    sett = desk_settings.effective(conn, cfg)
+    by = {r["ticker"]: r for r in book_rows(conn, goal["id"], statuses=("active", "exiting"))}
+    cap = float(sett["per_name_max_pct"])
+    cash_t = str(plan["cash"]["ticker"]).upper()
+    for m in _plan_moves(plan):
+        r = by.get(m["ticker"])
+        if r is None:
+            raise ProposalError(f"{m['ticker']} left the plan after this card")
+        new = 0.0 if m["exit"] else float(r["target_weight"] or 0.0) + m["delta"]
+        if m["ticker"] == cash_t:
+            hard = sett.get("cash_floor_pct")
+            if new < -1e-6:
+                raise ProposalError(f"the plan's cash would fall under 0% ({new:.1f}%)")
+            if hard is not None and new + 1e-9 < float(hard):
+                raise ProposalError(f"the plan's cash would be {new:.1f}% of the account, under the "
+                                    f"{float(hard):g}% cash floor")
+        elif m["delta"] > 0 and new > cap + 1e-9:
+            raise ProposalError(f"{m['ticker']} would be {new:.1f}% of the plan, over the {cap:g}% limit per name")
+
+
+def apply_plan_moves(led, conn, proposal: dict, tickers, now: str) -> list:
+    """Move the plan for the names of a sized owner trade whose orders filled (§10.6), in the
+    caller's transaction. Each name moves by the difference the card showed, so a change
+    made after the card still holds; a name sold in full leaves the plan (``exiting``). The
+    cash sleeve takes the matching difference, so the plan still sums to 100%. A name moves
+    once: ``result_json.plan_applied`` lists the names done. Returns the names moved now."""
+    payload = store.loads(proposal.get("payload_json"), {}) or {}
+    plan = payload.get("plan")
+    if not plan:
+        return []
+    done = set((store.loads(proposal.get("result_json"), {}) or {}).get("plan_applied") or [])
+    todo = {str(t).upper() for t in tickers or ()} - done
+    moves = _plan_moves(plan, todo)
+    goal = active_goal(conn)
+    if not moves or goal is None:
+        return []
+    gid, pid = goal["id"], int(proposal["id"])
+    by = {r["ticker"]: r for r in book_rows(conn, gid, statuses=("active", "exiting"))}
+    proof = json.dumps({"proposal_id": pid})
+    weights, log, exits = {}, [], []
+    for m in moves:
+        r = by.get(m["ticker"])
+        if r is None:
+            continue
+        cur_w = float(r["target_weight"] or 0.0)
+        new_w = 0.0 if m["exit"] else round(max(0.0, cur_w + m["delta"]), 4)
+        weights[m["ticker"]] = new_w
+        log.append({"ticker": m["ticker"], "from_value": cur_w, "to_value": new_w, "reason": "owner_trade",
+                    "proof_json": proof})
+        if m["exit"]:
+            exits.append(m["ticker"])
+    led.retarget_weights(gid, weights, now, log, trigger="owner_trade", conn=conn)
+    for t in exits:
+        conn.execute("UPDATE target_portfolio SET status='exiting', updated_at=? WHERE goal_id=? AND ticker=?",
+                     (now, gid, t))
+        led.record_strategy_change(goal_id=gid, changed_at=now, change_type="status", ticker=t,
+                                   from_value="active", to_value="exiting", trigger="owner_trade",
+                                   reason="sold in full", proof_json=proof, conn=conn)
+        if store.get_company(conn, t):
+            store.set_company_status(conn, t, "dropped", f"sold in full by proposal #{pid}", now)
+    moved = sorted(m["ticker"] for m in moves[:-1])
+    res = store.loads(proposal.get("result_json"), {}) or {}
+    res["plan_applied"] = sorted(done | set(moved))
+    conn.execute("UPDATE proposals SET result_json=? WHERE id=?", (json.dumps(res), pid))
+    return moved
 
 
 def build_follow_up(led, conn, cfg: Config, change_proposal: dict, *, now_dt=None, yf_price_fn=None) -> dict:
@@ -1225,17 +1772,28 @@ def build_follow_up(led, conn, cfg: Config, change_proposal: dict, *, now_dt=Non
         price, _ = quotes.price_for(conn, norm["ticker"], now_dt, yf_price_fn or quotes.yf_last_price)
         if price is None or price > float(bb):
             return {"none": True}
+    owner_made = change_proposal.get("origin") == "owner"
+    why = (f"Follows the change you asked for (#{change_proposal['id']})." if owner_made
+           else f"Follows your confirmed change #{change_proposal['id']}.")
     try:
         built = build_trade(led, conn, cfg=cfg, tickers=tickers, origin={}, python_origin="change",
-                            parent_change_id=int(change_proposal["id"]),
-                            rationale=f"Follows your confirmed change #{change_proposal['id']}.",
+                            parent_change_id=int(change_proposal["id"]), rationale=why,
                             evidence=[], created_by="system", now_dt=now_dt, yf_price_fn=yf_price_fn,
-                            only_side="buy" if norm["kind"] == "set_thesis" else None)
+                            only_side="buy" if norm["kind"] == "set_thesis" else None,
+                            money_rule="owner" if owner_made else None)
     except ProposalError as e:
         msg = str(e)
         if "snapshot is stale" in msg:
             return {"waiting": True}
         if msg.startswith("no order to propose"):
-            return {"none": True, "why": msg}
+            return {"none": True, "why": no_order_reasons(msg)}
         return {"refused": msg}
     return {"built": built}
+
+
+def no_order_reasons(msg: str) -> str:
+    """The reasons inside a "no order to propose (...)" refusal, for the owner's message."""
+    m = str(msg or "")
+    if m.startswith("no order to propose (") and ")" in m:
+        return m[len("no order to propose ("):m.rindex(")")]
+    return m

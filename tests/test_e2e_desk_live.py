@@ -24,6 +24,9 @@ answers, and a temp ``CLAUDE_CONFIG_DIR``. No broker. ``WebSearch`` is not a des
     rule and a lesson in the ledger. It ends with ``record_verdict`` and its forecast.
   * grade: ``tick.py learn-grade`` with the real yfinance closes (no model). Four forecasts made
     on 2026-06-01; the stored excess must equal one computed here from an independent fetch.
+  * collab: the 2026-11-04 VRT exchange on the test book (plan §10.6). ANET is above its plan
+    and cash is under the plan's cash share. The owner says "buy more": the desk sends a sized
+    buy card and never answers with a rule. Then "raise CEG to 18%" applies at once.
 
 Run one case: ``QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_e2e_desk_live.py desk_turn``.
 """
@@ -798,8 +801,142 @@ def case_grade(R):
              rows["ANET"]["marks"]["90"]["session"], max(d for d in sess if d <= target))
 
 
+COLLAB_BUY = ("ANET is under our good price to buy more, and I'm ok with owning more of it than the plan says. "
+              "If you think we should buy more, buy please.")
+COLLAB_PLAN = "Also lower CEG's planned share to 12% for now."
+# The answers the owner called friction (2026-11-04): a rule instead of a trade.
+FRICTION = re.compile(r"only moves|toward (?:its|the) (?:target|plan)|system refused|nothing to buy|change card"
+                      r"|isn'?t allowed|not allowed|a rule", re.I)
+
+
+def _collab_setup(root):
+    """The VRT case of 2026-11-04 on the test book, at today's real prices: ANET has a thesis
+    and trades under its good price to buy more, ANET is a bit over its 25% plan (26%), CEG is
+    at its 15% plan, and cash is 59% against the plan's 60%. ANET has room to 30% (the limit)."""
+    from desk_fakes import snapshot
+    from lib.desk import findings, proposals, quotes, store
+    p_anet, p_ceg = quotes.yf_last_price("ANET"), quotes.yf_last_price("CEG")
+    led, cfg = root.led(), root.cfg()
+    with led.connect() as c:
+        doc = c.execute("SELECT id FROM documents WHERE ticker='ANET' AND kind='filing_section' "
+                        "AND length(text) > 2000 ORDER BY id LIMIT 1").fetchone()[0]
+        text = store.get_document(c, doc)["text"]
+        fid = findings.record_finding(c, ticker="ANET", kind="growth", claim="AI networking demand",
+                                      quote=findings.normalize(text).strip()[:160], document_id=doc,
+                                      created_by="analyst", now=store.now_iso())
+    from lib.desk import settings as desk_settings, valuation
+    sc = lambda g1, g2: {"growth_1_5": g1, "growth_6_10": g2, "finding_ids": [fid]}  # noqa: E731
+    # As VRT on 2026-11-04: today's price < the good price to buy more < the middle case. Pick
+    # the middle-case growth so one share is worth about 20% more than today's price.
+    val = None
+    with led.connect() as c:
+        sett, cik = desk_settings.effective(c, cfg), (store.get_company(c, "ANET") or {}).get("cik")
+        for g in [x / 100.0 for x in range(14, 61, 2)]:
+            v = {"method": "dcf_fcf", "scenarios": {"bear": sc(g * 0.5, 0.04), "base": sc(g, 0.08),
+                                                    "bull": sc(g * 1.4, 0.10)}}
+            fv = valuation.fair_values(c, "ANET", v, settings=sett, cik=cik)
+            if (fv.get("fair_value_base") or 0) >= p_anet * 1.2:
+                val, base = v, fv["fair_value_base"]
+                break
+    assert val is not None, "no DCF growth gives a middle case above today's ANET price"
+    change = {"kind": "set_thesis", "ticker": "ANET", "premise_link": "AI clusters need fast networks",
+              "summary": "ANET sells the switches that AI clusters need, and its orders keep growing.",
+              "drivers": ["cloud spending on AI"], "falsifiers": ["cloud AI spending falls"],
+              "valuation": val, "buy_below": round(min(p_anet * 1.04, base * 0.9), 2),
+              "trim_above": round(base * 1.25, 2)}
+    with led.transaction() as c:
+        # A message an earlier turn already took (delivered), so the desk's turns do not see it.
+        c.execute("INSERT INTO chat_messages (chat_id, tg_message_id, role, source, text, created_at, "
+                  "delivered_to_session) VALUES (?, 6999, 'owner', 'chat', 'set the ANET thesis', ?, 1)",
+                  (str(OWNER), store.now_iso()))
+        proposals.apply_owner_change(led, c, cfg, change=change, rationale="The test thesis.", evidence=[],
+                                     owner_message_id=6999, turn_owner_ids=[6999], role="desk")
+    snapshot(root, at=store.now_iso(), positions={"ANET": round(520.0 / p_anet, 6), "CEG": round(300.0 / p_ceg, 6)},
+             quotes={"ANET": p_anet, "CEG": p_ceg, "SGOV": 100.0}, buying_power=1180.0, equity=2000.0)
+    return p_anet
+
+
+def case_collab(R):
+    if not need_env(R, "collab"):
+        return
+    import chat_bridge
+    from lib.desk import agent, proposals
+    with temp_root() as root:
+        seed_desk(root)
+        p_anet = _collab_setup(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        rec = {}
+
+        async def factory(options):
+            from claude_agent_sdk import ClaudeSDKClient
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            rec["c"] = Recorder(client)
+            return rec["c"]
+
+        bridge = chat_bridge.Bridge(runtime=runtime, secrets=secrets, led=root.led(), transport=tg,
+                                    client_factory=factory)
+
+        async def turn(update_id, mid, text):
+            await bridge.handle_update(owner_update(update_id, mid, text), offline=False)
+            await bridge.maybe_turn()
+            await bridge.turn_task
+
+        async def go():
+            await turn(1, 7011, COLLAB_BUY)
+            rec["n1"] = len(tg.sent())
+            rec["k1"] = len(rec["c"].tools) if "c" in rec else 0
+            await turn(2, 7012, COLLAB_PLAN)
+            await bridge.disconnect()
+
+        asyncio.run(go())
+        c = rec.get("c")
+        tools = c.tools if c else []
+        t1, t2 = tools[:rec.get("k1", 0)], tools[rec.get("k1", 0):]
+        print(f"  collab: ANET ${p_anet:.2f}; turn 1 tools={t1}")
+        print(f"  collab: turn 2 tools={t2}")
+        for name, text in (c.outputs if c else []):
+            if name and name.split("__")[-1] in ("plan_trade", "propose_trade", "propose_change"):
+                print(f"    {name.split('__')[-1]} ->", str(text)[:500])
+        sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        first, second = sent[:rec.get("n1", 0)], sent[rec.get("n1", 0):]
+        for p in sent:
+            print("    out>", str(p.get("text"))[:400].replace("\n", " "))
+        with root.led().connect() as conn:
+            trades = [dict(x) for x in conn.execute("SELECT * FROM proposals WHERE kind='trade' ORDER BY id")]
+            changes = [dict(x) for x in conn.execute("SELECT * FROM proposals WHERE kind='change' AND id > 1")]
+            goal = proposals.active_goal(conn)
+            book = {r["ticker"]: r["target_weight"] for r in proposals.book_rows(conn, goal["id"])}
+        buys = [t for t in trades if t["origin"] == "owner" and t["owner_message_id"] == 7011
+                and any(l["ticker"] == "ANET" and l["side"] == "buy" for l in json.loads(t["payload_json"])["legs"])]
+        R.ok("collab: turn 1 sends an ANET buy card from the owner's message", len(buys) >= 1,
+             [(t["id"], t["origin"], t["owner_message_id"]) for t in trades])
+        R.ok("collab: turn 1's card moves the plan with the trade (sized orders)",
+             any((json.loads(t["payload_json"]).get("plan") or {}).get("changes") for t in buys),
+             [t["payload_json"][:300] for t in buys])
+        R.ok("collab: the buy card waits for the tap", bool(buys) and all(t["state"] in ("pending", "superseded")
+                                                                          for t in buys), [t["state"] for t in buys])
+        R.eq("collab: turn 1 answers with no rule", [m.group(0) for p in first
+                                                     for m in [FRICTION.search(str(p.get("text") or ""))] if m], [])
+        ceg_card = [t for t in trades if t["owner_message_id"] == 7012 and any(
+            ch["ticker"] == "CEG" and abs(float(ch["target_weight"]) - 12.0) < 0.01
+            for ch in (json.loads(t["payload_json"]).get("plan") or {}).get("changes") or [])]
+        ceg_now = abs(float(book.get("CEG") or 0) - 12.0) < 0.01 and any(
+            x["origin"] == "owner" and x["state"] == "applied" and x["owner_message_id"] == 7012 for x in changes)
+        R.ok("collab: turn 2 moves CEG's plan to 12%: at once, or on the card's Approve", ceg_now or bool(ceg_card),
+             (book, [(x["id"], x["origin"], x["state"]) for x in changes]))
+        R.eq("collab: no Confirm card in either turn",
+             [p.get("text", "")[:80] for p in sent if "Confirm" in json.dumps(p.get("reply_markup") or {})], [])
+        R.eq("collab: turn 2 answers with no rule", [m.group(0) for p in second
+                                                     for m in [FRICTION.search(str(p.get("text") or ""))] if m], [])
+        R.eq("collab: no report labels", labels(p.get("text") for p in sent), [])
+
+
 CASES = {"desk_turn": case_desk_turn, "ladder": case_ladder, "deep_dive": case_deep_dive, "research": case_research,
-         "rule": case_rule, "reflect": case_reflect, "event": case_event, "grade": case_grade}
+         "rule": case_rule, "reflect": case_reflect, "event": case_event, "grade": case_grade,
+         "collab": case_collab}
 
 
 def main(argv) -> int:

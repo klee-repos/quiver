@@ -247,6 +247,27 @@ The desk proposes a trade on its own only when an event shows a change. When you
 trade, the desk passes your message id as the origin, and the card quotes your message word
 for word.
 
+### The plan follows the conversation
+
+A request in chat moves the plan. Only an order waits for a tap (plan §10.6).
+
+- "Buy $50 of VRT", "sell half my SMH", "take VRT to 9%": the desk sends one trade card with
+  the size you asked for. The card says how the plan moves ("VRT goes from 7.0% to 8.8% of
+  the account and cash goes from 18.0% to 16.2%") and the cash before and after. **Approve**
+  sends the order; the plan moves with it when it fills. **Reject**, an expired card, or an
+  order that is never placed moves nothing. New numbers after a price move keep your size.
+- "Buy more VRT": the desk works out a size with you on Python's numbers (`plan_trade`),
+  says where the money comes from, and sends the card.
+- The plan's cash share never blocks a trade you ask for. The $5 buffer and a set
+  `cash_floor_pct` still do. When cash is short, the desk says how much can be spent and
+  asks which holding to sell.
+- "Make VRT 9%", "add NVDA at 5%", "a good price to buy more is $200": the change applies at
+  once, with no Confirm card. Python sends a short note with the exact numbers ("I changed
+  the plan as you asked: VRT from 7.0% to 9.0% and SGOV from 18.0% to 16.0% of the
+  account."), then the trade card, if a trade follows. When no trade follows, the desk says why.
+- A risk setting (`set_risk`) and lifting a halt (`resume_trading`) still need **Confirm**.
+- A change the analyst proposes is still a card with **Confirm**.
+
 ## Taps and cards
 
 ### The cards
@@ -277,7 +298,8 @@ The seven change kinds:
 | `resume_trading` | Lifts today's daily-loss halt. It never touches the `KILL` file. |
 
 A confirmed change that implies a trade sends a second card with its own **Approve**
-button. A Confirm never approves a trade.
+button. A Confirm never approves a trade. A plan change from your own message applies at
+once, with no change card (see "The plan follows the conversation").
 
 ### What happens on a tap
 

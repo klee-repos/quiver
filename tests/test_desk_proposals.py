@@ -585,10 +585,19 @@ def case_anti_flip():
         new = c.finding(c.doc_id(ACC_10Q, "10-Q:I-1"), "2026-08-10T14:00:00Z")
         c.at("2026-08-15T14:00:00Z")                 # 10 days after the approval
         c.snap(positions={"ANET": 5, "CEG": 1, "SGOV": 11})
+        # The owner's own request is the reason for an owner trade, so the rule never holds
+        # one back (§10.6). The event trades keep it.
         e = refusal(lambda: owner_trade(c, ["ANET"], 1.0, evidence=["finding:%d" % old]))
-        r.ok("anti_flip: 10 days: a sell with only older evidence is refused", e is not None, e)
-        e = refusal(lambda: owner_trade(c, ["ANET"], 1.0, evidence=["finding:%d" % new]))
-        r.ok("anti_flip: 10 days: a finding newer than the approval passes", e is None, e)
+        r.ok("anti_flip: 10 days: an owner sell with only older evidence passes (the owner asked)", e is None, e)
+        e10q, _ = _event_ids(c)
+        queue(c)
+        verdict(c, e10q, "weakened")
+        doc = c.doc_id(ACC_10Q, "10-Q:I-2")
+        e = refusal(lambda: event_trade(c, e10q, evidence=["document:%d" % doc]))
+        r.ok("anti_flip: 10 days: an event sell with no finding after the approval is refused",
+             e is not None and "was approved on 2026-08-05" in e, e)
+        e = refusal(lambda: event_trade(c, e10q, evidence=["document:%d" % doc, "finding:%d" % new]))
+        r.ok("anti_flip: 10 days: an event sell with a finding newer than the approval passes", e is None, e)
         c.at("2026-09-05T14:02:00Z")                 # 31 days after the approval
         c.snap(positions={"ANET": 5, "CEG": 1, "SGOV": 11})
         e = refusal(lambda: owner_trade(c, ["ANET"], 1.0, evidence=["finding:%d" % old]))
@@ -1073,9 +1082,262 @@ def case_requote_copy():
                  and new["parent_change_id"] == ch["proposal_id"], (new, old))
 
 
+# --- owner_sized (§10.6: the plan follows the owner's trade) ---------------------------------
+
+# The 2026-11-04 failure, on the test book: cash is $1,160 (58% of $2,000) and the plan keeps
+# 60% in cash, so the plan's cash rule leaves no money for any buy. ANET 3.4 sh at $150 is
+# $510 (25.5%, plan 25%), CEG 1.1 sh at $300 is $330 (16.5%, plan 15%).
+SIZED = {"positions": {"ANET": 3.4, "CEG": 1.1}, "buying_power": 1160.0, "equity": 2000.0}
+
+
+def sized(c, orders, fund_from=None, mid=None, **kw):
+    if mid is None:
+        mid = c.owner_msg("buy more ANET please")
+    return build(c, [], origin={"owner_message_id": mid}, rationale="You asked for more.", evidence=[],
+                 created_by="desk", role="desk", turn_owner_ids=[mid], orders=orders, fund_from=fund_from, **kw)
+
+
+def fill_all(c, pid, only=None):
+    """The fills land (the ledger producer), then the job closes the proposal."""
+    for lgr in c.legs(pid):
+        if only is None or lgr["ticker"] in only:
+            c.led.set_order_state(lgr["ref_id"], "filled")
+    return proposals.close_from_legs(c.led, pid, c.now())
+
+
+def book_of(c):
+    return {x["ticker"]: (x["target_weight"], x["status"]) for x in
+            c.q("SELECT ticker, target_weight, status FROM target_portfolio WHERE goal_id=?", (c.gid(),))}
+
+
+def case_owner_sized():
+    with case() as c:
+        # The old way: ANET is under its plan (3.2 sh = 24%) and cash is $1,190 (59.5%, plan 60%).
+        # A plan-rule buy toward the plan finds no cash, and the refusal now says so.
+        c.snap(positions={"ANET": 3.2, "CEG": 1.1}, buying_power=1190.0, equity=2000.0)
+        e = refusal(lambda: drift_trade(c, ["ANET"]))
+        r.ok("owner_sized: repro: the plan's cash rule leaves no money, and the reason names the cash",
+             e is not None and "no cash to spend" in e and "$1,190.00" in e and "60% of the account" in e, e)
+        b0 = sized(c, [{"ticker": "ANET", "buy_dollars": 10}])
+        r.eq("owner_sized: the owner's $10 buy goes through; it stays under the plan, so the plan does not move",
+             (leg(b0, "ANET")["dollars"], b0["plan"]), (10.0, None))
+        c.snap(**SIZED)
+        # The new way: the owner's sized buy goes through, and the plan follows it.
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 80}])
+        lg = leg(b, "ANET")
+        r.eq("owner_sized: buy $80 of ANET -> one $80 buy leg", (len(b["legs"]), lg["side"], lg["dollars"]),
+             (1, "buy", 80.0))
+        r.eq("owner_sized: the money rule is the owner's", b["money_rule"], "owner")
+        r.eq("owner_sized: the plan moves ANET to its weight after the buy, cash takes the difference",
+             b["plan"], {"changes": [{"ticker": "ANET", "from": 25.0, "target_weight": 29.5, "exit": False}],
+                         "cash": {"ticker": "SGOV", "from": 60.0, "target_weight": 55.5}})
+        r.eq("owner_sized: the cash before and after", b["cash"], {"before": 1160.0, "after": 1080.0})
+        r.eq("owner_sized: the plan does not move before the tap", book_of(c)["ANET"], (25.0, "active"))
+        txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, b)))
+        for want in ("Buy $80 of ANET", "That takes ANET from 25.5% of the account to 29.5%.",
+                     "When the order fills, the plan moves with it: ANET goes from 25.0% to 29.5% of the "
+                     "account and cash goes from 60.0% to 55.5%.", "Cash goes from $1,160.00 to $1,080.00."):
+            r.ok(f"owner_sized: the card says {want!r}", want in txt, txt)
+        r.ok("owner_sized: the card does not call 29.5% the plan before the tap", "29.5% we planned" not in txt, txt)
+        res = tap(c, b["proposal_id"])
+        r.ok("owner_sized: Approve is ok", res["ok"] and c.prop(b["proposal_id"])["state"] == "approved", res)
+        r.eq("owner_sized: Approve alone does not move the plan (nothing is placed yet)",
+             (book_of(c)["ANET"][0], book_of(c)["SGOV"][0]), (25.0, 60.0))
+        fill_all(c, b["proposal_id"])
+        bk = book_of(c)
+        r.eq("owner_sized: the fill moves the plan with the order", (bk["ANET"][0], bk["SGOV"][0]), (29.5, 55.5))
+        fill_all(c, b["proposal_id"])
+        r.eq("owner_sized: a second close moves nothing more", (book_of(c)["ANET"][0], book_of(c)["SGOV"][0]),
+             (29.5, 55.5))
+        r.eq("owner_sized: the book still sums to 100",
+             round(sum(w for w, st in bk.values() if st == "active"), 6), 100.0)
+        log = c.q("SELECT ticker, from_value, to_value FROM strategy_change_log WHERE trigger='owner_trade' "
+                  "ORDER BY ticker")
+        r.eq("owner_sized: the change log names the card", [(x["ticker"], x["from_value"], x["to_value"]) for x in log],
+             [("ANET", "25.0", "29.5"), ("SGOV", "60.0", "55.5")])
+        r.eq("owner_sized: the execute job is queued",
+             c.one("SELECT COUNT(*) n FROM broker_jobs WHERE kind='execute' AND proposal_id=?",
+                   (b["proposal_id"],))["n"], 1)
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "CEG", "sell_all": True}])
+        tap(c, b["proposal_id"])
+        proposals.close_from_legs(c.led, b["proposal_id"], c.now())      # nothing was placed
+        r.eq("owner_sized: an approved card that sends nothing leaves the plan as it was",
+             (c.prop(b["proposal_id"])["state"], book_of(c)["CEG"], book_of(c)["SGOV"][0],
+              c.one("SELECT status FROM companies WHERE ticker='CEG'")["status"]),
+             ("failed", (15.0, "active"), 60.0, "holding"))
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 80}])
+        res = tap(c, b["proposal_id"], action="r")
+        r.ok("owner_sized: Reject leaves the plan as it was", res["ok"] and book_of(c)["ANET"] == (25.0, "active")
+             and book_of(c)["SGOV"][0] == 60.0, (res, book_of(c)))
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "ANET", "target_weight": 29}])
+        r.eq("owner_sized: target_weight 29% -> a buy of $70 (29% of $2,000 less $510)", leg(b, "ANET")["dollars"],
+             70.0)
+        b = sized(c, [{"ticker": "CEG", "sell_dollars": 100}])
+        lg = leg(b, "CEG")
+        r.ok("owner_sized: sell $100 of CEG -> 0.333333 sh", lg["side"] == "sell" and near(lg["quantity"], 0.333333),
+             lg)
+        r.eq("owner_sized: a sale lowers the plan to the weight after it; cash takes the rest",
+             (b["plan"]["changes"][0]["target_weight"], b["plan"]["cash"]["target_weight"]), (11.5, 63.5))
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 20}])
+        r.eq("owner_sized: a buy past the plan raises it to the weight after the buy (25.5% + $20 = 26.5%)",
+             b["plan"]["changes"][0]["target_weight"], 26.5)
+        b = sized(c, [{"ticker": "CEG", "sell_all": True}])
+        r.eq("owner_sized: sell_all sells the whole position and takes it out of the plan",
+             (leg(b, "CEG")["quantity"], b["plan"]["changes"][0]["exit"], b["plan"]["changes"][0]["target_weight"]),
+             (1.1, True, 0.0))
+        res = tap(c, b["proposal_id"])
+        fill_all(c, b["proposal_id"])
+        r.eq("owner_sized: a filled sell_all: CEG leaves the plan and cash takes its 15%",
+             (book_of(c)["CEG"], book_of(c)["SGOV"][0]), ((0.0, "exiting"), 75.0))
+        r.eq("owner_sized: sell_all drops the company", c.one("SELECT status FROM companies WHERE ticker='CEG'")["status"],
+             "dropped")
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 80}], fund_from=["CEG"])
+        sl = leg(b, "CEG")
+        r.ok("owner_sized: fund_from CEG sells about $80 of CEG", sl and sl["side"] == "sell"
+             and near(sl["quantity"] * sl["quote"], 80.0, 0.01), sl)
+        r.eq("owner_sized: fund_from: the sells go first", [l["ticker"] for l in b["legs"]], ["CEG", "ANET"])
+        r.eq("owner_sized: fund_from: the plan moves both names, cash nets out",
+             (b["plan"]["changes"], b["plan"]["cash"]["target_weight"]),
+             ([{"ticker": "CEG", "from": 15.0, "target_weight": 12.5, "exit": False},
+               {"ticker": "ANET", "from": 25.0, "target_weight": 29.5, "exit": False}], 58.0))
+        tap(c, b["proposal_id"])
+        for lgr in c.legs(b["proposal_id"]):      # the CEG sale fills; the ANET buy is never placed
+            if lgr["ticker"] == "CEG":
+                c.led.set_order_state(lgr["ref_id"], "filled")
+        proposals.close_from_legs(c.led, b["proposal_id"], c.now())
+        r.eq("owner_sized: a partial fill moves the plan for the filled name only; cash takes its part",
+             (c.prop(b["proposal_id"])["state"], book_of(c)["CEG"][0], book_of(c)["ANET"][0], book_of(c)["SGOV"][0]),
+             ("partially_executed", 12.5, 25.0, 62.5))
+    with case() as c:
+        c.snap(**SIZED)
+        rows = [("over the per-name limit", [{"ticker": "ANET", "buy_dollars": 100}],
+                 "over the 30% limit per name. The most it can take now is about $90.00 more"),
+                ("under the minimum", [{"ticker": "ANET", "buy_dollars": 3}], "under the $5.00 minimum"),
+                ("the cash sleeve", [{"ticker": "SGOV", "buy_dollars": 50}], "cash sleeve"),
+                ("not in the plan", [{"ticker": "TSM", "buy_dollars": 50}], "not in the book; propose add_company"),
+                ("two sizes", [{"ticker": "ANET", "buy_dollars": 50, "target_weight": 28}], "exactly one of"),
+                ("a target over the limit", [{"ticker": "ANET", "target_weight": 31}], "over the 30% limit")]
+        for name, orders, want in rows:
+            e = refusal(lambda: sized(c, orders))
+            r.ok(f"owner_sized: refused: {name}", e is not None and want in e, e)
+        mid = c.owner_msg("buy ANET")
+        e = refusal(lambda: build(c, [], origin={"event_id": 1}, rationale="x", evidence=[], created_by="analyst",
+                                  role="analyst", orders=[{"ticker": "ANET", "buy_dollars": 50}]))
+        r.ok("owner_sized: an event trade takes no sized order", e is not None and "owner" in e, e)
+        e = refusal(lambda: build(c, [], origin={"owner_message_id": mid}, rationale="x", evidence=[], created_by="desk",
+                                  role="desk", turn_owner_ids=[mid + 1], orders=[{"ticker": "ANET", "buy_dollars": 50}]))
+        r.ok("owner_sized: a message from another turn is refused", e is not None and "not part of this turn" in e, e)
+        c.root.kill.write_text("stop")
+        e = refusal(lambda: sized(c, [{"ticker": "ANET", "buy_dollars": 50}]))
+        r.ok("owner_sized: KILL still refuses a sized owner trade", e is not None and "KILL" in e, e)
+        c.root.kill.unlink()
+        c.led.set_holding_status(c.gid(), "CEG", "exiting", c.now())
+        e = refusal(lambda: sized(c, [{"ticker": "CEG", "buy_dollars": 50}]))
+        r.ok("owner_sized: a buy of a name on its way out asks to add it back first",
+             e is not None and "on its way out" in e and "add_company" in e, e)
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "CEG", "target_weight": 0}])
+        r.eq("owner_sized: target_weight 0 sells all and takes the name out",
+             (leg(b, "CEG")["quantity"], b["plan"]["changes"][0]["exit"]), (1.1, True))
+        for name, order, want in (("0 and a size", {"ticker": "CEG", "target_weight": 0, "sell_dollars": 50},
+                                   "exactly one of"),
+                                  ("sell_all as a string", {"ticker": "CEG", "sell_all": "false"}, "sell_all is true"),
+                                  ("a fraction over 1", {"ticker": "CEG", "sell_fraction": 1.5}, "at most 1")):
+            e = refusal(lambda: sized(c, [order]))
+            r.ok(f"owner_sized: refused: {name}", e is not None and want in e, e)
+        b = sized(c, [{"ticker": "CEG", "sell_fraction": 0.5}])
+        r.ok("owner_sized: sell_fraction 0.5 sells half the holding (0.55 sh)", near(leg(b, "CEG")["quantity"], 0.55), b)
+        r.eq("owner_sized: sell_all false counts as left out", refusal(lambda: sized(
+            c, [{"ticker": "ANET", "buy_dollars": 20, "sell_all": False}])), None)
+    with case() as c:
+        c.snap(positions={"ANET": 4.4, "CEG": 1.1}, buying_power=1010.0, equity=2000.0)   # ANET 33%, cap 30%
+        b = sized(c, [{"ticker": "ANET", "sell_dollars": 20}])
+        r.ok("owner_sized: a sale of a name over the limit is never held to the limit",
+             leg(b, "ANET") and leg(b, "ANET")["side"] == "sell", b)
+    with case() as c:
+        c.snap(positions={"ANET": 2, "CEG": 1}, buying_power=50.0, equity=950.0)
+        e = refusal(lambda: sized(c, [{"ticker": "CEG", "buy_dollars": 60}]))
+        r.ok("owner_sized: not enough cash: the refusal gives the numbers and the way out",
+             e is not None and "need $60.00, but $45.00 can be spent" in e and "fund_from" in e, e)
+    with case() as c:
+        c.snap(**SIZED)
+        before = c.one("SELECT COUNT(*) n FROM proposals")["n"]
+        mid = c.owner_msg("what if we bought $80 of ANET?")
+        pv = proposals.preview_trade(c.led, c.cfg, tickers=[], origin={"owner_message_id": mid}, rationale="x",
+                                     evidence=[], created_by="desk", role="desk", turn_owner_ids=[mid],
+                                     orders=[{"ticker": "ANET", "buy_dollars": 80}], yf_price_fn=PX())
+        r.eq("owner_sized: preview: the same plan as the card", pv["plan"]["changes"][0]["target_weight"], 29.5)
+        r.eq("owner_sized: preview: nothing is written",
+             (c.one("SELECT COUNT(*) n FROM proposals")["n"], c.one("SELECT COUNT(*) n FROM orders WHERE "
+                                                                   "state='proposed'")["n"]), (before, 0))
+        r.ok("owner_sized: preview: no proposal id", "proposal_id" not in pv, pv.keys())
+    with case() as c:
+        c.snap(**SIZED)
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 80}])
+        with c.led.connect() as conn:          # a hard cash floor set after the card was made
+            desk_settings.write(conn, "cash_floor_pct", 58.0, c.now(), None)
+        res = tap(c, b["proposal_id"])
+        p = c.prop(b["proposal_id"])
+        r.ok("owner_sized: a plan that fails its check at the tap sends nothing",
+             not res["ok"] and p["state"] == "failed" and "cash floor" in res["messages"][0], (res, p["state"]))
+        r.eq("owner_sized: ... and its legs end skipped, the plan unchanged, no execute job",
+             ([l["state"] for l in c.legs(b["proposal_id"])], book_of(c)["ANET"][0],
+              c.one("SELECT COUNT(*) n FROM broker_jobs WHERE kind='execute'")["n"]), (["skipped"], 25.0, 0))
+    with case() as c:
+        c.snap(**SIZED)
+        b = owner_trade(c, ["ANET", "CEG"], 1.0)
+        r.eq("owner_sized: an owner trade toward the plan keeps the plan (no plan on the card)", b["plan"], None)
+        r.eq("owner_sized: ... and may spend the plan's cash (the owner's money rule)", b["money_rule"], "owner")
+
+
+def case_owner_sized_requote():
+    """A requote keeps the owner's size (the 2026-11-04 review): ANET is 15% against a 25% plan,
+    the owner buys $20, and ANET moves 3.3% before the check."""
+    moved = {"ANET": 155.0, "CEG": 300.0, "SGOV": 100.0}
+    with case(at="2026-08-05T14:30:00Z") as c:
+        c.snap()
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 20}])
+        r.eq("owner_sized_requote: a $20 buy under the plan moves no plan", (leg(b, "ANET")["dollars"], b["plan"]),
+             (20.0, None))
+        c.at("2026-08-05T14:32:00Z")
+        chk, res, _snap = _requote(c, b["proposal_id"], moved)
+        new = res["new"] if res else None
+        r.ok("owner_sized_requote: the 3.3% move requotes", chk.get("action") == "requote" and new, (chk, res))
+        if new:
+            r.eq("owner_sized_requote: the new card still buys $20 (not the $192.50 to the plan)",
+                 [(l["ticker"], l["side"], l.get("dollars")) for l in new["legs"]], [("ANET", "buy", 20.0)])
+            p = json.loads(c.prop(new["proposal_id"])["payload_json"])
+            r.eq("owner_sized_requote: it stays sized, under the owner's money rule", (p["sized"], p["money_rule"]),
+                 (True, "owner"))
+    with case(at="2026-08-05T14:30:00Z") as c:
+        c.snap()
+        c.at("2026-08-05T14:32:00Z")
+        b2 = sized(c, [{"ticker": "ANET", "target_weight": 28}])   # 15% -> 28%, past the 25% plan
+        chk, res, _snap = _requote(c, b2["proposal_id"], moved)
+        new = res["new"] if res else None
+        if new:
+            p = json.loads(c.prop(new["proposal_id"])["payload_json"])
+            r.eq("owner_sized_requote: the requote keeps the dollars and carries the plan move",
+                 ([l.get("dollars") for l in new["legs"]], (p.get("plan") or {}).get("changes", [{}])[0].get("target_weight")),
+                 ([leg(b2, "ANET")["dollars"]], b2["plan"]["changes"][0]["target_weight"]))
+            r.eq("owner_sized_requote: the plan has not moved yet", book_of(c)["ANET"][0], 25.0)
+        else:
+            r.ok("owner_sized_requote: the 3.3% move requotes the sized card", False, (chk, res))
+
+
 CASES = [case_refuse, case_buy, case_sell, case_entry_max, case_order_scale, case_reserve, case_origin_event,
          case_anti_flip, case_origin_owner, case_supersede, case_expiry, case_card, case_drift, case_quote_source,
-         case_verdict_table, case_desk_news, case_owner_quote, case_leg_end, case_requote_copy]
+         case_verdict_table, case_desk_news, case_owner_quote, case_leg_end, case_requote_copy, case_owner_sized,
+         case_owner_sized_requote]
 
 if __name__ == "__main__":
     for fn in CASES:

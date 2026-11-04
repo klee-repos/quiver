@@ -24,7 +24,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-from lib import market, memory
+from lib import market, memory, notify
 from lib.desk import (agenda, documents, edgar, etf, events, findings, learning, news, outbox, proposals, quotes,
                       reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
 
@@ -48,7 +48,7 @@ READ_TOOLS = (
 )
 DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
              "defer_item", "hold_agenda", "show_card", "promise_read", "add_rule", "retire_rule",
-             "retire_lesson")
+             "retire_lesson", "plan_trade")
 ANALYST_ONLY = ("report", "record_verdict", "record_forecast")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
@@ -1058,6 +1058,60 @@ def _file_with_job(ctx: ToolContext, proposal_id: int, superseded, *, card=None)
     return True
 
 
+def _held(ctx: ToolContext, entry: tuple) -> bool:
+    """Hold a card or a Python note for the end of the desk turn (the bridge sends ``after``
+    once the desk's last message is out), so the card is the newest message. False outside
+    a bridge turn: the caller sends at once."""
+    if ctx.role != "desk" or ctx.turn is None or not getattr(ctx.turn, "hold_cards", False):
+        return False
+    ctx.turn.after.append(entry)
+    return True
+
+
+def _sizing_args(args: dict) -> tuple:
+    """``(orders, fund_from, every ticker named)`` of a trade request (§10.6)."""
+    orders = args.get("orders")
+    if orders is not None and (not isinstance(orders, list) or not all(isinstance(o, dict) for o in orders)):
+        raise ToolError("orders is a list of {ticker, buy_dollars | sell_dollars | sell_fraction | target_weight | "
+                        "sell_all}")
+    fund_from = args.get("fund_from")
+    if fund_from is not None and not isinstance(fund_from, list):
+        raise ToolError('fund_from is a list of tickers to sell to pay for the buys, or ["cash"]')
+    names = [str(t) for t in args.get("tickers") or [] if t]
+    names += [str(o.get("ticker")) for o in orders or [] if o.get("ticker")]
+    names += [str(t) for t in fund_from or [] if t and str(t).lower() != "cash"]
+    return orders or None, fund_from, names
+
+
+def _trade_out(built: dict) -> dict:
+    return {"legs": [{"ticker": l["ticker"], "side": l["side"], "dollars": l.get("dollars"),
+                      "quantity": l.get("quantity"), "quote": l["quote"],
+                      "weight_now": round(l["weight_now"], 2) if l.get("weight_now") is not None else None,
+                      "weight_after": round(l["weight_after"], 2) if l.get("weight_after") is not None else None}
+                     for l in built["legs"]],
+            "skipped": built["skipped"], "plan": built.get("plan"), "cash": built.get("cash")}
+
+
+def t_plan_trade(ctx: ToolContext, args: dict) -> dict:
+    """Work out an owner trade with Python's numbers and send nothing (§10.6)."""
+    origin = args.get("origin") or {}
+    if not isinstance(origin, dict) or "owner_message_id" not in origin:
+        raise ToolError('origin must be {"owner_message_id": n}: plan_trade works out a trade the owner asks for')
+    orders, fund_from, names = _sizing_args(args)
+    yf = proposals.prefetch_prices(ctx.led, names, yf_price_fn=ctx.yf_price_fn or quotes.yf_last_price)
+    try:
+        res = proposals.preview_trade(
+            ctx.led, ctx.cfg, tickers=args.get("tickers") or [], origin=origin, fraction=args.get("fraction"),
+            rationale="A preview for the owner.", evidence=[], created_by=ctx.role, role=ctx.role,
+            turn_owner_ids=(ctx.turn.owner_message_ids if ctx.turn is not None else ()), yf_price_fn=yf,
+            orders=orders, fund_from=fund_from)
+    except proposals.ProposalError as e:
+        raise ToolError(str(e))
+    return {**_trade_out(res), "deployable": round(res["deployable"], 2), "scaled": res["scaled"],
+            "note": ("Nothing was sent. Talk the size and the money through with the owner from these numbers. "
+                     "propose_trade with the same inputs sends this card.")}
+
+
 def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
     origin = args.get("origin") or {}
     if not isinstance(origin, dict):
@@ -1068,16 +1122,18 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
             ctx.job.kind != "analyze_event" or int(origin.get("event_id") or 0) != int(ctx.job.event_id or 0)):
         raise ToolError(f"this job can propose a trade only from its own event ({ctx.job.event_id})")
     p, used, fnote = _card_forecast_args(ctx, args)
-    yf = proposals.prefetch_prices(ctx.led, [str(t) for t in args.get("tickers") or [] if t],
-                                   yf_price_fn=ctx.yf_price_fn or quotes.yf_last_price)
+    orders, fund_from, names = _sizing_args(args)
+    evidence, enote = (_owner_evidence(args) if "owner_message_id" in origin
+                       else (args.get("evidence") or [], None))
+    yf = proposals.prefetch_prices(ctx.led, names, yf_price_fn=ctx.yf_price_fn or quotes.yf_last_price)
     try:
         with ctx.led.transaction() as c:
             built = proposals.build_trade(
                 ctx.led, c, cfg=ctx.cfg, tickers=args.get("tickers") or [], origin=origin,
                 fraction=args.get("fraction"), rationale=args.get("rationale") or "",
-                evidence=args.get("evidence") or [], created_by=ctx.role, role=ctx.role,
+                evidence=evidence, created_by=ctx.role, role=ctx.role,
                 turn_owner_ids=(ctx.turn.owner_message_ids if ctx.turn is not None else ()),
-                yf_price_fn=yf)
+                yf_price_fn=yf, orders=orders, fund_from=fund_from)
             sides = {}
             for leg in built["legs"]:
                 sides.setdefault(str(leg["ticker"]).upper(), 1 if leg["side"] == "buy" else -1)
@@ -1089,22 +1145,114 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
     if _file_with_job(ctx, built["proposal_id"], built["superseded"], card=card):
         note = ("The card waits with your report. The desk brings both up with the owner when they are free. "
                 "Only the owner's tap approves it.")
+    elif _held(ctx, ("card", built["proposal_id"], card)):
+        outbox.label_superseded(ctx.led, ctx.box, built["superseded"], built["proposal_id"])
+        note = ("The card with Approve and Reject goes out right after your last message, so it is the newest "
+                "message. Only the owner's tap approves it.")
     else:
         outbox.send_trade_card(ctx.led, ctx.box, ctx.led.connect, built)
         note = "The card with Approve and Reject is sent. Only the owner's tap approves it."
     if ctx.job is not None:
         ctx.job.proposal_ids.append(built["proposal_id"])
-    return {"proposal_id": built["proposal_id"], "fraction": built["fraction"],
-            "legs": [{"ticker": l["ticker"], "side": l["side"], "dollars": l.get("dollars"),
-                      "quantity": l.get("quantity"), "quote": l["quote"]} for l in built["legs"]],
-            "skipped": built["skipped"], "superseded": built["superseded"], "expires_at": built["expires_at"],
-            "forecasts": journal, **({"forecast_note": fnote} if fnote else {}), "note": note}
+    if built.get("plan"):
+        note += " When the order fills, the plan moves with it (the card says how), so nothing else is needed."
+    return {"proposal_id": built["proposal_id"], "fraction": built["fraction"], **_trade_out(built),
+            "superseded": built["superseded"], "expires_at": built["expires_at"],
+            "forecasts": journal, **({"forecast_note": fnote} if fnote else {}),
+            **({"evidence_note": enote} if enote else {}), "note": note}
+
+
+def _owner_follow_up(ctx: ToolContext, pid: int) -> dict:
+    """Build and send the trade that follows a change the owner made in chat (§10.6)."""
+    with ctx.conn() as c:
+        prop = proposals.get_proposal(c, pid)
+    yf = proposals.prefetch_prices(ctx.led, proposals.change_tickers(store.loads(prop.get("payload_json"), {})),
+                                   yf_price_fn=ctx.yf_price_fn or quotes.yf_last_price)
+    with ctx.led.transaction() as c:
+        fu = proposals.build_follow_up(ctx.led, c, ctx.cfg, prop, yf_price_fn=yf)
+        if fu.get("waiting"):
+            c.execute("UPDATE proposals SET result_json=? WHERE id=?",
+                      (store.canonical_json({"follow_up": "waiting"}), pid))
+            store.enqueue_snapshot_job(c, requested_by="follow_up", now=store.now_iso())
+    if fu.get("built"):
+        b = fu["built"]
+        if _held(ctx, ("card", b["proposal_id"], {"legs": b["legs"], "skipped": b["skipped"], "scaled": b["scaled"]})):
+            outbox.label_superseded(ctx.led, ctx.box, b["superseded"], b["proposal_id"])
+        else:
+            outbox.send_trade_card(ctx.led, ctx.box, ctx.led.connect, b)
+        return {"follow_up": {"proposal_id": b["proposal_id"], **_trade_out(b)},
+                "follow_note": "Its trade card with Approve and Reject goes to the owner as the newest message. Only "
+                               "the owner's tap sends the order."}
+    if fu.get("waiting"):
+        ctx.trigger("broker")
+        return {"follow_up": "waiting",
+                "follow_note": "The portfolio snapshot is old, so the trade card comes after a fresh snapshot, in a "
+                               "few minutes. Tell the owner."}
+    if fu.get("refused"):
+        return {"follow_up": {"refused": fu["refused"]},
+                "follow_note": "No trade card: " + fu["refused"] + ". Tell the owner in plain words and settle it."}
+    if fu.get("why"):
+        return {"follow_up": {"none": fu["why"]},
+                "follow_note": "No trade follows now: " + fu["why"] + ". Tell the owner why in plain words. To trade "
+                               "anyway, use propose_trade with orders."}
+    return {"follow_up": None, "follow_note": "No trade follows this change."}
+
+
+def _owner_evidence(args: dict) -> tuple:
+    """The evidence of an owner request: the owner's message is the reason, so an item that
+    is not a finding, a document or a metric is dropped, never a reason to refuse."""
+    keep, dropped = [], []
+    for e in args.get("evidence") or []:
+        try:
+            proposals.evidence_items([e])
+            keep.append(e)
+        except proposals.ProposalError:
+            dropped.append(e)
+    return keep, (f"evidence items that are not a finding, document or metric were dropped: {dropped}"
+                  if dropped else None)
+
+
+def _apply_from_owner(ctx: ToolContext, args: dict, change: dict, origin: dict) -> dict:
+    """A plan change the owner asked for in this turn: it applies at once, with no card."""
+    p, used, fnote = _card_forecast_args(ctx, args)
+    evidence, enote = _owner_evidence(args)
+    try:
+        with ctx.led.transaction() as c:
+            res = proposals.apply_owner_change(
+                ctx.led, c, ctx.cfg, change=change, rationale=args.get("rationale") or "",
+                evidence=evidence, owner_message_id=origin.get("owner_message_id"),
+                turn_owner_ids=(ctx.turn.owner_message_ids if ctx.turn is not None else ()), role=ctx.role)
+            journal = _card_journal(c, ctx, res["proposal_id"], _change_sides(res["change"], res["before"]), p, used,
+                                    args.get("rationale") or "")
+    except proposals.ProposalError as e:
+        raise ToolError(str(e))
+    outbox.label_superseded(ctx.led, ctx.box, res["superseded"], res["proposal_id"])
+    # A fixed Python note with the exact numbers: a change a planted text talked the desk
+    # into is seen at once.
+    note_text = notify.render_change_applied({"change": res["change"], "before": res["before"]})
+    if not _held(ctx, ("text", note_text, None)):
+        ctx.box.send(note_text, source="system", delivered=1)
+    out = {"proposal_id": res["proposal_id"], "applied": True, "change": res["change"],
+           "superseded": res["superseded"], "forecasts": journal, **({"forecast_note": fnote} if fnote else {}),
+           **({"evidence_note": enote} if enote else {})}
+    out.update(_owner_follow_up(ctx, res["proposal_id"]))
+    out["note"] = ("The change is in. Python sends the owner a short note with the exact numbers, so do not repeat "
+                   "them. " + out.pop("follow_note"))
+    return out
 
 
 def t_propose_change(ctx: ToolContext, args: dict) -> dict:
     change = args.get("change")
     if not isinstance(change, dict):
         raise ToolError("change must be an object with a kind")
+    origin = args.get("origin")
+    if origin is not None:
+        if not isinstance(origin, dict) or set(origin) != {"owner_message_id"}:
+            raise ToolError('origin must be {"owner_message_id": n}: the owner message of this turn that asks for it')
+        if ctx.role != "desk":
+            raise ToolError("only the desk applies a change from the owner's message; file a card without origin")
+        if change.get("kind") not in proposals.TAP_ONLY_KINDS:
+            return _apply_from_owner(ctx, args, change, origin)
     p, used, fnote = _card_forecast_args(ctx, args)
     try:
         with ctx.led.transaction() as c:
@@ -1120,6 +1268,10 @@ def t_propose_change(ctx: ToolContext, args: dict) -> dict:
     if _file_with_job(ctx, built["proposal_id"], built["superseded"]):
         note = ("The card waits with your report. The desk brings both up with the owner when they are free. "
                 "Only the owner's tap applies it.")
+    elif _held(ctx, ("card", built["proposal_id"], None)):
+        outbox.label_superseded(ctx.led, ctx.box, built["superseded"], built["proposal_id"])
+        note = ("The card with Confirm and Reject goes out right after your last message. Only the owner's tap "
+                "applies it.")
     else:
         outbox.send_change_card(ctx.led, ctx.box, ctx.cfg, built["proposal_id"], superseded=built["superseded"])
         note = "The card with Confirm and Reject is sent. Only the owner's tap applies it."
@@ -1128,6 +1280,8 @@ def t_propose_change(ctx: ToolContext, args: dict) -> dict:
     if built["superseded"]:
         note += (" It replaces the older open card(s) " + ", ".join(f"#{s}" for s in built["superseded"]) +
                  " on the same subject; those buttons now say Replaced.")
+    if origin is not None:
+        note += " It changes a safety limit, so it waits for the owner's Confirm tap; say so in one sentence."
     return {"proposal_id": built["proposal_id"], "change": built["change"],
             "superseded": built["superseded"], "forecasts": journal, **({"forecast_note": fnote} if fnote else {}),
             "note": note}
@@ -1205,6 +1359,11 @@ TICKERS = {"type": "array", "items": S, "maxItems": 20}
 EVIDENCE = {"type": "array", "items": {"type": ["string", "object", "integer"]}, "maxItems": 30}
 P_BEAT = {"type": "number", "minimum": 0.01, "maximum": 0.99}
 LESSONS_USED = {"type": "array", "items": I, "maxItems": 12}
+ORDERS = {"type": "array", "maxItems": 10, "items": {"type": "object", "properties": {
+    "ticker": S, "buy_dollars": N, "sell_dollars": N, "sell_fraction": N, "target_weight": N,
+    "sell_all": {"type": "boolean"}},
+    "required": ["ticker"], "additionalProperties": False}}
+FUND_FROM = {"type": "array", "items": S, "maxItems": 5}
 
 SPECS = {
     "portfolio_view": ("The latest broker snapshot with live prices: equity, cash, buying power, each position's "
@@ -1308,23 +1467,39 @@ SPECS = {
     "retire_lesson": ("Retire a lesson when the owner disagrees with it.",
                       _obj({"lesson_id": I, "reason": S}, ["lesson_id"])),
     "withdraw_proposal": ("Withdraw a pending proposal the desk made.", _obj({"proposal_id": I}, ["proposal_id"])),
-    "propose_trade": ("Propose a trade toward the target. Python sizes it; the owner taps Approve. origin is "
-                      '{"event_id": n} or {"owner_message_id": n}; fraction (owner trades only) is 0.25, 0.5 or 1.0. '
+    "propose_trade": ("Propose a trade. Python sizes it and sends the card; the owner taps Approve. origin is "
+                      '{"event_id": n} or {"owner_message_id": n}. An owner trade takes either tickers with '
+                      "fraction (0.25, 0.5 or 1.0 of the way to the plan), or orders: [{ticker, buy_dollars | "
+                      "sell_dollars | sell_fraction (0.5 = half the holding) | target_weight (percent of the "
+                      'account) | sell_all: true}] with fund_from (holdings to sell to pay for the buys; default '
+                      '["cash"]). With orders, Python moves the plan to fit the trade when the order fills, so the '
+                      "plan never blocks a trade the owner asks for. "
                       "p_beat_benchmark (optional, one name only): your chance the name beats SPY over 90 days.",
-                      _obj({"tickers": TICKERS, "origin": {"type": "object"}, "fraction": N, "rationale": S,
-                            "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},
-                           ["tickers", "origin", "rationale", "evidence"])),
-    "propose_change": ("Propose a change. The owner taps Confirm. `change.kind` is one of: "
+                      _obj({"tickers": TICKERS, "origin": {"type": "object"}, "fraction": N, "orders": ORDERS,
+                            "fund_from": FUND_FROM, "rationale": S, "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT,
+                            "lessons_used": LESSONS_USED},
+                           ["origin", "rationale"])),
+    "plan_trade": ("Work out a trade the owner asks for, and send nothing: the same inputs as propose_trade "
+                   '(origin {"owner_message_id": n}, orders or tickers with fraction, fund_from). Returns the exact '
+                   "orders, how the plan moves, and the cash before and after. Use it to settle the size and where "
+                   "the money comes from with the owner.",
+                   _obj({"tickers": TICKERS, "origin": {"type": "object"}, "fraction": N, "orders": ORDERS,
+                         "fund_from": FUND_FROM}, ["origin"])),
+    "propose_change": ("Change the plan. With origin {\"owner_message_id\": n} (the owner's message in this turn "
+                       "that asks for it), a plan change applies at once with no card: Python sends the owner a "
+                       "short note and the trade card that follows, if any. set_risk and resume_trading always "
+                       "send a Confirm card. Without origin, a card with Confirm and Reject goes to the owner. "
+                       "Leave the cash sleeve out and Python balances the plan on it. `change.kind` is one of: "
                        "add_company {ticker, sleeve, target_weight, band, entry {mode: now|at_or_below, price}, "
                        "funding [{ticker, target_weight}]}; drop_company {ticker, exit {mode: now|at_or_above, price}, "
                        "redistribute [{ticker, target_weight}]}; set_weights {changes [{ticker, target_weight, band}]}; "
                        "set_risk {key, value}; set_premise {text, goal {target_return_pct, horizon_months, benchmark}}; "
                        "set_thesis {ticker, premise_link, summary, drivers [], falsifiers [], "
                        "valuation {method, scenarios}, buy_below, trim_above}; resume_trading {}. "
-                       "Use exactly these field names. Each accepted call sends a card to the owner.",
-                       _obj({"change": {"type": "object"}, "rationale": S, "evidence": EVIDENCE,
-                             "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},
-                            ["change", "rationale", "evidence"])),
+                       "Use exactly these field names.",
+                       _obj({"change": {"type": "object"}, "origin": {"type": "object"}, "rationale": S,
+                             "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},
+                            ["change", "rationale"])),
 }
 
 FUNCS = {name: globals()[f"t_{name}"] for name in SPECS}

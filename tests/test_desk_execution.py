@@ -244,14 +244,18 @@ class Ctx:
         at = kw.pop("at", None) or self.now()
         return snapshot(self.root, at=at, **kw)
 
-    def build(self, tickers, fraction=1.0):
+    def build(self, tickers, fraction=1.0, *, drift=False, orders=None):
         self.owner_msg += 1
         with self.led.transaction() as c:
+            if drift:
+                return proposals.build_trade(self.led, c, cfg=self.cfg, tickers=list(tickers), origin={},
+                                             python_origin="drift", rationale="The book drifted.", evidence=[],
+                                             created_by="monitor", now_dt=self.clk.now, yf_price_fn=_no_yfinance)
             return proposals.build_trade(self.led, c, cfg=self.cfg, tickers=list(tickers),
                                          origin={"owner_message_id": self.owner_msg}, fraction=fraction,
                                          rationale="Test trade.", evidence=[], created_by="desk", role="desk",
                                          turn_owner_ids=[self.owner_msg], now_dt=self.clk.now,
-                                         yf_price_fn=_no_yfinance)
+                                         yf_price_fn=_no_yfinance, orders=orders)
 
     def approve(self, built):
         outbox.send_trade_card(self.led, self.box, self.led.connect, built, now_dt=self.clk.now)
@@ -1602,11 +1606,14 @@ def t_fields():
 
 def t_buy_clamp():
     build_q = {**STD_Q, "ANET": 152.40}
+    # "floor null" follows the plan's cash share (SGOV 60%) for a drift trade. An owner trade
+    # may spend the plan's cash (§10.6), so for it a null floor is no floor.
     for label, bp, floor, want_kind in (("floor 0", 150.0, 0.0, "clamp"), ("floor null", 150.0, None, "clamp"),
+                                        ("floor null owner", 150.0, None, "clamp"),
                                         ("bp 500", 500.0, 0.0, "full"), ("bp 1e6", 1_000_000.0, 0.0, "full"),
                                         ("under min", 9.0, 0.0, "skip")):
         with case(f"buy_clamp {label}", quotes=build_q) as c:
-            built = c.build(["ANET"])
+            built = c.build(["ANET"], drift=(label == "floor null"))
             leg0 = c.legs(built["proposal_id"])[0]
             r.eq(f"buy_clamp {label}: the built leg is 196.40", leg0["dollar_amount"], 196.40)
             c.setting("cash_floor_pct", floor)
@@ -1621,11 +1628,11 @@ def t_buy_clamp():
             leg = c.legs(pid)[0]
             d = 2 * 152.80 + 300 + 1100 + bp
             room = 0.25 * d - 2 * 152.80
-            fl = 0.0 if floor is not None else 60.0
+            fl = 60.0 if label == "floor null" else 0.0
             money = min(bp - 5, bp + 1100 - fl / 100.0 * d)
             want = round(min(196.40, room, money), 2)
             if want_kind == "clamp":
-                exp = {"floor 0": 145.00, "floor null": 136.64}[label]
+                exp = {"floor 0": 145.00, "floor null": 136.64, "floor null owner": 145.00}[label]
                 r.eq(f"buy_clamp {label}: the plan number", want, exp)
                 r.eq(f"buy_clamp {label}: clamped to {exp}", (leg["state"], leg["dollar_amount"], leg["clamped_from"]),
                      ("checked", exp, 196.40))
@@ -1635,6 +1642,57 @@ def t_buy_clamp():
                      ("checked", 196.40, None))
             else:
                 r.eq(f"buy_clamp {label}: under min_trade_notional -> skipped", (leg["state"], out.get("action")), ("skipped", "none"))
+
+
+def t_owner_money():
+    """§10.6: a sized owner buy keeps its size through exec-check when cash is under the plan's
+    cash share. The 2026-11-04 case: cash $1,160 of $2,000 (58%), the plan keeps 60%."""
+    pos = {"ANET": 3.4, "CEG": 1.1}
+    with case("owner_money", positions=pos, buying_power=1160.0, equity=2000.0) as c:
+        built = c.build([], orders=[{"ticker": "ANET", "buy_dollars": 80}])
+        r.eq("owner_money: the card buys $80 and the plan follows (ANET 29.5%)",
+             (c.legs(built["proposal_id"])[0]["dollar_amount"], built["plan"]["changes"][0]["target_weight"]),
+             (80.0, 29.5))
+        c.clk.advance(10)
+        c.approve(built)
+        c.clk.advance(10)
+        pid = built["proposal_id"]
+        prep, env = c.start(pid)
+        # ANET up 1.0% (inside the 1.5% tolerance). The plan still says 25% (it moves when the
+        # order fills), so neither the plan's room nor its cash share may cut the approved $80.
+        live = {"positions": pos, "quotes": {**STD_Q, "ANET": 151.5}, "bp": 1160.0, "equity": 2000.0}
+        c.check(pid, "sells", c.write("s.json", c.snapfile(**live)), env)
+        out = c.check(pid, "buys", c.write("b.json", c.snapfile(**live)), env)
+        leg = c.legs(pid)[0]
+        r.eq("owner_money: exec-check keeps the whole $80 after a 1% move",
+             (leg["state"], leg["dollar_amount"], leg["clamped_from"]), ("checked", 80.0, None))
+        r.eq("owner_money: the returned field", [l["dollar_amount"] for l in out.get("legs", [])], ["80.00"])
+    with case("owner_money sell", positions={"ANET": 4.4, "CEG": 1.1}, buying_power=1010.0, equity=2000.0) as c:
+        built = c.build([], orders=[{"ticker": "ANET", "sell_dollars": 150}])
+        want = c.legs(built["proposal_id"])[0]["quantity"]
+        c.clk.advance(10)
+        c.approve(built)
+        c.clk.advance(10)
+        pid = built["proposal_id"]
+        prep, env = c.start(pid)
+        live = {"positions": {"ANET": 4.4, "CEG": 1.1}, "quotes": {**STD_Q, "ANET": 148.0}, "bp": 1010.0,
+                "equity": 2000.0}
+        c.check(pid, "sells", c.write("s.json", c.snapfile(**live)), env)
+        leg = c.legs(pid)[0]
+        r.eq("owner_money: a sized sale keeps its quantity after a 1.3% drop (the plan does not cap it)",
+             (leg["state"], leg["quantity"]), ("checked", want))
+    with case("owner_money drift", positions={"ANET": 3.2, "CEG": 1.1}, buying_power=1190.0, equity=2000.0) as c:
+        e = _refusal(lambda: c.build(["ANET"], drift=True))
+        r.ok("owner_money: a drift buy under the same cash finds no money (the plan's rule)",
+             e is not None and "no cash to spend" in e, e)
+
+
+def _refusal(fn):
+    try:
+        fn()
+    except proposals.ProposalError as e:
+        return str(e)
+    return None
 
 
 # =============================================================================================
@@ -2508,7 +2566,8 @@ def t_gate_b():
         r.eq("gate-b SEC-1: no ledger cell holds the account number", sorted(set(hits)), [])
 
 CASES = [t_prepare, t_check_gate, t_check_gate_jobs, t_requote_buys, t_stopped, t_canary, t_audit,
-         t_requote_edge, t_requote, t_no_quote, t_fields, t_buy_clamp, t_input_path, t_commit, t_review_gate,
+         t_requote_edge, t_requote, t_no_quote, t_fields, t_buy_clamp, t_owner_money, t_input_path, t_commit,
+         t_review_gate,
          t_fills, t_recovery, t_snapshot, t_child, t_wait, t_main, t_gate_b]
 
 if __name__ == "__main__":

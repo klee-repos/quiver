@@ -457,6 +457,11 @@ def _check_sells(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> di
     base = proposals.valuation_base(conn, snap, now_dt, None, snap)
     deployable = base["deployable"]
     min_notional = max(float(sett["min_trade_notional"]), sizing.MIN_SELL_NOTIONAL_USD)
+    # A sized owner trade (§10.6): the owner approved this exact sale, and the plan moves to it
+    # only when it fills, so the plan's target does not cap it. A sale of all of it is an exit.
+    payload = store.loads(prop.get("payload_json"), {}) or {}
+    sized = bool(payload.get("sized"))
+    sized_exits = {c["ticker"] for c in ((payload.get("plan") or {}).get("changes") or []) if c.get("exit")}
     out = []
     for l in legs:
         if l["side"] != "sell":
@@ -466,8 +471,8 @@ def _check_sells(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> di
         held = float(p.get("quantity") or 0.0)
         free = float(p.get("available") if p.get("available") is not None else held)
         row = rows.get(l["ticker"])
-        exit_leg = row is not None and row["status"] == "exiting"
-        if exit_leg:
+        exit_leg = (row is not None and row["status"] == "exiting") or (sized and l["ticker"] in sized_exits)
+        if exit_leg or sized:
             target_qty = held
         else:
             T = float((row or {}).get("target_weight") or 0.0) / 100.0 * deployable
@@ -529,7 +534,18 @@ def _check_buys(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> dic
     deployable = base["deployable"]
     bp = pf["buying_power"]
     cash_t = cfg.risk.cash_sleeve_ticker
-    floor_pct = desk_settings.cash_floor_pct(sett, list(rows.values()), cash_t)
+    # The card's money rule (proposals.build_trade, §10.6): an owner trade may spend the cash
+    # the plan keeps; only a set cash_floor_pct binds it. Every other trade keeps the plan's
+    # cash share. The rule comes from the payload Python wrote, never from a model.
+    payload = store.loads(prop.get("payload_json"), {}) or {}
+    if payload.get("money_rule") == "owner":
+        hard = sett.get("cash_floor_pct")
+        floor_pct = float(hard) if hard is not None else 0.0
+    else:
+        floor_pct = desk_settings.cash_floor_pct(sett, list(rows.values()), cash_t)
+    # A sized owner buy keeps the size the owner approved: the plan moves to it only when it
+    # fills, so the plan's room does not cap it. The money still does.
+    sized = bool(payload.get("sized"))
     money = min(bp - float(sett["min_buying_power_buffer"]),
                 bp + base["values"].get(cash_t, 0.0) - floor_pct / 100.0 * deployable)
     min_notional = max(float(sett["min_trade_notional"]), sizing.MIN_SELL_NOTIONAL_USD)
@@ -551,7 +567,7 @@ def _check_buys(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> dic
         row = rows.get(l["ticker"]) or {}
         T = float(row.get("target_weight") or 0.0) / 100.0 * deployable
         v = base["values"].get(l["ticker"], 0.0)
-        room = max(0.0, T - v)
+        room = float("inf") if sized else max(0.0, T - v)
         want = float(l["dollar_amount"] or 0.0)
         cap = max(0.0, min(room, money))
         dollars, _src = sizing.resolve_buy_dollars(want, 1.0, available=cap, min_notional=min_notional)

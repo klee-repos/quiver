@@ -1925,6 +1925,65 @@ def case_agenda_review_fixes():
             r.ok("stop: the agenda holds", agenda.hold_until(c, store.now_iso()) is not None)
 
 
+def case_card_last():
+    """§10.6: a card the desk makes in a turn goes out after its last message, so the card is
+    the newest message; a plan change's Python note goes just before its card."""
+    with world(seeded=True) as w:
+        br = w.bridge
+        snapshot(w.root, at="2026-08-05T13:59:00Z")
+        out = {}
+
+        def buy_then_say():
+            async def run(sdk, prompt):
+                yield init_msg(sdk.sid())
+                await react_all(sdk)
+                res = await sdk.tool("propose_trade", {
+                    "origin": {"owner_message_id": 5101}, "orders": [{"ticker": "ANET", "buy_dollars": 50}],
+                    "rationale": "You asked for more ANET."})
+                out["trade"] = res
+                await sdk.tool("say", {"text": "Yes, I'd add $50 of ANET. The card is right below."})
+                yield text_msg("done")
+                yield result_msg(sdk.sid())
+            return run
+
+        def change_then_say():
+            async def run(sdk, prompt):
+                yield init_msg(sdk.sid())
+                await react_all(sdk)
+                res = await sdk.tool("propose_change", {
+                    "change": {"kind": "set_weights", "changes": [{"ticker": "CEG", "target_weight": 20}]},
+                    "origin": {"owner_message_id": 5102}, "rationale": "You asked for more CEG."})
+                out["change"] = res
+                await sdk.tool("say", {"text": "Done, CEG's plan is up. Its buy card is below."})
+                yield text_msg("done")
+                yield result_msg(sdk.sid())
+            return run
+
+        async def go():
+            w.sdk.turns = [buy_then_say()]
+            msg_update(w, 5101, "buy $50 more ANET")
+            await poll_and_turn(br)
+            await settle()
+            out["n1"] = len(w.tg.of("sendMessage"))
+            w.sdk.turns = [change_then_say()]
+            fresh_poll_mark(w)
+            msg_update(w, 5102, "raise CEG to 20%")
+            await poll_and_turn(br)
+            await settle()
+        asyncio.run(go())
+        sent = w.tg.of("sendMessage")
+        kinds = [("card" if c["params"].get("reply_markup") else "text", str(c["params"].get("text"))[:40]) for c in sent]
+        r.ok("card_last: the trade tool ran", not is_err(out.get("trade") or {"is_error": True}), out.get("trade"))
+        first = kinds[:out.get("n1", 0)]
+        r.eq("card_last: turn 1: the desk's words, then the card (the newest message)",
+             [k for k, _ in first], ["text", "card"])
+        second = kinds[out.get("n1", 0):]
+        r.eq("card_last: turn 2: the desk's words, then Python's note, then the card",
+             [k for k, _ in second], ["text", "text", "card"])
+        r.ok("card_last: turn 2's middle message is Python's note", second[1][1].startswith("I changed the plan"),
+             second)
+
+
 CASES = [
     ("allowlist", case_allowlist),
     ("offset_crash", case_offset_crash),
@@ -1953,6 +2012,7 @@ CASES = [
     ("agenda_fallback", case_agenda_fallback),
     ("agenda_follow_up", case_agenda_follow_up),
     ("agenda_review_fixes", case_agenda_review_fixes),
+    ("card_last", case_card_last),
 ]
 
 
