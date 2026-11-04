@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from lib import market, memory
-from lib.desk import (agenda, documents, edgar, etf, events, findings, news, outbox, proposals, quotes,
+from lib.desk import (agenda, documents, edgar, etf, events, findings, learning, news, outbox, proposals, quotes,
                       reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
 
 SAY_LIMIT = 1200
@@ -44,13 +44,18 @@ READ_TOOLS = (
     "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials",
     "get_metrics", "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
     "get_events", "get_proposals", "get_track_record", "get_attribution", "get_settings",
-    "ledger_query", "screen_companies",
+    "ledger_query", "screen_companies", "get_learning",
 )
 DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
-             "defer_item", "hold_agenda", "show_card", "promise_read")
-ANALYST_ONLY = ("report", "record_verdict")
+             "defer_item", "hold_agenda", "show_card", "promise_read", "add_rule", "retire_rule",
+             "retire_lesson")
+ANALYST_ONLY = ("report", "record_verdict", "record_forecast")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
+# The reflect job (plan §6.5) reads the journal and the research, files one report and
+# changes the lessons. It cannot propose, record a finding or load a company.
+REFLECT_TOOLS = ("get_learning", "get_track_record", "get_company", "get_events", "get_proposals",
+                 "search_research", "get_document", "report", "curate_lessons")
 
 
 def role_tool_names(role: str) -> list:
@@ -58,6 +63,8 @@ def role_tool_names(role: str) -> list:
         return list(READ_TOOLS) + list(DESK_ONLY) + list(SHARED_WRITE)
     if role == "analyst":
         return list(READ_TOOLS) + list(ANALYST_ONLY) + list(SHARED_WRITE)
+    if role == "reflect":
+        return list(REFLECT_TOOLS)
     raise ValueError(role)
 
 
@@ -487,11 +494,18 @@ def t_get_proposals(ctx: ToolContext, args: dict) -> dict:
     return {"proposals": out}
 
 
+def _desk_decision(row: dict) -> bool:
+    """A ``decisions`` row of a desk trade. The ledger also holds the old bot's calls (June to
+    October 2026); they are not the desk's record."""
+    return "proposal_id" in str(row.get("proof_json") or "")
+
+
 def t_get_track_record(ctx: ToolContext, args: dict) -> dict:
     if args.get("ticker"):
         t = _ticker(args["ticker"])
-        rows = ctx.led.decisions_with_outcomes(t, limit=20)
-        return {"ticker": t, "scorecard": memory.scorecard(ctx.led, t), "decisions": rows}
+        rows = [r for r in ctx.led.decisions_with_outcomes(t, limit=200) if _desk_decision(r)][:20]
+        return {"ticker": t, "scorecard": memory.build_scorecard(t, rows), "decisions": rows,
+                "forecasts": "see get_learning for the graded forecasts"}
     with ctx.conn() as c:
         rows = [dict(r) for r in c.execute(
             "SELECT d.id, d.trade_date, d.ticker, d.signal, d.decision_price, o.directional_return, o.alpha, "
@@ -501,6 +515,24 @@ def t_get_track_record(ctx: ToolContext, args: dict) -> dict:
     hits = sum(1 for r in scored if (r["directional_return"] or 0) * (1 if r["signal"] == "buy" else -1) > 0)
     return {"decisions": rows, "scored": len(scored), "hit_rate": round(hits / len(scored), 4) if scored else None,
             "realized_pnl": round(sum(r["realized_pnl"] or 0 for r in rows), 2)}
+
+
+def t_get_learning(ctx: ToolContext, args: dict) -> dict:
+    """The graded track record of the journal, the active lessons and the owner's rules. With
+    a ticker: also that name's resolved and open forecasts."""
+    t = _ticker(args["ticker"]) if args.get("ticker") else None
+    with ctx.conn() as c:
+        cal = learning.calibration(c, ticker=t)
+        out = {"summary": learning.summary_line(cal), "scores": cal,
+               "lessons": learning.lesson_lines(learning.lessons_for(
+                   c, scope="desk" if ctx.role == "desk" else "analyst", ticker=t, limit=learning.LESSONS_ACTIVE_MAX)),
+               "rules": learning.rule_lines(learning.active_rules(c))}
+        if t:
+            out["resolved"] = learning.record_lines(c, t, limit=12)
+            out["open"] = [dict(r) for r in c.execute(
+                "SELECT id, source, verdict, p_beat, stance, made_at, due_date FROM forecasts WHERE ticker=? "
+                "AND resolved_at IS NULL ORDER BY id DESC LIMIT 12", (t,)).fetchall()]
+    return out
 
 
 def t_get_attribution(ctx: ToolContext, args: dict) -> dict:
@@ -850,14 +882,154 @@ def t_record_verdict(ctx: ToolContext, args: dict) -> dict:
     if ctx.job is not None and (ctx.job.kind != "analyze_event" or eid != ctx.job.event_id):
         # A job records the verdict of its own event only (an injected text must not close another).
         raise ToolError(f"this job analyzes event {ctx.job.event_id}, not event {eid}")
+    job_id = getattr(ctx.job, "job_id", None) if ctx.job is not None else None
     with ctx.conn() as c:
+        ev = c.execute("SELECT ticker, type FROM events WHERE id=?", (eid,)).fetchone()
+        if ev is None:
+            raise ToolError(f"event {eid} does not exist")
+        against_itself = str(ev["ticker"]).upper() == learning.BENCHMARK
+        try:
+            p = learning.check_p(args.get("p_beat_benchmark"), required=not against_itself)
+            used = learning.check_lessons_used(c, args.get("lessons_used"))
+        except learning.ForecastError as e:
+            raise ToolError(str(e))
         cur = c.execute("UPDATE events SET status='analyzed', verdict=?, analysis=?, analyzed_at=? "
                         "WHERE id=? AND status IN ('queued','analyzed')", (verdict, summary[:4000], store.now_iso(), eid))
         if cur.rowcount != 1:
             raise ToolError(f"event {eid} is not queued for analysis")
+        fid = None
+        if not against_itself:
+            fid = _journal(c, ctx, source="verdict", ticker=ev["ticker"], p=p, stance=learning.stance_of(p),
+                           reason=summary, horizon=learning.horizon_for("verdict", ev["type"]), verdict=verdict,
+                           event_id=eid, job_id=job_id, used=used)
     if ctx.job is not None:
         ctx.job.verdict_recorded = True
-    return {"event_id": eid, "verdict": verdict}
+        ctx.job.forecast_id = fid
+    out = {"event_id": eid, "verdict": verdict}
+    if fid:
+        out["forecast"] = {"id": fid, "p_beat_benchmark": p, "horizon_days": learning.horizon_for("verdict", ev["type"]),
+                           "benchmark": learning.BENCHMARK}
+    return out
+
+
+def _journal(c, ctx: ToolContext, *, source, ticker, p, stance, reason, horizon, verdict=None, event_id=None,
+             job_id=None, proposal_id=None, used=()) -> int:
+    """Write the call's forecast. A job keeps one forecast per source: a second call in the
+    same job (or in its retry) replaces the first. The window moves to the new call's next
+    close, so a restated chance never sees a price move inside its own window."""
+    if job_id is not None and source in ("verdict", "deep_dive"):
+        row = c.execute("SELECT id, horizon_days FROM forecasts WHERE job_id=? AND source=? AND resolved_at IS NULL "
+                        "AND marks_json='{}'", (job_id, source)).fetchone()
+        if row is not None:
+            made = ctx.now()
+            start = learning.start_session_for(made)
+            c.execute("UPDATE forecasts SET p_beat=?, stance=?, verdict=?, reason=?, lesson_ids=?, made_at=?, "
+                      "start_session=?, due_date=? WHERE id=?",
+                      (p, stance, verdict, " ".join(str(reason).split())[:learning.REASON_MAX],
+                       json.dumps(list(used)), store.iso(made), start, learning.add_days(start, row[1]), row[0]))
+            return int(row[0])
+    return learning.record_forecast(
+        c, source=source, ticker=ticker, p_beat=p, stance=stance, made_at=ctx.now(),
+        created_by="analyst" if ctx.role == "analyst" else "desk", reason=reason, horizon_days=horizon,
+        verdict=verdict, event_id=event_id, job_id=job_id, proposal_id=proposal_id, lessons_used=used)
+
+
+def t_record_forecast(ctx: ToolContext, args: dict) -> dict:
+    """The deep-dive's forecast (an event job states its chance in record_verdict)."""
+    if ctx.job is None or ctx.job.kind != "deep_dive" or ctx.job.job_id is None:
+        raise ToolError("record_forecast works inside a deep-dive job; an event analysis states it in record_verdict")
+    t = _ticker(args.get("ticker"))
+    if ctx.job.ticker and t != ctx.job.ticker:
+        raise ToolError(f"this deep-dive is on {ctx.job.ticker}, not {t}")
+    reason = str(args.get("reason") or "").strip()
+    if not reason:
+        raise ToolError("give a reason: the one or two facts behind the chance")
+    with ctx.conn() as c:
+        try:
+            p = learning.check_p(args.get("p_beat_benchmark"), required=True)
+            used = learning.check_lessons_used(c, args.get("lessons_used"))
+            fid = _journal(c, ctx, source="deep_dive", ticker=t, p=p, stance=learning.stance_of(p), reason=reason,
+                           horizon=learning.horizon_for("deep_dive"), job_id=ctx.job.job_id, used=used)
+        except learning.ForecastError as e:
+            raise ToolError(str(e))
+    ctx.job.forecast_id = fid
+    return {"forecast_id": fid, "ticker": t, "p_beat_benchmark": p, "horizon_days": learning.horizon_for("deep_dive"),
+            "benchmark": learning.BENCHMARK}
+
+
+def t_curate_lessons(ctx: ToolContext, args: dict) -> dict:
+    if ctx.role != "reflect" or ctx.job is None or ctx.job.job_id is None:
+        raise ToolError("curate_lessons works inside a reflect job only")
+    with ctx.conn() as c:
+        try:
+            res = learning.apply_ops(c, args.get("ops"), job_id=ctx.job.job_id, now_iso=store.now_iso())
+        except learning.LessonError as e:
+            raise ToolError(str(e))
+    return res
+
+
+def _owner_message(ctx: ToolContext, name: str, raw) -> int:
+    """The owner message id that a rule cites. It must be one of this turn's owner messages."""
+    _owner_turn(ctx, name)
+    try:
+        mid = int(raw)
+    except (TypeError, ValueError):
+        raise ToolError("give owner_message_id: the id of the owner message that states the rule")
+    if mid not in ctx.turn.owner_message_ids:
+        raise ToolError(f"message {mid} is not an owner message of this turn")
+    return mid
+
+
+def t_add_rule(ctx: ToolContext, args: dict) -> dict:
+    mid = _owner_message(ctx, "add_rule", args.get("owner_message_id"))
+    t = _ticker(args["ticker"]) if args.get("ticker") else None
+    with ctx.conn() as c:
+        try:
+            rid = learning.add_rule(c, text=str(args.get("text") or ""), owner_message_id=mid, ticker=t,
+                                    now_iso=store.now_iso())
+        except learning.LessonError as e:
+            raise ToolError(str(e))
+    _notice(ctx, f"I saved this as a standing rule (rule {rid}): \"{_norm(args.get('text'))}\" "
+                 "Tell me to drop it any time.")
+    return {"rule_id": rid, "note": "Every desk turn and every analyst job now sees this rule. Python sent the owner a "
+                                    "short notice with its exact words, so do not repeat the rule."}
+
+
+def t_retire_rule(ctx: ToolContext, args: dict) -> dict:
+    _owner_turn(ctx, "retire_rule")
+    with ctx.conn() as c:
+        try:
+            learning.retire_rule(c, args.get("rule_id"), reason=str(args.get("reason") or ""), now_iso=store.now_iso())
+        except learning.LessonError as e:
+            raise ToolError(str(e))
+        text = c.execute("SELECT text FROM owner_rules WHERE id=?", (int(args.get("rule_id")),)).fetchone()[0]
+    _notice(ctx, f"I dropped rule {int(args.get('rule_id'))}: \"{text}\"")
+    return {"rule_id": int(args.get("rule_id")), "retired": True}
+
+
+def _norm(text) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _notice(ctx: ToolContext, text: str) -> None:
+    """A fixed Python message to the owner for each change to the rules and the lessons. A
+    rule or a retirement that a planted document talked the desk into is seen at once."""
+    ctx.box.send(text, source="system", html=False, delivered=1)
+
+
+def t_retire_lesson(ctx: ToolContext, args: dict) -> dict:
+    """The owner can drop a lesson. A lesson is the desk's inference; the owner outranks it."""
+    _owner_turn(ctx, "retire_lesson")
+    with ctx.conn() as c:
+        try:
+            learning.retire_lesson(c, args.get("lesson_id"),
+                                   reason="the owner: " + (str(args.get("reason") or "").strip() or "asked to drop it"),
+                                   by="owner", now_iso=store.now_iso())
+        except learning.LessonError as e:
+            raise ToolError(str(e))
+        text = c.execute("SELECT text FROM lessons WHERE id=?", (int(args.get("lesson_id")),)).fetchone()[0]
+    _notice(ctx, f"I dropped lesson {int(args.get('lesson_id'))}: \"{text}\"")
+    return {"lesson_id": int(args.get("lesson_id")), "retired": True}
 
 
 def t_withdraw_proposal(ctx: ToolContext, args: dict) -> dict:
@@ -895,6 +1067,7 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
     if ctx.role == "analyst" and ctx.job is not None and (
             ctx.job.kind != "analyze_event" or int(origin.get("event_id") or 0) != int(ctx.job.event_id or 0)):
         raise ToolError(f"this job can propose a trade only from its own event ({ctx.job.event_id})")
+    p, used, fnote = _card_forecast_args(ctx, args)
     yf = proposals.prefetch_prices(ctx.led, [str(t) for t in args.get("tickers") or [] if t],
                                    yf_price_fn=ctx.yf_price_fn or quotes.yf_last_price)
     try:
@@ -905,6 +1078,11 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
                 evidence=args.get("evidence") or [], created_by=ctx.role, role=ctx.role,
                 turn_owner_ids=(ctx.turn.owner_message_ids if ctx.turn is not None else ()),
                 yf_price_fn=yf)
+            sides = {}
+            for leg in built["legs"]:
+                sides.setdefault(str(leg["ticker"]).upper(), 1 if leg["side"] == "buy" else -1)
+            journal = _card_journal(c, ctx, built["proposal_id"], sides, p, used, args.get("rationale") or "",
+                                    event_id=origin.get("event_id"))
     except proposals.ProposalError as e:
         raise ToolError(str(e))
     card = {"legs": built["legs"], "skipped": built["skipped"], "scaled": built["scaled"]}
@@ -920,17 +1098,23 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
             "legs": [{"ticker": l["ticker"], "side": l["side"], "dollars": l.get("dollars"),
                       "quantity": l.get("quantity"), "quote": l["quote"]} for l in built["legs"]],
             "skipped": built["skipped"], "superseded": built["superseded"], "expires_at": built["expires_at"],
-            "note": note}
+            "forecasts": journal, **({"forecast_note": fnote} if fnote else {}), "note": note}
 
 
 def t_propose_change(ctx: ToolContext, args: dict) -> dict:
     change = args.get("change")
     if not isinstance(change, dict):
         raise ToolError("change must be an object with a kind")
+    p, used, fnote = _card_forecast_args(ctx, args)
     try:
         with ctx.led.transaction() as c:
+            goal = proposals.active_goal(c)
+            before = {str(r["ticker"]).upper(): float(r["target_weight"] or 0)
+                      for r in (proposals.book_rows(c, goal["id"]) if goal else [])}
             built = proposals.build_change(c, ctx.cfg, change=change, rationale=args.get("rationale") or "",
                                            evidence=args.get("evidence") or [], created_by=ctx.role)
+            journal = _card_journal(c, ctx, built["proposal_id"], _change_sides(built["change"], before), p, used,
+                                    args.get("rationale") or "")
     except proposals.ProposalError as e:
         raise ToolError(str(e))
     if _file_with_job(ctx, built["proposal_id"], built["superseded"]):
@@ -945,7 +1129,67 @@ def t_propose_change(ctx: ToolContext, args: dict) -> dict:
         note += (" It replaces the older open card(s) " + ", ".join(f"#{s}" for s in built["superseded"]) +
                  " on the same subject; those buttons now say Replaced.")
     return {"proposal_id": built["proposal_id"], "change": built["change"],
-            "superseded": built["superseded"], "note": note}
+            "superseded": built["superseded"], "forecasts": journal, **({"forecast_note": fnote} if fnote else {}),
+            "note": note}
+
+
+def _card_forecast_args(ctx: ToolContext, args: dict) -> tuple:
+    """The card's optional stated chance and the lessons it used. A bad value is dropped, never
+    a reason to refuse the card: ``(chance, lessons, note)``."""
+    note = None
+    with ctx.conn() as c:
+        try:
+            p = learning.check_p(args.get("p_beat_benchmark"), required=False)
+        except learning.ForecastError as e:
+            p, note = None, f"the chance was dropped: {e}"
+        try:
+            used = learning.check_lessons_used(c, args.get("lessons_used"))
+        except learning.ForecastError as e:
+            used, note = [], (note + "; " if note else "") + f"lessons_used was dropped: {e}"
+    return p, used, note
+
+
+def _change_sides(norm: dict, before: dict) -> dict:
+    """The side a change card takes on each name: an add or a larger planned share favors the
+    name; a drop or a smaller planned share goes against it. Other kinds take no side."""
+    kind = norm.get("kind")
+    if kind == "add_company":
+        return {str(norm["ticker"]).upper(): 1}
+    if kind == "drop_company":
+        return {str(norm["ticker"]).upper(): -1}
+    if kind == "set_weights":
+        out = {}
+        for ch in norm.get("changes") or []:
+            t = str(ch["ticker"]).upper()
+            delta = float(ch["target_weight"]) - before.get(t, 0.0)
+            if delta:
+                out[t] = 1 if delta > 0 else -1
+        return out
+    return {}
+
+
+def _card_journal(c, ctx: ToolContext, proposal_id: int, sides: dict, p, used, rationale: str,
+                  event_id=None) -> list:
+    """One forecast per name a card takes a side on. The cash fund takes no side: a card moves
+    it only to fund or to park the other names. A stated chance applies to a card on one
+    name only. A journal refusal (the benchmark itself) never stops the card."""
+    cash = {str(ctx.cfg.risk.cash_sleeve_ticker or "").upper()}
+    cash |= {str(r[0]).upper() for r in c.execute("SELECT ticker FROM companies WHERE kind='cash'").fetchall()}
+    sides = {t: s for t, s in sides.items() if t not in cash}
+    out = []
+    for t, side in sides.items():
+        chance = p if len(sides) == 1 else None
+        if chance is not None and learning.stance_of(chance) not in (0, side):
+            chance = None  # a chance that contradicts the card's side is dropped, not graded
+        try:
+            fid = _journal(c, ctx, source="proposal", ticker=t, p=chance, stance=side,
+                           reason=rationale or f"card #{proposal_id}", horizon=learning.horizon_for("proposal"),
+                           event_id=event_id, job_id=getattr(ctx.job, "job_id", None) if ctx.job else None,
+                           proposal_id=proposal_id, used=used)
+        except learning.ForecastError:
+            continue
+        out.append({"forecast_id": fid, "ticker": t, "side": side, "p_beat_benchmark": chance})
+    return out
 
 
 # --- schemas ---------------------------------------------------------------------------
@@ -959,6 +1203,8 @@ I = {"type": "integer"}
 N = {"type": "number"}
 TICKERS = {"type": "array", "items": S, "maxItems": 20}
 EVIDENCE = {"type": "array", "items": {"type": ["string", "object", "integer"]}, "maxItems": 30}
+P_BEAT = {"type": "number", "minimum": 0.01, "maximum": 0.99}
+LESSONS_USED = {"type": "array", "items": I, "maxItems": 12}
 
 SPECS = {
     "portfolio_view": ("The latest broker snapshot with live prices: equity, cash, buying power, each position's "
@@ -998,7 +1244,11 @@ SPECS = {
     "get_etf_lookthrough": ("An ETF's holdings, weighted metrics and expense ratio.", _obj({"ticker": S}, ["ticker"])),
     "get_events": ("Events with verdicts.", _obj({"ticker": S, "status": S, "since": S, "limit": I})),
     "get_proposals": ("Proposals with legs and results.", _obj({"state": S, "limit": I})),
-    "get_track_record": ("Executed decisions with outcomes.", _obj({"ticker": S})),
+    "get_track_record": ("The desk's executed trades with outcomes (the old bot's calls are left out).",
+                         _obj({"ticker": S})),
+    "get_learning": ("The graded track record of every forecast (Brier score, skill, reliability, resolution, "
+                     "by verdict, by card and what the owner did with it), the active lessons and the owner's "
+                     "rules. With ticker: that name's resolved and open forecasts.", _obj({"ticker": S})),
     "get_attribution": ("The read-only factor attribution of the book (beta).", _obj({})),
     "get_settings": ("The effective settings, the KILL state and the halt state.", _obj({})),
     "ledger_query": ("One read-only SELECT over the ledger, at most 200 rows.", _obj({"sql": S}, ["sql"])),
@@ -1035,13 +1285,35 @@ SPECS = {
     "log_news_event": ("Create a news event from a stored news document (feed date within 7 days).",
                        _obj({"ticker": S, "document_id": I}, ["ticker", "document_id"])),
     "start_deep_dive": ("Queue a deep-dive by the analyst; it reports back.", _obj({"ticker": S, "focus": S}, ["ticker"])),
-    "record_verdict": ("Close an event's analysis: intact, strengthened, weakened or broken, and what changed.",
-                       _obj({"event_id": I, "verdict": S, "summary": S}, ["event_id", "verdict", "summary"])),
+    "record_verdict": ("Close an event's analysis: intact, strengthened, weakened or broken, and what changed. "
+                       "p_beat_benchmark is your chance (0.01 to 0.99) that the name's price beats SPY's over the "
+                       "horizon in the job; 0.5 means no edge. Python grades it. lessons_used: the ids of the lessons "
+                       "you applied.",
+                       _obj({"event_id": I, "verdict": S, "summary": S, "p_beat_benchmark": P_BEAT,
+                             "lessons_used": LESSONS_USED}, ["event_id", "verdict", "summary"])),
+    "record_forecast": ("A deep-dive's forecast: your chance (0.01 to 0.99) that the name's price beats SPY's "
+                        "over the next 90 days, and the one or two facts behind it. Python grades it. "
+                        "lessons_used: the ids of the lessons you applied.",
+                        _obj({"ticker": S, "p_beat_benchmark": P_BEAT, "reason": S, "lessons_used": LESSONS_USED},
+                             ["ticker", "p_beat_benchmark", "reason"])),
+    "curate_lessons": ("Change the lessons. ops: [{op: add, scope: analyst|desk|both, ticker?, text, evidence: "
+                       "[resolved forecast ids, at least 3]}, {op: retire, lesson_id, reason, evidence: [resolved "
+                       "forecast ids]}]. Python checks each op and answers per op.",
+                       _obj({"ops": {"type": "array", "items": {"type": "object"}, "maxItems": 10}}, ["ops"])),
+    "add_rule": ("Store a standing rule the owner states in this turn (\"always\", \"never\", \"keep X at\"). "
+                 "Every desk turn and analyst job sees it. owner_message_id: the owner message that states it.",
+                 _obj({"text": S, "owner_message_id": I, "ticker": S}, ["text", "owner_message_id"])),
+    "retire_rule": ("Retire an owner rule when the owner drops or changes it.",
+                    _obj({"rule_id": I, "reason": S}, ["rule_id", "reason"])),
+    "retire_lesson": ("Retire a lesson when the owner disagrees with it.",
+                      _obj({"lesson_id": I, "reason": S}, ["lesson_id"])),
     "withdraw_proposal": ("Withdraw a pending proposal the desk made.", _obj({"proposal_id": I}, ["proposal_id"])),
     "propose_trade": ("Propose a trade toward the target. Python sizes it; the owner taps Approve. origin is "
-                      '{"event_id": n} or {"owner_message_id": n}; fraction (owner trades only) is 0.25, 0.5 or 1.0.',
+                      '{"event_id": n} or {"owner_message_id": n}; fraction (owner trades only) is 0.25, 0.5 or 1.0. '
+                      "p_beat_benchmark (optional, one name only): your chance the name beats SPY over 90 days.",
                       _obj({"tickers": TICKERS, "origin": {"type": "object"}, "fraction": N, "rationale": S,
-                            "evidence": EVIDENCE}, ["tickers", "origin", "rationale", "evidence"])),
+                            "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},
+                           ["tickers", "origin", "rationale", "evidence"])),
     "propose_change": ("Propose a change. The owner taps Confirm. `change.kind` is one of: "
                        "add_company {ticker, sleeve, target_weight, band, entry {mode: now|at_or_below, price}, "
                        "funding [{ticker, target_weight}]}; drop_company {ticker, exit {mode: now|at_or_above, price}, "
@@ -1050,7 +1322,8 @@ SPECS = {
                        "set_thesis {ticker, premise_link, summary, drivers [], falsifiers [], "
                        "valuation {method, scenarios}, buy_below, trim_above}; resume_trading {}. "
                        "Use exactly these field names. Each accepted call sends a card to the owner.",
-                       _obj({"change": {"type": "object"}, "rationale": S, "evidence": EVIDENCE},
+                       _obj({"change": {"type": "object"}, "rationale": S, "evidence": EVIDENCE,
+                             "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},
                             ["change", "rationale", "evidence"])),
 }
 

@@ -29,12 +29,17 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
         "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials", "get_metrics",
         "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
         "get_events", "get_proposals",
-        "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
+        "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies",
+        "get_learning"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
-           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read"]
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
+           "add_rule", "retire_rule", "retire_lesson"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
-           "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
+           "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
+# The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.
+R_TOOLS = ["get_learning", "get_track_record", "get_company", "get_events", "get_proposals", "search_research",
+           "get_document", "report", "curate_lessons"]
 W3_NAMES = {"approvals", "execution", "handle_tap", "apply_change", "subprocess", "Popen", "shutil",
             "write_text", "write_bytes",
             # A dynamic import can load lib.desk.execution by a built string, so W3 refuses it.
@@ -102,9 +107,13 @@ def case_registry():
     r.eq("registry: the A name set equals the §5.4 tables", set(tools.role_tool_names("analyst")), set(READ + A_WRITE))
     r.eq("registry: no name twice in a role", (len(tools.role_tool_names("desk")), len(tools.role_tool_names("analyst"))),
          (len(set(READ + D_WRITE)), len(set(READ + A_WRITE))))
-    r.eq("registry: the schemas name exactly the union", set(tools.SPECS), set(READ + D_WRITE + A_WRITE))
+    r.eq("registry: the reflect name set is the §6.5 list", tools.role_tool_names("reflect"), R_TOOLS)
+    r.eq("registry: the schemas name exactly the union", set(tools.SPECS), set(READ + D_WRITE + A_WRITE + R_TOOLS))
     r.eq("registry: one function t_<name> per tool", {n: f.__name__ for n, f in tools.FUNCS.items()},
-         {n: f"t_{n}" for n in READ + D_WRITE + A_WRITE})
+         {n: f"t_{n}" for n in READ + D_WRITE + A_WRITE + R_TOOLS})
+    for name in ("propose_trade", "propose_change", "record_finding", "load_company", "fetch_document", "add_note",
+                 "say", "ledger_query"):
+        r.ok(f"registry: the reflect role has no {name}", name not in tools.role_tool_names("reflect"))
     bad = [n for n, (_d, s) in tools.SPECS.items() if s.get("type") != "object" or s.get("additionalProperties") is not False]
     r.eq("registry: every input schema is a closed object", bad, [])
     for name in ("approve", "approve_proposal", "execute", "place_order", "cancel_order", "run_shell", "write_file"):
@@ -557,7 +566,13 @@ ARGS = {
     "add_note": {"text": "The owner prefers short messages."},
     "set_research_status": {"ticker": "ANET", "status": "watch", "reason": "test"},
     "log_news_event": {"ticker": "ANET", "document_id": 1}, "start_deep_dive": {"ticker": "ANET"},
-    "record_verdict": {"event_id": 1, "verdict": "intact", "summary": "x"}, "withdraw_proposal": {"proposal_id": 1},
+    "record_verdict": {"event_id": 1, "verdict": "intact", "summary": "x", "p_beat_benchmark": 0.5},
+    "withdraw_proposal": {"proposal_id": 1},
+    "get_learning": {"ticker": "ANET"},
+    "record_forecast": {"ticker": "ANET", "p_beat_benchmark": 0.55, "reason": "x"},
+    "curate_lessons": {"ops": [{"op": "add", "scope": "analyst", "text": "x", "evidence": [1, 2, 3]}]},
+    "add_rule": {"text": "Keep BOT at 5%.", "owner_message_id": 1}, "retire_rule": {"rule_id": 1, "reason": "x"},
+    "retire_lesson": {"lesson_id": 1},
     "propose_trade": {"tickers": ["ANET"], "origin": {"owner_message_id": 1}, "fraction": 1.0, "rationale": "x",
                       "evidence": []},
     "propose_change": {"change": {"kind": "set_risk", "changes": {"min_trade_notional": 6}}, "rationale": "x",
@@ -581,7 +596,8 @@ def case_smoke():
     crashes, non_json, leaks, kinds = [], [], [], []
     try:
         for name in sorted(tools.SPECS):
-            role = "analyst" if name in ("report", "record_verdict") else "desk"
+            role = ("reflect" if name == "curate_lessons" else
+                    "analyst" if name in ("report", "record_verdict", "record_forecast") else "desk")
             with temp_root() as root:
                 led = root.led()
                 with led.connect() as c:
@@ -593,7 +609,8 @@ def case_smoke():
                 if turn is not None:
                     turn.start(chat_id=OWNER, owner_message_ids=[], started_at=store.now_iso())
                 ctx = tools.ToolContext.build(
-                    role=role, runtime=rt, secrets=SECRETS, turn=turn, job=agent.JobState() if role == "analyst" else None,
+                    role=role, runtime=rt, secrets=SECRETS, turn=turn,
+                    job=agent.JobState(role=role) if role in ("analyst", "reflect") else None,
                     led=led, transport=tp, box=box, seams=seams(), yf_price_fn=FakePrices(),
                     fetch_fn=FakeConn(), screen_fn=lambda q: [], efts_fn=lambda q: [], sleep=lambda s: None,
                     touch=lambda n: None,

@@ -429,7 +429,7 @@ def analyst_script(state):
         sc = {"growth_1_5": 0.15, "growth_6_10": 0.08, "finding_ids": fids}
         state["valuation"] = call("run_valuation", {"ticker": "ANET", "method": "dcf_fcf", "scenarios": {
             "bear": dict(sc, growth_1_5=0.08), "base": sc, "bull": dict(sc, growth_1_5=0.22)}})
-        state["verdict"] = call("record_verdict", {"event_id": eid, "verdict": "strengthened",
+        state["verdict"] = call("record_verdict", {"event_id": eid, "verdict": "strengthened", "p_beat_benchmark": 0.6,
                                                    "summary": "The Q2 10-Q adds an AI risk factor and shows FCF "
                                                               "growth; the thesis is stronger."})
         with ctx.conn() as c:
@@ -658,6 +658,10 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     r.ok("4 the second proposal is refused", "already backs proposal #1" in astate.get("propose2", {}).get("_error", ""),
          astate.get("propose2"))
     r.eq("4 one trade proposal", one(led, "SELECT COUNT(*) FROM proposals"), 1)
+    # §6.5: the job's verdict and its card each wrote one forecast, graded later against SPY.
+    r.eq("4 the journal: the verdict's forecast and the card's", [tuple(x.values()) for x in rows(
+        led, "SELECT source, ticker, p_beat, stance, horizon_days, proposal_id FROM forecasts ORDER BY id")],
+         [("verdict", "ANET", 0.6, 1, 90, None), ("proposal", "ANET", None, 1, 90, 1)])
     r.eq("4 event proposed at the job end", one(led, "SELECT status FROM events WHERE id=1"), "proposed")
     r.eq("4 the analyze_event job is done", one(led, "SELECT status FROM jobs WHERE kind='analyze_event'"), "done")
     # The worker sends nothing: the report and card #1 wait on the agenda as one item.

@@ -207,7 +207,7 @@ cards, and the research memory.
 Use the venv interpreter (`.venv/bin/python`). On the box, run each command as the `quiver`
 user with `/etc/quiver/quiver.env` loaded ([docs/DEPLOY.md](docs/DEPLOY.md)).
 
-`tick.py` has 22 subcommands. Each prints one JSON line.
+`tick.py` has 23 subcommands. Each prints one JSON line.
 
 | Subcommand | Who calls it |
 |---|---|
@@ -215,7 +215,7 @@ user with `/etc/quiver/quiver.env` loaded ([docs/DEPLOY.md](docs/DEPLOY.md)).
 | `exec-prepare`, `exec-check`, `exec-commit` | `run_broker.py` and `EXECUTE.md` |
 | `snapshot-prepare`, `snapshot-commit` | `run_broker.py` and `SNAPSHOT.md` |
 | `auth-stop` | `SNAPSHOT.md` and `EXECUTE.md` on a Robinhood 401 |
-| `reflect`, `benchmark-fetch`, `benchmark-backfill`, `goal-track`, `prune` | `run_monitor.py`, after the close |
+| `reflect`, `benchmark-fetch`, `benchmark-backfill`, `learn-grade`, `goal-track`, `prune` | `run_monitor.py`, after the close |
 | `flow-record`, `flow-suggest` | You (record a deposit or a withdrawal) |
 | `attribution`, `factors-fetch` | You (read-only factor attribution) |
 | `strategy-history`, `decision-proof` | You (the change log and the proof of one decision) |

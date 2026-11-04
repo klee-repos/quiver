@@ -201,7 +201,8 @@ company value and the multiples of sales and profit at each price, on one share 
 `get_technicals`,
 `get_transcript`, `get_etf_lookthrough`, `get_events`, `get_proposals`, `get_track_record`,
 `get_attribution`, `get_settings`, `ledger_query` (one read-only `SELECT`, at most 200
-rows), `screen_companies`.
+rows), `screen_companies`, `get_learning` (the graded record of every forecast, the lessons
+and your rules).
 
 **Write tools that need no tap:**
 
@@ -219,11 +220,16 @@ rows), `screen_companies`.
 | `load_company` | D, A | Loads a company or an ETF: filings, sections, XBRL, metrics, transcript. A new name gets `status='candidate'`. |
 | `fetch_document` | D, A | Fetches a web page and stores its text, so the desk can quote it later. |
 | `record_finding` | D, A | Stores a fact only if its quote is in a stored document. |
-| `add_note` | D, A | Stores a note, for example an owner preference. |
+| `add_note` | D, A | Stores a note: a one-off fact or preference. |
+| `add_rule` | D | Stores a standing rule you state ("always", "never", "keep X at"). It cites your message. Every desk turn and every analyst job sees it. |
+| `retire_rule` | D | Retires a rule when you drop or change it. |
+| `retire_lesson` | D | Retires a lesson you disagree with. You outrank any lesson. |
 | `set_research_status` | D | Sets `candidate`, `watch`, or `rejected` with a reason. Never `holding` or `dropped`. |
 | `log_news_event` | D, A | Creates a `news` event from a stored news document with a feed date in the last 7 days. |
 | `start_deep_dive` | D | Queues a deep-dive for the analyst, with an optional `focus` (the owner's question). One at a time per ticker, at most 6 a day. |
-| `record_verdict` | A | Closes an event's analysis: `intact`, `strengthened`, `weakened`, or `broken`. |
+| `record_verdict` | A | Closes an event's analysis: `intact`, `strengthened`, `weakened`, or `broken`, with the analyst's chance that the name beats SPY over the window. Python grades that chance later. |
+| `record_forecast` | A | A deep-dive's chance that the name beats SPY over 90 days. |
+| `curate_lessons` | reflect | Adds or retires lessons. Python checks each change (§6.5 of the plan). |
 | `withdraw_proposal` | D, A | Withdraws a pending proposal that the desk made. |
 
 **Proposal tools (you tap):**
@@ -326,6 +332,35 @@ or "why did we add GEV?" in any later conversation.
 **Exact quotes.** `record_finding` stores a fact only if its quote appears in a stored
 document. Python checks the quote. Each number the desk states names its source: a filing
 and section, a finding id, or a metric.
+
+## What the desk learns
+
+Plan §6.5 gives the full rules. The short form:
+
+- **Each call is a forecast.** Each analyst verdict, each deep-dive and each card writes the
+  chance that the name beats SPY over a fixed window: 30 days for a headline or a price
+  level, 90 days for the rest. The window starts at the next close, so the call cannot see
+  any of it.
+- **Python grades it.** After the close, `tick.py learn-grade` reads the market closes and
+  marks each forecast at 30, 90, 180 and 365 days. At the end of the window the forecast is
+  right or wrong, with a Brier score (0.25 is a coin flip; lower is better). No model writes
+  a grade. Cards you rejected are graded too, so you can see what they would have done.
+- **The desk keeps lessons.** When 5 or more forecasts have resolved, a weekly reflect job
+  reads them and adds or retires short lessons. Python checks each one: it cites at least 3
+  graded forecasts, it repeats no other lesson, and it says nothing about approvals or
+  limits. Each lesson counts how often the calls that used it were right. A lesson that does
+  worse than a coin flip retires by itself. The review comes up on the agenda: "What I
+  learned from N graded calls."
+- **Your rules win.** Say "from now on…" or "never…" and the desk stores it with `add_rule`.
+  Python then sends you a short notice with the rule's exact words, so a rule you did not
+  give is seen at once. Every desk turn and every analyst job sees your rules, and a rule
+  wins over any lesson. A rule about approvals or limits is refused: a limit is a risk card.
+  Say "drop that rule" or "I disagree with that lesson" to retire one.
+- **Ask how it is doing.** "How good have your calls been?" makes the desk answer from
+  `get_learning`. With fewer than 20 graded calls it says the sample is too small to judge.
+
+Nothing here can size, approve or place a trade. The learning code is on the research side
+of the decision wall.
 
 ## The walls
 

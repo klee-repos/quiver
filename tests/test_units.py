@@ -719,7 +719,7 @@ _WALL_GRANTS = {
     # (the caller passes `available`, §14.6), so the dead-grant check drops that grant.
 }
 _RESEARCH = ["lib/desk/%s.py" % m for m in ("edgar", "sections", "xbrl", "valuation", "transcripts",
-             "news", "etf", "documents", "findings", "events", "levels")]
+             "news", "etf", "documents", "findings", "events", "levels", "learning")]
 # W2: a research module also imports none of these.
 _RESEARCH_FORBIDDEN = _WALL_IMPORTS | {"lib.desk.proposals", "lib.desk.tools", "lib.desk.agent",
                                        "lib.desk.outbox", "lib.telegram", "subprocess"}
@@ -1733,7 +1733,7 @@ check("healthcheck: the runner import list", list(_hc.RUNNERS),
       ["run_monitor", "run_worker", "run_broker", "broker_guard", "chat_bridge"])
 check("healthcheck: the runbook list (§15.5 step 8)", list(_hc.RUNBOOKS),
       ["prompts/desk.md", "prompts/analyst.md", "prompts/news_classifier.md", "prompts/broker.md",
-       "EXECUTE.md", "SNAPSHOT.md"])
+       "prompts/reflector.md", "EXECUTE.md", "SNAPSHOT.md"])
 check_true("healthcheck: the eve_install check is deleted", not hasattr(_hc, "check_eve_install")
            and not hasattr(_hc, "_eve_install"))
 check_true("healthcheck: every lib/desk module is in the import list",

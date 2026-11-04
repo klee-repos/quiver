@@ -106,7 +106,7 @@ def ok_call(ctx, name, args):
 
 
 def verdict(ctx, js, v="intact"):
-    return ok_call(ctx, "record_verdict", {"event_id": js.event_id, "verdict": v,
+    return ok_call(ctx, "record_verdict", {"event_id": js.event_id, "verdict": v, "p_beat_benchmark": 0.5,
                                             "summary": "The new facts leave the thesis as it was."})
 
 

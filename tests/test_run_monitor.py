@@ -36,7 +36,7 @@ ET = ZoneInfo("America/New_York")
 Q2_10Q = "0001596532-26-000175"     # ANET 10-Q for 2026-06-30 (sub_anet, index 55)
 FEEDS = {"ANET": fx("yf_news")["news"], "CEG": fx("yf_news_ceg")["news"]}
 AFTER_CLOSE_TICKS = [["benchmark-fetch"], ["benchmark-backfill", "--apply", "--fill-only", "--max-rows", "12"],
-                     ["goal-track"], ["prune"]]
+                     ["learn-grade"], ["goal-track"], ["prune"]]
 PLAN_ORDER = ["market", "snapshot", "edgar", "news", "levels", "drift", "expire", "queue", "path_unit",
               "brief", "after_close"]
 
@@ -264,8 +264,8 @@ def case_order(r: Results):
     def body(h: Harness):
         st, m = h.run(et("2026-10-28 16:40"))
         r.eq("order: the steps run in the plan order", m.order[:len(PLAN_ORDER)], PLAN_ORDER)
-        r.eq("order: after-close runs reflect, benchmark, goal, prune last", m.order[len(PLAN_ORDER):],
-             ["reflect", "benchmark", "goal", "prune"])
+        r.eq("order: after-close runs reflect, benchmark, learn, goal, prune last", m.order[len(PLAN_ORDER):],
+             ["reflect", "benchmark", "learn", "goal", "prune"])
         r.eq("order: no step failed", m.failed, [])
         r.ok("order: the edgar step found the new 10-Q", st["filings"] == 1, st)
         r.ok("order: path_unit checks both .path units", ["is-failed", "quiver-worker.path", "quiver-broker.path"]

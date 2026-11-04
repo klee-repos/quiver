@@ -463,6 +463,7 @@ Each background process sent the moment it finished. The agenda replaces that.
 |---|---|---|---|---|
 | Desk agent | `quiver-chat` | `QUIVER_DESK_MODEL=claude-sonnet-5-5` | resident, resumed | 60 tool turns, 600 s per turn |
 | Analyst | `quiver-worker` | `QUIVER_ANALYST_MODEL=claude-opus-5-5` | one `query()` per job | 80 tool turns; 900 s per event job, 1,800 s per deep-dive |
+| Reflect (§6.5) | `quiver-worker` | `QUIVER_ANALYST_MODEL=claude-opus-5-5` | one `query()` per reflect job | 30 tool turns, 900 s; the reflect tools only |
 | News classifier | `quiver-worker` | `QUIVER_CLASSIFIER_MODEL=claude-haiku-5-5` | one `query()` per batch | no tools, JSON out, 120 s |
 | Quick reaction (§4.2 step 6) | `quiver-chat` | `QUIVER_CLASSIFIER_MODEL` | one `query()` per message | no tools, one emoji out, 10 s |
 
@@ -577,6 +578,17 @@ then asserts that `os.environ` holds only the allowlist before the first SDK cli
    every other trade and sets the fraction. A change proposal (`set_thesis`, `set_weights`,
    `drop_company`) is your call, and the owner confirms it.
 
+`prompts/reflector.md` (§6.5): judge the process, not only the result; a lesson comes from a
+pattern across 3 or more graded calls; one specific rule of thumb about research or
+confidence, never about sizes, approvals, taps or halts; never against an owner rule; one
+`curate_lessons` call, then one report to the owner in plain words.
+
+Both `prompts/desk.md` and `prompts/analyst.md` add the learning rules (§6.5): the owner's
+rules win over a lesson and over the model's own view; apply a lesson only when it fits and
+list its id in `lessons_used`; state each forecast from the outside view (start at 0.5 or a
+little below, move only as far as the facts support); with fewer than 20 graded calls, do
+not lean on the record. The desk stores a standing rule the owner states with `add_rule`.
+
 `prompts/news_classifier.md`: for each headline, return
 `{"id": n, "material": true|false, "category": "contract|regulation|m&a|management|guidance|litigation|product|other", "reason": "<= 160 chars"}`.
 Material means it can change revenue, margins, the capital structure, or the thesis.
@@ -608,11 +620,12 @@ Each tool takes typed input and returns compact JSON. Roles: D = desk agent, A =
 | `get_etf_lookthrough` | `ticker` | holdings (source, as-of), weighted metrics, expense ratio |
 | `get_events` | `ticker?, status?, since?, limit<=30` | events with verdicts |
 | `get_proposals` | `state?, limit<=30` | proposals with legs and results |
-| `get_track_record` | `ticker?` | executed decisions with outcomes (hit rate, realized P&L, vs SPY) |
+| `get_track_record` | `ticker?` | the desk's executed trades with outcomes (hit rate, realized P&L, vs SPY). The old bot's `decisions` rows are left out |
 | `get_attribution` | none | the read-only factor attribution (beta book) |
 | `get_settings` | none | effective settings (config + `desk_settings` overlay) |
 | `ledger_query` | `sql` | SELECT-only read through today's `chat_query` module, max 200 rows |
 | `screen_companies` | `query?, sector?, industry?, market_cap_min?, limit<=25` | candidates from SEC full-text search, the yfinance screener, and the book ETFs' holdings, with quick metrics when XBRL exists |
+| `get_learning` | `ticker?` | the graded record of the journal (§6.5): the Brier score, skill, reliability, resolution, the record by verdict and by card (with what the owner did with each card), the active lessons and the owner's rules. With a ticker: that name's resolved and open forecasts |
 
 **Write tools that need no tap**
 
@@ -634,15 +647,32 @@ Each tool takes typed input and returns compact JSON. Roles: D = desk agent, A =
 | `set_research_status` | D | `candidate`, `watch`, or `rejected` with a reason. Never `holding` or `dropped`: those change only through a confirmed proposal |
 | `log_news_event` | D, A | creates a `news` event (`events.created_by='desk'`) from a stored `news` document that a `news_items` row points to. `published_at` comes from the yfinance feed, never from the page, and must be within the last 7 days. A `web` document is research only and backs no event: a page controls its own date. At most one desk news event per ticker per day |
 | `start_deep_dive` | D | input `ticker`, optional `focus` (one sentence). Queues a `deep_dive` job; its report comes back on the agenda with priority `now`. It refuses a second queued or running deep-dive for the same ticker, and a 7th call on one day (counted in `api_budget`, `provider='deep_dive'`; the `desk-seed` jobs do not count) |
-| `record_verdict` | A | closes an event's analysis with a verdict and a summary |
+| `record_verdict` | A | closes an event's analysis with a verdict, a summary and the job's forecast: `p_beat_benchmark` (required; 0.01 to 0.99) and `lessons_used`. One transaction writes both. Not required for an event on the benchmark itself |
+| `record_forecast` | A | a deep-dive's forecast: `ticker` (the job's own), `p_beat_benchmark`, `reason`, `lessons_used`. A second call in the job replaces the first |
+| `curate_lessons` | reflect | `ops[]` of `add` or `retire` (§6.5). Python checks and applies each op on its own and answers per op |
+| `add_rule` | D | stores a standing owner rule: `text`, `owner_message_id` (one of this turn's owner messages), `ticker?`. Refused with no owner message in the turn |
+| `retire_rule` | D | retires an owner rule, with a reason. Refused with no owner message in the turn |
+| `retire_lesson` | D | retires a lesson the owner disagrees with. Refused with no owner message in the turn |
 | `withdraw_proposal` | D, A | withdraws a pending proposal that the desk made |
 
 **Proposal tools (the owner taps)**
 
 | Tool | Role | Input |
 |---|---|---|
-| `propose_trade` | D, A | An analyst job's card waits on the job's agenda item; the desk's card goes out at once. `tickers[]`, `origin` (`{"event_id": n}` or `{"owner_message_id": n}`), `fraction` in {0.25, 0.5, 1.0} (owner origin only: the fraction the owner asked for; for an event, Python sets it from §10.2 step 7), `rationale<=280 chars`, `evidence[]` (finding ids, document ids, metric keys) |
-| `propose_change` | D, A | `change` (one of the seven kinds in §10.3), `rationale<=280 chars`, `evidence[]` |
+| `propose_trade` | D, A | An analyst job's card waits on the job's agenda item; the desk's card goes out at once. `tickers[]`, `origin` (`{"event_id": n}` or `{"owner_message_id": n}`), `fraction` in {0.25, 0.5, 1.0} (owner origin only: the fraction the owner asked for; for an event, Python sets it from §10.2 step 7), `rationale<=280 chars`, `evidence[]` (finding ids, document ids, metric keys), `p_beat_benchmark?`, `lessons_used?` |
+| `propose_change` | D, A | `change` (one of the seven kinds in §10.3), `rationale<=280 chars`, `evidence[]`, `p_beat_benchmark?`, `lessons_used?` |
+
+Each card writes one `proposal` forecast for each name it takes a side on (§6.5): a buy, an
+`add_company` or a larger planned share favors the name; a sell, a `drop_company` or a smaller
+planned share goes against it. The cash fund (company kind `cash`, or the cash sleeve ticker)
+takes no side: a card moves it only to fund or to park the other names. A stated chance
+applies to a card on one name only, and Python drops a chance that contradicts the card's
+side. A bad optional chance or lesson id is dropped and named in `forecast_note`. A journal
+refusal never stops a card.
+
+**The reflect tools** (§6.5): `get_learning`, `get_track_record`, `get_company`, `get_events`,
+`get_proposals`, `search_research`, `get_document`, `report`, `curate_lessons`. The reflect job
+cannot propose, record a finding, add a note or load a company.
 
 No tool approves, executes, places, or cancels an order. No tool edits a file, runs a shell
 command, or changes code. The W3 test (§14.10) parses `lib/desk/tools.py` and enforces this.
@@ -802,7 +832,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL CHECK (kind IN ('analyze_event','deep_dive','classify_news')),
+  kind TEXT NOT NULL CHECK (kind IN ('analyze_event','deep_dive','classify_news','reflect')),
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')),
   requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
@@ -928,6 +958,149 @@ Nothing in §6.1 is ever pruned. These rows are the memory. `tick.py prune` (whi
 `storage.prune_dir`) keeps pruning
 only the log directories. Size: about 25 MB of section text a year for 13 holdings and their
 look-through companies. The nightly backup gzips the whole database.
+
+### 6.5 The learning loop (`lib/desk/learning.py`)
+
+The research memory stores what the desk read. The learning loop stores what the desk
+predicted, grades it against the market, and turns the grades into a short list of lessons
+that every later call reads. Python does every grade and every merge. A model never writes
+a grade, and no output of the loop reaches a size, a limit or an approval. The module is on
+the research side of the decision wall (W2 list, §14.10).
+
+The design follows these practices:
+
+| Practice | Where |
+|---|---|
+| A decision journal: write the call, the reason and the expected result when the call is made (Mauboussin) | the `forecasts` table |
+| A proper score that separates calibration from resolution | the Brier score with the Murphy split; skill against the base rate |
+| A reliable feedback signal (weak feedback makes a self-improving context worse: ACE, ICLR 2026) | Python grades from market closes |
+| No look-ahead (the outcome embargo of LLM trading surveys) | the window starts at the first close after the call; a mark waits for a final close; a lesson cites resolved forecasts only |
+| Itemized lessons with helpful and harmful counts, merged by deterministic code, never by a full rewrite (ACE) | `lessons`, `apply_ops`, `_tag_lessons` |
+| Each reflection cites its episodes; a write gate checks every new memory; an append-only log; untested memories expire (agent-memory surveys, SSGM) | the gate in `add_lesson`; `lesson_log`; `maintain_lessons` |
+| The user's statements outrank the agent's inferences | `owner_rules`; the owner can retire any lesson |
+| The smallest set of high-signal tokens in context; the rest on demand (Anthropic, context engineering) | rules and the top lessons in each turn and job; the rest through `get_learning` |
+
+**Tables.** `ensure_desk_schema` creates them (all `IF NOT EXISTS`):
+
+```sql
+CREATE TABLE IF NOT EXISTS forecasts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL CHECK (source IN ('verdict','deep_dive','proposal')),
+  ticker TEXT NOT NULL, benchmark TEXT NOT NULL,
+  p_beat REAL CHECK (p_beat IS NULL OR (p_beat > 0 AND p_beat < 1)),
+  stance INTEGER NOT NULL CHECK (stance IN (-1, 0, 1)),
+  horizon_days INTEGER NOT NULL, made_at TEXT NOT NULL, start_session TEXT NOT NULL, due_date TEXT NOT NULL,
+  verdict TEXT, event_id INTEGER, job_id INTEGER, proposal_id INTEGER,
+  created_by TEXT NOT NULL CHECK (created_by IN ('desk','analyst')),
+  reason TEXT NOT NULL, lesson_ids TEXT NOT NULL DEFAULT '[]',
+  marks_json TEXT NOT NULL DEFAULT '{}',
+  resolved_at TEXT, outcome INTEGER CHECK (outcome IN (0, 1)), excess REAL, brier REAL
+);
+CREATE TABLE IF NOT EXISTS lessons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL CHECK (scope IN ('analyst','desk','both')), ticker TEXT, text TEXT NOT NULL,
+  evidence_json TEXT NOT NULL, helpful INTEGER NOT NULL DEFAULT 0, harmful INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('active','retired')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, retired_at TEXT, retire_reason TEXT
+);
+CREATE TABLE IF NOT EXISTS lesson_log (     -- append-only
+  id INTEGER PRIMARY KEY AUTOINCREMENT, lesson_id INTEGER NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('add','helpful','harmful','retire')),
+  detail_json TEXT NOT NULL, job_id INTEGER, at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS owner_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, text TEXT NOT NULL,
+  owner_message_id INTEGER NOT NULL, created_at TEXT NOT NULL, retired_at TEXT, retire_reason TEXT
+);
+```
+
+`jobs.kind` takes `reflect`. `_migrate_jobs_kind` rebuilds an older `jobs` table once, inside
+`BEGIN IMMEDIATE`, and keeps every row and id.
+
+**1. The journal.** Each call writes one forecast when it is made:
+
+| Call | Source | Chance | Horizon |
+|---|---|---|---|
+| `record_verdict` on a `news` or `price_level` event | `verdict` | required | 30 days |
+| `record_verdict` on any other event | `verdict` | required | 90 days |
+| `record_forecast` in a deep-dive | `deep_dive` | required | 90 days |
+| a trade or change card (§5.4) | `proposal` | optional; one name only | 90 days |
+
+The question is always the same: the chance (`p_beat`, 0.01 to 0.99) that the name's price
+return beats SPY's over the horizon. Python sets the horizon, so all calls of one kind share
+one window. The window starts at the close of the session open at the call, else of the next
+session (`market.session_close_et`): a call after the close starts at the next close, so no
+part of the window is known when the call is made. `stance` is the side (1 for the name, -1
+against it). A verdict's side follows its chance. A second verdict or deep-dive forecast in
+the same job (or in its retry) replaces the first, and its window moves to the new call's
+next close: a retry can run after a close, and a restated chance must not see a move inside
+its own window. A forecast on the benchmark itself is refused.
+
+**2. The grade** (`tick.py learn-grade`, the monitor's `learn` step after the close). It fetches
+the daily closes (yfinance `auto_adjust=True` Close: the ratio of two closes is a total
+return, dividends in, for both legs; `BRK.B` is fetched as `BRK-B`) of every name and
+benchmark with a due mark. A close is final 30 minutes after its session ends. For
+each forecast it takes the marks at 30, 90, 180 and 365 days after the start session with
+`lib.benchmark.window_return` (the strict anchors: the last session on or before the date,
+and that close must exist; no other close stands in). A mark records the name's return, the
+benchmark's return and the excess. At the horizon the forecast resolves: `outcome` is 1 when
+the excess is above 0, `excess` is the horizon's excess, and `brier` is (p - outcome)² when a
+chance was stated. A failed or empty fetch waits: yfinance answers a network failure with an
+empty frame, so `_learn_history` raises on an empty answer. A fetched series with no close 30
+days after a mark's date makes the mark void (the name stopped trading or changed its
+symbol); a void forecast has no outcome and counts in no score.
+
+**3. The scores** (`calibration`). The Brier score of the resolved forecasts with a chance,
+its standard error, the base rate, the climatology score (base rate × (1 - base rate)),
+skill (1 - Brier / climatology), the Murphy split (reliability: the gap between the stated
+chances and what happened; resolution: how much the calls separate winners from losers;
+uncertainty), sharpness, and a 10-bin reliability table. Then by source, by verdict (the
+right-side rate and the mean excess at each mark), and by card: `taken` (executed, partly
+executed, applied), `refused` (rejected) and `lapsed` (expired, superseded, withdrawn,
+requoted, failed). So the record shows what a rejected card would have done. Below 20 graded
+calls `small_sample` is true and the summary line says so.
+
+**4. The lessons.** The monitor queues one `reflect` job when 5 or more forecasts with an
+outcome resolved since the last done, queued or running reflect job, no reflect job is queued
+or running, and the last done one is 6 days old or more. A failed job does not count, so its
+forecasts come up again. The job's payload holds `since`, `through` and `new`. The reflect
+model gets `groups` (every newly graded call, grouped by source, event type and verdict, and
+by name: the count, the right-side rate, the mean chance, the mean excess, the Brier score and
+the ids to cite), `graded` (up to 40 calls in full with each event's analysis: the worst
+misses and the best calls first), the scores, the active lessons and the owner's rules. It
+has no built-in tool. It changes the lessons with `curate_lessons`:
+
+- `add` {`scope`: analyst, desk or both; `ticker?`; `text`; `evidence`}. The gate refuses: a
+  text outside 20 to 280 characters; a text about approvals, taps, halts, the KILL switch,
+  buying power or instructions; fewer than 3 cited forecasts; a cited forecast with no
+  outcome; evidence that is not a list; a lesson on one name that cites another name; a
+  general lesson that cites fewer than 2 names; a text with a similarity of 0.8 or more to an
+  active lesson, or to a lesson retired for a cause (any reason but "untested"); a 41st
+  active lesson; a 6th add in one job.
+- `retire` {`lesson_id`, `reason`, `evidence`}: one or more resolved forecasts; at most 5 in
+  one job.
+
+Each op is checked and applied on its own; a refused op does not stop the others. A call
+lists the lessons it applied in `lessons_used`. When that call resolves, Python adds one
+`helpful` (the call was on the right side) or one `harmful` (the wrong side) to each lesson;
+a call at 0.5 counts neither. Python retires a lesson that is 3 or more `harmful` above its
+`helpful`, and a lesson with fewer than 3 graded uses after 180 days. Every change writes one
+`lesson_log` row; no code updates or deletes a log row. The job ends as one agenda item,
+"What I learned from N graded calls.", priority `next` when a lesson changed, else `fyi`.
+
+**5. The owner's rules.** `add_rule` stores a rule only from a desk turn with an owner
+message, and it cites that message's id. The lesson filter applies: a rule may not speak to
+approvals, taps, halts, buying power or instructions (a limit is a `set_risk` card). At most
+20 are active. The owner can retire a rule (`retire_rule`) and any lesson (`retire_lesson`).
+Python sends the owner a fixed notice with the exact words of each new or retired rule and
+each retired lesson, so a rule that a planted document talked the desk into is seen at once.
+
+**6. What each model sees.** Each desk turn holds an `<owner_rules>` block (every active rule)
+and a `<lessons>` block (the top 5 desk and both-scope lessons) before the `<agenda>` block.
+They come in every turn: a long session compacts, and a rule must never drop out of view.
+Each analyst job's JSON holds `forecast` (the question, the horizon, the tool), `owner_rules`,
+`lessons` (the top 8 analyst and both-scope lessons, the name's own first, then by net graded
+uses) and `track_record` (the summary line and the name's last 6 resolved forecasts).
 
 ## 7. Data sources and ingestion
 
@@ -1214,7 +1387,7 @@ The timer fires Monday to Friday at :40, from 11:40 to 23:40 UTC. That covers pr
 releases (about 7:00 ET) and after-close releases (about 16:05 ET). Steps, in order. Each
 step catches its own errors, logs them, and pages once per day per stage. Each step pages
 with the stage of its own name (`edgar`, `news`, `levels`, `drift`, `expire`, `queue`,
-`brief`, `reflect`, `benchmark`, `goal`, `prune`); §14.9 lists them. The paging code moves
+`brief`, `reflect`, `benchmark`, `learn`, `goal`, `prune`); §14.9 lists them. The paging code moves
 from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,400 s.
 
 1. Take `run_lock(led, "monitor", ...)` (§3.5: one lock per name).
@@ -1271,6 +1444,8 @@ from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,40
       the latest `broker_snapshots` row, then run `tick.py reflect --input` it;
     - `tick.py benchmark-fetch`, then `tick.py benchmark-backfill --apply --fill-only --max-rows 12`
       (the backfill refuses to run without a fresh benchmark sidecar);
+    - `learn`: `tick.py learn-grade` (§6.5 step 2), then queue one `reflect` job when one is due
+      (§6.5 step 4) and touch the worker trigger;
     - `tick.py goal-track`;
     - `tick.py prune`.
     `exec-commit` writes one `decisions` row per placed leg (§11.2), so `reflect` scores the
@@ -1284,7 +1459,7 @@ from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,40
 
 1. Delete the trigger file `state/triggers/worker`. Put jobs left in `running` back to
    `queued`. Take `run_lock(led, "worker", ...)`. Drain `jobs` in this order: `classify_news`, then
-   `analyze_event` (oldest first), then `deep_dive`. Run one job at a time.
+   `analyze_event` (oldest first), then `deep_dive`, then `reflect` (§6.5). Run one job at a time.
 2. Mark the job `running` and add 1 to `attempts`. Run it. On success, mark the job `done`.
    On error, put it back to `queued` if `attempts < 2`. Otherwise mark it `failed` and file a
    `failure` agenda item (at least `next`): "I could not analyze ANET's 10-Q (error: ...). I stopped trying."
@@ -1299,12 +1474,14 @@ from `run_tick.py` to `deploy/runner/runner_common.py`. The run lock TTL is 2,40
    - After two failed jobs, the worker sets `failed`.
    - A `drift` event goes straight to `noted`.
 3. An `analyze_event` job must end with `record_verdict`. If it does not, the job fails
-   with "no verdict".
+   with "no verdict". A `deep_dive` with no `record_forecast` still files its report; the
+   worker logs `forecast_missing`.
 4. Before it exits, check the queue again. Exit only when the queue is empty.
 
 The `analyze_event` prompt holds: the event, the company dossier (`get_company`), the new
-document ids with their section keys and sizes, the last three verdicts for the name, and
-the open proposals for the name. A group adds `also_events` (the other headlines and their
+document ids with their section keys and sizes, the last three verdicts for the name, the
+open proposals for the name, and the learning blocks of §6.5 step 6. The `deep_dive` prompt
+holds the learning blocks too. A group adds `also_events` (the other headlines and their
 article documents) and asks for one `record_verdict` on the job's own event.
 
 A `deep_dive` reads the annual report (Business, the risk factors or their diff, MD&A),

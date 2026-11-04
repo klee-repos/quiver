@@ -12,6 +12,7 @@ Subcommands:
   snapshot-prepare / snapshot-commit        the snapshot job (plan §11.4)
   fills / wait / auth-stop                  runbook helpers
   reflect / benchmark-fetch / benchmark-backfill / goal-track / prune   after the close
+  learn-grade                               grade the forecasts of the journal (plan §6.5)
   flow-record / flow-suggest / attribution / factors-fetch / strategy-history /
   decision-proof / send-test                operator tools
   desk-seed                                 the one-time cutover seed (plan §16)
@@ -866,6 +867,70 @@ def cmd_prune(_args) -> dict:
     }
 
 
+# A close is final this long after the session ends (plan §6.5): a mark never reads a bar that
+# can still change.
+LEARN_CLOSE_SETTLE = timedelta(minutes=30)
+
+
+def _learn_history(ticker: str, start: str) -> dict:
+    """Daily closes from ``start`` to today: yfinance ``auto_adjust=True`` Close, so the ratio
+    of two closes is a total return (dividends in) for the name and the benchmark alike. A
+    later dividend scales every earlier close by one factor, so a stored mark stays right.
+    yfinance answers a network failure with an empty frame, so an empty answer raises: a
+    failed fetch never voids a mark. ``BRK.B`` is ``BRK-B`` on Yahoo."""
+    import yfinance as yf
+    hist = yf.Ticker(str(ticker).replace(".", "-")).history(start=start, auto_adjust=True)
+    out = {}
+    for idx, row in hist.iterrows():
+        try:
+            d, c = str(idx)[:10], float(row["Close"])
+        except Exception:  # noqa: BLE001
+            continue
+        if c > 0 and c == c and c != float("inf"):
+            out[d] = c
+    if not out:
+        raise ValueError(f"no closes for {ticker} since {start}")
+    return out
+
+
+def cmd_learn_grade(args, *, history_fn=None, now=None) -> dict:
+    """Grade the journal (plan §6.5). Fetch the closes of every name and benchmark with a due
+    mark, then let ``lib.desk.learning.grade`` take the marks and resolve each forecast at its
+    horizon. A mark waits until its session's close is final. A failed fetch leaves its marks
+    for the next run; nothing stands in for a missing close."""
+    from lib.desk import learning
+    led = Ledger(LEDGER_DB)
+    now = now or store.utc_now()
+    now_et = now.astimezone(market.ET)
+    with led.connect() as c:
+        first = c.execute("SELECT MIN(start_session) FROM forecasts").fetchone()[0]
+    if not first:
+        return {"ok": True, "forecasts": 0, "marked": 0, "resolved": 0}
+    begin = datetime.strptime(first, "%Y-%m-%d").replace(tzinfo=market.ET) - timedelta(days=7)
+    sess = market.sessions_between(begin, now_et)
+    final = [d for d, _open, close in sess if close + LEARN_CLOSE_SETTLE <= now_et]
+    if not final:
+        return {"ok": True, "marked": 0, "resolved": 0, "note": "no final close yet"}
+    final_through = final[-1]
+    with led.connect() as c:
+        need = learning.tickers_due(c, final_through)
+    fetch = history_fn or _learn_history
+    if history_fn is None:
+        import socket
+        socket.setdefaulttimeout(15)
+    series, errors = {}, {}
+    for t, start in sorted(need.items()):
+        since = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+        try:
+            series[t] = fetch(t, since)
+        except Exception as e:  # noqa: BLE001 — one name's failure leaves its marks waiting
+            errors[t] = f"{type(e).__name__}: {e}"[:160]
+    with led.transaction() as c:
+        res = learning.grade(c, series=series, sessions=[d for d, _o, _c in sess], final_through=final_through,
+                             now_iso=store.iso(now))
+    return {"ok": True, "final_through": final_through, "tickers": len(need), "fetch_errors": errors, **res}
+
+
 def main(argv) -> int:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -926,6 +991,7 @@ def main(argv) -> int:
     p_ds.add_argument("--skip-intro", dest="skip_intro", action="store_true")
     p_dr = sub.add_parser("desk-review")
     p_dr.add_argument("--tickers", default="")
+    sub.add_parser("learn-grade")
     args = ap.parse_args(argv)
 
     handlers = {
@@ -937,7 +1003,7 @@ def main(argv) -> int:
         "decision-proof": cmd_decision_proof, "auth-stop": cmd_auth_stop,
         "exec-prepare": cmd_exec_prepare, "exec-check": cmd_exec_check, "exec-commit": cmd_exec_commit,
         "snapshot-prepare": cmd_snapshot_prepare, "snapshot-commit": cmd_snapshot_commit,
-        "desk-seed": cmd_desk_seed, "desk-review": cmd_desk_review,
+        "desk-seed": cmd_desk_seed, "desk-review": cmd_desk_review, "learn-grade": cmd_learn_grade,
     }
     try:
         out = handlers[args.cmd](args)

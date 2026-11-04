@@ -52,7 +52,7 @@ CORE_MODULES = ("lib.sizing", "lib.portfolio", "lib.goal", "lib.universe", "lib.
 THIRD_PARTY = ("claude_agent_sdk", "bs4", "lxml")
 RUNNERS = ("run_monitor", "run_worker", "run_broker", "broker_guard", "chat_bridge")
 RUNBOOKS = ("prompts/desk.md", "prompts/analyst.md", "prompts/news_classifier.md",
-            "prompts/broker.md", "EXECUTE.md", "SNAPSHOT.md")
+            "prompts/broker.md", "prompts/reflector.md", "EXECUTE.md", "SNAPSHOT.md")
 
 # §6.1: the new columns on the existing tables.
 ORDERS_COLUMNS = ("proposal_id", "leg_seq", "quote_at_proposal", "clamped_from", "check_quote",

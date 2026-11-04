@@ -342,7 +342,7 @@ class Bridge:
 
     def build_input(self, owners, updates, item=None) -> str:
         from lib import market
-        from lib.desk import agenda, store
+        from lib.desk import agenda, learning, store
 
         def clock(ts):
             dt = store.parse_ts(ts)
@@ -361,6 +361,18 @@ class Bridge:
             agenda.refresh(c, now)
             lines = agenda.block_lines(agenda.view(c, now))
             cards = agenda.card_facts(c, item) if item else []
+            rules = learning.rule_lines(learning.active_rules(c))
+            lessons = learning.lesson_lines(learning.lessons_for(c, scope="desk", limit=learning.DESK_LESSONS))
+        # The owner's rules and the desk's lessons (plan §6.5) come in every turn: a long
+        # session compacts, and a rule must never drop out of view.
+        if rules:
+            parts.append("<owner_rules>")
+            parts.extend(_esc(x) for x in rules)
+            parts.append("</owner_rules>")
+        if lessons:
+            parts.append("<lessons>")
+            parts.extend(_esc(x) for x in lessons)
+            parts.append("</lessons>")
         if lines:
             parts.append("<agenda>")
             parts.extend(_esc(x) for x in lines)

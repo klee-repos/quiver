@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE TABLE IF NOT EXISTS jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL CHECK (kind IN ('analyze_event','deep_dive','classify_news')),
+  kind TEXT NOT NULL CHECK (kind IN ('analyze_event','deep_dive','classify_news','reflect')),
   payload_json TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')),
   requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
@@ -248,6 +248,68 @@ CREATE TABLE IF NOT EXISTS agenda (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_job ON agenda(job_id) WHERE job_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_open ON agenda(status) WHERE status = 'open';
 CREATE INDEX IF NOT EXISTS idx_agenda_status ON agenda(status, priority, id);
+-- The decision journal (plan §6.5, lib/desk/learning.py). One row is one call, written when
+-- the call is made: the chance that the name beats the benchmark over the horizon. Python
+-- grades it from market closes. A model never writes a grade column.
+-- stance: 1 the call favors the name, -1 against it, 0 no side. p_beat: NULL for a card
+-- with no stated chance. marks_json: {"30": {"session", "ret", "bench", "excess"}, ...}.
+CREATE TABLE IF NOT EXISTS forecasts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL CHECK (source IN ('verdict','deep_dive','proposal')),
+  ticker TEXT NOT NULL,
+  benchmark TEXT NOT NULL,
+  p_beat REAL CHECK (p_beat IS NULL OR (p_beat > 0 AND p_beat < 1)),
+  stance INTEGER NOT NULL CHECK (stance IN (-1, 0, 1)),
+  horizon_days INTEGER NOT NULL,
+  made_at TEXT NOT NULL,
+  start_session TEXT NOT NULL,
+  due_date TEXT NOT NULL,
+  verdict TEXT, event_id INTEGER, job_id INTEGER, proposal_id INTEGER,
+  created_by TEXT NOT NULL CHECK (created_by IN ('desk','analyst')),
+  reason TEXT NOT NULL,
+  lesson_ids TEXT NOT NULL DEFAULT '[]',
+  marks_json TEXT NOT NULL DEFAULT '{}',
+  resolved_at TEXT,
+  outcome INTEGER CHECK (outcome IN (0, 1)),
+  excess REAL,
+  brier REAL
+);
+CREATE INDEX IF NOT EXISTS idx_forecasts_ticker ON forecasts(ticker, made_at);
+CREATE INDEX IF NOT EXISTS idx_forecasts_open ON forecasts(resolved_at, start_session);
+-- The lessons (plan §6.5): short rules of thumb that the reflect job draws from graded
+-- forecasts. Python checks and merges each change. helpful / harmful count the graded
+-- forecasts that cited the lesson and scored better / worse than a coin flip.
+CREATE TABLE IF NOT EXISTS lessons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL CHECK (scope IN ('analyst','desk','both')),
+  ticker TEXT,
+  text TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  helpful INTEGER NOT NULL DEFAULT 0,
+  harmful INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL CHECK (status IN ('active','retired')),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  retired_at TEXT, retire_reason TEXT
+);
+-- Every change to a lesson, append-only. No code updates or deletes a row here.
+CREATE TABLE IF NOT EXISTS lesson_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lesson_id INTEGER NOT NULL,
+  op TEXT NOT NULL CHECK (op IN ('add','helpful','harmful','retire')),
+  detail_json TEXT NOT NULL,
+  job_id INTEGER,
+  at TEXT NOT NULL
+);
+-- The owner's standing rules (plan §6.5). Only a desk turn with an owner message adds or
+-- retires one. Every desk turn and every analyst job sees the active rules.
+CREATE TABLE IF NOT EXISTS owner_rules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticker TEXT,
+  text TEXT NOT NULL,
+  owner_message_id INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  retired_at TEXT, retire_reason TEXT
+);
 """
 
 # FTS5 table -> (content table, indexed columns). One external-content index per table.
@@ -258,14 +320,14 @@ FTS_TABLES = {
     "chat_messages_fts": ("chat_messages", ("text",)),
 }
 
-# The tables of §6.1 (the 31 a fresh schema creates; FTS shadow tables not counted).
+# The tables of §6.1 and §6.5 (the 35 a fresh schema creates; FTS shadow tables not counted).
 DESK_TABLES = (
     "companies", "sec_ticker_map", "sec_overrides", "filings", "documents", "documents_fts",
     "xbrl_facts", "metrics", "findings", "findings_fts", "notes", "notes_fts", "premise",
     "theses", "level_state", "news_items", "transcripts", "api_budget", "etf_holdings",
     "events", "jobs", "broker_jobs", "broker_snapshots", "proposals", "desk_settings",
     "chat_messages", "chat_messages_fts", "chat_sessions", "bridge_state", "run_locks",
-    "agenda",
+    "agenda", "forecasts", "lessons", "lesson_log", "owner_rules",
 )
 
 
@@ -289,8 +351,47 @@ def _fts_triggers() -> str:
 
 def ensure_desk_schema(conn) -> None:
     """Create every §6.1 table, index and FTS trigger. Safe to run again."""
+    _migrate_jobs_kind(conn)
     conn.executescript(DESK_SCHEMA)
     conn.executescript(_fts_triggers())
+
+
+JOB_KINDS = ("analyze_event", "deep_dive", "classify_news", "reflect")
+
+
+def _migrate_jobs_kind(conn) -> None:
+    """Widen the ``jobs.kind`` CHECK of an older ledger to ``JOB_KINDS`` (plan §6.5 adds
+    ``reflect``). SQLite cannot change a CHECK in place, so this rebuilds the table and
+    keeps every row and id. It runs before ``DESK_SCHEMA``. It does nothing on a fresh
+    ledger (no table yet) or on a widened one. The check runs again inside the write lock,
+    so two processes that start together rebuild the table once."""
+    def old_sql():
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone()
+        sql = row[0] if row else None
+        return sql if sql and "'reflect'" not in sql else None
+
+    if old_sql() is None:
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if old_sql() is not None:
+            conn.execute("ALTER TABLE jobs RENAME TO jobs_old")
+            conn.execute(
+                "CREATE TABLE jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "kind TEXT NOT NULL CHECK (kind IN ('analyze_event','deep_dive','classify_news','reflect')), "
+                "payload_json TEXT NOT NULL, "
+                "status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')), "
+                "requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, "
+                "attempts INTEGER NOT NULL DEFAULT 0, error TEXT)")
+            conn.execute("INSERT INTO jobs (id, kind, payload_json, status, requested_by, created_at, started_at, "
+                         "finished_at, attempts, error) SELECT id, kind, payload_json, status, requested_by, "
+                         "created_at, started_at, finished_at, attempts, error FROM jobs_old")
+            conn.execute("DROP TABLE jobs_old")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 # --- time and hashing --------------------------------------------------------------

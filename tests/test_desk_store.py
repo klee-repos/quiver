@@ -75,6 +75,14 @@ PLAN_TABLES = {
     "run_locks": ('name', 'holder', 'acquired_at'),
     "agenda": ('id', 'kind', 'priority', 'status', 'ticker', 'title', 'body', 'job_id', 'event_id', 'proposal_ids',
                'cards_json', 'not_before', 'created_at', 'opened_at', 'closed_at', 'close_reason'),
+    # §6.5: the learning loop.
+    "forecasts": ('id', 'source', 'ticker', 'benchmark', 'p_beat', 'stance', 'horizon_days', 'made_at',
+                  'start_session', 'due_date', 'verdict', 'event_id', 'job_id', 'proposal_id', 'created_by',
+                  'reason', 'lesson_ids', 'marks_json', 'resolved_at', 'outcome', 'excess', 'brier'),
+    "lessons": ('id', 'scope', 'ticker', 'text', 'evidence_json', 'helpful', 'harmful', 'status', 'created_at',
+                'updated_at', 'retired_at', 'retire_reason'),
+    "lesson_log": ('id', 'lesson_id', 'op', 'detail_json', 'job_id', 'at'),
+    "owner_rules": ('id', 'ticker', 'text', 'owner_message_id', 'created_at', 'retired_at', 'retire_reason'),
 }
 PLAN_FTS = {"documents_fts": "documents", "findings_fts": "findings", "notes_fts": "notes",
             "chat_messages_fts": "chat_messages"}
@@ -185,9 +193,9 @@ def case_schema_all():
         root.led()
         c = raw(root.db)
         names = table_names(c)
-        r.eq("schema_all store.DESK_TABLES has 31 names", len(store.DESK_TABLES), 31)
+        r.eq("schema_all store.DESK_TABLES has 35 names", len(store.DESK_TABLES), 35)
         r.eq("schema_all store.DESK_TABLES is the plan list", set(store.DESK_TABLES), set(PLAN_TABLES))
-        r.eq("schema_all the plan lists 31 tables", len(PLAN_TABLES), 31)
+        r.eq("schema_all the plan lists 35 tables", len(PLAN_TABLES), 35)
         r.eq("schema_all every plan table exists", sorted(set(PLAN_TABLES) - names), [])
         for t, want in PLAN_TABLES.items():
             r.eq(f"schema_all columns of {t}", tuple(cols(c, t)), want)

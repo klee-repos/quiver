@@ -38,12 +38,17 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
         "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials", "get_metrics",
         "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
         "get_events", "get_proposals",
-        "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
+        "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies",
+        "get_learning"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
-           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read"]
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
+           "add_rule", "retire_rule", "retire_lesson"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
-           "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
+           "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
+# The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.
+R_TOOLS = ["get_learning", "get_track_record", "get_company", "get_events", "get_proposals", "search_research",
+           "get_document", "report", "curate_lessons"]
 D_TOOLS = READ + D_WRITE
 A_TOOLS = READ + A_WRITE
 # The secret paths of today's tests/test_chat_guard.py (at 889a2ad), as (tool, input).
@@ -168,6 +173,22 @@ def case_roles(root, clock):
          sorted([f"mcp__desk__{t}" for t in D_TOOLS] + BUILTINS))
     r.eq("roles: analyst allowed_tools = the A tools + the 4 built-ins", sorted(a_opts.allowed_tools),
          sorted([f"mcp__desk__{t}" for t in A_TOOLS] + BUILTINS))
+    # The reflect job (§6.5): its tools pass; every card, research write and chat tool is denied.
+    rjs = agent.JobState(role="reflect", kind="reflect")
+    r_opts = agent.reflect_options(rt, make_secrets(), rjs, ctx=build_ctx(root, rt, "reflect", job=rjs))
+    rh = hook_of(r_opts)
+    r.eq("roles: reflect: every reflect tool passes", sorted(t for t in R_TOOLS if call_hook(rh, f"mcp__desk__{t}")[0]),
+         sorted(R_TOOLS))
+    for t in ("propose_trade", "propose_change", "record_finding", "record_verdict", "load_company", "say",
+              "add_rule", "ledger_query", "fetch_document"):
+        r.ok(f"roles: reflect: {t} is denied", not call_hook(rh, f"mcp__desk__{t}")[0])
+    r.eq("roles: reflect allowed_tools = the reflect tools only (no built-in tool)", sorted(r_opts.allowed_tools),
+         sorted(f"mcp__desk__{t}" for t in R_TOOLS))
+    r.eq("roles: reflect gets no built-in tool", list(r_opts.tools), [])
+    for t in BUILTINS:
+        r.ok(f"roles: reflect: {t} is denied", not call_hook(rh, t, {"file_path": str(root.path / "README.md")})[0])
+    r.eq("roles: reflect runs the analyst model", r_opts.model, rt.analyst_model)
+    r.ok("roles: reflect runs the reflector prompt", "reviewer of the Quiver desk" in str(r_opts.system_prompt))
     r.ok("roles: an unknown mcp__desk__ tool is denied", not call_hook(dh, "mcp__desk__approve_proposal")[0])
 
 

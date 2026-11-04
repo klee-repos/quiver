@@ -4,11 +4,13 @@
 ``quiver-worker.path`` starts this unit while ``state/triggers/worker`` exists. The runner
 deletes the trigger, puts jobs left in ``running`` back to ``queued``, takes the ``worker``
 run lock, and drains ``jobs``: ``classify_news`` first, then ``analyze_event`` (oldest
-first), then ``deep_dive``, one at a time. It checks the queue again before it exits, so a
-job queued during the drain runs too.
+first), then ``deep_dive``, then ``reflect``, one at a time. It checks the queue again before
+it exits, so a job queued during the drain runs too.
 
 A job that fails runs once more; the second failure marks it ``failed``. An
-``analyze_event`` job must end with ``record_verdict``. The analyst has no broker access
+``analyze_event`` job must end with ``record_verdict``, which also writes the job's forecast
+(plan §6.5). A ``deep_dive`` job writes its forecast with ``record_forecast``. A ``reflect``
+job reads the graded forecasts and changes the lessons. The analyst has no broker access
 (the unit hides the Robinhood config) and no shell: its tools are the A set of
 ``lib/desk/tools.py``.
 
@@ -33,13 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import runner_common as rc  # noqa: E402
 from lib import market, runlock  # noqa: E402
-from lib.desk import agenda, agent, documents, events, news, outbox, store, tools  # noqa: E402
+from lib.desk import agenda, agent, documents, events, learning, news, outbox, store, tools  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 from lib.prompts import load_prompt  # noqa: E402
 
 LOCK_TTL_S = 28800
-TIMEOUTS = {"analyze_event": 900, "deep_dive": 1800, "classify_news": 120}
-ORDER = ("classify_news", "analyze_event", "deep_dive")
+TIMEOUTS = {"analyze_event": 900, "deep_dive": 1800, "classify_news": 120, "reflect": 900}
+ORDER = ("classify_news", "analyze_event", "deep_dive", "reflect")
 MAX_ATTEMPTS = 2
 
 
@@ -99,7 +101,7 @@ class Worker:
         with self.led.connect() as conn:
             row = conn.execute(
                 "SELECT * FROM jobs WHERE status='queued' ORDER BY CASE kind WHEN 'classify_news' THEN 0 "
-                "WHEN 'analyze_event' THEN 1 ELSE 2 END, created_at, id LIMIT 1").fetchone()
+                "WHEN 'analyze_event' THEN 1 WHEN 'deep_dive' THEN 2 ELSE 3 END, created_at, id LIMIT 1").fetchone()
             return dict(row) if row else None
 
     def start(self, job) -> int:
@@ -178,10 +180,12 @@ class Worker:
                 "SELECT DISTINCT p.id, p.kind, p.state, p.rationale FROM proposals p LEFT JOIN orders o "
                 "ON o.proposal_id=p.id WHERE p.state IN ('pending','approved','executing') AND "
                 "(o.ticker=? OR p.payload_json LIKE ?)", (t, f'%"ticker":"{t}"%')).fetchall()]
+            learned = self.learning_context(conn, t, source="verdict", event_type=event["type"])
         body = {"job": "analyze_event", "event": {"id": event["id"], "ticker": t, "type": event["type"],
                                                   "created_by": event["created_by"], "detail": detail,
                                                   "detected_at": event["detected_at"]},
-                "new_documents": docs, "last_verdicts": verdicts, "open_proposals": props, "dossier": dossier}
+                "new_documents": docs, "last_verdicts": verdicts, "open_proposals": props, **learned,
+                "dossier": dossier}
         if also_events:
             body["also_events"] = also_events
         lead = "Analyze this event. Follow the analyst instructions. End with record_verdict for event "
@@ -190,21 +194,49 @@ class Worker:
                     "all of them. Follow the analyst instructions. End with ONE record_verdict for event ")
         return (lead + f"{event['id']}.\n\n```json\n" + json.dumps(body, default=str)[:60000] + "\n```")
 
+    @staticmethod
+    def learning_context(conn, ticker: str, *, source: str, event_type=None) -> dict:
+        """The learning blocks of an analyst job (plan §6.5): the forecast to state, the
+        owner's rules, the lessons for this name, and the graded record."""
+        h = learning.horizon_for(source, event_type)
+        cal = learning.calibration(conn)
+        return {"forecast": {"question": f"What is the chance that {ticker}'s price return beats "
+                                         f"{learning.BENCHMARK}'s over the next {h} days?",
+                             "horizon_days": h, "benchmark": learning.BENCHMARK,
+                             "tool": "record_verdict" if source == "verdict" else "record_forecast"},
+                "owner_rules": learning.rule_lines(learning.active_rules(conn)),
+                "lessons": learning.lesson_lines(learning.lessons_for(conn, scope="analyst", ticker=ticker,
+                                                                      limit=learning.ANALYST_LESSONS)),
+                "track_record": {"all_calls": learning.summary_line(cal),
+                                 "this_name": learning.record_lines(conn, ticker)}}
+
     def deep_dive_prompt(self, payload: dict) -> str:
         t = payload["ticker"]
         focus = payload.get("focus")
+        with self.led.connect() as conn:
+            learned = self.learning_context(conn, t, source="deep_dive")
         return (f"Run a deep-dive on {t}." + (f" Focus: {focus}" if focus else "") +
-                " Follow the analyst instructions for a deep-dive. Start with get_company and list_filings.")
+                " Follow the analyst instructions for a deep-dive. Start with get_company and list_filings."
+                " End with record_forecast, then report.\n\n```json\n" + json.dumps(learned, default=str)[:20000]
+                + "\n```")
+
+    def reflect_prompt(self, payload: dict) -> str:
+        with self.led.connect() as conn:
+            body = learning.reflect_input(conn, payload)
+        return ("Reflect on these graded forecasts. Follow the reflector instructions. Change the lessons with "
+                "curate_lessons, then file one report.\n\n```json\n" + json.dumps(body, default=str)[:90000]
+                + "\n```")
 
     def make_ctx(self, job_state):
         if self.ctx_factory:
             return self.ctx_factory(job_state)
-        return tools.ToolContext.build(role="analyst", runtime=self.runtime, secrets=self.secrets, job=job_state,
-                                       led=self.led, box=self.box)
+        return tools.ToolContext.build(role=job_state.role, runtime=self.runtime, secrets=self.secrets,
+                                       job=job_state, led=self.led, box=self.box)
 
     def run_agent_job(self, kind: str, prompt: str, job_state) -> None:
         ctx = self.make_ctx(job_state)
-        opts = agent.analyst_options(self.runtime, self.secrets, job_state, ctx=ctx)
+        build = agent.reflect_options if kind == "reflect" else agent.analyst_options
+        opts = build(self.runtime, self.secrets, job_state, ctx=ctx)
         asyncio.run(_run_query(prompt, opts, TIMEOUTS[kind]))
 
     def run_event(self, job):
@@ -234,9 +266,21 @@ class Worker:
 
     def run_deep_dive(self, job):
         payload = store.loads(job["payload_json"], {}) or {}
-        js = agent.JobState(job_id=job["id"], role="analyst", kind="deep_dive")
+        js = agent.JobState(job_id=job["id"], role="analyst", kind="deep_dive",
+                            ticker=str(payload.get("ticker") or "").upper() or None)
         self.job_runner("deep_dive", self.deep_dive_prompt(payload), js)
-        return {"ticker": payload.get("ticker"), "proposals": js.proposal_ids, "messages": js.messages}
+        if js.forecast_id is None:
+            # The report still goes out: a missing forecast costs one graded call, not the deep-dive.
+            rc._emit({"stage": "worker", "job": job["id"], "event": "forecast_missing", "ticker": js.ticker})
+        return {"ticker": payload.get("ticker"), "proposals": js.proposal_ids, "messages": js.messages,
+                "forecast": js.forecast_id}
+
+    def run_reflect(self, job):
+        payload = store.loads(job["payload_json"], {}) or {}
+        js = agent.JobState(job_id=job["id"], role="reflect", kind="reflect")
+        self.job_runner("reflect", self.reflect_prompt(payload), js)
+        with self.led.connect() as conn:
+            return {"reflect": learning.job_changes(conn, job["id"]), "graded": payload.get("new")}
 
     def describe(self, job) -> str:
         payload = store.loads(job["payload_json"], {}) or {}
@@ -248,6 +292,8 @@ class Worker:
             return f"analyze {ev.get('ticker', '?')}'s {form}"
         if job["kind"] == "deep_dive":
             return f"finish the deep-dive on {payload.get('ticker', '?')}"
+        if job["kind"] == "reflect":
+            return "review my graded calls"
         return "classify the news"
 
     def file_item(self, job, *, error=None):
@@ -269,6 +315,15 @@ class Worker:
                 prio = agenda.job_priority(conn, proposal_ids=pids, verdict=verdict, ticker=ticker,
                                            event_type=ev.get("type"))
                 body_if_empty = ev.get("analysis") or ""
+            elif job["kind"] == "reflect":
+                ticker = None
+                ch = learning.job_changes(conn, job["id"])
+                n = int(payload.get("new") or 0)
+                title = f"What I learned from {n} graded calls."
+                # A changed lesson list comes up; a review that changed nothing waits for the close brief.
+                prio = agenda.NEXT if (ch["added"] or ch["retired"]) else agenda.FYI
+                body_if_empty = (f"I reviewed {n} graded calls. I added {len(ch['added'])} lessons and retired "
+                                 f"{len(ch['retired'])}.")
             else:
                 ticker, by = payload.get("ticker"), job.get("requested_by")
                 if payload.get("review"):
@@ -318,6 +373,8 @@ class Worker:
                 res = self.run_classify(job)
             elif job["kind"] == "analyze_event":
                 res = self.run_event(job)
+            elif job["kind"] == "reflect":
+                res = self.run_reflect(job)
             else:
                 res = self.run_deep_dive(job)
             self.finish(job, "done")

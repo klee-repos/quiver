@@ -231,18 +231,27 @@ def refusal(fn):
 
 
 class _VerdictCtx:
-    """The two members ``tools.t_record_verdict`` reads: ``conn()`` and ``job``."""
+    """The members ``tools.t_record_verdict`` reads: ``conn()``, ``job``, ``role`` and
+    ``now()`` (the forecast it writes, plan §6.5)."""
 
     def __init__(self, led):
         self.led = led
         self.job = None
+        self.role = "analyst"
 
     def conn(self):
         return self.led.connect()
 
+    def now(self):
+        return store.utc_now()
+
+
+# The stated chance that goes with each verdict in these cases (plan §6.5).
+P_OF = {"strengthened": 0.62, "intact": 0.52, "weakened": 0.4, "broken": 0.3}
+
 
 def verdict(c: Ctx, eid: int, v: str):
-    return tools.t_record_verdict(_VerdictCtx(c.led), {"event_id": eid, "verdict": v,
+    return tools.t_record_verdict(_VerdictCtx(c.led), {"event_id": eid, "verdict": v, "p_beat_benchmark": P_OF[v],
                                                         "summary": f"the analyst finds the thesis {v}"})
 
 

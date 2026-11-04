@@ -8,7 +8,8 @@ stage of its own name. The steps, in order:
   snapshot (queue a broker snapshot in or just after the session), edgar (the EDGAR sweep,
   the day's first metrics, pending transcripts), news, levels (session only), drift and the
   close brief (once a day, after the close), expire, queue (analysis jobs), path_unit, and
-  after the close: reflect, benchmark, goal, prune. The last line is one JSON status line.
+  after the close: reflect, benchmark, learn (grade the journal and queue the reflect job,
+  plan §6.5), goal, prune. The last line is one JSON status line.
 
 Under KILL the monitor still detects events and queues analysis: research is harmless.
 
@@ -35,7 +36,7 @@ import runner_common as rc  # noqa: E402
 from lib import goal as goal_mod  # noqa: E402
 from lib import market, notify, portfolio, runlock  # noqa: E402
 from lib.config import load_config  # noqa: E402
-from lib.desk import agenda, brief, edgar, events, levels, news, outbox, proposals, quotes  # noqa: E402
+from lib.desk import agenda, brief, edgar, events, learning, levels, news, outbox, proposals, quotes  # noqa: E402
 from lib.desk import settings as desk_settings, store, transcripts  # noqa: E402
 from lib.ledger import Ledger  # noqa: E402
 
@@ -355,6 +356,7 @@ class Monitor:
         res = {}
         res["reflect"] = self.step("reflect", self.reflect)
         res["benchmark"] = self.step("benchmark", self.benchmark)
+        res["learn"] = self.step("learn", self.learn)
         res["goal"] = self.step("goal", lambda: self._check(self.tick(["goal-track"], timeout=120)))
         res["prune"] = self.step("prune", lambda: self._check(self.tick(["prune"], timeout=120)))
         self.set_state(f"after_close_done:{self.day}", store.iso(self.now))
@@ -386,6 +388,21 @@ class Monitor:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"resolutions": res}), encoding="utf-8")
         return self._check(self.tick(["reflect", "--input", str(path)], timeout=120))
+
+    def learn(self):
+        """Grade the journal (``tick.py learn-grade``), then queue one reflect job when enough
+        forecasts resolved since the last one (plan §6.5)."""
+        graded = self._check(self.tick(["learn-grade"], timeout=600))
+        now = store.iso(self.now)
+        job = None
+        with self.led.transaction() as conn:
+            due = learning.reflect_due(conn, now)
+            if due:
+                job = store.enqueue_job(conn, kind="reflect", payload=due, requested_by="monitor", now=now)
+        if job:
+            rc.touch_trigger(ROOT, "worker", now)
+        keep = ("final_through", "tickers", "marked", "waiting", "resolved", "lessons_retired", "fetch_errors")
+        return {"grade": {k: graded.get(k) for k in keep if k in graded}, "reflect_job": job}
 
     def benchmark(self):
         bf = self._check(self.tick(["benchmark-fetch"], timeout=120))

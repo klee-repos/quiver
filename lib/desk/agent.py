@@ -1,8 +1,9 @@
 """Claude Agent SDK options for the desk agent, the analyst and the small jobs (plan §5).
 
-Three roles:
+Four roles:
   * desk agent (``quiver-chat``): Sonnet 5.5, a resident session, the D tools.
   * analyst (``quiver-worker``): Opus 5.5, one ``query()`` per job, the A tools.
+  * reflect (``quiver-worker``): Opus 5.5, one ``query()`` per reflect job, the reflect tools.
   * small jobs (news classifier, quick reaction): Haiku 5.5, no tools, one turn.
 
 The SDK starts the CLI with the parent's whole ``os.environ`` and lays ``options.env`` on
@@ -35,6 +36,7 @@ ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "XDG_CACHE_HOME", "CLAU
 DESK_CONFIG_DIR = "/opt/quiver/state/claude-desk"
 DESK_MAX_TURNS = 60
 ANALYST_MAX_TURNS = 80
+REFLECT_MAX_TURNS = 30
 
 
 @dataclass
@@ -136,7 +138,9 @@ class JobState:
     event_id: Optional[int] = None
     role: str = "analyst"
     kind: str = ""
+    ticker: Optional[str] = None
     verdict_recorded: bool = False
+    forecast_id: Optional[int] = None
     proposal_ids: list = field(default_factory=list)
     messages: int = 0
 
@@ -170,14 +174,15 @@ def _base_env() -> dict:
 
 
 def role_options(runtime: Runtime, *, role: str, server, tool_names: list, system_prompt: str,
-                 model: str, max_turns: int, resume: Optional[str] = None):
-    """``ClaudeAgentOptions`` for the desk agent or the analyst (§5.2)."""
+                 model: str, max_turns: int, resume: Optional[str] = None, builtins=guard.BUILTINS):
+    """``ClaudeAgentOptions`` for the desk agent, the analyst or the reflect job (§5.2).
+    ``builtins`` are the Claude Code tools the role gets; the reflect job gets none."""
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
-    allowed = frozenset([f"mcp__desk__{n}" for n in tool_names] + list(guard.BUILTINS))
+    allowed = frozenset([f"mcp__desk__{n}" for n in tool_names] + list(builtins))
     env = _base_env()
     if runtime.config_dir and runtime.config_dir != DESK_CONFIG_DIR and not runtime.config_dir.endswith("claude-config"):
         env["CLAUDE_CONFIG_DIR"] = runtime.config_dir
-    kw = dict(system_prompt=system_prompt, tools=list(guard.BUILTINS), mcp_servers={"desk": server},
+    kw = dict(system_prompt=system_prompt, tools=list(builtins), mcp_servers={"desk": server},
               strict_mcp_config=True, allowed_tools=sorted(allowed), permission_mode="bypassPermissions",
               hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[make_hook(allowed, runtime.root)])]},
               setting_sources=[], cwd=runtime.root, env=env, model=model, max_turns=max_turns)
@@ -225,3 +230,15 @@ def analyst_options(runtime: Runtime, secrets: Secrets, job_state: JobState, *, 
     return role_options(runtime, role="analyst", server=server, tool_names=tools.role_tool_names("analyst"),
                         system_prompt=load_prompt("analyst"), model=runtime.analyst_model,
                         max_turns=ANALYST_MAX_TURNS)
+
+
+def reflect_options(runtime: Runtime, secrets: Secrets, job_state: JobState, *, ctx=None):
+    """The reflect job (plan §6.5): the analyst model with the reflect tools and
+    ``prompts/reflector.md``."""
+    from lib.desk import tools
+    from lib.prompts import load_prompt
+    ctx = ctx or tools.ToolContext.build(role="reflect", runtime=runtime, secrets=secrets, job=job_state)
+    server = tools.build_server(ctx)
+    return role_options(runtime, role="reflect", server=server, tool_names=tools.role_tool_names("reflect"),
+                        system_prompt=load_prompt("reflector"), model=runtime.analyst_model,
+                        max_turns=REFLECT_MAX_TURNS, builtins=())

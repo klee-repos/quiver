@@ -103,13 +103,15 @@ with temp_root() as root:
              ["queued", "queued"])
     js = agent.JobState(job_id=1, event_id=e1, kind="analyze_event")
     ctx, _ = ctx_for(root, "analyst", job=js)
-    other = result(tools.call(ctx, "record_verdict", {"event_id": e2, "verdict": "weakened", "summary": "x"}))
+    other = result(tools.call(ctx, "record_verdict", {"event_id": e2, "verdict": "weakened", "summary": "x",
+                                                      "p_beat_benchmark": 0.4}))
     r.ok("SEC-4: a verdict on another event is refused", "_error" in other and f"not event {e2}" in other["_error"],
          other)
     with root.led().connect() as c:
         r.eq("SEC-4: the other event stays queued", store.get_event(c, e2)["status"], "queued")
     r.eq("SEC-4: the refusal sets no verdict flag", js.verdict_recorded, False)
-    own = result(tools.call(ctx, "record_verdict", {"event_id": e1, "verdict": "intact", "summary": "no change"}))
+    own = result(tools.call(ctx, "record_verdict", {"event_id": e1, "verdict": "intact", "summary": "no change",
+                                                    "p_beat_benchmark": 0.5}))
     r.eq("SEC-4: the verdict on its own event is recorded", own.get("verdict"), "intact")
     trade = result(tools.call(ctx, "propose_trade", {"tickers": ["CEG"], "origin": {"event_id": e2},
                                                      "rationale": "x", "evidence": []}))

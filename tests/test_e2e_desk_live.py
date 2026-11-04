@@ -1,6 +1,6 @@
 """The live desk e2e (plan §18.7). Gated: the cases run only with ``QUIVER_LIVE_E2E=1``.
 
-Without the gate it prints ``0 passed, 0 failed, 4 skipped``. With the gate it needs
+Without the gate it prints ``0 passed, 0 failed, 8 skipped``. With the gate it needs
 ``CLAUDE_CODE_OAUTH_TOKEN`` and ``CLAUDE_BIN``; a missing one FAILS the case, it does not skip.
 Every case bills the subscription token. Run ``tests/run_e2e.sh --live`` before a cutover and
 after a prompt change.
@@ -17,6 +17,13 @@ answers, and a temp ``CLAUDE_CONFIG_DIR``. No broker. ``WebSearch`` is not a des
   * research: the owner asks about NVDA, a name that is not loaded. The desk loads it from the
     real SEC EDGAR (it needs ``SEC_USER_AGENT``) and queues a deep-dive with the question as its
     focus; then the worker runs that deep-dive. Every message must be in plain English.
+  * rule: the owner states a standing rule. The desk stores it with ``add_rule`` (plan §6.5).
+  * reflect: a reflect job (``QUIVER_ANALYST_MODEL``) reads graded forecasts with one clear
+    pattern and keeps the lessons through ``curate_lessons`` (plan §6.5).
+  * event: an ``analyze_event`` job on ANET's Q2 10-Q (``QUIVER_ANALYST_MODEL``) with an owner
+    rule and a lesson in the ledger. It ends with ``record_verdict`` and its forecast.
+  * grade: ``tick.py learn-grade`` with the real yfinance closes (no model). Four forecasts made
+    on 2026-06-01; the stored excess must equal one computed here from an independent fetch.
 
 Run one case: ``QUIVER_LIVE_E2E=1 .venv/bin/python tests/test_e2e_desk_live.py desk_turn``.
 """
@@ -370,6 +377,14 @@ def case_deep_dive(R):
         R.ok("deep_dive: the item holds the pending set_thesis card",
              any(p["id"] in (it.get("proposal_ids") or []) for p in thesis), (it.get("proposal_ids"), thesis))
         R.eq("deep_dive: the report has no report labels or counters", labels([it.get("body")]), [])
+        with led.connect() as c:
+            fcs = [dict(x) for x in c.execute("SELECT source, ticker, p_beat, horizon_days FROM forecasts "
+                                              "WHERE job_id=?", (job["id"],)).fetchall()]
+        print("  deep_dive forecasts:", fcs)
+        R.ok("deep_dive: one forecast on ANET with a chance, graded over 90 days (plan §6.5)",
+             [(f["source"], f["ticker"], f["horizon_days"]) for f in fcs if f["source"] == "deep_dive"]
+             == [("deep_dive", "ANET", 90)] and all(0.01 <= (f["p_beat"] or 0) <= 0.99 for f in fcs
+                                                   if f["source"] == "deep_dive"), fcs)
         R.eq("deep_dive: the report uses no finance jargon", jargon([it.get("body")]), [])
 
 
@@ -379,7 +394,8 @@ JARGON = ("bear case", "bull case", "base case", "fair value", "yoy", "adx", "th
 
 
 def jargon(texts) -> list:
-    return sorted({w for t in texts for w in JARGON if w in str(t).lower()})
+    """The JARGON terms in the texts, as whole words: "on the books" (accounting) is not "the book"."""
+    return sorted({w for t in texts for w in JARGON if re.search(rf"\b{re.escape(w)}\b", str(t).lower())})
 
 
 # Report-style labels and counters the voice rules (prompts/desk.md, prompts/analyst.md) forbid.
@@ -509,7 +525,281 @@ def case_research(R):
              [len(w) for w in words])
 
 
-CASES = {"desk_turn": case_desk_turn, "ladder": case_ladder, "deep_dive": case_deep_dive, "research": case_research}
+RULE_Q = "From now on, never bring me news about SGOV. It is only my cash, so I don't care what it does."
+
+
+def case_rule(R):
+    if not need_env(R, "rule"):
+        return
+    import chat_bridge
+    from lib.desk import agent, learning
+    with temp_root() as root:
+        seed_desk(root, load=False)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        rec = {}
+
+        async def factory(options):
+            from claude_agent_sdk import ClaudeSDKClient
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            rec["c"] = Recorder(client)
+            return rec["c"]
+
+        bridge = chat_bridge.Bridge(runtime=runtime, secrets=secrets, led=root.led(), transport=tg,
+                                    client_factory=factory)
+
+        async def go():
+            await bridge.handle_update(owner_update(1, 7002, RULE_Q), offline=False)
+            await bridge.maybe_turn()
+            await bridge.turn_task
+            await bridge.disconnect()
+
+        asyncio.run(go())
+        tools = rec["c"].tools if "c" in rec else []
+        print(f"  rule: tools={tools}")
+        with root.led().connect() as c:
+            rules = learning.active_rules(c)
+        print("  rule rows:", rules)
+        R.ok("rule: the desk calls add_rule", "mcp__desk__add_rule" in tools, tools)
+        R.ok("rule: one active rule about SGOV, citing the owner's message",
+             len(rules) == 1 and "SGOV" in rules[0]["text"].upper() and rules[0]["owner_message_id"] == 7002, rules)
+        sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        R.ok("rule: one to three short messages confirm it", 1 <= len(sent) <= 3, len(sent))
+        R.eq("rule: no report labels", labels(p.get("text") for p in sent), [])
+        for p in sent:
+            print("    say>", str(p.get("text"))[:300].replace("\n", " "))
+
+
+def case_reflect(R):
+    if not need_env(R, "reflect"):
+        return
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import run_worker
+    from lib import market
+    from lib.desk import agent, learning, outbox, store
+    et = ZoneInfo("America/New_York")
+    with temp_root() as root:
+        seed_desk(root, load=False)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        led = root.led()
+        sess = [d for d, _o, _c in market.sessions_between(datetime(2026, 5, 1, 9, tzinfo=et),
+                                                           datetime(2026, 12, 31, 9, tzinfo=et))]
+
+        def series(p0, step):
+            out, p = {}, p0
+            for d in sess:
+                out[d] = round(p, 6)
+                p *= step
+            return out
+        data = {"SPY": series(500, 1.0005), "ANET": series(150, 1.002), "CEG": series(300, 0.999)}
+        with led.connect() as c:
+            # The pattern: four sure CEG calls on headlines alone, all wrong; three ANET calls on filings, right.
+            for i, day in enumerate(("2026-06-01", "2026-06-03", "2026-06-08", "2026-06-10")):
+                learning.record_forecast(
+                    c, source="verdict", ticker="CEG", p_beat=0.72, stance=1, verdict="strengthened",
+                    made_at=datetime.fromisoformat(day + "T15:00:00").replace(tzinfo=et), created_by="analyst",
+                    horizon_days=90, reason=f"A headline about a new data center power deal ({i + 1}); no numbers "
+                                            "and no filing behind it yet, but it sounds big.")
+            for day in ("2026-06-02", "2026-06-04", "2026-06-09"):
+                learning.record_forecast(
+                    c, source="verdict", ticker="ANET", p_beat=0.6, stance=1, verdict="intact",
+                    made_at=datetime.fromisoformat(day + "T15:00:00").replace(tzinfo=et), created_by="analyst",
+                    horizon_days=90, reason="The quarterly report shows orders up and margins holding.")
+            res = learning.grade(c, series=data, sessions=sess, final_through="2026-09-30",
+                                 now_iso=store.now_iso())
+            due = learning.reflect_due(c, store.now_iso())
+            jid = store.enqueue_job(c, kind="reflect", payload=due, requested_by="monitor", now=store.now_iso())
+            job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
+        R.eq("reflect: seven forecasts resolved", res["resolved"], 7)
+        box = outbox.Outbox(led, transport=tg, chat_id=str(OWNER))
+        worker = run_worker.Worker(runtime=runtime, secrets=secrets, led=led, box=box)
+        captured = []
+        orig_query = run_worker._run_query
+
+        async def recording_query(prompt, options, timeout):
+            msgs = await orig_query(prompt, options, timeout)
+            captured.extend(msgs)
+            return msgs
+        run_worker._run_query = recording_query
+        t0 = time.monotonic()
+        try:
+            worker.run_one(job)
+        finally:
+            run_worker._run_query = orig_query
+        secs = round(time.monotonic() - t0, 1)
+        from claude_agent_sdk import AssistantMessage, ToolUseBlock
+        calls = [b for m in captured if isinstance(m, AssistantMessage) for b in m.content
+                 if isinstance(b, ToolUseBlock)]
+        names = [b.name.replace("mcp__desk__", "") for b in calls]
+        print(f"  reflect: {secs}s, tools={names}")
+        for b in calls:
+            if b.name.endswith("curate_lessons"):
+                print("    curate_lessons input:", json.dumps(b.input)[:900])
+        with led.connect() as c:
+            j = dict(c.execute("SELECT status, error FROM jobs WHERE id=?", (jid,)).fetchone())
+            lessons = [dict(x) for x in c.execute("SELECT * FROM lessons").fetchall()]
+            resolved = {int(x[0]) for x in c.execute("SELECT id FROM forecasts WHERE outcome IS NOT NULL")}
+        it = job_item(led, jid)
+        print("  lessons:", [(x["scope"], x["ticker"], x["text"]) for x in lessons])
+        print("  report:", (it.get("body") or "")[:900].replace("\n", " "))
+        R.eq("reflect: the job is done", j["status"], "done")
+        R.ok("reflect: the reviewer calls curate_lessons", "curate_lessons" in names, names)
+        R.ok("reflect: one or more lessons added", len(lessons) >= 1, lessons)
+        R.ok("reflect: each lesson cites 3 or more graded forecasts",
+             all(len(set(json.loads(x["evidence_json"])) & resolved) >= 3 for x in lessons), lessons)
+        R.ok("reflect: a lesson speaks to the headline-only CEG calls",
+             any(("headline" in x["text"].lower() or "news" in x["text"].lower() or x["ticker"] == "CEG")
+                 for x in lessons), [x["text"] for x in lessons])
+        R.ok("reflect: no card and no research write", not ({"propose_trade", "propose_change", "record_finding",
+                                                             "add_note"} & set(names)), names)
+        R.ok("reflect: the report is on the agenda", 200 <= len(it.get("body") or "") <= 3000, len(it.get("body") or ""))
+        R.eq("reflect: the report has no report labels or counters", labels([it.get("body")]), [])
+        R.eq("reflect: the report uses no finance jargon", jargon([it.get("body")]), [])
+        R.eq("reflect: nothing goes to the owner from the worker", len(tg.sent()), 0)
+
+
+EVENT_ACC = "0001596532-26-000175"   # ANET's Q2 10-Q (the captured SEC files)
+
+
+def case_event(R):
+    if not need_env(R, "event"):
+        return
+    import run_worker
+    from lib.desk import agent, learning, outbox, store
+    with temp_root() as root:
+        seed_desk(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        led = root.led()
+        now = store.now_iso()
+        with led.connect() as c:
+            c.execute("INSERT INTO lessons (scope, text, evidence_json, status, created_at, updated_at) VALUES "
+                      "('analyst', 'On a quarterly report, read the cash flow statement before you trust a jump in "
+                      "profit.', '[]', 'active', ?, ?)", (now, now))
+            lid = c.execute("SELECT MAX(id) FROM lessons").fetchone()[0]
+            learning.add_rule(c, text="Never add to SPCX.", owner_message_id=1, now_iso=now)
+            eid = store.create_event(c, dedup_key=f"filing:{EVENT_ACC}", ticker="ANET", type="filing",
+                                     detail={"accession": EVENT_ACC, "form": "10-Q"}, now=now, status="queued")
+            jid = store.enqueue_job(c, kind="analyze_event", payload={"event_id": eid}, requested_by="monitor", now=now)
+            job = dict(c.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone())
+            ev = store.get_event(c, eid)
+        box = outbox.Outbox(led, transport=tg, chat_id=str(OWNER))
+        worker = run_worker.Worker(runtime=runtime, secrets=secrets, led=led, box=box)
+        prompt = worker.event_prompt(agent.JobState(job_id=jid, event_id=eid, kind="analyze_event"), ev)
+        R.ok("event: the prompt holds the rule, the lesson and the forecast question",
+             "Never add to SPCX." in prompt and f"[lesson {lid}" in prompt and "over the next 90 days" in prompt)
+        captured = []
+        orig_query = run_worker._run_query
+
+        async def recording_query(prompt, options, timeout):
+            msgs = await orig_query(prompt, options, timeout)
+            captured.extend(msgs)
+            return msgs
+        run_worker._run_query = recording_query
+        t0 = time.monotonic()
+        try:
+            worker.run_one(job)
+        finally:
+            run_worker._run_query = orig_query
+        secs = round(time.monotonic() - t0, 1)
+        from claude_agent_sdk import AssistantMessage, ToolUseBlock
+        calls = [b for m in captured if isinstance(m, AssistantMessage) for b in m.content
+                 if isinstance(b, ToolUseBlock)]
+        names = [b.name.replace("mcp__desk__", "") for b in calls]
+        verdicts = [b.input for b in calls if b.name.endswith("record_verdict")]
+        print(f"  event: {secs}s, tools={names}")
+        print("  record_verdict inputs:", json.dumps(verdicts)[:900])
+        with led.connect() as c:
+            j = dict(c.execute("SELECT status, error, attempts FROM jobs WHERE id=?", (jid,)).fetchone())
+            evr = store.get_event(c, eid)
+            fcs = [dict(x) for x in c.execute("SELECT * FROM forecasts WHERE event_id=? AND source='verdict'", (eid,))]
+        it = job_item(led, jid)
+        print("  forecasts:", [(f["p_beat"], f["stance"], f["horizon_days"], f["start_session"], f["lesson_ids"])
+                               for f in fcs])
+        print("  report:", (it.get("body") or "")[:600].replace("\n", " "))
+        R.eq("event: the job is done on its first attempt", (j["status"], j["attempts"]), ("done", 1))
+        R.ok("event: the event is analyzed", evr["status"] in ("noted", "proposed") and evr["verdict"], evr["status"])
+        R.ok("event: every record_verdict call states a chance", verdicts and all(
+            "p_beat_benchmark" in v for v in verdicts), verdicts)
+        R.eq("event: one verdict forecast, 90 days, for the job", [(f["ticker"], f["horizon_days"], f["job_id"])
+                                                                 for f in fcs], [("ANET", 90, jid)])
+        R.ok("event: the chance is in range and its side matches it", fcs and 0.01 <= fcs[0]["p_beat"] <= 0.99
+             and fcs[0]["stance"] == learning.stance_of(fcs[0]["p_beat"]), fcs)
+        R.ok("event: lessons_used names only the active lesson",
+             fcs and set(json.loads(fcs[0]["lesson_ids"])) <= {lid}, fcs and fcs[0]["lesson_ids"])
+        R.ok("event: the report is on the agenda", 100 <= len(it.get("body") or "") <= 3000, len(it.get("body") or ""))
+        R.eq("event: the report has no report labels or counters", labels([it.get("body")]), [])
+        R.eq("event: the report uses no finance jargon", jargon([it.get("body")]), [])
+        R.eq("event: nothing goes to the owner from the worker", len(tg.sent()), 0)
+
+
+def case_grade(R):
+    """The real grade: yfinance closes, the real calendar, the real tick command. No model."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    import tick
+    import yfinance as yf
+    from lib import benchmark, market
+    from lib.desk import learning, store
+    et = ZoneInfo("America/New_York")
+    made = datetime(2026, 6, 1, 15, 0, tzinfo=et)
+    with temp_root() as root:
+        led = root.led()
+        with led.connect() as c:
+            ids = {t: learning.record_forecast(c, source="verdict", ticker=t, p_beat=p, stance=learning.stance_of(p),
+                                               made_at=made, created_by="analyst", reason="live grade case",
+                                               horizon_days=h)
+                   for t, p, h in (("ANET", 0.6, 90), ("CEG", 0.4, 90), ("BRK.B", 0.55, 30), ("ZZZQXV", 0.6, 30))}
+        prev = tick.LEDGER_DB
+        tick.LEDGER_DB = root.db
+        try:
+            out = tick.cmd_learn_grade(None)
+            again = tick.cmd_learn_grade(None)
+        finally:
+            tick.LEDGER_DB = prev
+        print("  grade:", json.dumps(out)[:700])
+        with led.connect() as c:
+            rows = {r["ticker"]: learning._row(r) for r in c.execute("SELECT * FROM forecasts").fetchall()}
+        R.ok("grade: the command ran", out.get("ok") is True, out)
+        R.eq("grade: the window starts at the 2026-06-01 close", {t: r["start_session"] for t, r in rows.items()},
+             {t: "2026-06-01" for t in rows})
+        R.eq("grade: ANET, CEG and BRK.B resolve", sorted(out.get("resolved_ids") or []),
+             sorted([ids["ANET"], ids["CEG"], ids["BRK.B"]]))
+        R.ok("grade: BRK.B is fetched as BRK-B", rows["BRK.B"]["outcome"] in (0, 1), rows["BRK.B"])
+        R.ok("grade: an unknown symbol is a fetch error, not a void",
+             "ZZZQXV" in (out.get("fetch_errors") or {}) and rows["ZZZQXV"]["resolved_at"] is None
+             and rows["ZZZQXV"]["marks"] == {}, (out.get("fetch_errors"), rows["ZZZQXV"]))
+        R.eq("grade: a second run resolves nothing new", (again.get("resolved"), again.get("marked")), (0, 0))
+        # The independent check: fetch the closes here and compute ANET's 90-day excess by hand.
+        sess = [d for d, _o, _c in market.sessions_between(made, datetime.now(et))]
+
+        def closes(t):
+            h = yf.Ticker(t).history(start="2026-05-25", auto_adjust=True)
+            return {str(i)[:10]: float(v) for i, v in h["Close"].items()}
+        a, s = closes("ANET"), closes("SPY")
+        target = learning.add_days("2026-06-01", 90)
+        ra, _ = benchmark.window_return(a, "2026-06-01", target, sess)
+        rs, _ = benchmark.window_return(s, "2026-06-01", target, sess)
+        want = ra - rs
+        got = rows["ANET"]["excess"]
+        print(f"  ANET 90-day excess: stored {got}, computed here {round(want, 6)} "
+              f"(ANET {round(ra, 4)}, SPY {round(rs, 4)})")
+        R.ok("grade: the stored excess equals the independent computation", abs(got - want) < 1e-5, (got, want))
+        R.eq("grade: the outcome and the Brier score follow from it",
+             (rows["ANET"]["outcome"], rows["ANET"]["brier"]),
+             (1 if want > 0 else 0, learning.brier(0.6, 1 if want > 0 else 0)))
+        R.eq("grade: the 90-day mark is the last close on or before the target",
+             rows["ANET"]["marks"]["90"]["session"], max(d for d in sess if d <= target))
+
+
+CASES = {"desk_turn": case_desk_turn, "ladder": case_ladder, "deep_dive": case_deep_dive, "research": case_research,
+         "rule": case_rule, "reflect": case_reflect, "event": case_event, "grade": case_grade}
 
 
 def main(argv) -> int:

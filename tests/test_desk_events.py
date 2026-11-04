@@ -388,6 +388,7 @@ def make_worker(root, led, behavior: dict):
             raise RuntimeError("the model call failed")
         if act in ("noted", "proposed"):
             tools.t_record_verdict(ctx, {"event_id": js.event_id, "verdict": "intact" if act == "noted" else "weakened",
+                                         "p_beat_benchmark": 0.5 if act == "noted" else 0.4,
                                          "summary": "The filing changes nothing." if act == "noted"
                                          else "Guidance fell; the buy level moves down."})
             with led.connect() as conn:
@@ -493,9 +494,11 @@ def case_queue():
                     continue
                 r.raises(f"queue a {st} event takes no new verdict",
                          lambda eid=eid: tools.t_record_verdict(ctx, {"event_id": eid, "verdict": "broken",
-                                                                     "summary": "x"}), tools.ToolError, "not queued")
+                                                                     "p_beat_benchmark": 0.3, "summary": "x"}),
+                         tools.ToolError, "not queued")
             r.raises("queue a new event takes no verdict",
-                     lambda: tools.t_record_verdict(ctx, {"event_id": drift, "verdict": "broken", "summary": "x"}),
+                     lambda: tools.t_record_verdict(ctx, {"event_id": drift, "verdict": "broken", "summary": "x",
+                                                          "p_beat_benchmark": 0.3}),
                      tools.ToolError, "not queued")
     finally:
         clock.unpin()
