@@ -1123,6 +1123,9 @@ def case_say():
             n0 = len(w.tg.of("sendMessage"))
             out["bad"] = await sdk.tool("say", {"text": long_bad})
             out["bad_sent"] = len(w.tg.of("sendMessage")) - n0
+            # 2026-11-04: "Good: revenue $13.4B" and "Worrying: ..." reached the owner (report style).
+            out["label"] = await sdk.tool("say", {"text": "AMD, short take.\nGood: revenue grew 45%."})
+            out["label_sent"] = len(w.tg.of("sendMessage")) - n0
             out["ok"] = await sdk.tool("say", {"text": long_ok})
             out["two"] = await sdk.tool("say", {"text": "Second message."})
             yield text_msg(closing)
@@ -1139,6 +1142,9 @@ def case_say():
         r.ok("say: 1,201 chars refused", is_err(b), b)
         r.ok("say: the refusal says split it", "split it" in tool_text(b) if b else False, b)
         r.eq("say: a refused say sends nothing", out.get("bad_sent"), 0)
+        lb = out.get("label", {})
+        r.ok("say: a line that starts with a label is refused", is_err(lb) and "Good:" in tool_text(lb), lb)
+        r.eq("say: the refused label sends nothing", out.get("label_sent"), 0)
         r.ok("say: 1,200 chars pass", not is_err(out.get("ok", {"is_error": True})), out.get("ok"))
         sends = w.tg.of("sendMessage")
         r.eq("say: the say messages in order, the trailing text dropped (D-live-1)",

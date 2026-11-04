@@ -621,9 +621,49 @@ def case_agenda(r: Results):
     with_root("2026-10-28 09:00", body)
 
 
+def case_results(r: Results):
+    """2026-11-03: the ANET results read (an 8-K item 2.02, strengthened) was filed fyi and never came
+    up. A holding's results come up first; its 10-Q with an unchanged thesis stays fyi; a read the
+    desk promised (promise_read) comes up first even when nothing changed."""
+    def body(h: Harness):
+        quiet = h.worker(Script(h, lambda *a: None))
+        quiet.drain()
+        with h.led.connect() as c:
+            # The producer call of events.sweep for a holding's 8-K with item 2.02.
+            er = store.create_event(c, dedup_key="filing:0001596532-26-000252", ticker="ANET", type="earnings",
+                                    detail={"accession": "0001596532-26-000252", "form": "8-K", "items": "2.02,9.01",
+                                            "document_keys": ["8-K:body", "8-K:EX-99.1"]},
+                                    now=store.now_iso(), created_by="monitor")
+        h.level_event("CEG", "trim_above", 250.0, "2026-10-28 16:20")
+        jobs = h.queue()
+        ceg_job = next(j for j in jobs if h.one("SELECT e.ticker FROM jobs j JOIN events e ON "
+                                                 "e.id=json_extract(j.payload_json, '$.event_id') WHERE j.id=?", (j,)) == "CEG")
+        with h.led.connect() as c:
+            r.eq("results: promise_read marks the queued CEG job", agenda.promise_read(c, "CEG", now=store.now_iso())["jobs"],
+                 [ceg_job])
+
+        def fn(h, kind, prompt, js, ctx, attempt):
+            if kind == "analyze_event":
+                verdict(ctx, js, "strengthened" if js.event_id == er else "intact")
+                ok_call(ctx, "report", {"text": "Arista beat its own forecast, so our reason to own it got stronger."
+                                        if js.event_id == er else "Nothing in this changes why we own it."})
+        h.worker(Script(h, fn)).drain()
+        # The 10-Q comes the next day, in its own job (one job per ticker's group of events).
+        evs = h.sweep_10q("2026-10-28 16:30")
+        h.queue()
+        h.worker(Script(h, fn)).drain()
+        got = {i["event_id"]: i["priority"] for i in h.q("SELECT event_id, priority FROM agenda WHERE status='waiting'")}
+        ceg_ev = h.one("SELECT id FROM events WHERE ticker='CEG' ORDER BY id DESC LIMIT 1")
+        r.eq("results: the holding's results are now, its intact 10-Q is fyi, the promised CEG read is now",
+             (got.get(er), got.get(evs[0] if evs else None), got.get(ceg_ev)), (agenda.NOW, agenda.FYI, agenda.NOW))
+
+    with_root("2026-10-28 09:00", body, new_10q=True)
+
+
 def main() -> int:
     r = Results("run-worker")
-    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt, case_review, case_agenda):
+    for case in (case_order, case_retry_fail, case_no_verdict, case_drain, case_prompt, case_review, case_agenda,
+                 case_results):
         try:
             case(r)
         except Exception as e:  # noqa: BLE001

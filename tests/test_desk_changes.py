@@ -449,6 +449,45 @@ def case_thesis():
              th and abs(th["buy_below"] - th["fair_value_base"] * 0.80) < 1e-6, th)
 
 
+def case_ladder():
+    """The price ladder reads the confirmed thesis: the case prices, their plain names, and the
+    analyst's `bet` sentence of each case (stored in valuation_json by set_thesis)."""
+    with case() as c:
+        c.snap()
+        f = c.finding()
+        val = dcf([f], [f], [f])
+        bets = {"bear": "Orders stall when the big clouds pause their spending.",
+                "base": "The clouds keep buying at about today's pace.",
+                "bull": "Arista wins the back-end network of most new AI clusters."}
+        for k, b in bets.items():
+            val["scenarios"][k]["bet"] = b
+        pid, res = confirm(c, thesis("ANET", val))
+        th = c.one("SELECT * FROM theses WHERE ticker='ANET' ORDER BY version DESC LIMIT 1")
+        r.ok("ladder: the thesis with bets applies", res["ok"] and th is not None, res)
+        r.eq("ladder: set_thesis stores each bet", {k: v["bet"] for k, v in
+                                                    json.loads(th["valuation_json"])["scenarios"].items()}, bets)
+        with c.led.connect() as conn:
+            cik = store.get_company(conn, "ANET")["cik"]
+            lad = valuation.price_ladder(conn, "ANET", cik=cik, price=th["fair_value_base"] * 1.05)
+            lv = [(x["keys"], x["name"], x["bet"]) for x in lad["levels"]]
+            r.eq("ladder: the thesis prices, cheapest first; the sell-some price and the bull case share a line", lv, [
+                (["fair_value_low"], "if things go badly", bets["bear"]),
+                (["buy_below"], "a good price to buy more", None),
+                (["fair_value_base"], "the middle case", bets["base"]),
+                (["today"], "today", None),
+                (["trim_above", "fair_value_high"], "a good price to sell some; if things go very well", bets["bull"])])
+            r.eq("ladder: each price is the thesis price",
+                 [x["price"] for x in lad["levels"] if x["keys"] != ["today"]],
+                 [round(th[k], 2) for k in ("fair_value_low", "buy_below", "fair_value_base", "trim_above")])
+            r.ok("ladder: a company has multiples", all(x["x_sales"] is not None for x in lad["levels"]), lad["levels"])
+        confirm(c, thesis("SOXX", {"method": "price_levels", "reason": "an ETF has no fair value"}, buy_below=250.0))
+        with c.led.connect() as conn:
+            etf = valuation.price_ladder(conn, "SOXX", cik=None, price=270.0, kind="etf")
+        r.eq("ladder: a fund shows prices only", [(x["keys"], x["price"], "x_sales" in x) for x in etf["levels"]],
+             [(["buy_below"], 250.0, False), (["today"], 270.0, False)])
+        r.ok("ladder: a fund's caveat says why", any("fund" in x for x in etf["caveats"]), etf["caveats"])
+
+
 # --- resume -------------------------------------------------------------------------------
 
 def case_resume():
@@ -861,7 +900,7 @@ def case_plain_card():
              in text, text)
 
 
-CASES = [case_add, case_drop, case_weights_risk, case_premise, case_thesis, case_resume, case_revalidate, case_log,
+CASES = [case_add, case_drop, case_weights_risk, case_premise, case_thesis, case_ladder, case_resume, case_revalidate, case_log,
          case_follow_up, case_supersede_on_change, case_preview, case_one_open_card, case_plain_card]
 
 if __name__ == "__main__":

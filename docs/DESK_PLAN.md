@@ -391,11 +391,24 @@ Each background process sent the moment it finished. The agenda replaces that.
 2. **States.** `draft` (the job still runs; it never comes up), `waiting`, `open` (brought up;
    a unique index allows one), `done`, `dropped`.
 3. **Priority** (`agenda.job_priority`, one rule). `now` (0): a pending trade card, a deep-dive
-   the desk queued for the owner, a weaker or broken thesis on a holding, the drift card.
-   `next` (1): a pending change card, any other deep-dive, a weaker or broken thesis on a name
-   the owner does not hold, the close brief. `fyi` (2): everything else, for example a news
-   check that changed nothing. An fyi item never comes up by itself. The desk sees it in the
-   `<agenda>` block, and the close brief closes it (`agenda.close_fyi`).
+   the desk queued for the owner, a weaker or broken thesis on a holding, the results of a
+   holding (an `earnings` event, any verdict), the drift card. `next` (1): a pending change
+   card, any other deep-dive, a weaker or broken thesis on a name the owner does not hold, a
+   stronger thesis on a holding, the close brief. `fyi` (2): everything else, for example a
+   news check that changed nothing, or a 10-Q that kept the thesis as it was. An fyi item never
+   comes up by itself. The desk sees it in the `<agenda>` block, and the close brief closes it
+   (`agenda.close_fyi`).
+   Build deviation D-results (2026-11-04). On 2026-11-03 the ANET results (an 8-K item 2.02,
+   verdict strengthened) were filed `fyi`, so they never came up. The desk had told the owner
+   "I'll send the ANET read as soon as it lands", and the owner asked "And?" the next morning.
+   So a holding's results are `now` (they take over an unanswered brief after
+   `AGENDA_PREEMPT_S`), and a holding's stronger thesis is `next`.
+3b. **A promised read** (`promise_read(ticker)`, desk only, `agenda.promise_read`). Before the
+   desk tells the owner it will come back with the analyst's read, it calls `promise_read`.
+   Python marks the draft of each queued or running `analyze_event` or `deep_dive` job on that
+   ticker `now`, and `finish_job` keeps the mark over the rule's value. With no such job the
+   tool refuses: with a ready read on the agenda it returns that report to tell now; with none
+   it tells the desk not to promise.
 4. **Bringing an item up.** Every `AGENDA_POLL_S` (5 s), and after every turn, the bridge opens
    the next due item (`now` first, then by the time it was ready) when all of these hold: no
    turn runs, no item is open, no tap is in progress, no hold is set, no `execute` broker job
@@ -589,6 +602,7 @@ Each tool takes typed input and returns compact JSON. Roles: D = desk agent, A =
 | `get_financials` | `ticker, period=quarterly\|annual, limit<=12` | XBRL table: revenue, gross profit, operating income, net income, OCF, capex, FCF, shares |
 | `get_metrics` | `ticker` | latest `metrics` row (§8) |
 | `run_valuation` | `ticker, method, scenarios` | DCF / reverse DCF / EV-Sales / multiple results. Computes; stores nothing |
+| `price_ladder` | `ticker, prices?[<=6], ev_sales_targets?[<=6]` | the price ladder (§8.6): at each thesis price, today's price and each extra price, the market value, the company value, the multiple of a year of sales and of profit, and the case's `bet`. Computes; stores nothing |
 | `get_technicals` | `ticker` | `lib/trend.trend_metrics`: regime, ADX, drawdown, Sharpe, momentum |
 | `get_transcript` | `ticker, quarter?` | the transcript's document id; fetches it if missing and the budget allows |
 | `get_etf_lookthrough` | `ticker` | holdings (source, as-of), weighted metrics, expense ratio |
@@ -612,6 +626,7 @@ Each tool takes typed input and returns compact JSON. Roles: D = desk agent, A =
 | `defer_item` | D | puts an agenda item back in line for 1 to 72 hours. Refused with no owner message in the turn |
 | `hold_agenda` | D | no agenda item comes up by itself for 0 to 24 hours (0 lifts it). Refused with no owner message in the turn |
 | `show_card` | D | sends a pending card again as the newest message; the older card message says "Moved down" |
+| `promise_read` | D | input `ticker`. Marks the drafts of the ticker's queued or running analyst jobs `now` (§4.8 step 3b). Refused when no such job exists |
 | `load_company` | D, A | ingests a company or ETF (§7.7); a new name gets `status='candidate'` |
 | `fetch_document` | D, A | fetches a URL, stores the text as a `web` or `news` document |
 | `record_finding` | D, A | stores a finding only if the quote is in the document (§6.3) |
@@ -1161,6 +1176,35 @@ a cef) NAV premium only.
 `get_technicals` returns `lib/trend.trend_metrics` over the full 5-year frame that
 `load_ohlcv` returns (a shorter frame leaves `momentum_12_1`, `ret_2y` and `ret_3y` empty).
 Technicals are facts the desk can cite. They never create an event.
+
+### 8.6 The price ladder
+
+Build deviation D-ladder (2026-11-04). The owner asked about SPCX and got the analysis they
+want: at each price, what they bet on, and the multiple of sales at that price. But the desk
+did the arithmetic itself. It divided by the Q3 weighted diluted count (12.475B), while the
+share count today is 13.581B, so each multiple was about 9% low (29x at $141, not 32x).
+`valuation.price_ladder` (tool `price_ladder`) does every calculation, on one share count:
+
+1. **Prices.** The thesis prices (`fair_value_low`, `buy_below`, `fair_value_base`,
+   `trim_above`, `fair_value_high`), today's price (live; else the metrics row price) and up
+   to 6 extra `prices`. Cheapest first. Two prices within half a cent share one line.
+2. **Shares** (`ladder_shares`). The dei shares outstanding of the latest cover page; else
+   the metrics row market value / its price (one yfinance read); else the weighted diluted
+   shares of the latest quarter. A caveat names a gap of more than 5% between the count used
+   and the weighted diluted count.
+3. **Per price.** market value = price × shares. company value = market value − (cash +
+   short-term investments − debt), on the latest balance sheet. `x_sales` = company value /
+   a year of sales; `x_earnings` = market value / a year of profit (none for a loss). A year
+   is the TTM when it ends at the latest quarter, else the latest quarter × 4 (a caveat says
+   so). Below today, `sales_growth_needed_pct` = (company value today / company value at that
+   price − 1) × 100.
+4. **`ev_sales_targets`.** For each multiple m: the price at m today = (m × a year of sales +
+   net cash) / shares, and the sales growth today's price needs to cost m.
+5. **Bets.** Each thesis scenario may carry `bet`, one plain sentence of what must be true for
+   one share to be worth that case. `set_thesis` stores it in `valuation_json`, and the ladder
+   returns it on its case's line.
+6. A fund, or a name with no CIK, gets prices only. The desk and the analyst state no
+   multiple, company value or year of sales that the tool did not give.
 
 ## 9. Monitoring and events
 

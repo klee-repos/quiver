@@ -1,6 +1,6 @@
 """The live desk e2e (plan §18.7). Gated: the cases run only with ``QUIVER_LIVE_E2E=1``.
 
-Without the gate it prints ``0 passed, 0 failed, 3 skipped``. With the gate it needs
+Without the gate it prints ``0 passed, 0 failed, 4 skipped``. With the gate it needs
 ``CLAUDE_CODE_OAUTH_TOKEN`` and ``CLAUDE_BIN``; a missing one FAILS the case, it does not skip.
 Every case bills the subscription token. Run ``tests/run_e2e.sh --live`` before a cutover and
 after a prompt change.
@@ -10,6 +10,8 @@ captured SEC files), the real tool server, a ``FakeTelegram`` that replays the c
 answers, and a temp ``CLAUDE_CONFIG_DIR``. No broker. ``WebSearch`` is not a desk tool.
 
   * desk_turn: one real desk turn (``QUIVER_DESK_MODEL``) through ``chat_bridge.Bridge``.
+  * ladder: the owner asks for the multiples of sales at three prices. The desk calls
+    ``price_ladder``, and each multiple it states comes from that tool's result.
   * deep_dive: the seed's ANET ``deep_dive`` job (``QUIVER_ANALYST_MODEL``) through
     ``run_worker.Worker.run_one``.
   * research: the owner asks about NVDA, a name that is not loaded. The desk loads it from the
@@ -105,15 +107,27 @@ class Recorder:
         self.inner = inner
         self.tools = []
         self.results = []
+        self.names = {}       # tool_use_id -> tool name
+        self.outputs = []     # (tool name, result text)
 
     async def query(self, prompt):
         await self.inner.query(prompt)
 
     async def receive_response(self):
-        from claude_agent_sdk import AssistantMessage, ResultMessage, ToolUseBlock
+        from claude_agent_sdk import AssistantMessage, ResultMessage, ToolResultBlock, ToolUseBlock, UserMessage
         async for m in self.inner.receive_response():
             if isinstance(m, AssistantMessage):
-                self.tools += [b.name for b in m.content if isinstance(b, ToolUseBlock)]
+                for b in m.content:
+                    if isinstance(b, ToolUseBlock):
+                        self.tools.append(b.name)
+                        self.names[b.id] = b.name
+            elif isinstance(m, UserMessage) and isinstance(m.content, list):
+                for b in m.content:
+                    if isinstance(b, ToolResultBlock):
+                        c = b.content
+                        text = c if isinstance(c, str) else "".join(
+                            x.get("text", "") for x in (c or []) if isinstance(x, dict))
+                        self.outputs.append((self.names.get(b.tool_use_id), text))
             elif isinstance(m, ResultMessage):
                 self.results.append({"is_error": m.is_error, "subtype": m.subtype,
                                      "usage": getattr(m, "usage", None)})
@@ -184,6 +198,82 @@ def case_desk_turn(R):
         R.eq("desk_turn: the owner message is delivered", undelivered, 0)
         for p in sent:
             print("    say>", str(p.get("text"))[:300].replace("\n", " "))
+
+
+LADDER_Q = ("How does ANET look at today's price? Give me numbers: what multiple of sales am I paying at $150, "
+            "at today's price and at $200, and what am I betting on at each?")
+# A multiple in a message: "32x", "about 27.5x", "29×".
+MULTIPLE = re.compile(r"(?<![\w.$])(\d+(?:\.\d+)?)\s?[x×](?![a-z])", re.I)
+
+
+def ladder_numbers(outputs) -> list:
+    """Every multiple that a price_ladder result gives (each level and each sales target)."""
+    out = []
+    for name, text in outputs:
+        if name != "mcp__desk__price_ladder":
+            continue
+        try:
+            body = json.loads(text)
+        except ValueError:
+            continue
+        for lv in body.get("levels") or []:
+            out += [lv[k] for k in ("x_sales", "x_sales_ttm", "x_sales_run_rate", "x_earnings", "x_earnings_ttm",
+                                    "x_earnings_run_rate") if lv.get(k) is not None]
+        out += [t["x_sales"] for t in body.get("sales_targets") or []]
+    return out
+
+
+def case_ladder(R):
+    """2026-11-04: the owner wants the price ladder (at each price, the multiple of sales and the
+    bet). The desk did that arithmetic itself, on the wrong share count. Now each multiple it
+    states must come from the price_ladder tool."""
+    if not need_env(R, "ladder"):
+        return
+    import chat_bridge
+    from lib.desk import agent
+    with temp_root() as root:
+        seed_desk(root)
+        runtime, secrets = build_runtime(root)
+        agent.scrub_process_env()
+        tg = FakeTelegram()
+        rec = {}
+
+        async def factory(options):
+            from claude_agent_sdk import ClaudeSDKClient
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            rec["c"] = Recorder(client)
+            return rec["c"]
+
+        bridge = chat_bridge.Bridge(runtime=runtime, secrets=secrets, led=root.led(), transport=tg,
+                                    client_factory=factory)
+
+        async def go():
+            await bridge.handle_update(owner_update(1, 7101, LADDER_Q), offline=False)
+            await bridge.maybe_turn()
+            await bridge.turn_task
+            await bridge.disconnect()
+
+        t0 = time.monotonic()
+        asyncio.run(go())
+        secs = round(time.monotonic() - t0, 1)
+        c = rec.get("c")
+        tools = c.tools if c else []
+        print(f"  ladder: {secs}s, tools={tools}")
+        R.ok("ladder: the desk calls price_ladder", "mcp__desk__price_ladder" in tools, tools)
+        sent = [str(p.get("text")) for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
+        R.ok("ladder: one to four messages", 1 <= len(sent) <= 4, len(sent))
+        allowed = ladder_numbers(c.outputs if c else [])
+        said = [float(m) for t in sent for m in MULTIPLE.findall(t)]
+        R.ok("ladder: the desk states multiples", len(said) >= 2, said)
+        R.eq("ladder: every multiple the desk states comes from the tool (within rounding)",
+             [x for x in said if not any(abs(x - a) <= 0.6 for a in allowed)], [])
+        R.eq("ladder: no report labels or counters", labels(sent), [])
+        R.eq("ladder: no jargon", jargon(sent), [])
+        R.ok("ladder: no error result", all(not x["is_error"] for x in c.results) if c else False,
+             c.results if c else None)
+        for t in sent:
+            print("    say>", t[:400].replace("\n", " | "))
 
 
 def case_deep_dive(R):
@@ -419,7 +509,7 @@ def case_research(R):
              [len(w) for w in words])
 
 
-CASES = {"desk_turn": case_desk_turn, "deep_dive": case_deep_dive, "research": case_research}
+CASES = {"desk_turn": case_desk_turn, "ladder": case_ladder, "deep_dive": case_deep_dive, "research": case_research}
 
 
 def main(argv) -> int:

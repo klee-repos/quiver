@@ -228,4 +228,67 @@ with temp_root() as root:
                      "bear": {"revenue_cagr_5y": 0.1, "exit_ev_sales": 8}, "base": sc["base"], "bull": sc["bull"]},
                      settings=S, cik=CIK), ValuationError, "cites no finding")
 
+        # --- price ladder: ANET (a cover-page share count, four quarters of sales) ---------
+        so, bal = xbrl.shares_outstanding(c, CIK), xbrl.balance(c, CIK)
+        rev, ni = xbrl.ttm(c, CIK, "revenue"), xbrl.ttm(c, CIK, "net_income")
+        net_cash = bal["cash"] + bal["st_investments"] - bal["debt"]
+        before = c.total_changes
+        lad = valuation.price_ladder(c, "ANET", cik=CIK, price=PRICE, prices=[150, 177.2], ev_sales_targets=[10])
+        r.eq("ladder: it writes no row", c.total_changes - before, 0)
+        r.eq("ladder: the share count is the cover page", (lad["shares"]["value"], lad["shares"]["source"]),
+             (round(so["value"]), "the share count on the cover of the latest filing"))
+        r.eq("ladder: four quarters in a row -> the sales basis is the TTM", lad["sales"]["basis"], "ttm")
+        r.eq("ladder: an extra price equal to today joins today's line; levels go cheapest first",
+             [(lv["keys"], lv["price"]) for lv in lad["levels"]], [(["price"], 150.0), (["today", "price"], 177.2)])
+        today = lad["levels"][-1]
+        r.eq("ladder: x_sales = (price x shares - net cash) / TTM sales",
+             today["x_sales"], round((PRICE * so["value"] - net_cash) / rev["value"], 1))
+        r.eq("ladder: x_earnings = price x shares / TTM profit",
+             today["x_earnings"], round(PRICE * so["value"] / ni["value"], 1))
+        r.eq("ladder: the company value and its text", (today["company_value"], today["company_value_text"]),
+             (round(PRICE * so["value"] - net_cash), f"${(PRICE * so['value'] - net_cash) / 1e9:,.1f}B"))
+        cheap = lad["levels"][0]
+        r.eq("ladder: a lower price gives the sales growth today's price needs to cost the same",
+             cheap["sales_growth_needed_pct"],
+             round(((PRICE * so["value"] - net_cash) / (150 * so["value"] - net_cash) - 1) * 100, 1))
+        r.ok("ladder: today's line has no growth figure", "sales_growth_needed_pct" not in today, today)
+        tg = lad["sales_targets"][0]
+        r.eq("ladder: 10x sales today = (10 x TTM sales + net cash) / shares",
+             tg["price_at_it_today"], round((10 * rev["value"] + net_cash) / so["value"], 2))
+        r.ok("ladder: no thesis -> a caveat says so", any("no thesis" in x for x in lad["caveats"]), lad["caveats"])
+        r.raises("ladder: no price and no metrics row -> refused",
+                 lambda: valuation.price_ladder(c, "ZZZQ", cik=CIK, price=None), ValuationError, "no price")
+
+# --- price ladder: SPCX on 2026-11-04 (no cover-page shares, a share count that grew) ----
+# The desk told the owner ~18.5x / 24.5x / 29x / 41x sales at $91 / $119 / $141 / $196. It
+# divided by the Q3 weighted diluted count (12.475B). The stored market value of 11-04
+# ($1,919,140,079,561.90 at $141.31, one yfinance read) gives 13.581B shares today.
+CF_S = fx("cf_spcx")
+CIK_S = xbrl.cik10(CF_S["cik"])
+P_S, MC_S = 141.309997558594, 1_919_140_079_561.8962
+with temp_root() as root:
+    with root.led().connect() as c:
+        xbrl.upsert_companyfacts(c, CF_S)
+        valuation.compute_metrics(c, "SPCX", cik=CIK_S, settings=S, now="2026-11-04T11:40:46Z",
+                                  price_fn=lambda t: P_S, market_cap_fn=lambda t: MC_S)
+        lad = valuation.price_ladder(c, "SPCX", cik=CIK_S, price=141.31, prices=[91, 119, 196], ev_sales_targets=[15])
+        shares = MC_S / P_S
+        q3, q3_profit = 14_575_000_000, 4_404_000_000
+        net_cash = 51_294_000_000 + 38_561_000_000 - 37_861_000_000
+        r.eq("spcx: no dei fact -> the shares are the stored market value / the stored price",
+             (lad["shares"]["value"], lad["shares"]["source"]),
+             (round(shares), "the stored market value / the stored price (one yfinance read)"))
+        r.eq("spcx: no four quarters in a row -> the sales basis is the Q3 run rate", (lad["sales"]["basis"],
+             lad["sales"]["ttm"], lad["sales"]["run_rate"]), ("run_rate", None, 4 * q3))
+        want = [round((p * shares - net_cash) / (4 * q3), 1) for p in (91, 119, 141.31, 196)]
+        r.eq("spcx: x_sales at $91 / $119 / $141.31 / $196", [lv["x_sales"] for lv in lad["levels"]], want)
+        r.eq("spcx: the 11-04 numbers the owner should have got", want, [20.3, 26.8, 32.0, 44.8])
+        r.eq("spcx: x_earnings today is on the Q3 profit run rate", lad["levels"][2]["x_earnings"],
+             round(141.31 * shares / (4 * q3_profit), 1))
+        r.eq("spcx: 15x sales today", lad["sales_targets"][0]["price_at_it_today"],
+             round((15 * 4 * q3 + net_cash) / shares, 2))
+        cav = " ".join(lad["caveats"])
+        r.ok("spcx: the caveats name the run rate and the share count gap",
+             "latest quarter x 4" in cav and "12.475B" in cav and "13.581B" in cav, lad["caveats"])
+
 raise SystemExit(r.done())

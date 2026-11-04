@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from desk_fakes import REPO, FakeClock, FakeConn, FakeOpener, FakePrices, Results, seams, temp_root  # noqa: E402
 
-from lib.desk import agent, outbox, store, tools  # noqa: E402
+from lib.desk import agenda, agent, outbox, store, tools  # noqa: E402
 
 r = Results("desk-tools-static")
 TOOLS_PY = REPO / "lib" / "desk" / "tools.py"
@@ -27,11 +27,12 @@ OWNER = "987654321"
 # §5.4, written out from the plan tables.
 READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_companies", "get_company",
         "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials", "get_metrics",
-        "run_valuation", "get_technicals", "get_transcript", "get_etf_lookthrough", "get_events", "get_proposals",
+        "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
+        "get_events", "get_proposals",
         "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
-           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card"]
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
 W3_NAMES = {"approvals", "execution", "handle_tap", "apply_change", "subprocess", "Popen", "shutil",
@@ -542,14 +543,15 @@ ARGS = {
     "search_research": {"query": "revenue"}, "list_filings": {"ticker": "ANET"},
     "get_filing_sections": {"accession": "0001596532-26-000174"}, "get_document": {"document_id": 1},
     "get_financials": {"ticker": "ANET"}, "get_metrics": {"ticker": "ANET"},
-    "run_valuation": {"ticker": "ANET", "method": "dcf", "scenarios": {}}, "get_technicals": {"ticker": "ANET"},
+    "run_valuation": {"ticker": "ANET", "method": "dcf", "scenarios": {}},
+    "price_ladder": {"ticker": "ANET"}, "get_technicals": {"ticker": "ANET"},
     "get_transcript": {"ticker": "ANET"}, "get_etf_lookthrough": {"ticker": "SOXX"}, "get_events": {},
     "get_proposals": {}, "get_track_record": {}, "get_attribution": {}, "get_settings": {},
     "ledger_query": {"sql": "SELECT 1 AS one"}, "screen_companies": {},
     "react": {"message_id": 1, "emoji": "👍"}, "say": {"text": "Hello."},
     "report": {"text": "The ANET 10-Q is in."}, "load_company": {"ticker": "ZZZZQ"},
     "bring_up_next": {}, "close_item": {"item_id": 1}, "defer_item": {"item_id": 1, "hours": 2},
-    "hold_agenda": {"hours": 1}, "show_card": {"proposal_id": 1},
+    "hold_agenda": {"hours": 1}, "show_card": {"proposal_id": 1}, "promise_read": {"ticker": "ANET"},
     "fetch_document": {"url": "http://127.0.0.1/x"},
     "record_finding": {"ticker": "ANET", "kind": "growth", "claim": "x", "quote": "y", "document_id": 1},
     "add_note": {"text": "The owner prefers short messages."},
@@ -629,8 +631,64 @@ def case_smoke():
     r.ok("smoke: refresh_portfolio queued one snapshot job", ("refresh_portfolio", "snapshot") in kinds, kinds)
 
 
+def case_promise_and_labels():
+    """promise_read keeps a promise only when a job will file a read (2026-11-03 ANET); report
+    refuses a report-style label; price_ladder needs a loaded name."""
+    clock = FakeClock("2026-08-05T14:00:00Z").pin_market()
+    try:
+        with temp_root() as root:
+            led = root.led()
+            with led.connect() as c:
+                store.ensure_desk_schema(c)
+            rt = agent.Runtime.from_env(root.env)
+            tp = FakeTransport()
+            box = outbox.Outbox(led, transport=tp, chat_id=OWNER, sleep=lambda s: None)
+
+            def ctx_of(role, job=None):
+                turn = agent.TurnState() if role == "desk" else None
+                if turn is not None:
+                    turn.start(chat_id=OWNER, owner_message_ids=[], started_at=store.now_iso())
+                return tools.ToolContext.build(role=role, runtime=rt, secrets=SECRETS, turn=turn, job=job, led=led,
+                                               transport=tp, box=box, seams=seams(), yf_price_fn=FakePrices(),
+                                               touch=lambda n: None)
+
+            def text(res):
+                return res["content"][0]["text"]
+
+            d = ctx_of("desk")
+            res = tools.call(d, "promise_read", {"ticker": "ANET"})
+            r.ok("promise_read: no job -> refused, and it says not to promise",
+                 res.get("is_error") and "Do not promise" in text(res), res)
+            now = store.now_iso()
+            with led.connect() as c:
+                eid = store.create_event(c, dedup_key="filing:X-9", ticker="ANET", type="earnings",
+                                         detail={"form": "8-K", "items": "2.02"}, now=now)
+                jid = store.enqueue_job(c, kind="analyze_event", payload={"event_id": eid}, requested_by="monitor", now=now)
+            res = tools.call(d, "promise_read", {"ticker": "anet"})
+            r.ok("promise_read: a queued job -> marked", not res.get("is_error") and json.loads(text(res))["jobs"] == [jid], res)
+            with led.connect() as c:
+                c.execute("UPDATE jobs SET status='done' WHERE id=?", (jid,))
+                agenda.set_report(c, jid, "Arista beat its own forecast.", now=now)
+                agenda.finish_job(c, jid, kind="report", priority=agenda.FYI, title="ANET results.", now=now, ticker="ANET")
+            res = tools.call(d, "promise_read", {"ticker": "ANET"})
+            r.ok("promise_read: no job but a ready read -> refused with the report to tell now",
+                 res.get("is_error") and "read is ready" in text(res) and "Arista beat" in text(res), res)
+            res = tools.call(d, "price_ladder", {"ticker": "ANET"})
+            r.ok("price_ladder: a name not loaded -> refused", res.get("is_error") and "load_company" in text(res), res)
+            with led.connect() as c:
+                j2 = store.enqueue_job(c, kind="deep_dive", payload={"ticker": "ANET"}, requested_by="desk", now=now)
+            a = ctx_of("analyst", agent.JobState(job_id=j2, role="analyst", kind="deep_dive"))
+            res = tools.call(a, "report", {"text": "Arista is strong.\n\nVerdict: strengthened."})
+            r.ok("report: a line that starts with a label is refused", res.get("is_error") and "Verdict:" in text(res), res)
+            res = tools.call(a, "report", {"text": "Arista is strong, so our reason to own it got stronger."})
+            r.ok("report: plain sentences pass", not res.get("is_error"), res)
+    finally:
+        clock.unpin()
+
+
 def main() -> int:
-    for case in (case_registry, case_no_refs, case_jobs_kind, case_state_writes, case_closure, case_smoke):
+    for case in (case_registry, case_no_refs, case_jobs_kind, case_state_writes, case_closure, case_smoke,
+                 case_promise_and_labels):
         try:
             case()
         except Exception as e:  # noqa: BLE001

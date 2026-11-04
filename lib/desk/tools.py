@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -29,6 +30,10 @@ from lib.desk import (agenda, documents, edgar, etf, events, findings, news, out
 
 SAY_LIMIT = 1200
 REPORT_LIMIT = 3000
+# A report-style label at the start of a line or a sentence (prompts/desk.md "How you talk").
+# say and report refuse it.
+LABEL_RE = re.compile(r"(?mi)(?:^|(?<=[.!?] ))[ \t*_]*(good|bad|worrying|value|verdict|card|next|risks?|answer|net"
+                      r"|bottom line)[ \t*_]*:")
 DEEP_DIVES_PER_DAY = 6
 REFRESH_MAX_WAIT_S = 120
 
@@ -37,12 +42,12 @@ REFRESH_MAX_WAIT_S = 120
 READ_TOOLS = (
     "portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_companies", "get_company",
     "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials",
-    "get_metrics", "run_valuation", "get_technicals", "get_transcript", "get_etf_lookthrough",
+    "get_metrics", "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
     "get_events", "get_proposals", "get_track_record", "get_attribution", "get_settings",
     "ledger_query", "screen_companies",
 )
 DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
-             "defer_item", "hold_agenda", "show_card")
+             "defer_item", "hold_agenda", "show_card", "promise_read")
 ANALYST_ONLY = ("report", "record_verdict")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
@@ -368,6 +373,25 @@ def t_run_valuation(ctx: ToolContext, args: dict) -> dict:
             raise ToolError(str(e))
 
 
+def t_price_ladder(ctx: ToolContext, args: dict) -> dict:
+    t = _ticker(args.get("ticker"))
+    with ctx.conn() as c:
+        comp = store.get_company(c, t)
+    if comp is None:
+        raise ToolError(f"{t} is not loaded; call load_company")
+    try:
+        price, source = ctx.price(t), "live (yfinance)"
+    except Exception:  # noqa: BLE001 - a feed outage falls back to the metrics row price
+        price, source = None, ""
+    with ctx.conn() as c:
+        try:
+            return valuation.price_ladder(c, t, cik=comp.get("cik"), price=price, price_source=source,
+                                          kind=comp.get("kind") or "company", prices=args.get("prices") or [],
+                                          ev_sales_targets=args.get("ev_sales_targets") or [])
+        except valuation.ValuationError as e:
+            raise ToolError(str(e))
+
+
 def t_get_technicals(ctx: ToolContext, args: dict) -> dict:
     t = _ticker(args.get("ticker"))
     fn = ctx.extra.get("technicals_fn") or valuation.trend_technicals
@@ -556,13 +580,22 @@ def t_react(ctx: ToolContext, args: dict) -> dict:
     return {"reacted": mid, "emoji": emoji, "telegram_ok": bool(res.get("ok"))}
 
 
+def check_labels(text: str) -> None:
+    """Refuse a report-style label ("Good:", "Worrying:", "Net:") at the start of a line or a sentence."""
+    m = LABEL_RE.search(str(text or ""))
+    if m:
+        raise ToolError(f"do not start a line with a label like '{m.group(0).strip()}'. Write it as a sentence "
+                        "that says what the fact means for the owner, then send it again")
+
+
 def check_say(turn, text: str) -> None:
-    """The ``say`` rules (§4.4 step 1, §4.2 step 3): at most 1,200 characters, and a
-    reaction on every owner message of the turn first."""
+    """The ``say`` rules (§4.4 step 1, §4.2 step 3): at most 1,200 characters, no report-style
+    label, and a reaction on every owner message of the turn first."""
     if not str(text or "").strip():
         raise ToolError("say needs text")
     if len(text) > SAY_LIMIT:
         raise ToolError(f"that message is {len(text)} characters; the limit is 1200, so split it")
+    check_labels(text)
     missing = turn.unreacted()
     if missing:
         raise ToolError(f"react to owner message(s) {missing} first")
@@ -587,6 +620,7 @@ def t_report(ctx: ToolContext, args: dict) -> dict:
         raise ToolError("report needs text")
     if len(text) > REPORT_LIMIT:
         raise ToolError(f"that report is {len(text)} characters; the limit is {REPORT_LIMIT}, so cut it")
+    check_labels(text)
     if ctx.job is None or ctx.job.job_id is None:
         raise ToolError("report works inside a job only")
     with ctx.conn() as c:
@@ -771,6 +805,24 @@ def t_hold_agenda(ctx: ToolContext, args: dict) -> dict:
     return {"hold_until": until, "waiting": n["waiting"], "open": n["open"]}
 
 
+def t_promise_read(ctx: ToolContext, args: dict) -> dict:
+    """Keep the promise "I'll send the read when it lands": the analyst's next report on the
+    ticker comes up first (priority now), even when nothing changed."""
+    t = _ticker(args.get("ticker"))
+    with ctx.conn() as c:
+        res = agenda.promise_read(c, t, now=store.now_iso())
+    waiting = [{"item": it["id"], "title": it["title"], "report": it["body"]} for it in res["waiting"]]
+    if not res["jobs"]:
+        if waiting:
+            raise ToolError(f"no analysis of {t} is queued or running, but its read is ready: tell the owner "
+                            f"from the report below now, and do not promise a later one. Ready: "
+                            + json.dumps(waiting)[:4000])
+        raise ToolError(f"no analysis of {t} is queued or running, so nothing would come later. Do not promise "
+                        f"a read; call start_deep_dive to research it")
+    return {"ticker": t, "jobs": res["jobs"],
+            "note": "Its report comes up first as soon as the analyst files it. Tell the owner you will bring it."}
+
+
 def t_show_card(ctx: ToolContext, args: dict) -> dict:
     """Send a pending card again at the bottom of the chat (or for the first time)."""
     pid = int(args.get("proposal_id"))
@@ -933,6 +985,13 @@ SPECS = {
     "run_valuation": ("Compute a DCF, reverse DCF, EV/Sales or multiple valuation. Stores nothing. Each scenario cites "
                       "finding ids in an `evidence` list.",
                       _obj({"ticker": S, "method": S, "scenarios": {"type": "object"}}, ["ticker", "method", "scenarios"])),
+    "price_ladder": ("At each price of the thesis (the three cases, buy more, sell some), today's price and any "
+                     "extra `prices`: what the whole company costs, its multiple of a year of sales and of profit, "
+                     "and the analyst's bet for the case, all on one share count. `ev_sales_targets` (sales "
+                     "multiples) gives the price at each multiple today and the sales growth today's price needs. "
+                     "Use these numbers; never compute a multiple yourself.",
+                     _obj({"ticker": S, "prices": {"type": "array", "items": N, "maxItems": 6},
+                           "ev_sales_targets": {"type": "array", "items": N, "maxItems": 6}}, ["ticker"])),
     "get_technicals": ("Trend facts: regime, ADX, drawdown, Sharpe, momentum.", _obj({"ticker": S}, ["ticker"])),
     "get_transcript": ("The earnings-call transcript's document id; fetches it if the budget allows.",
                        _obj({"ticker": S, "quarter": S}, ["ticker"])),
@@ -960,6 +1019,9 @@ SPECS = {
                     _obj({"hours": N}, ["hours"])),
     "show_card": ("Send a pending card again as the newest message, so the owner need not scroll. The old copy "
                   "loses its buttons.", _obj({"proposal_id": I}, ["proposal_id"])),
+    "promise_read": ("Before you tell the owner you will come back with the analyst's read on a ticker, call this: "
+                  "its next report then comes up first, even when nothing changed. Refused when no analysis of "
+                  "the ticker is queued or running.", _obj({"ticker": S}, ["ticker"])),
     "load_company": ("Load a company or ETF: filings, sections, XBRL, metrics, transcript.", _obj({"ticker": S}, ["ticker"])),
     "fetch_document": ("Fetch a web page and store its text so it can be quoted.", _obj({"url": S, "ticker": S}, ["url"])),
     "record_finding": ("Store a fact with an exact quote from a stored document. kind: market_size, growth, guidance, "

@@ -11,11 +11,14 @@ index allows one), ``done`` and ``dropped``. A ``NOW`` (0) item comes up before 
 (1) item. An ``FYI`` (2) item never comes up by itself: the desk sees it in the
 ``<agenda>`` block, and the close brief covers it.
 
+``promise_read`` keeps a promise of the desk ("I'll send the read when it lands"): it marks the
+drafts of a name's queued or running jobs ``NOW``, and ``finish_job`` keeps that mark.
+
 A reply to the owner's own action does not wait here: a tap answer, a fill, a requote and
 the trade card after a Confirm go out at once.
 
-This module reads ``proposals`` and ``orders`` with SQL only. It approves nothing and sends
-nothing.
+This module reads ``proposals``, ``orders``, ``jobs``, ``events`` and ``companies`` with SQL
+only. It approves nothing and sends nothing.
 """
 
 from __future__ import annotations
@@ -116,11 +119,44 @@ def finish_job(conn, job_id: int, *, kind: str, priority: int, title: str, now: 
                      "close_reason='nothing to report' WHERE id=?",
                      (str(title)[:TITLE_MAX], ticker, event_id, now, it["id"]))
         return it["id"]
+    # A draft that promise_read marked keeps its mark: a new draft holds FYI, so min() keeps the rule's value.
+    prio = min(int(priority), int(it["priority"]))
     # created_at becomes the time the item is ready: the agenda brings items up in that order.
     conn.execute("UPDATE agenda SET kind=?, priority=?, status='waiting', title=?, ticker=?, event_id=?, body=?, "
                  "created_at=? WHERE id=? AND status='draft'",
-                 (kind, int(priority), str(title)[:TITLE_MAX], ticker, event_id, body[:BODY_MAX], now, it["id"]))
+                 (kind, prio, str(title)[:TITLE_MAX], ticker, event_id, body[:BODY_MAX], now, it["id"]))
     return it["id"]
+
+
+def _job_ticker(conn, job: dict) -> Optional[str]:
+    """The ticker of an analyst job: a deep-dive's payload ticker, or the ticker of an
+    event analysis's event."""
+    payload = store.loads(job["payload_json"], {}) or {}
+    if job["kind"] == "deep_dive":
+        return str(payload.get("ticker") or "").upper() or None
+    if job["kind"] == "analyze_event":
+        row = conn.execute("SELECT ticker FROM events WHERE id=?", (int(payload.get("event_id") or 0),)).fetchone()
+        return str(row[0]).upper() if row and row[0] else None
+    return None
+
+
+def promise_read(conn, ticker: str, *, now: str) -> dict:
+    """The owner waits for the analyst's read on ``ticker``. Mark the draft of each queued or
+    running job on it ``NOW``, so its item comes up first when it is filed, even when nothing
+    changed. Returns ``{"jobs": [ids], "waiting": [items of the ticker that wait]}``."""
+    t = str(ticker or "").strip().upper()
+    jobs = [dict(j) for j in conn.execute(
+        "SELECT id, kind, payload_json FROM jobs WHERE status IN ('queued','running') "
+        "AND kind IN ('analyze_event','deep_dive') ORDER BY id").fetchall()]
+    marked = []
+    for j in jobs:
+        if _job_ticker(conn, j) != t:
+            continue
+        job_draft(conn, j["id"], now=now)
+        conn.execute("UPDATE agenda SET priority=? WHERE job_id=? AND status='draft'", (NOW, j["id"]))
+        marked.append(j["id"])
+    waiting = _items(conn, "SELECT * FROM agenda WHERE status='waiting' AND ticker=? ORDER BY created_at, id", (t,))
+    return {"jobs": marked, "waiting": waiting}
 
 
 # --- the priority rule ------------------------------------------------------------------
@@ -136,14 +172,16 @@ def _proposals(conn, ids) -> dict:
 
 
 def job_priority(conn, *, proposal_ids, verdict=None, ticker=None, deep_dive=False,
-                 requested_by=None) -> int:
+                 requested_by=None, event_type=None) -> int:
     """The one priority rule for an analyst job.
 
     NOW:  a pending trade card; a deep-dive the desk queued for the owner; a weaker or broken
-          thesis on a name the owner holds.
+          thesis on a name the owner holds; the results of a name the owner holds (an
+          ``earnings`` event: the owner waits for those).
     NEXT: a pending change card; any other deep-dive; a weaker or broken thesis on a name the
-          owner does not hold.
-    FYI:  everything else (a news check that changed nothing)."""
+          owner does not hold; a stronger thesis on a name the owner holds.
+    FYI:  everything else (a news check that changed nothing, a filing that kept the thesis
+          as it was, a stronger thesis on a name the owner does not hold)."""
     pending = [p for p in _proposals(conn, proposal_ids).values() if p["state"] == "pending"]
     out = FYI
     if any(p["kind"] == "trade" for p in pending):
@@ -152,10 +190,14 @@ def job_priority(conn, *, proposal_ids, verdict=None, ticker=None, deep_dive=Fal
         out = NEXT
     if deep_dive:
         out = min(out, NOW if requested_by == "desk" else NEXT)
+    held = bool(ticker) and conn.execute("SELECT 1 FROM companies WHERE ticker=? AND status='holding'",
+                                         (str(ticker),)).fetchone() is not None
     if verdict in ("weakened", "broken"):
-        held = conn.execute("SELECT 1 FROM companies WHERE ticker=? AND status='holding'",
-                            (str(ticker or ""),)).fetchone()
         out = min(out, NOW if held else NEXT)
+    if held and event_type == "earnings":
+        out = min(out, NOW)
+    if held and verdict == "strengthened":
+        out = min(out, NEXT)
     return out
 
 

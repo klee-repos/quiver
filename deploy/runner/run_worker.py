@@ -266,7 +266,8 @@ class Worker:
                 title = events.describe_event(ev) if ev else "An event."
                 if verdict:
                     title += f" Verdict: {verdict}."
-                prio = agenda.job_priority(conn, proposal_ids=pids, verdict=verdict, ticker=ticker)
+                prio = agenda.job_priority(conn, proposal_ids=pids, verdict=verdict, ticker=ticker,
+                                           event_type=ev.get("type"))
                 body_if_empty = ev.get("analysis") or ""
             else:
                 ticker, by = payload.get("ticker"), job.get("requested_by")

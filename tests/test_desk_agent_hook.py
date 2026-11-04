@@ -36,11 +36,12 @@ BUILTINS = ["Read", "Grep", "Glob", "WebSearch"]
 # §5.4, written out from the plan tables (the spec, not the code).
 READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_companies", "get_company",
         "search_research", "list_filings", "get_filing_sections", "get_document", "get_financials", "get_metrics",
-        "run_valuation", "get_technicals", "get_transcript", "get_etf_lookthrough", "get_events", "get_proposals",
+        "run_valuation", "price_ladder", "get_technicals", "get_transcript", "get_etf_lookthrough",
+        "get_events", "get_proposals",
         "get_track_record", "get_attribution", "get_settings", "ledger_query", "screen_companies"]
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
-           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card"]
+           "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "withdraw_proposal", "propose_trade", "propose_change"]
 D_TOOLS = READ + D_WRITE

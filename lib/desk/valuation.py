@@ -8,6 +8,8 @@ calculation:
 * ``fair_values`` turns a thesis valuation (bear, base, bull) into fair values and default
   levels (§8.3). It refuses a scenario that cites no stored finding.
 * ``run_valuation`` gives the same results to the desk and stores nothing.
+* ``price_ladder`` gives, at each price of the thesis and today's price, what the company
+  costs and its multiple of sales and profit, on one share count. It stores nothing.
 
 The caller passes ``settings`` as a plain dict with the keys ``valuation_discount_rate``,
 ``valuation_terminal_growth``, ``valuation_years`` and ``margin_of_safety_pct``. This module
@@ -408,6 +410,199 @@ def run_valuation(conn, ticker: str, method: str, scenarios: dict, *, settings: 
     res["settings"] = {"discount_rate": r, "terminal_growth": gt, "years": n,
                        "margin_of_safety_pct": float(settings.get("margin_of_safety_pct", 15.0))}
     return res
+
+
+# --- the price ladder ----------------------------------------------------------------
+
+# A thesis level -> its plain name (the desk glossary) and the scenario that gives its bet.
+LADDER_LEVELS = (
+    ("fair_value_low", "if things go badly", "bear"),
+    ("buy_below", "a good price to buy more", None),
+    ("fair_value_base", "the middle case", "base"),
+    ("trim_above", "a good price to sell some", None),
+    ("fair_value_high", "if things go very well", "bull"),
+)
+SHARE_GAP_PCT = 5.0
+LADDER_MAX_PRICES = 6
+LADDER_HOW_TO_READ = {
+    "market_value": "the price of every share together: price x shares",
+    "company_value": "market_value less net cash (cash and short-term investments less debt)",
+    "x_sales": "company_value / a year of sales, on sales_basis",
+    "x_earnings": "market_value / a year of profit, on the same basis; null when that profit is a loss",
+    "sales_growth_needed_pct": "on a level below today: how much a year of sales must grow before today's "
+                               "price costs the multiple this level costs now",
+    "bet": "the analyst's sentence for this case: what must be true for one share to be worth this price",
+}
+
+
+def _money(v) -> Optional[str]:
+    """$1.92T, $223.5B, $812M: a dollar amount the desk can say without converting it."""
+    if v is None:
+        return None
+    a = abs(v)
+    sign = "-" if v < 0 else ""
+    for cut, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M")):
+        if a >= cut:
+            return f"{sign}${a / cut:,.2f}{unit}" if unit == "T" else f"{sign}${a / cut:,.1f}{unit}"
+    return f"{sign}${a:,.0f}"
+
+
+def _r(v, nd=1):
+    return round(v, nd) if v is not None else None
+
+
+def _year(conn, cik, metric: str) -> dict:
+    """A year of one flow metric: the TTM and the latest quarter x 4 (the run rate)."""
+    t = xbrl.ttm(conn, cik, metric)
+    qs = xbrl.quarters(conn, cik, metric)
+    q = qs[-1] if qs else None
+    return {"ttm": t["value"] if t else None,
+            "ttm_periods": [p["end"] for p in t["periods"]] if t else None,
+            "ttm_end": t["periods"][-1]["end"] if t else None,
+            "quarter": q["value"] if q else None,
+            "quarter_period": {"start": q["start"], "end": q["end"]} if q else None,
+            "run_rate": q["value"] * 4 if q else None}
+
+
+def ladder_shares(conn, cik, row: Optional[dict]) -> dict:
+    """The one share count of the price ladder: ``{value, source, as_of, diluted_weighted}``.
+
+    In order: the dei shares outstanding of the latest cover page; the stored market value
+    / the stored price of the latest metrics row (both come from one yfinance read); the
+    weighted diluted shares of the latest quarter. A weighted count trails a count that
+    changed in the quarter (a split, a listing, a share sale), so it comes last."""
+    dil = xbrl.diluted_shares(conn, cik) if cik else None
+    out = {"value": None, "source": None, "as_of": None,
+           "diluted_weighted": dil["value"] if dil else None,
+           "diluted_weighted_period": {"start": dil["start"], "end": dil["end"]} if dil else None}
+    so = xbrl.shares_outstanding(conn, cik) if cik else None
+    row = row or {}
+    mm = row.get("metrics") or {}
+    if so:
+        out.update(value=so["value"], source="the share count on the cover of the latest filing", as_of=so["date"])
+    elif mm.get("market_cap") and row.get("price"):
+        out.update(value=mm["market_cap"] / row["price"],
+                   source="the stored market value / the stored price (one yfinance read)", as_of=row.get("as_of"))
+    elif dil:
+        out.update(value=dil["value"], source="the weighted diluted shares of the latest quarter", as_of=dil["end"])
+    return out
+
+
+def price_ladder(conn, ticker: str, *, cik, price: Optional[float], price_source: str = "live",
+                 kind: str = "company", prices=(), ev_sales_targets=()) -> dict:
+    """The ``price_ladder`` desk tool: for each price of the thesis (the three cases, the
+    buy-more and sell-some prices), today's price and any extra ``prices``, what the whole
+    company costs at that price and its multiple of a year of sales and of profit, all on
+    one share count. ``ev_sales_targets`` gives, for each sales multiple, the price at it today
+    and the sales growth that today's price needs to reach it. Every number is computed
+    here, so the desk never does arithmetic. It computes and stores nothing."""
+    t = str(ticker).upper()
+    row = latest_metrics(conn, t)
+    if price is None and row and row.get("price"):
+        price, price_source = float(row["price"]), f"the metrics row of {row['as_of']}"
+    if price is None or float(price) <= 0:
+        raise ValuationError(f"no price for {t}: call get_quotes, or load_company to build its metrics")
+    price = float(price)
+    th = conn.execute("SELECT * FROM theses WHERE ticker=? ORDER BY version DESC LIMIT 1", (t,)).fetchone()
+    th = dict(th) if th else None
+    scen = ((desk_store.loads(th["valuation_json"], {}) or {}).get("scenarios") or {}) if th else {}
+    caveats = []
+
+    # The levels: one entry per price; two levels at the same price share an entry.
+    raw = [("today", "today", price, None)]
+    for key, name, sc in LADDER_LEVELS:
+        v = th.get(key) if th else None
+        if v is not None and float(v) > 0:
+            bet = (scen.get(sc) or {}).get("bet") if sc and isinstance(scen.get(sc), dict) else None
+            raw.append((key, name, float(v), bet))
+    for p in list(prices or [])[:LADDER_MAX_PRICES]:
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            raise ValuationError(f"prices must be numbers, got {p!r}")
+        if p > 0:
+            raw.append(("price", f"${p:,.2f}", p, None))
+    levels = []
+    for key, name, p, bet in sorted(raw, key=lambda x: x[2]):
+        if levels and abs(levels[-1]["price"] - round(p, 2)) < 0.005:
+            levels[-1]["keys"].append(key)
+            levels[-1]["name"] += f"; {name}"
+            levels[-1]["bet"] = levels[-1]["bet"] or bet
+            continue
+        levels.append({"keys": [key], "name": name, "price": round(p, 2), "bet": bet,
+                       "vs_today_pct": _r((p / price - 1) * 100)})
+    if th is None:
+        caveats.append(f"{t} has no thesis yet, so the ladder has no case prices.")
+
+    out = {"ticker": t, "price": round(price, 2), "price_source": price_source, "levels": levels,
+           "how_to_read": LADDER_HOW_TO_READ, "caveats": caveats}
+    if kind != "company" or not cik:
+        caveats.append(f"{t} is a fund or has no SEC financials, so the ladder shows prices only: "
+                       "it has no sales or profit of its own.")
+        return out
+
+    sh = ladder_shares(conn, cik, row)
+    if not sh["value"]:
+        caveats.append("No share count: the filings have none and the metrics row has no market value.")
+        out["shares"] = sh
+        return out
+    shares = float(sh["value"])
+    bal = xbrl.balance(conn, cik)
+    net_cash = (bal["cash"] or 0.0) + (bal["st_investments"] or 0.0) - (bal["debt"] or 0.0)
+    rev, ni = _year(conn, cik, "revenue"), _year(conn, cik, "net_income")
+    latest_q = (rev["quarter_period"] or {}).get("end")
+    basis = "ttm" if rev["ttm"] and rev["ttm_end"] == latest_q else ("run_rate" if rev["run_rate"] else None)
+    sales = rev[basis] if basis else None
+    profit = ni[basis] if basis else None
+    if basis == "run_rate":
+        caveats.append(f"A year of sales here is the latest quarter x 4 (the quarter to {latest_q}): the filings "
+                       "do not give four quarters in a row. One big or one-time quarter makes it too high.")
+    elif basis == "ttm" and rev["run_rate"]:
+        caveats.append(f"A year of sales here is the last four quarters (to {latest_q}). At the latest quarter's "
+                       f"pace (x 4) it is {_money(rev['run_rate'])}; x_sales_run_rate uses that.")
+    if basis is None:
+        caveats.append("The filings give no sales, so the ladder has no sales multiple.")
+    if sh["diluted_weighted"] and abs(sh["diluted_weighted"] / shares - 1) * 100 > SHARE_GAP_PCT:
+        caveats.append(f"The share count changed a lot in the latest quarter: the quarter's weighted diluted count "
+                       f"is {sh['diluted_weighted'] / 1e9:,.3f}B, the count used here is {shares / 1e9:,.3f}B "
+                       f"({sh['source']}). Per-share figures in the filings (profit per share) use the older count.")
+
+    def _x(cv, base):
+        return _r(cv / base) if cv is not None and base and base > 0 else None
+
+    cv_today = price * shares - net_cash
+    for lv in levels:
+        mv = lv["price"] * shares
+        cv = mv - net_cash
+        lv.update({"market_value": round(mv), "market_value_text": _money(mv),
+                   "company_value": round(cv), "company_value_text": _money(cv),
+                   "x_sales": _x(cv, sales), "x_sales_ttm": _x(cv, rev["ttm"]),
+                   "x_sales_run_rate": _x(cv, rev["run_rate"]),
+                   "x_earnings": _x(mv, profit), "x_earnings_ttm": _x(mv, ni["ttm"]),
+                   "x_earnings_run_rate": _x(mv, ni["run_rate"])})
+        if lv["price"] < price and cv > 0 and cv_today > 0:
+            lv["sales_growth_needed_pct"] = _r((cv_today / cv - 1) * 100)
+    targets = []
+    for m in list(ev_sales_targets or [])[:LADDER_MAX_PRICES]:
+        try:
+            m = float(m)
+        except (TypeError, ValueError):
+            raise ValuationError(f"ev_sales_targets must be numbers, got {m!r}")
+        if m <= 0 or not sales:
+            continue
+        need = cv_today / m
+        targets.append({"x_sales": m, "price_at_it_today": round((m * sales + net_cash) / shares, 2),
+                        "sales_needed_at_today_price": round(need), "sales_needed_text": _money(need),
+                        "sales_growth_needed_pct": _r((need / sales - 1) * 100)})
+    out.update({
+        "shares": {**sh, "value": round(shares)},
+        "balance": {"cash": bal["cash"], "st_investments": bal["st_investments"], "debt": bal["debt"],
+                    "net_cash": round(net_cash), "net_cash_text": _money(net_cash), "as_of": bal["as_of"]},
+        "sales": {**rev, "basis": basis, "year_text": _money(sales)},
+        "profit": {**ni, "basis": basis, "year_text": _money(profit)},
+        "sales_targets": targets,
+    })
+    return out
 
 
 # --- production seams (network; tests pass fakes) ------------------------------------

@@ -70,17 +70,22 @@ one at a time, like an assistant with a list.
   closes it. "Next", "skip" or a decision in chat closes it too, and the desk can bring up
   the next one in the same reply. An item with no card (the brief, a report) closes when you
   answer it.
-- Urgent things do not wait forever: a trade card, research you asked for, or a weaker thesis
-  on a holding takes over an item you left unanswered for 20 minutes.
+- Urgent things do not wait forever: a trade card, research you asked for, a weaker thesis
+  on a holding, or the results of a holding takes over an item you left unanswered for 20
+  minutes.
+- When the desk says it will send the analyst's read later, it first marks that read
+  (`promise_read`), so the read comes up first as soon as it is ready. With no read on the
+  way, the desk does not promise one.
 - Nothing is lost quietly. If a card expires before its item comes up, the report still comes
   up, with a note. A failed analysis comes up too.
 - "Later" puts one item back in line for some hours. "Hold the rest for an hour" stops new
   items until then.
 - Ask "what's left?" and the desk answers from the agenda: how many things wait, and the
   next one or two.
-- Order: a trade card, research you asked for, and a thesis that got weaker on a holding come
-  first. Then the change cards, the other reviews and the close brief. A news check that
-  changes nothing is not brought up: the close brief covers it.
+- Order: a trade card, research you asked for, a thesis that got weaker on a holding, and the
+  results of a holding come first. Then the change cards, a thesis that got stronger on a
+  holding, the other reviews and the close brief. A news check that changes nothing is not
+  brought up: the close brief covers it.
 - Ask to see a card again and the desk sends it as the newest message. The old copy says
   "Moved down" and its buttons stop working.
 - These still come at once, because they answer what you just did: a tap answer, the fills,
@@ -95,11 +100,24 @@ The desk and the analyst write for a reader with no finance training, and they t
 partner, not a report. Their prompts (`prompts/desk.md`, `prompts/analyst.md`) follow the
 agent-persona skill's written voice: lead with the view, give the one or two facts that
 explain it and what they mean for you, use full connected sentences, and end with the one
-thing the desk needs from you. No labels ("Good:", "Value:"), no counters, no recaps. Words
+thing the desk needs from you. No labels ("Good:", "Value:"): `say` and `report` refuse a line
+or a sentence that starts with one. No counters, no recaps. Words
 stay common and sentences short, but a thought is never chopped into fragments. A finance
 term gets a plain explanation the first time it appears in a message, and the prompts name
 one word for each idea (for example "what one share is worth", not "fair value"). The cards
 (`lib/notify.py`) use the same words; a thesis card is short paragraphs.
+
+### The price ladder
+
+Ask what the desk thinks of a name, how it looks now, or whether to buy, add or sell. The
+desk answers with the price ladder (`price_ladder`, plan §8.6). First its view: where today's
+price sits against the cases, and what the plan says. Then one line per price, cheapest
+first: the price, its name (if things go badly, a good price to buy more, the middle case,
+today, a good price to sell some, if things go very well), what you pay as a multiple of a
+year of sales, and what you bet on at that price. Then what it would take: how much sales
+must grow before today's price costs what the bad case costs now, with the inputs and their
+limits (a year of sales taken from one quarter, a share count that changed). Python computes
+every number; the desk does no arithmetic.
 
 ### Research on request
 
@@ -178,7 +196,9 @@ on the repo root is denied, because it would reach `state/` and `.env`.
 
 **Read tools (D, A):** `portfolio_view`, `refresh_portfolio`, `get_quotes`, `get_book`,
 `list_companies`, `get_company`, `search_research`, `list_filings`, `get_filing_sections`,
-`get_document`, `get_financials`, `get_metrics`, `run_valuation`, `get_technicals`,
+`get_document`, `get_financials`, `get_metrics`, `run_valuation`, `price_ladder` (the
+company value and the multiples of sales and profit at each price, on one share count),
+`get_technicals`,
 `get_transcript`, `get_etf_lookthrough`, `get_events`, `get_proposals`, `get_track_record`,
 `get_attribution`, `get_settings`, `ledger_query` (one read-only `SELECT`, at most 200
 rows), `screen_companies`.
@@ -195,6 +215,7 @@ rows), `screen_companies`.
 | `defer_item` | D | Puts an agenda item back in line for 1 to 72 hours. |
 | `hold_agenda` | D | Stops new agenda items for 0 to 24 hours (0 lifts the hold). |
 | `show_card` | D | Sends a pending card again as the newest message. |
+| `promise_read` | D | Marks the analyst's coming read on a ticker, so it comes up first. Refused when no read is on the way. |
 | `load_company` | D, A | Loads a company or an ETF: filings, sections, XBRL, metrics, transcript. A new name gets `status='candidate'`. |
 | `fetch_document` | D, A | Fetches a web page and stores its text, so the desk can quote it later. |
 | `record_finding` | D, A | Stores a fact only if its quote is in a stored document. |

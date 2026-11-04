@@ -126,8 +126,22 @@ def case_priority():
             r.eq("priority: a pending change card -> next", jp(c, proposal_ids=[change]), agenda.NEXT)
             r.eq("priority: an ended card counts for nothing -> fyi", jp(c, proposal_ids=[gone]), agenda.FYI)
             r.eq("priority: no card, intact -> fyi", jp(c, proposal_ids=[], verdict="intact", ticker="ANET"), agenda.FYI)
-            r.eq("priority: strengthened, no card -> fyi", jp(c, proposal_ids=[], verdict="strengthened",
-                                                             ticker="ANET"), agenda.FYI)
+            # 2026-11-03: the ANET results read (strengthened) was fyi, so it never came up, and the
+            # owner asked "And?" the next morning. A holding's stronger thesis and its results come up.
+            r.eq("priority: strengthened on a holding -> next", jp(c, proposal_ids=[], verdict="strengthened",
+                                                                ticker="ANET"), agenda.NEXT)
+            r.eq("priority: strengthened on a name we do not hold -> fyi",
+                 jp(c, proposal_ids=[], verdict="strengthened", ticker="AVGO"), agenda.FYI)
+            r.eq("priority: the results of a holding (an earnings event) -> now",
+                 jp(c, proposal_ids=[], verdict="strengthened", ticker="ANET", event_type="earnings"), agenda.NOW)
+            r.eq("priority: the results of a holding with intact -> now",
+                 jp(c, proposal_ids=[], verdict="intact", ticker="ANET", event_type="earnings"), agenda.NOW)
+            r.eq("priority: the results of a name we do not hold, intact -> fyi",
+                 jp(c, proposal_ids=[], verdict="intact", ticker="AVGO", event_type="earnings"), agenda.FYI)
+            r.eq("priority: a 10-Q of a holding that kept the thesis -> fyi",
+                 jp(c, proposal_ids=[], verdict="intact", ticker="ANET", event_type="filing"), agenda.FYI)
+            r.eq("priority: intact news on a holding -> fyi",
+                 jp(c, proposal_ids=[], verdict="intact", ticker="ANET", event_type="news"), agenda.FYI)
             r.eq("priority: weakened on a holding -> now", jp(c, proposal_ids=[], verdict="weakened", ticker="ANET"),
                  agenda.NOW)
             r.eq("priority: broken on a name we do not hold -> next",
@@ -138,6 +152,41 @@ def case_priority():
                  jp(c, proposal_ids=[change], deep_dive=True, requested_by="desk-review"), agenda.NEXT)
             r.eq("priority: a review with a trade card -> now",
                  jp(c, proposal_ids=[trade], deep_dive=True, requested_by="desk-review"), agenda.NOW)
+
+
+def case_promise_read():
+    """The desk's promise "I'll send the read when it lands" (2026-11-03 ANET): promise_read marks the
+    drafts of the name's queued and running jobs now, and finish_job keeps the mark."""
+    with temp_root() as root:
+        with root.led().connect() as c:
+            def event(ticker):
+                return store.create_event(c, dedup_key=f"news:{ticker}:1", ticker=ticker, type="news",
+                                          detail={"title": "x"}, now=T0, created_by="monitor")
+            e_anet, e_amd = event("ANET"), event("AMD")
+            j_anet = store.enqueue_job(c, kind="analyze_event", payload={"event_id": e_anet}, requested_by="monitor", now=T0)
+            j_amd = store.enqueue_job(c, kind="analyze_event", payload={"event_id": e_amd}, requested_by="monitor", now=T0)
+            j_dd = store.enqueue_job(c, kind="deep_dive", payload={"ticker": "ANET"}, requested_by="desk-review", now=T0)
+            j_done = store.enqueue_job(c, kind="analyze_event", payload={"event_id": e_anet}, requested_by="monitor", now=T0)
+            c.execute("UPDATE jobs SET status='running' WHERE id=?", (j_dd,))
+            c.execute("UPDATE jobs SET status='done' WHERE id=?", (j_done,))
+            ready = agenda.add(c, kind="report", priority=agenda.FYI, title="ANET news, no change.", now=T0, ticker="ANET",
+                               body="The 10-Q kept the thesis.")
+            res = agenda.promise_read(c, "anet", now=T1)
+            r.eq("promise_read: marks the queued and the running ANET jobs, not AMD, not a done job",
+                 res["jobs"], [j_anet, j_dd])
+            r.eq("promise_read: lists the ANET item that waits", [it["id"] for it in res["waiting"]], [ready])
+            r.eq("promise_read: the drafts hold now", [agenda.get(c, agenda.job_draft(c, j, now=T1)["id"])["priority"]
+                                                   for j in (j_anet, j_dd)], [agenda.NOW, agenda.NOW])
+            r.eq("promise_read: no draft for the AMD job",
+                 c.execute("SELECT COUNT(*) FROM agenda WHERE job_id=?", (j_amd,)).fetchone()[0], 0)
+            iid = agenda.finish_job(c, j_anet, kind="report", priority=agenda.FYI, title="ANET news, no change.",
+                                    now=T2, ticker="ANET", body_if_empty="Nothing changed.")
+            r.eq("promise_read: finish_job keeps the mark over an fyi rule", agenda.get(c, iid)["priority"], agenda.NOW)
+            other = agenda.finish_job(c, j_amd, kind="report", priority=agenda.FYI, title="AMD.", now=T2,
+                                      body_if_empty="Nothing changed.")
+            r.eq("promise_read: an unmarked job keeps the rule's priority", agenda.get(c, other)["priority"], agenda.FYI)
+            r.eq("promise_read: the marked item is due first", [x["id"] for x in agenda.due(c, T2)], [iid])
+            r.eq("promise_read: nothing queued for MSFT", agenda.promise_read(c, "MSFT", now=T1), {"jobs": [], "waiting": []})
 
 
 def case_refresh():
@@ -261,8 +310,8 @@ def case_review_fixes():
 
 
 def main() -> int:
-    for case in (case_order_and_one_open, case_job_draft, case_priority, case_refresh, case_defer_and_hold,
-                 case_view_and_text, case_review_fixes):
+    for case in (case_order_and_one_open, case_job_draft, case_priority, case_promise_read, case_refresh,
+                 case_defer_and_hold, case_view_and_text, case_review_fixes):
         try:
             case()
         except Exception as e:  # noqa: BLE001 — one broken case must not hide the others
