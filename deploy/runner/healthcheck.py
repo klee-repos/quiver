@@ -59,7 +59,7 @@ ORDERS_COLUMNS = ("proposal_id", "leg_seq", "quote_at_proposal", "clamped_from",
                   "checked_at", "reconcile_attempts", "skip_reason", "review_ok", "review_json",
                   "reviewed_at")
 TARGET_PORTFOLIO_COLUMNS = ("entry_price_max",)
-BROKER_JOBS_COLUMNS = ("recovery",)
+BROKER_JOBS_COLUMNS = ("recovery", "not_before")
 
 # §11.3: the two hooks of deploy/runner/settings.json, and the canary hook.
 GUARD = "/opt/quiver/.venv/bin/python /opt/quiver/deploy/runner/broker_guard.py"

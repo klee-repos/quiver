@@ -1658,9 +1658,10 @@ power above the new floor. The desk never sells SGOV shares to fund a buy.
 When you tap **Confirm**, Python applies the change. Then it builds the follow-up trade
 proposal (`origin='change'`, `parent_change_id`) and sends it `pending`, with its own
 **Approve** and **Reject** buttons and the exact orders. Nothing executes until you tap
-**Approve** on that card. A Confirm never approves a trade. If the session is closed, or
-trading is halted or stopped by `KILL`, the card stays `pending`. Python refuses an Approve tap
-on it until trading resumes (§10.5 check 4).
+**Approve** on that card. A Confirm never approves a trade. If trading is halted or stopped
+by `KILL`, the card stays `pending`. Python refuses an Approve tap on it until trading resumes
+(§10.5 check 4). If the session is closed, an Approve tap holds the order to the next session
+(§10.5 check 4).
 
 When no trade follows (each gap is under `min_trade_notional`, or no cash is left under the
 plan's cash rule), the tap answer says so in one message with the reason: "The plan is
@@ -1683,16 +1684,49 @@ Checks run in this order. The first failure answers the tap and stops:
    chat id and the message id equal the proposal's `tg_chat_id` and `tg_message_id`. The nonce matches.
 2. The state is `pending`. Otherwise, answer with the current state.
 3. `now < expires_at`. Otherwise, set `expired` with the conditional statement of §10.1 rule 6.
-4. Approve on a trade: no `KILL` file, today not halted, the regular session open, and at
-   least 5 minutes before the close. Otherwise answer with the first reason that fails, and
-   keep the proposal `pending`:
+4. Approve on a trade: no `KILL` file, and the day the order goes (today, or the send day of
+   a held order) not halted. Otherwise answer with the first reason that fails, and keep the
+   proposal `pending`:
    - `KILL`: "Trading is stopped on the box. This stays open until \<close> ET."
    - halted: "Trading is halted for today after the daily-loss check. Ask me to propose
      `resume_trading` to lift it."
-   - closed: "The market is closed. It opens at \<open> ET. This stays open until \<close> ET.
-     Tap again then."
-   - near the close: "It's too close to the close. This one expires at \<close> ET."
-   Python fills \<open> and \<close> for the session from `lib/market`.
+   The market hours never refuse a tap (changed 2026-11-04). The cause: a card came at
+   4:44 PM ET, the owner tapped Approve five times, and each tap got "The market is closed"
+   as a two-second toast. The owner read it as a dead button. Now, when the session is
+   closed or less than 6 minutes from its close (`market.HOLD_CLOSE_MARGIN`: the 5 minutes
+   of `exec-prepare` and one minute for the broker to start), the tap **holds** the order. `market.held_send_et` gives the send time: 10 minutes after the next
+   open (`SEND_AFTER_OPEN`), 9:40 AM ET. Steps 5 and 6 run as for any Approve, with these
+   differences:
+   - The `execute` job gets `broker_jobs.not_before` = the send time. `run_broker.next_job`
+     skips it until then. When the proposal expires before the send session's close (a tap
+     in the last 5 minutes), `expires_at` moves to that close.
+   - The tap names no broker trigger. The answer is "Approved. I send it at \<when>.", and
+     the message is "Approved. The market is closed now, so I send #N at \<when>. Until
+     then, tap Cancel on the card to stop it. ..." The buttons become the label "Approved,
+     sends \<when>" and **Cancel** (the Reject callback).
+   - Before the send time, a second Approve answers "Already approved. I send it at
+     \<when>." and keeps the label and Cancel. A tap on the label button gets a silent
+     answer.
+   - At the send time the bridge (`release_held`, every 5 s in the agenda loop) touches the
+     broker trigger once, sets the label to "Approved", and starts the broker watch. The
+     monitor run at :40 also wakes the broker in the session.
+   - `exec-prepare` counts the age of a held job from the send time, not from the tap, and
+     allows 30 minutes (`HELD_MAX_AGE`): held jobs share one send time and the broker runs
+     them one at a time. It refuses a held job before its send time and changes nothing. It
+     checks the plan move of a sized owner trade again (`check_trade_plan`): the plan may
+     have changed after the tap. `exec-check` compares the live
+     quote with the card as always, so an overnight move over `requote_tolerance_pct` sends
+     a requote and places nothing.
+   - A held job does not hold the agenda (§4.8). `/status` names each held order.
+   - `build_trade` refuses a new trade on the ticker while the held order waits, and names it
+     and the way out: "ANET has an approved order (#N) that I send at \<when>. To change it,
+     the owner taps Cancel on that card first". The drift step leaves a name with an order
+     in flight off the drift card; the other names still go on it.
+   A card sent while the market cannot take the order says so: "The market is closed now.
+   If you tap Approve before it opens, I hold the order and send it at \<when>." The
+   `propose_trade` tool note tells the desk the same.
+   A tap answer that leaves the card as it was (a refusal, "This button is not valid.", the
+   offline answer) is a popup (`show_alert`), not a toast.
 5. One statement: `UPDATE proposals SET state='approved', decided_at=?, decided_by=? WHERE id=? AND state='pending' AND nonce=?`.
    It must change exactly one row. A second tap changes zero rows and gets "Already approved".
 6. Trade: in one transaction, set the legs' `orders.state='approved'`, move the plan of a
@@ -1708,6 +1742,14 @@ decided_at=?, decided_by=? WHERE id=? AND state='pending' AND nonce=?`. It must 
 one row; otherwise answer with the current state. In the same transaction, set the legs to
 `skipped` with `finalized=1`. Then mirror a line "You rejected #41." The desk sees it in its
 next turn.
+
+Cancel (Reject on a held trade, check 4): in one transaction, the held job goes `failed`
+("cancelled by the owner") only while `not_before` is in the future, the proposal goes
+`approved` → `rejected` (`result_json` keeps `approved_at`), and the legs go `skipped`
+(`cancelled`, `finalized=1`). The answer is "Cancelled" and the message "You cancelled #N. I
+sent nothing to Robinhood." At or after the send time, Cancel changes nothing and answers in
+a popup: "Too late to cancel: it is going to Robinhood now." An approval that goes at once is
+never cancelled.
 
 ### 10.6 The plan follows the conversation (2026-11-04)
 
@@ -3379,7 +3421,7 @@ check fails, stop, fix the cause, and run the check again.
 | 12 | "do a deep-dive on ANET" at time T | within 30 min: the `deep_dive` job is `done`; `SELECT count(*), count(DISTINCT kind) FROM findings WHERE ticker='ANET' AND created_by='analyst' AND created_at>='T'` ≥ 8 and ≥ 5; 3–6 analyst messages; a `set_thesis` card if ANET had no thesis; `quiver-worker` then `inactive` |
 | 13 | with no new filing since the seed: `sudo systemctl start quiver.service`; `tail -1 /var/log/quiver/tick.log` | one JSON line with `"event": "monitor_ok"`, `"filings": 0`, `"events": 0`, `"proposals": 0`; no `events` row since the run start |
 | 14 | "propose a quarter of the way to target on \<a name under target>", then tap **Reject** | buttons read "Rejected"; row `rejected`; legs `skipped`, `finalized=1`; "You rejected \#N." in `chat_messages` |
-| 15 | after the close, ask for an owner trade and tap **Approve** | "The market is closed. It opens at \<open> ET. …" with the next session's times from `lib/market`; row stays `pending`; after the next close it is `expired`, its legs `expired` with `finalized=1`, and the buttons read "Expired" |
+| 15 | after the close, ask for an owner trade and tap **Approve** | the card says "The market is closed now. If you tap Approve, I hold the order and send it at 9:40 AM ET on \<day>."; the tap answers "Approved. I send it at 9:40 AM ET on \<day>."; the buttons read "Approved, sends \<day> 9:40 AM ET" and Cancel; at 9:40 AM ET the broker runs it as test 17 does |
 | 16 | `touch KILL`, ask for a trade, `rm KILL`; then pipe into `.venv/bin/python deploy/runner/broker_guard.py`: a `cancel_equity_order`, a `place_equity_order` with an unknown `ref_id`, a `Read` of `config.yaml`, and a `ToolSearch` `select:` of the allowed Robinhood names | the desk reports the refusal and no `proposals` row appears; the first three deny; the `ToolSearch` allows |
 | 17 | tap **Approve** on the first real trade proposal, in session | "On it. Checking the price now." within 5 s; then "Done. …" with fills, or new buttons after a requote (then the new card must execute); proposal `executed`; each leg `filled` with `broker_order_id` and `fill_avg_price`; one guard allow per leg, no place deny and no `ToolSearch` deny in `logs/desk/broker.log`; each leg passed `checked` before `placing`; the Robinhood app shows the same orders |
 | 18 | wait for the first close; then `sudo systemctl start quiver.service` once more | 2–4 brief messages at the first run ≥ 15 min after the close; one `notifications` row (`brief`, `brief`) for the day; the extra run sends nothing |
@@ -3682,7 +3724,8 @@ set the fake yfinance price to \$177.20 (the Robinhood market cap \$223.49B of 2
 |---|---|
 | identity | refused, no change: bad data (`…:x`, `q:…`, `p:abc:…`, 5 fields), a non-owner `from.id`, another chat or message id, a wrong nonce |
 | state | a non-`pending` row answers with its state (`superseded` → "Replaced by \#N"); past `expires_at` → `expired` and "Expired", checked before the market |
-| gate | each reason keeps the row `pending` with its own text: `KILL` "Trading is stopped on the box. …"; halted "Trading is halted for today …"; closed "The market is closed. It opens at 9:30 AM ET. This stays open until 4:00 PM ET. Tap again then." (1:00 PM ET on 2026-11-27); 4 min before the close "It's too close to the close. …"; the first failing reason wins |
+| gate | each reason keeps the row `pending` with its own text: `KILL` "Trading is stopped on the box. …"; halted "Trading is halted for today …"; the first failing reason wins; the market hours are not a reason |
+| held | pre-open, after the close, 4 and 5 min before the close and the half day: approved, one `execute` job `queued` with `not_before` = 9:40 AM ET of the send session, no trigger, the held buttons; 6 min before the close goes at once; a tap near the close moves `expires_at` to the next close; today's halt does not refuse a tap held to tomorrow; a second Approve names the send time and keeps Cancel; a new trade on the ticker names the held order; Cancel before the send time ends job, row and legs; Cancel at the send time changes nothing and says it is too late; the broker skips the job until the send time, then executes it; 29 minutes after the send time it starts, 30 minutes after `exec-prepare` fails it ("within 30 minutes of its send time"); a sized buy whose plan move broke overnight fails ("the plan changed after your tap"); `exec-prepare` before the send time changes nothing; a drift name with a held order leaves the drift card |
 | claim_once | two threads, two connections: one approval, one "Already approved", one `execute` job |
 | txn | the UPDATE, legs `approved` and the job commit together; an error after the UPDATE rolls back all; trigger touched after commit; "On it. Checking the price now."; a change applies and sets `applied` in the same way |
 | reject | passes with `KILL`, halt, closed market: `rejected`, legs `skipped`/`finalized=1`, "You rejected #41.", "Rejected"; `decided_at`/`decided_by` set; one conditional UPDATE: Approve then Reject from two threads → one wins, the other answers the current state, and an approved row is never overwritten |

@@ -615,8 +615,11 @@ def case_follow_up():
         if fu:
             r.eq("follow_up: closed: it stays open to the next close", c.prop(fu)["expires_at"], "2026-08-06T20:00:00Z")
             t = tap(c, fu)
-            r.ok("follow_up: closed: Approve is refused, the card stays pending",
-                 not t["ok"] and "closed" in t["answer"] and c.prop(fu)["state"] == "pending" and exec_jobs(c) == 0, t)
+            held = c.one("SELECT status, not_before FROM broker_jobs WHERE kind='execute' AND proposal_id=?", (fu,))
+            r.ok("follow_up: closed: Approve holds the order to 9:40 AM ET of the next session (§10.5 check 4)",
+                 t["ok"] and t["answer"] == "Approved. I send it at 9:40 AM ET on Thursday, August 6."
+                 and c.prop(fu)["state"] == "approved" and exec_jobs(c) == 1 and not t["touch"]
+                 and dict(held) == {"status": "queued", "not_before": "2026-08-06T13:40:00Z"}, (t, held))
     with case() as c:                                   # halted (G6)
         c.halt()
         ch, res = confirm(c, weights(("ANET", 30), ("SGOV", 55)))

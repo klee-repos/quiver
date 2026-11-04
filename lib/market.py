@@ -174,6 +174,37 @@ def session_open_et(now: datetime | None = None) -> tuple:
     raise RuntimeError("no XNYS session in the next 12 days")
 
 
+SEND_AFTER_OPEN = timedelta(minutes=10)
+ORDER_CLOSE_MARGIN = timedelta(minutes=5)   # exec-prepare starts no order closer to the close
+# A tap holds the order when less than this is left: the broker needs a moment to start.
+HOLD_CLOSE_MARGIN = ORDER_CLOSE_MARGIN + timedelta(minutes=1)
+
+
+def held_send_et(now: datetime | None = None, *, close_margin: timedelta = HOLD_CLOSE_MARGIN) -> "tuple | None":
+    """When an order approved at ``now`` can go to the broker (plan §10.5 check 4).
+
+    None while the session is open and ``close_margin`` or more from its close: the order
+    goes at once. Otherwise ``(send_dt, close_dt)``: ``SEND_AFTER_OPEN`` after the next
+    open, and that session's close. The send time skips the opening minutes."""
+    now = (now or now_et()).astimezone(ET)
+    for _day, open_t, close in sessions_between(now, now + timedelta(days=12)):
+        if open_t <= now < close and close - now >= close_margin:
+            return None
+        send = open_t + SEND_AFTER_OPEN
+        if send > now and close - send >= close_margin:
+            return send, close
+    raise RuntimeError("no XNYS session in the next 12 days")
+
+
+def fmt_when_et(dt: datetime, now: datetime | None = None) -> str:
+    """'9:40 AM ET' on the same ET day as ``now``, else '9:40 AM ET on Thursday, November 5'."""
+    t = dt.astimezone(ET)
+    n = (now or now_et()).astimezone(ET)
+    if t.date() == n.date():
+        return f"{fmt_et(t)} ET"
+    return f"{fmt_et(t)} ET on {t.strftime('%A, %B')} {t.day}"
+
+
 def last_close_et(now: datetime | None = None):
     """The close of the latest session that closed at or before ``now`` (ET datetime)."""
     now = (now or now_et()).astimezone(ET)

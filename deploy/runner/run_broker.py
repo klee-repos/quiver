@@ -3,7 +3,8 @@
 
 ``quiver-broker.path`` starts this unit while ``state/triggers/broker`` exists. The runner
 deletes the trigger, takes the ``broker`` run lock, and drains ``broker_jobs``: ``execute``
-jobs first, then ``snapshot`` jobs. For each job it runs one ``claude -p`` with the Robinhood
+jobs first, then ``snapshot`` jobs. A held ``execute`` job (``not_before`` in the future)
+waits; the bridge touches the trigger at its send time. For each job it runs one ``claude -p`` with the Robinhood
 MCP, a runbook (EXECUTE.md or SNAPSHOT.md) in its system prompt, and ``broker_guard`` as
 the hook on every tool call. Python sizes and checks every order; the model only calls the
 tools the runbook names and passes raw results to ``tick.py``.
@@ -256,19 +257,26 @@ class Broker:
             self.say(f"I lost track of the {l['ticker']} order at {at}. I'm checking it with Robinhood.")
 
     def next_job(self):
+        """The next queued job. A held execute job (``not_before`` in the future: an Approve
+        tap while the market was closed) waits for its send time."""
         with self.led.connect() as conn:
-            row = conn.execute("SELECT * FROM broker_jobs WHERE status='queued' ORDER BY "
-                               "CASE kind WHEN 'execute' THEN 0 ELSE 1 END, id LIMIT 1").fetchone()
+            row = conn.execute("SELECT * FROM broker_jobs WHERE status='queued' AND "
+                               "(not_before IS NULL OR not_before <= ?) ORDER BY "
+                               "CASE kind WHEN 'execute' THEN 0 ELSE 1 END, id LIMIT 1",
+                               (store.iso(self.now_fn()),)).fetchone()
             return dict(row) if row else None
 
-    def mark(self, job_id, status, error=None):
+    def mark(self, job_id, status, error=None) -> bool:
+        """Set a job's status. ``running`` is a claim: False when the job left ``queued``
+        (a Cancel tap ended it after ``next_job`` read it)."""
         with self.led.connect() as conn:
             if status == "running":
-                conn.execute("UPDATE broker_jobs SET status='running', started_at=? WHERE id=? AND status='queued'",
-                             (store.now_iso(), job_id))
-            else:
-                conn.execute("UPDATE broker_jobs SET status=?, finished_at=?, error=? WHERE id=?",
-                             (status, store.now_iso(), error, job_id))
+                cur = conn.execute("UPDATE broker_jobs SET status='running', started_at=? WHERE id=? "
+                                   "AND status='queued'", (store.now_iso(), job_id))
+                return cur.rowcount == 1
+            conn.execute("UPDATE broker_jobs SET status=?, finished_at=?, error=? WHERE id=?",
+                         (status, store.now_iso(), error, job_id))
+            return True
 
     def write_prompt(self, job, values: dict, runbook: str) -> str:
         text = load_prompt("broker") + "\n\n" + (_REPO / runbook).read_text(encoding="utf-8") + \
@@ -466,7 +474,8 @@ class Broker:
             job = self.next_job()
             if job is None:
                 return n
-            self.mark(job["id"], "running")
+            if not self.mark(job["id"], "running"):
+                continue
             try:
                 if job["kind"] == "execute":
                     self.run_execute(job)

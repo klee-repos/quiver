@@ -311,13 +311,21 @@ tap and stops:
    the nonce match the proposal.
 2. The proposal is `pending`. Otherwise the answer gives its current state.
 3. The proposal has not expired. A proposal expires at the close of the current session.
-4. For **Approve** on a trade: no `KILL` file, today not halted, the market open, and at
-   least 5 minutes before the close. Otherwise the proposal stays open and the answer gives
-   the reason.
+4. For **Approve** on a trade: no `KILL` file, and the day the order goes is not halted.
+   Otherwise the proposal stays open and the answer gives the reason in a popup.
 5. One conditional `UPDATE` claims the proposal. A second tap gets "Already approved".
 
 Then the bridge replaces the buttons with the result: "Approved", "Rejected", "Expired",
 "Price moved", or "Replaced by #N".
+
+**Approve works at any hour.** When the market is closed, or closes in less than 6 minutes,
+the tap approves the trade and holds the order. The desk sends it at 9:40 AM ET of the next
+session, and says so: "Approved. The market is closed now, so I send #41 at 9:40 AM ET on
+Thursday, November 5." The buttons become "Approved, sends Thu 9:40 AM ET" and **Cancel**.
+Tap Cancel before 9:40 AM ET to stop the order. After 9:40 AM ET it is too late to cancel,
+and the desk says so. At 9:40 AM ET the broker re-quotes each leg
+as always. If a price moved more than `requote_tolerance_pct` overnight, you get new numbers
+with new buttons, and nothing is placed.
 
 On **Approve**, the desk answers "On it. Checking the price now." The broker runner
 re-quotes each leg. If a price moved more than `requote_tolerance_pct` (1.5% to start), the

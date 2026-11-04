@@ -153,6 +153,7 @@ class Bridge:
         self.turn_item = None              # the agenda item of the running turn
         self.turn_stopped = False
         self.agenda_task = None
+        self.released = set()              # held execute jobs whose send time came (one wake each)
         self.stopping = False
 
     # --- plumbing -----------------------------------------------------------------
@@ -274,6 +275,9 @@ class Bridge:
         with self.led.connect() as c:
             snap = c.execute("SELECT captured_at FROM broker_snapshots ORDER BY id DESC LIMIT 1").fetchone()
             pending = c.execute("SELECT COUNT(*) FROM proposals WHERE state='pending'").fetchone()[0]
+            held = c.execute("SELECT proposal_id, not_before FROM broker_jobs WHERE kind='execute' AND "
+                             "status='queued' AND not_before > ? ORDER BY not_before, id",
+                             (store.now_iso(),)).fetchall()
             last_run = store.get_state(c, "monitor_last_run")
             job = c.execute("SELECT status, error, finished_at FROM broker_jobs WHERE kind='snapshot' AND status IN "
                             "('done','failed') ORDER BY id DESC LIMIT 1").fetchone()
@@ -282,6 +286,7 @@ class Bridge:
         age = store.age_seconds(snap[0]) if snap else None
         parts = [f"Snapshot: {round(age / 60)} min old." if age is not None else "Snapshot: none yet.",
                  f"Pending proposals: {pending}.",
+                 *[f"Approved #{h[0]} goes at {market.fmt_when_et(store.parse_ts(h[1]))}." for h in held],
                  f"Agenda: {ag['open']} open, {ag['waiting']} waiting, {ag['fyi']} fyi.",
                  f"Last monitor run: {last_run}." if last_run else "Last monitor run: none yet.",
                  "Trading is halted today." if halted else "Trading is not halted.",
@@ -610,7 +615,7 @@ class Bridge:
             if agenda.hold_until(c, now):
                 return None
             if c.execute("SELECT 1 FROM broker_jobs WHERE kind='execute' AND status IN ('queued','running') "
-                         "LIMIT 1").fetchone():
+                         "AND (not_before IS NULL OR not_before <= ?) LIMIT 1", (now,)).fetchone():
                 return None
             agenda.refresh(c, now)
             op = agenda.open_item(c)
@@ -646,9 +651,36 @@ class Bridge:
         while not self.stopping:
             await self.sleep(AGENDA_POLL_S)
             try:
+                await self.release_held()
+            except Exception as e:  # noqa: BLE001 — the loop never stops
+                self.log({"event": "release_error", "error": f"{type(e).__name__}: {e}"})
+            try:
                 await self.maybe_turn()
             except Exception as e:  # noqa: BLE001 — the loop never stops
                 self.log({"event": "agenda_error", "error": f"{type(e).__name__}: {e}"})
+
+    async def release_held(self):
+        """Wake the broker for each held execute job whose send time came (§10.5 check 4).
+        The card loses its Cancel button, and the broker watch starts. ``released`` keeps
+        one wake per job; after a restart a due job gets one more wake, which is harmless."""
+        from lib.desk import store
+        now = store.now_iso()
+        with self.led.connect() as c:
+            rows = c.execute("SELECT j.id, j.proposal_id, p.tg_message_id FROM broker_jobs j "
+                             "JOIN proposals p ON p.id = j.proposal_id WHERE j.kind='execute' AND "
+                             "j.status='queued' AND j.not_before IS NOT NULL AND j.not_before <= ?",
+                             (now,)).fetchall()
+        due = [tuple(r) for r in rows if r[0] not in self.released]
+        if not due:
+            return []
+        store.touch_trigger(self.runtime.root, "broker")
+        for job_id, pid, mid in due:
+            self.released.add(job_id)
+            self.log({"event": "release", "job": job_id, "proposal_id": pid})
+            if mid:
+                await asyncio.to_thread(self.box.set_label, mid, "Approved")
+            asyncio.create_task(self.broker_watch(pid))
+        return due
 
     async def report_error(self, text: str, *, quiet: bool = False):
         """Log, page and tell the owner. ``quiet`` (an agenda turn) skips the owner text: the
@@ -716,8 +748,12 @@ class Bridge:
             asyncio.ensure_future(self.maybe_turn())
 
     async def handle_tap(self, cbq, *, offline: bool):
+        if cbq.get("data") == "noop":
+            # A label button ("Approved", "Approved, sends Thu 9:40 AM ET"): nothing to do.
+            await self.tg("answerCallbackQuery", {"callback_query_id": cbq.get("id")})
+            return {"noop": True}
         if offline:
-            await self.tg("answerCallbackQuery", {"callback_query_id": cbq.get("id"),
+            await self.tg("answerCallbackQuery", {"callback_query_id": cbq.get("id"), "show_alert": True,
                                                   "text": "I was offline when you tapped. Tap again."})
             return {"offline": True}
         # No agenda item comes up while a tap runs: its follow-up card must join the open item first.
@@ -739,8 +775,15 @@ class Bridge:
         res = await asyncio.to_thread(
             approvals.handle_tap, self.led, self.runtime.cfg, callback_data=cbq.get("data"), from_id=frm,
             chat_id=chat_id, message_id=msg.get("message_id"), owner_ids=self.owner_ids)
-        await self.tg("answerCallbackQuery", {"callback_query_id": cid, "text": str(res["answer"])[:200]})
-        if res.get("label") and msg.get("message_id"):
+        # A tap that leaves the card as it was answers with a popup: a toast is gone in two
+        # seconds, and the owner reads a refused tap as a dead button.
+        answer = {"callback_query_id": cid, "text": str(res["answer"])[:200]}
+        if res.get("alert") or (not res.get("label") and not res.get("buttons")):
+            answer["show_alert"] = True
+        await self.tg("answerCallbackQuery", answer)
+        if res.get("buttons") and msg.get("message_id"):
+            await asyncio.to_thread(self.box.set_buttons, msg["message_id"], res["buttons"])
+        elif res.get("label") and msg.get("message_id"):
             await asyncio.to_thread(self.box.set_label, msg["message_id"], res["label"])
         for t in res.get("touch", []):
             from lib.desk import store

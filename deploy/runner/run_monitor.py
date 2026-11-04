@@ -240,6 +240,12 @@ class Monitor:
                 if portfolio.needs_rebalance(d, band):
                     out.append(t)
         res = {"outside": out}
+        with self.led.connect() as conn:
+            busy = [t for t in out if proposals.in_flight_ticker(conn, t)]
+        if busy:
+            # A name with an order in flight (a held order, say) waits; the others go on the card.
+            res["in_flight"] = busy
+            out = [t for t in out if t not in busy]
         if out:
             yf = proposals.prefetch_prices(self.led, out, now_dt=self.now, yf_price_fn=self.yf_price_fn)
             with self.led.transaction() as conn:

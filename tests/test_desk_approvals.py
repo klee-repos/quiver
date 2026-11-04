@@ -425,28 +425,14 @@ def case_gate():
     kill_txt = "Trading is stopped on the box. This stays open until 4:00 PM ET."
     halt_txt = ("Trading is halted for today after the daily-loss check. "
                 "Ask me to propose resume_trading to lift it.")
-    closed_txt = ("The market is closed. It opens at 9:30 AM ET. This stays open until 4:00 PM ET. "
-                  "Tap again then.")
-    close_txt = "It's too close to the close. This one expires at 4:00 PM ET."
     _gate_case("KILL", snap="2026-08-05T13:35:00Z", build_at="2026-08-05T14:00:00Z",
                tap_at="2026-08-05T14:05:00Z", setup=_kill, want=kill_txt)
     _gate_case("halted", snap="2026-08-05T13:35:00Z", build_at="2026-08-05T14:00:00Z",
                tap_at="2026-08-05T14:05:00Z", setup=_halt("2026-08-05"), want=halt_txt)
-    # Closed: a proposal built before the open (08:00 ET), tapped at 09:00 ET.
-    _gate_case("closed (pre-open 2026-08-05)", snap="2026-08-05T11:55:00Z", build_at="2026-08-05T12:00:00Z",
-               tap_at="2026-08-05T13:00:00Z", setup=lambda root: None, want=closed_txt)
-    # 2026-11-27 is a half day: the close is 1:00 PM ET (18:00Z).
-    _gate_case("closed (pre-open 2026-11-27 half day)", snap="2026-11-27T12:55:00Z",
-               build_at="2026-11-27T13:00:00Z", tap_at="2026-11-27T13:30:00Z", setup=lambda root: None,
-               want=("The market is closed. It opens at 9:30 AM ET. This stays open until 1:00 PM ET. "
-                     "Tap again then."))
-    _gate_case("4 min before the close", snap="2026-08-05T13:35:00Z", build_at="2026-08-05T14:00:00Z",
-               tap_at="2026-08-05T19:56:00Z", setup=lambda root: None, want=close_txt)
-    _gate_case("4 min before the half-day close", snap="2026-11-27T14:35:00Z",
-               build_at="2026-11-27T15:00:00Z", tap_at="2026-11-27T17:56:00Z", setup=lambda root: None,
-               want="It's too close to the close. This one expires at 1:00 PM ET.")
-    _gate_case("exactly 5 min before the close", snap="2026-08-05T13:35:00Z",
-               build_at="2026-08-05T14:00:00Z", tap_at="2026-08-05T19:55:00Z", setup=lambda root: None,
+    # The market hours never refuse a tap: they hold the order (case_held).
+    # 6 minutes before the close goes at once; less holds (the broker needs a minute to start).
+    _gate_case("exactly 6 min before the close", snap="2026-08-05T13:35:00Z",
+               build_at="2026-08-05T14:00:00Z", tap_at="2026-08-05T19:54:00Z", setup=lambda root: None,
                want=None, want_ok=True)
     # The first failing reason wins.
     _gate_case("KILL + halted + closed -> KILL", snap="2026-08-05T11:55:00Z",
@@ -474,6 +460,175 @@ def case_gate():
             r.eq("gate: one execute job after the KILL refusal", len(jobs(root, p["id"])), 1)
         finally:
             fc.unpin()
+
+
+# --- held (§10.5 check 4) -----------------------------------------------------------
+
+def _held_case(label, *, snap, build_at, tap_at, send_at, expires_at, answer, button, why=None):
+    """An Approve tap while the market cannot take the order: approved, one held job, no
+    trigger, the held buttons. Returns (root context, root, proposal row, fc) for more taps."""
+    root_cm = fresh_root()
+    root = root_cm.__enter__()
+    fc = FakeClock(snap).pin_market()
+    p, _ = trade(root, fc, snap=snap, at=build_at)
+    led, cfg = root.led(), root.cfg()
+    now = at(tap_at)
+    fc.set(now)
+    res = tap(led, cfg, cb(p), now)
+    r.eq(f"held: {label} approves", (res.get("ok"), res.get("answer"), res.get("label")), (True, answer, None))
+    r.eq(f"held: {label} names no trigger", res.get("touch"), [])
+    r.eq(f"held: {label} row approved", prop(root, p["id"])["state"], "approved")
+    r.eq(f"held: {label} legs approved", [l["state"] for l in legs(root, p["id"])], ["approved"])
+    with led.connect() as conn:
+        js = [dict(x) for x in conn.execute("SELECT kind, status, recovery, not_before FROM broker_jobs")]
+    r.eq(f"held: {label} one held execute job", js,
+         [{"kind": "execute", "status": "queued", "recovery": 0, "not_before": send_at}])
+    r.eq(f"held: {label} expires_at", prop(root, p["id"])["expires_at"], expires_at)
+    r.eq(f"held: {label} the buttons: the label, then Cancel", res.get("buttons"),
+         [[{"text": button, "callback_data": "noop"}],
+          [{"text": "Cancel", "callback_data": f"p:{p['id']}:{p['nonce']}:r", "style": "danger"}]])
+    when = answer.split("send it at ", 1)[1].rstrip(".")
+    want = (f"Approved. {why}, so I send #{p['id']} at {when}. Until then, tap Cancel on the card to stop it. "
+            "If the price moves more than the requote limit before then, I send you fresh numbers instead.")
+    r.eq(f"held: {label} the message names the reason, the send time and Cancel", res.get("messages"),
+         [want] if why else res.get("messages"))
+    return root_cm, root, p, fc
+
+
+def case_held():
+    # Pre-open (08:00 ET build, 09:00 ET tap): held to 9:40 AM ET the same day.
+    cm, root, p, fc = _held_case("pre-open", snap="2026-08-05T11:55:00Z", build_at="2026-08-05T12:00:00Z",
+                                 tap_at="2026-08-05T13:00:00Z", send_at="2026-08-05T13:40:00Z",
+                                 expires_at="2026-08-05T20:00:00Z", answer="Approved. I send it at 9:40 AM ET.",
+                                 button="Approved, sends 9:40 AM ET", why="The market is closed now")
+    try:
+        led, cfg = root.led(), root.cfg()
+        res = tap(led, cfg, cb(p), at("2026-08-05T13:01:00Z"))
+        r.eq("held: a second Approve names the send time and keeps Cancel",
+             (res.get("answer"), res.get("label"), res.get("buttons")),
+             ("Already approved. I send it at 9:40 AM ET.", None,
+              outbox.held_buttons(p["id"], p["nonce"], "Approved, sends 9:40 AM ET")))
+        r.eq("held: still one job", len(jobs(root, p["id"])), 1)
+        # A new trade on the same ticker names the held order and the way out.
+        try:
+            with led.transaction() as conn:
+                proposals.build_trade(led, conn, cfg=cfg, tickers=["ANET"], origin=None, rationale="again",
+                                      created_by="monitor", now_dt=at("2026-08-05T13:02:00Z"),
+                                      python_origin="drift", yf_price_fn=FakePrices())
+            err = None
+        except proposals.ProposalError as e:
+            err = str(e)
+        r.eq("held: a new trade on the ticker names the held order",
+             err, f"ANET has an approved order (#{p['id']}) that I send at 9:40 AM ET. To change it, the owner "
+                  "taps Cancel on that card first")
+        # Cancel before the send time: the job, the row and the legs end together.
+        before = prop(root, p["id"])
+        now = at("2026-08-05T13:30:00Z")
+        fc.set(now)
+        res = tap(led, cfg, cb(p, "r"), now)
+        r.eq("held: Cancel before the send time", (res.get("ok"), res.get("answer"), res.get("label")),
+             (True, "Cancelled", "Cancelled"))
+        r.eq("held: Cancel's message", res.get("messages"), [f"You cancelled #{p['id']}. I sent nothing to Robinhood."])
+        row = prop(root, p["id"])
+        r.eq("held: Cancel ends the row rejected, decided now by the owner",
+             (row["state"], row["decided_at"], row["decided_by"]), ("rejected", "2026-08-05T13:30:00Z", str(OWNER)))
+        r.eq("held: Cancel keeps the approval time", store.loads(row["result_json"], {}).get("approved_at"),
+             before["decided_at"])
+        r.eq("held: Cancel skips the legs", [(l["state"], l["finalized"], l["skip_reason"]) for l in legs(root, p["id"])],
+             [("skipped", 1, "cancelled")])
+        with led.connect() as conn:
+            j = dict(conn.execute("SELECT status, error FROM broker_jobs").fetchone())
+        r.eq("held: Cancel fails the held job", j, {"status": "failed", "error": "cancelled by the owner"})
+        res = tap(led, cfg, cb(p, "r"), at("2026-08-05T13:31:00Z"))
+        r.eq("held: a second Cancel answers 'Rejected'", res.get("answer"), "Rejected")
+        res = tap(led, cfg, cb(p), at("2026-08-05T13:32:00Z"))
+        r.eq("held: an Approve after Cancel answers 'Rejected'", res.get("answer"), "Rejected")
+        with led.connect() as conn:
+            r.eq("held: no ANET leg is in flight after Cancel", proposals.in_flight_ticker(conn, "ANET"), None)
+    finally:
+        fc.unpin()
+        cm.__exit__(None, None, None)
+
+    # Cancel at the send time: too late, the approved row stays as it is.
+    cm, root, p, fc = _held_case("late cancel", snap="2026-08-05T11:55:00Z", build_at="2026-08-05T12:00:00Z",
+                                 tap_at="2026-08-05T13:00:00Z", send_at="2026-08-05T13:40:00Z",
+                                 expires_at="2026-08-05T20:00:00Z", answer="Approved. I send it at 9:40 AM ET.",
+                                 button="Approved, sends 9:40 AM ET")
+    try:
+        led, cfg = root.led(), root.cfg()
+        before = dump(root)
+        res = tap(led, cfg, cb(p, "r"), at("2026-08-05T13:40:00Z"))
+        r.eq("held: Cancel at the send time says it is too late, in a popup",
+             (res.get("answer"), res.get("label"), res.get("alert")),
+             ("Too late to cancel: it is going to Robinhood now.", "Approved", True))
+        r.eq("held: a late Cancel changes nothing", dump(root), before)
+        res = tap(led, cfg, cb(p), at("2026-08-05T13:40:00Z"))
+        r.eq("held: an Approve at the send time answers 'Already approved'", res.get("answer"), "Already approved")
+    finally:
+        fc.unpin()
+        cm.__exit__(None, None, None)
+
+    # After the close (the live case of 2026-11-04): held to 9:40 AM ET of the next session.
+    cm, root, p, fc = _held_case("after the close", snap="2026-08-05T20:40:00Z", build_at="2026-08-05T20:44:00Z",
+                                 tap_at="2026-08-05T20:46:00Z", send_at="2026-08-06T13:40:00Z",
+                                 expires_at="2026-08-06T20:00:00Z",
+                                 answer="Approved. I send it at 9:40 AM ET on Thursday, August 6.",
+                                 button="Approved, sends Thu 9:40 AM ET", why="The market is closed now")
+    fc.unpin()
+    cm.__exit__(None, None, None)
+
+    # 4 minutes before the close: held to the next session; expires_at moves to its close.
+    soon, closed = "The market closes in a few minutes", "The market is closed now"
+    for label, snap, build_at, tap_at, send_at, expires_at, answer, button, why in (
+            ("4 min before the close", "2026-08-05T13:35:00Z", "2026-08-05T14:00:00Z", "2026-08-05T19:56:00Z",
+             "2026-08-06T13:40:00Z", "2026-08-06T20:00:00Z",
+             "Approved. I send it at 9:40 AM ET on Thursday, August 6.", "Approved, sends Thu 9:40 AM ET", soon),
+            # 2026-11-27 is a half day (1:00 PM ET close); 11-28 and 11-29 are a weekend.
+            ("4 min before the half-day close", "2026-11-27T14:35:00Z", "2026-11-27T15:00:00Z",
+             "2026-11-27T17:56:00Z", "2026-11-30T14:40:00Z", "2026-11-30T21:00:00Z",
+             "Approved. I send it at 9:40 AM ET on Monday, November 30.", "Approved, sends Mon 9:40 AM ET", soon),
+            ("pre-open half day", "2026-11-27T12:55:00Z", "2026-11-27T13:00:00Z", "2026-11-27T13:30:00Z",
+             "2026-11-27T14:40:00Z", "2026-11-27T18:00:00Z", "Approved. I send it at 9:40 AM ET.",
+             "Approved, sends 9:40 AM ET", closed),
+            ("exactly 5 min before the close", "2026-08-05T13:35:00Z", "2026-08-05T14:00:00Z",
+             "2026-08-05T19:55:00Z", "2026-08-06T13:40:00Z", "2026-08-06T20:00:00Z",
+             "Approved. I send it at 9:40 AM ET on Thursday, August 6.", "Approved, sends Thu 9:40 AM ET", soon)):
+        cm, root, p, fc = _held_case(label, snap=snap, build_at=build_at, tap_at=tap_at, send_at=send_at,
+                                     expires_at=expires_at, answer=answer, button=button, why=why)
+        fc.unpin()
+        cm.__exit__(None, None, None)
+
+    # The halt binds the day the order goes: a halted day does not refuse a tap for tomorrow.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T20:40:00Z").pin_market()
+        try:
+            p, _ = trade(root, fc, snap="2026-08-05T20:40:00Z", at="2026-08-05T20:44:00Z")
+            _halt("2026-08-05")(root)
+            led, cfg = root.led(), root.cfg()
+            res = tap(led, cfg, cb(p), at("2026-08-05T20:46:00Z"))
+            r.eq("held: today's halt does not refuse a tap held to tomorrow",
+                 (res.get("ok"), res.get("answer")), (True, "Approved. I send it at 9:40 AM ET on Thursday, August 6."))
+        finally:
+            fc.unpin()
+
+    # The card names the send time when the market is closed, and not in the session.
+    for label, snap, build_at, want in (
+            ("after the close", "2026-08-05T20:40:00Z", "2026-08-05T20:44:00Z",
+             "The market is closed now. If you tap Approve before it opens, I hold the order and send it at "
+             "9:40 AM ET on Thursday, August 6."),
+            ("in the session", "2026-08-05T13:35:00Z", "2026-08-05T14:00:00Z", None)):
+        with fresh_root() as root:
+            fc = FakeClock(snap).pin_market()
+            try:
+                tg = FakeTG()
+                trade(root, fc, snap=snap, at=build_at, tg=tg)
+                text = [c[1]["text"] for c in tg.calls if c[0] == "sendMessage"][-1]
+                if want:
+                    r.ok(f"held: the card {label} names the send time", want in text, text)
+                else:
+                    r.ok(f"held: the card {label} has no hold sentence", "I hold the order" not in text, text)
+            finally:
+                fc.unpin()
 
 
 # --- claim_once ---------------------------------------------------------------------
@@ -790,7 +945,8 @@ def case_only_caller():
 
 
 def main() -> int:
-    for case in (case_identity, case_state, case_gate, case_claim_once, case_txn, case_reject, case_only_caller):
+    for case in (case_identity, case_state, case_gate, case_held, case_claim_once, case_txn, case_reject,
+                 case_only_caller):
         try:
             case()
         except Exception as e:  # noqa: BLE001

@@ -785,9 +785,11 @@ def case_tap_order():
 
 
 def case_tap_refusal_reason():
+    # A refused tap leaves the card as it was, so the answer is a popup the owner must
+    # dismiss (2026-11-04: five taps on a card read a 2-second toast as a dead button).
     with world(seeded=True) as w:
         prop = make_card(w)
-        w.fc.set("2026-08-05T19:57:00Z")          # 3 minutes before the 4:00 PM ET close
+        w.root.kill.write_text("stop", encoding="utf-8")
         want = approvals.trade_gate(w.root.led(), w.root.cfg(), prop, w.fc.now)
         fresh_poll_mark(w)
         tap_update(w, prop, "a", qid="qc")
@@ -797,11 +799,75 @@ def case_tap_refusal_reason():
             await settle()
         asyncio.run(go())
         a = answers(w, "qc")
-        r.ok("tap_order: the gate refuses near the close", bool(want), want)
+        r.ok("tap_order: KILL refuses the tap", bool(want), want)
         r.eq("tap_order: one answer for the refused tap", len(a), 1)
-        r.eq("tap_order: the answer is the refusal reason", a[0].get("text") if a else None, (want or "")[:200])
+        r.eq("tap_order: the answer is the refusal reason, as a popup",
+             (a[0].get("text"), a[0].get("show_alert")) if a else None, ((want or "")[:200], True))
         r.eq("tap_order: the refused proposal stays pending", prop_state(w, prop["id"]), "pending")
         r.eq("tap_order: a refusal keeps the buttons", w.tg.of("editMessageReplyMarkup"), [])
+
+
+def case_tap_held():
+    # 3 minutes before the close: the tap approves and holds the order to the next session.
+    with world(seeded=True) as w:
+        prop = make_card(w)
+        br = w.bridge
+        w.fc.set("2026-08-05T19:57:00Z")
+        fresh_poll_mark(w)
+        tap_update(w, prop, "a", qid="qh")
+        trig = w.root.path / "state" / "triggers" / "broker"
+
+        async def go():
+            await br.poll_once()
+            await settle()
+        asyncio.run(go())
+        a = answers(w, "qh")
+        r.eq("held: one answer, a toast (the card changes)",
+             [(x.get("text"), x.get("show_alert")) for x in a],
+             [("Approved. I send it at 9:40 AM ET on Thursday, August 6.", None)])
+        edits = w.tg.of("editMessageReplyMarkup")
+        r.eq("held: the card shows the label and Cancel",
+             [e["params"]["reply_markup"]["inline_keyboard"] for e in edits],
+             [outbox.held_buttons(prop["id"], prop["nonce"], "Approved, sends Thu 9:40 AM ET")])
+        r.ok("held: the chat says when it goes and how to cancel",
+             any(f"so I send #{prop['id']} at 9:40 AM ET on Thursday, August 6. Until then, tap Cancel" in t
+                 for t in w.tg.texts()), w.tg.texts())
+        r.eq("held: the proposal is approved", prop_state(w, prop["id"]), "approved")
+        r.ok("held: no broker trigger at the tap", not trig.exists())
+        r.ok("held: no broker watch at the tap", not any("has not started" in t for t in w.tg.texts()), w.tg.texts())
+        r.ok("held: /status names the held order",
+             f"Approved #{prop['id']} goes at 9:40 AM ET on Thursday, August 6." in br.status_text(), br.status_text())
+
+        # A tap on the label button does nothing: one silent answer.
+        fresh_poll_mark(w)
+        tap_update(w, prop, "a", qid="qn")["callback_query"]["data"] = "noop"
+        asyncio.run(go())
+        r.eq("held: a tap on the label gets one silent answer", answers(w, "qn"), [{"callback_query_id": "qn"}])
+        r.eq("held: the label tap changes nothing", prop_state(w, prop["id"]), "approved")
+
+        # Before the send time the bridge does not wake the broker.
+        w.fc.set("2026-08-06T13:39:59Z")
+
+        async def rel():
+            out = await br.release_held()
+            await settle()
+            return out
+        r.eq("release: nothing before the send time", asyncio.run(rel()), [])
+        r.ok("release: no trigger before the send time", not trig.exists())
+        # At the send time: one wake, the card loses Cancel, the broker watch starts.
+        w.fc.set("2026-08-06T13:40:00Z")
+        job = rows(w, "SELECT id FROM broker_jobs WHERE kind='execute' AND proposal_id=?", (prop["id"],))[0]["id"]
+        due = asyncio.run(rel())
+        r.eq("release: one wake at the send time", [d[0] for d in due], [job])
+        r.ok("release: the broker trigger", trig.exists())
+        r.eq("release: the card label is Approved",
+             w.tg.of("editMessageReplyMarkup")[-1]["params"]["reply_markup"]["inline_keyboard"],
+             [[{"text": "Approved", "callback_data": "noop"}]])
+        r.ok("release: the broker watch runs", any(f"The broker has not started #{prop['id']} yet." in t
+                                                    for t in w.tg.texts()), w.tg.texts())
+        trig.unlink()
+        r.eq("release: one wake per job", asyncio.run(rel()), [])
+        r.ok("release: no second trigger", not trig.exists())
 
 
 # --- react_gate (§4.2 step 3) -----------------------------------------------------------
@@ -1764,6 +1830,19 @@ def case_agenda_quiet_and_busy():
         r.eq("quiet: the item comes up once the owner is quiet and the broker is done", item(w, a)["status"], "open")
 
 
+def case_agenda_held_job():
+    # A held trade (an Approve tap while the market was closed) does not hold the agenda.
+    with world(seeded=True) as w:
+        br = w.bridge
+        a = add_item(w, title="The ANET review.")
+        with w.root.led().connect() as c:
+            c.execute("INSERT INTO broker_jobs (kind, proposal_id, recovery, status, requested_by, created_at, "
+                      "not_before) VALUES ('execute', 1, 0, 'queued', 'tap', ?, ?)",
+                      (store.now_iso(), store.iso(w.fc.now + timedelta(hours=12))))
+        got = br.agenda_next()
+        r.eq("busy: a held trade does not hold the agenda", (got or {}).get("id"), a)
+
+
 def case_agenda_fallback():
     with world(seeded=True) as w:
         br = w.bridge
@@ -1995,6 +2074,7 @@ CASES = [
     ("broker_watch", case_broker_watch),
     ("tap_order", case_tap_order),
     ("tap_refusal_reason", case_tap_refusal_reason),
+    ("tap_held", case_tap_held),
     ("react_gate", case_react_gate),
     ("emoji", case_emoji),
     ("quick_react", case_quick_react),
@@ -2009,6 +2089,7 @@ CASES = [
     ("agenda_one_at_a_time", case_agenda_one_at_a_time),
     ("agenda_owner_turn", case_agenda_owner_turn),
     ("agenda_quiet_and_busy", case_agenda_quiet_and_busy),
+    ("agenda_held_job", case_agenda_held_job),
     ("agenda_fallback", case_agenda_fallback),
     ("agenda_follow_up", case_agenda_follow_up),
     ("agenda_review_fixes", case_agenda_review_fixes),

@@ -242,6 +242,16 @@ def _until(expires_at, now) -> str:
     return f"Open until {_clock(expires_at)} ET on {e.strftime('%A, %B')} {e.day}."
 
 
+def _when(ts, now) -> str:
+    """'9:40 AM ET', with the weekday and date when it is not today (ET)."""
+    t, n = _et(ts), _et(now)
+    if t is None:
+        return ""
+    if n is not None and t.date() == n.date():
+        return f"{_clock(ts)} ET"
+    return f"{_clock(ts)} ET on {t.strftime('%A, %B')} {t.day}"
+
+
 # --- proposal cards (§10.1 rule 5) -------------------------------------------------
 
 def _leg_sentence(leg: dict, first: bool, plan_moves: bool = False) -> str:
@@ -335,6 +345,14 @@ def render_trade_card(model: dict) -> list:
     ev = _evidence_sentence(model.get("evidence"))
     if ev:
         parts.append(ev)
+    if model.get("send_at"):
+        when = _when(model["send_at"], model.get("now"))
+        if model.get("closing"):
+            parts.append(f"The market closes in a few minutes. If you tap Approve now, I hold the order and send "
+                         f"it at {when}.")
+        else:
+            parts.append(f"The market is closed now. If you tap Approve before it opens, I hold the order and "
+                         f"send it at {when}.")
     parts.append(_until(model["expires_at"], model.get("now")))
     return _pack(" ".join(p for p in parts if p))
 

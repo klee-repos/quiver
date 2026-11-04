@@ -2565,10 +2565,126 @@ def t_gate_b():
         r.ok("gate-b SEC-1: the account number is set in the test config", bool(acct), acct)
         r.eq("gate-b SEC-1: no ledger cell holds the account number", sorted(set(hits)), [])
 
+# =============================================================================================
+# held (§10.5 check 4): an Approve tap while the market cannot take the order
+# =============================================================================================
+
+
+def t_held():
+    # The live case of 2026-11-04: a card made after the close and tapped at once.
+    with case("held", at="2026-08-05T20:35:00Z") as c:
+        c.at("2026-08-05T20:40:00Z")
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        c.at("2026-08-05T20:46:00Z")
+        c.approve(built)
+        job = c.job_of(pid)
+        r.eq("held: the tap holds the job to 9:40 AM ET of the next session",
+             (job["status"], job["not_before"]), ("queued", "2026-08-06T13:40:00Z"))
+        r.eq("held: the proposal is approved, its expiry unchanged",
+             (c.prop(pid)["state"], c.prop(pid)["expires_at"]), ("approved", "2026-08-06T20:00:00Z"))
+        for when in ("2026-08-05T20:47:00Z", "2026-08-06T13:30:00Z", "2026-08-06T13:39:59Z"):
+            c.at(when)
+            runner = Runner(c)
+            n = c.broker(runner).drain()
+            r.eq(f"held: at {when} the broker skips the held job",
+                 (n, runner.jobs, c.job_of(pid)["status"], c.prop(pid)["state"]), (0, [], "queued", "approved"))
+        c.at("2026-08-06T13:40:30Z")
+        c.rh.script = {"ANET": ["filled"]}
+        c.rh.fill = {"ANET": (1.333333, 150.0)}
+        runner, _b = run_job(c, pid, {"sells": std(), "after": std(positions={"ANET": 3.333333, "CEG": 1, "SGOV": 11},
+                                                                     bp=100.0)})
+        r.eq("held: at the send time the broker runs it", len(runner.jobs), 1)
+        r.eq("held: the order fills and the proposal ends executed", c.prop(pid)["state"], "executed")
+        r.eq("held: the leg trades in the send session", c.legs(pid)[0]["trade_date"], "2026-08-06")
+        r.ok("held: the owner gets the result", any(t.startswith("Done. Bought $200.00 of ANET") for t in c.tg.texts()),
+             c.tg.texts())
+
+    # 4 minutes before the close: held to the next session; the expiry moves to that close.
+    with case("held near the close") as c:
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        r.eq("held near the close: the card expires at today's close", built["expires_at"], "2026-08-05T20:00:00Z")
+        c.at("2026-08-05T19:56:00Z")
+        c.approve(built)
+        r.eq("held near the close: the job waits for the next session",
+             c.job_of(pid)["not_before"], "2026-08-06T13:40:00Z")
+        r.eq("held near the close: the expiry moves to the send session's close",
+             c.prop(pid)["expires_at"], "2026-08-06T20:00:00Z")
+        c.at("2026-08-06T13:41:00Z")
+        c.rh.script = {"ANET": ["filled"]}
+        c.rh.fill = {"ANET": (1.333333, 150.0)}
+        run_job(c, pid, {"sells": std(), "after": std(positions={"ANET": 3.333333, "CEG": 1, "SGOV": 11}, bp=100.0)})
+        r.eq("held near the close: the next session executes it", c.prop(pid)["state"], "executed")
+
+    # A held job may start up to 30 minutes after its send time: held jobs share one send
+    # time and the broker runs them one at a time.
+    with case("held late start", at="2026-08-05T20:35:00Z") as c:
+        c.at("2026-08-05T20:40:00Z")
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        c.approve(built)
+        c.at("2026-08-06T14:09:00Z")
+        prep, _env = c.start(pid)
+        r.eq("held late start: 29 minutes after the send time it starts", prep.get("ok"), True)
+    with case("held too old", at="2026-08-05T20:35:00Z") as c:
+        c.at("2026-08-05T20:40:00Z")
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        c.approve(built)
+        c.at("2026-08-06T14:10:00Z")
+        runner = Runner(c)
+        c.broker(runner).drain()
+        r.eq("held too old: 30 minutes after the send time it fails", c.prop(pid)["state"], "failed")
+        r.eq("held too old: nothing spawned", runner.jobs, [])
+        r.ok("held too old: the text names the send time",
+             any(f"I could not start #{pid} within 30 minutes of its send time (9:40 AM ET)" in t for t in c.tg.texts()),
+             c.tg.texts())
+    # An approval that goes at once keeps its 10 minutes.
+    with case("tap too old") as c:
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        c.approve(built)
+        c.clk.advance(600)
+        prep, _env = c.start(pid)
+        r.eq("tap too old: 10 minutes after an in-session tap it fails", prep.get("reason"), "tap_too_old")
+
+    # A sized owner buy held overnight: the plan changed after the tap, so exec-prepare
+    # re-checks the plan move and sends nothing.
+    pos = {"ANET": 3.4, "CEG": 1.1}
+    with case("held plan changed", at="2026-08-05T20:35:00Z", positions=pos, buying_power=1160.0,
+              equity=2000.0) as c:
+        c.at("2026-08-05T20:40:00Z")
+        built = c.build([], orders=[{"ticker": "ANET", "buy_dollars": 80}])
+        pid = built["proposal_id"]
+        r.eq("held plan changed: the card moves ANET to 29.5%", built["plan"]["changes"][0]["target_weight"], 29.5)
+        c.approve(built)
+        c.setting("per_name_max_pct", 28.0)        # the limit falls overnight
+        c.at("2026-08-06T13:41:00Z")
+        runner = Runner(c)
+        c.broker(runner).drain()
+        r.eq("held plan changed: the proposal fails, nothing spawned", (c.prop(pid)["state"], runner.jobs), ("failed", []))
+        r.ok("held plan changed: the owner gets the reason",
+             any(f"I did not send #{pid}, because the plan changed after your tap" in t and "28% limit" in t
+                 for t in c.tg.texts()), c.tg.texts())
+
+    # exec-prepare before the send time (by hand) changes nothing.
+    with case("held early", at="2026-08-05T20:35:00Z") as c:
+        c.at("2026-08-05T20:40:00Z")
+        built = c.build(["ANET"])
+        pid = built["proposal_id"]
+        c.approve(built)
+        c.at("2026-08-06T13:35:00Z")
+        out, _env = c.start(pid)
+        r.ok("held early: exec-prepare refuses before the send time", "held until" in str((out or {}).get("error")), out)
+        r.eq("held early: the proposal and the leg stay approved",
+             (c.prop(pid)["state"], c.legs(pid)[0]["state"]), ("approved", "approved"))
+
+
 CASES = [t_prepare, t_check_gate, t_check_gate_jobs, t_requote_buys, t_stopped, t_canary, t_audit,
          t_requote_edge, t_requote, t_no_quote, t_fields, t_buy_clamp, t_owner_money, t_input_path, t_commit,
          t_review_gate,
-         t_fills, t_recovery, t_snapshot, t_child, t_wait, t_main, t_gate_b]
+         t_fills, t_recovery, t_snapshot, t_child, t_wait, t_main, t_gate_b, t_held]
 
 if __name__ == "__main__":
     only = set(sys.argv[1:])

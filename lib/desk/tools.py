@@ -1156,10 +1156,21 @@ def t_propose_trade(ctx: ToolContext, args: dict) -> dict:
         ctx.job.proposal_ids.append(built["proposal_id"])
     if built.get("plan"):
         note += " When the order fills, the plan moves with it (the card says how), so nothing else is needed."
+    note += _held_note()
     return {"proposal_id": built["proposal_id"], "fraction": built["fraction"], **_trade_out(built),
             "superseded": built["superseded"], "expires_at": built["expires_at"],
             "forecasts": journal, **({"forecast_note": fnote} if fnote else {}),
             **({"evidence_note": enote} if enote else {}), "note": note}
+
+
+def _held_note() -> str:
+    """The tool note when the market cannot take an order now (plan §10.5 check 4)."""
+    held = market.held_send_et()
+    if held is None:
+        return ""
+    return (f" The market cannot take the order now. The owner can tap Approve at any time: Python then holds "
+            f"the order and sends it at {market.fmt_when_et(held[0])}, and the card shows Cancel until then. "
+            "Tell the owner this in plain words.")
 
 
 def _owner_follow_up(ctx: ToolContext, pid: int) -> dict:
@@ -1182,7 +1193,7 @@ def _owner_follow_up(ctx: ToolContext, pid: int) -> dict:
             outbox.send_trade_card(ctx.led, ctx.box, ctx.led.connect, b)
         return {"follow_up": {"proposal_id": b["proposal_id"], **_trade_out(b)},
                 "follow_note": "Its trade card with Approve and Reject goes to the owner as the newest message. Only "
-                               "the owner's tap sends the order."}
+                               "the owner's tap sends the order." + _held_note()}
     if fu.get("waiting"):
         ctx.trigger("broker")
         return {"follow_up": "waiting",

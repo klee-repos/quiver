@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from datetime import datetime, timezone
 from typing import Iterable, Optional
 
@@ -178,7 +179,8 @@ CREATE TABLE IF NOT EXISTS broker_jobs (
   kind TEXT NOT NULL CHECK (kind IN ('snapshot','execute')),
   proposal_id INTEGER, recovery INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')),
-  requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT
+  requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT,
+  not_before TEXT
 );
 CREATE TABLE IF NOT EXISTS broker_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, captured_at TEXT NOT NULL,
@@ -354,6 +356,21 @@ def ensure_desk_schema(conn) -> None:
     _migrate_jobs_kind(conn)
     conn.executescript(DESK_SCHEMA)
     conn.executescript(_fts_triggers())
+    _migrate_broker_jobs(conn)
+
+
+def _migrate_broker_jobs(conn) -> None:
+    """Add ``broker_jobs.not_before`` to an older ledger. NULL means the job may run at once.
+    An Approve tap while the market cannot take the order sets it to the send time (§10.5).
+    Two processes that start together may both try the ALTER: the second one skips."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(broker_jobs)").fetchall()}
+    if "not_before" in have:
+        return
+    try:
+        conn.execute("ALTER TABLE broker_jobs ADD COLUMN not_before TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
 JOB_KINDS = ("analyze_event", "deep_dive", "classify_news", "reflect")

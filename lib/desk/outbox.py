@@ -84,6 +84,13 @@ def trade_buttons(proposal_id: int, nonce: str) -> list:
              {"text": "Reject", "callback_data": f"p:{proposal_id}:{nonce}:r", "style": "danger"}]]
 
 
+def held_buttons(proposal_id: int, nonce: str, label: str) -> list:
+    """A held trade (plan §10.5 check 4): the label, then Cancel. Cancel sends the Reject
+    callback. Until the send time, the tap code cancels the held job with it."""
+    return [[{"text": label, "callback_data": "noop"}],
+            [{"text": "Cancel", "callback_data": f"p:{proposal_id}:{nonce}:r", "style": "danger"}]]
+
+
 def change_buttons(proposal_id: int, nonce: str) -> list:
     return [[{"text": "Confirm", "callback_data": f"p:{proposal_id}:{nonce}:a", "style": "success"},
              {"text": "Reject", "callback_data": f"p:{proposal_id}:{nonce}:r", "style": "danger"}]]
@@ -160,11 +167,15 @@ class Outbox:
 
     def set_label(self, message_id, label: str) -> dict:
         """Replace a card's buttons with one label button ("Approved", "Expired", ...)."""
+        return self.set_buttons(message_id, [[{"text": label, "callback_data": "noop"}]])
+
+    def set_buttons(self, message_id, rows: list) -> dict:
+        """Replace a card's buttons with ``rows`` (an inline keyboard)."""
         if not message_id:
             return {"ok": False}
         return self.transport("editMessageReplyMarkup", {
             "chat_id": self.chat_id, "message_id": int(message_id),
-            "reply_markup": {"inline_keyboard": [[{"text": label, "callback_data": "noop"}]]}}) or {}
+            "reply_markup": {"inline_keyboard": rows}}) or {}
 
 
 def _split(text: str, limit: int = _LIMIT) -> list:

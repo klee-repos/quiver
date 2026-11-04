@@ -59,7 +59,7 @@ PLAN_TABLES = {
     "jobs": ('id', 'kind', 'payload_json', 'status', 'requested_by', 'created_at', 'started_at', 'finished_at',
              'attempts', 'error'),
     "broker_jobs": ('id', 'kind', 'proposal_id', 'recovery', 'status', 'requested_by', 'created_at',
-                    'started_at', 'finished_at', 'error'),
+                    'started_at', 'finished_at', 'error', 'not_before'),
     "broker_snapshots": ('id', 'captured_at', 'equity', 'cash', 'buying_power', 'positions_json',
                          'quotes_json', 'approval_setting', 'raw_json'),
     "proposals": ('id', 'kind', 'origin', 'event_id', 'owner_message_id', 'parent_change_id', 'payload_json',
@@ -470,6 +470,24 @@ def case_migrate():
         fresh = {x[1]: (x[2].upper(), x[3], x[4]) for x in c.execute("PRAGMA table_info(orders)")}
         r.eq("migrate a fresh ledger has the same desk columns", {k: fresh.get(k) for k in ORDERS_NEW}, ORDERS_NEW)
         r.ok("migrate a fresh target_portfolio has entry_price_max", "entry_price_max" in cols(c, "target_portfolio"))
+        c.close()
+    # A ledger from before the held tap (§10.5 check 4): broker_jobs gains not_before, rows kept.
+    with temp_root() as root:
+        root.led()
+        c = raw(root.db)
+        c.execute("INSERT INTO broker_jobs (kind, status, requested_by, created_at) VALUES ('snapshot','done','t',?)",
+                  (T0,))
+        c.execute("ALTER TABLE broker_jobs DROP COLUMN not_before")
+        c.commit()
+        r.ok("migrate the old broker_jobs has no not_before", "not_before" not in cols(c, "broker_jobs"))
+        c.close()
+        Ledger(root.db)
+        Ledger(root.db)
+        c = raw(root.db)
+        bj = {x[1]: (x[2].upper(), x[3], x[4]) for x in c.execute("PRAGMA table_info(broker_jobs)")}
+        r.eq("migrate broker_jobs gains not_before TEXT (NULL: run at once)", bj.get("not_before"), ("TEXT", 0, None))
+        r.eq("migrate broker_jobs keeps its rows",
+             [tuple(x) for x in c.execute("SELECT kind, status, not_before FROM broker_jobs")], [("snapshot", "done", None)])
         c.close()
 
 

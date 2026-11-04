@@ -357,6 +357,16 @@ def in_flight_ticker(conn, ticker) -> Optional[str]:
     return row[0] if row else None
 
 
+def held_job_of_leg(conn, ref_id, now: str):
+    """``(proposal_id, not_before)`` when the leg's proposal waits on a held execute job
+    (an Approve tap while the market was closed, §10.5 check 4); else None."""
+    row = conn.execute("SELECT j.proposal_id, j.not_before FROM orders o JOIN broker_jobs j ON "
+                       "j.proposal_id = o.proposal_id WHERE o.ref_id=? AND j.kind='execute' AND "
+                       "j.status='queued' AND j.not_before > ? ORDER BY j.id DESC LIMIT 1",
+                       (ref_id, now)).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 # --- trades (§10.2) ------------------------------------------------------------------
 
 def _fund_names(fund_from, cash_ticker) -> list:
@@ -708,6 +718,11 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
                                 "at once, and its buy card follows)")
         hold = in_flight_ticker(conn, t)
         if hold:
+            held = held_job_of_leg(conn, hold, store.iso(now_dt))
+            if held:
+                raise ProposalError(f"{t} has an approved order (#{held[0]}) that I send at "
+                                    f"{market.fmt_when_et(store.parse_ts(held[1]), now_dt)}. To change it, the owner "
+                                    "taps Cancel on that card first")
             raise ProposalError(f"{t} has an order in flight. Wait for the fill.")
     cash_ticker = cfg.risk.cash_sleeve_ticker
 
@@ -1123,6 +1138,11 @@ def trade_card_model(conn, built: dict, *, now_dt=None) -> dict:
              "evidence": store.loads(prop["evidence_json"], []), "drift": prop["origin"] == "drift",
              "plan": payload.get("plan"),
              "cash": payload.get("cash") if payload.get("money_rule") == "owner" else None}
+    held = market.held_send_et(now_dt or _now_dt())
+    if held is not None:
+        # The market cannot take the order now: a tap approves it and holds it to this time.
+        model["send_at"] = store.iso(held[0])
+        model["closing"] = market.is_open_at(now_dt or _now_dt())
     if prop["owner_message_id"] is not None:
         row = conn.execute("SELECT text, created_at FROM chat_messages WHERE role='owner' "
                            "AND tg_message_id=? ORDER BY id DESC LIMIT 1",

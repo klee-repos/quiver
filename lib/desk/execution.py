@@ -27,7 +27,10 @@ from lib.desk import proposals, quotes, settings as desk_settings, store
 
 INPUT_MAX_AGE_S = 60.0
 DECIDED_MAX_AGE = timedelta(minutes=10)
-CLOSE_MARGIN = timedelta(minutes=5)
+# Held jobs share one send time and the broker runs them one at a time, so each may start
+# up to this long after it. exec-check still compares each live quote with the card.
+HELD_MAX_AGE = timedelta(minutes=30)
+CLOSE_MARGIN = market.ORDER_CLOSE_MARGIN
 RESEND_CLOSE_MARGIN = timedelta(seconds=120)
 RECONCILE_WINDOW = timedelta(minutes=2)
 APPROVAL_OFF_TEXT = ("Robinhood trade approvals are on for this account. Turn them off in the "
@@ -324,13 +327,29 @@ def exec_prepare(led, cfg: Config, proposal_id: int, *, recovery: bool = False, 
         code = text = None
         expires = store.parse_ts(prop["expires_at"])
         decided = store.parse_ts(prop["decided_at"])
+        # A held approval (§10.5 check 4) counts its age from the job's send time.
+        held = conn.execute("SELECT not_before FROM broker_jobs WHERE kind='execute' AND proposal_id=? "
+                            "AND recovery=0 ORDER BY id DESC LIMIT 1", (proposal_id,)).fetchone()
+        send_at = store.parse_ts(held[0]) if held and held[0] else None
+        if send_at is not None and now_dt < send_at:
+            raise ExecError(f"proposal #{proposal_id} is held until {held[0]}")
+        start = send_at or decided
+        plan_err = None
+        if send_at is not None:
+            # A held order waited for hours: the plan may have changed after the tap (§10.6).
+            try:
+                proposals.check_trade_plan(conn, cfg, prop)
+            except proposals.ProposalError as e:
+                plan_err = str(e)
         now_et = now_dt.astimezone(market.ET)
         _d, open_t, close_t = market.session_open_et(now_et)
         snap = proposals.latest_snapshot(conn)
         if now_dt >= expires:
             code, text = "expired", f"Proposal #{proposal_id} expired before I could start it, so I placed nothing."
-        elif decided is None or now_dt - decided >= DECIDED_MAX_AGE:
-            code, text = "tap_too_old", (f"I could not start #{proposal_id} within 10 minutes of your tap, "
+        elif start is None or decided is None or now_dt - start >= (HELD_MAX_AGE if send_at else DECIDED_MAX_AGE):
+            since = (f"30 minutes of its send time ({market.fmt_et(send_at)} ET)" if send_at
+                     else "10 minutes of your tap")
+            code, text = "tap_too_old", (f"I could not start #{proposal_id} within {since}, "
                                          "so I placed nothing. Ask me for fresh numbers.")
         elif not (open_t <= now_et < close_t) or close_t - now_et < CLOSE_MARGIN:
             code, text = "session", f"The market is closed or about to close, so I placed nothing for #{proposal_id}."
@@ -340,6 +359,9 @@ def exec_prepare(led, cfg: Config, proposal_id: int, *, recovery: bool = False, 
             code, text = "halted", f"Trading is halted for today, so I placed nothing for #{proposal_id}."
         elif snap is None or snap.get("approval_setting") != "off":
             code, text = "approval_setting", APPROVAL_OFF_TEXT
+        elif plan_err:
+            code, text = "plan_changed", (f"I did not send #{proposal_id}, because the plan changed after your tap "
+                                          f"({plan_err}). Nothing was bought or sold. Ask me and I'll make a fresh one.")
         if code:
             _fail_proposal(conn, proposal_id, code, text)
             return {"ok": False, "proposal": proposal_id, "reason": code, "text": text}

@@ -651,6 +651,35 @@ def case_misc(r: Results):
 
 # --- path units (§9.1 step 9b) ---------------------------------------------------------
 
+def case_drift_in_flight(r: Results):
+    """A drift name with an order in flight (a held order: an Approve tap after the close)
+    leaves the drift card. Before, build_trade refused the whole card for the day."""
+    def seq(h: Harness):
+        now = store.iso(et("2026-10-28 16:30"))
+        with h.led.transaction() as c:
+            cur = c.execute("INSERT INTO proposals (kind, origin, payload_json, payload_sha256, rationale, "
+                            "evidence_json, created_by, created_at, expires_at, state, nonce) VALUES "
+                            "('trade','owner','{}','x','held','[]','desk',?,?,'approved','n1')",
+                            (now, store.iso(et("2026-10-29 16:00"))))
+            pid = cur.lastrowid
+        h.led.reserve_order("held-1", "2026-10-29", "ANET", side="buy", type="market", dollar_amount=50.0,
+                            quantity=None, now_iso=now, state="approved", proposal_id=pid, leg_seq=1,
+                            quote_at_proposal=150.0)
+        h.clock.set(et("2026-10-28 16:40"))
+        h._took, h.snap_on_wait = False, True
+        m = h.make()
+        got, orig = {}, m.drift
+        m.drift = lambda: got.setdefault("res", orig())
+        m.run()
+        res = got.get("res") or {}
+        r.eq("drift_in_flight: ANET is outside its band", res.get("outside"), ["ANET"])
+        r.eq("drift_in_flight: the name with an order in flight waits", res.get("in_flight"), ["ANET"])
+        r.ok("drift_in_flight: no refusal", "refused" not in res, res)
+        r.eq("drift_in_flight: no drift card", h.drift_proposals(), [])
+
+    with_root(et("2026-10-28 09:00"), seq)
+
+
 def case_path_unit(r: Results):
     def body(h: Harness):
         h.failed_paths = True
@@ -671,7 +700,8 @@ def case_path_unit(r: Results):
 
 def main() -> int:
     r = Results("run-monitor")
-    for case in (case_order, case_isolation, case_snapshot, case_once_a_day, case_misc, case_path_unit):
+    for case in (case_order, case_isolation, case_snapshot, case_once_a_day, case_misc, case_path_unit,
+                 case_drift_in_flight):
         try:
             case(r)
         except Exception as e:  # noqa: BLE001 — a crashed case is one failure, the rest still run

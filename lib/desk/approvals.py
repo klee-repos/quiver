@@ -7,10 +7,14 @@ and takes well under a second. No model tool can reach it: only
 Checks, in order; the first failure answers the tap and stops:
   1. ``callback_data`` is ``p:<id>:<nonce>:<a|r>``; ``from.id`` is an owner; the chat id and
      message id equal the proposal's card; the nonce matches.
-  2. The proposal is ``pending``.
+  2. The proposal is ``pending``. A held trade (below) answers with its send time and keeps
+     its Cancel button; Reject on it before the send time cancels it.
   3. ``now < expires_at`` (else it becomes ``expired``).
-  4. Approve on a trade only: no KILL file, today not halted, the session open, and at
-     least 5 minutes before the close. A failure keeps the proposal ``pending``.
+  4. Approve on a trade only: no KILL file, and the day the order goes is not halted. A
+     failure keeps the proposal ``pending``. The market hours never refuse a tap: when the
+     session is closed or less than 6 minutes from its close, the tap approves and the job
+     is held to ``market.held_send_et`` (10 minutes after the next open). The card then
+     shows Cancel until that time.
   5. One conditional UPDATE claims it. A second tap changes zero rows.
   6. A trade: in the same transaction the plan move of a sized owner trade is checked
      (§10.6), the legs become ``approved``, and one ``execute`` broker job is queued. A change: it is
@@ -23,14 +27,12 @@ messages, the follow-up cards, and the broker trigger.
 from __future__ import annotations
 
 import os
-from datetime import timedelta
 from typing import Optional
 
 from lib import market
 from lib.config import Config
 from lib.desk import proposals, store
 
-CLOSE_MARGIN = timedelta(minutes=5)
 _STATE_TEXT = {
     "approved": "Already approved", "executing": "Already approved", "executed": "Already done",
     "partially_executed": "Already done", "failed": "This one failed", "rejected": "Rejected",
@@ -65,22 +67,24 @@ def _state_answer(prop: dict) -> dict:
     return _result(text, label=text, proposal_id=prop["id"])
 
 
-def trade_gate(led, cfg: Config, prop: dict, now_dt) -> Optional[str]:
-    """The first check-4 reason that fails, as the owner's text; None when all pass."""
+def trade_gate(led, cfg: Config, prop: dict, now_dt, held=None) -> Optional[str]:
+    """The first check-4 reason that fails, as the owner's text; None when all pass. The
+    market hours are not a reason: ``held_send_et`` holds the order instead. The halt
+    binds the day the order goes: today, or the send day of a held order."""
     close_txt = market.fmt_et(store.parse_ts(prop["expires_at"]))
     if os.path.exists(cfg.kill_switch_file):
         return f"Trading is stopped on the box. This stays open until {close_txt} ET."
-    if led.is_halted(market.trading_day_et()):
+    day = held[0].astimezone(market.ET).strftime("%Y-%m-%d") if held else market.trading_day_et()
+    if led.is_halted(day):
         return ("Trading is halted for today after the daily-loss check. "
                 "Ask me to propose resume_trading to lift it.")
-    now_et = now_dt.astimezone(market.ET)
-    _day, open_t, close_t = market.session_open_et(now_et)
-    if not (open_t <= now_et < close_t):
-        return (f"The market is closed. It opens at {market.fmt_et(open_t)} ET. "
-                f"This stays open until {close_txt} ET. Tap again then.")
-    if close_t - now_et < CLOSE_MARGIN:
-        return f"It's too close to the close. This one expires at {close_txt} ET."
     return None
+
+
+def held_send_et(now_dt):
+    """``(send_dt, close_dt)`` when the order must wait for the session; None when it can
+    go at once."""
+    return market.held_send_et(now_dt)
 
 
 def handle_tap(led, cfg: Config, *, callback_data: str, from_id, chat_id, message_id,
@@ -102,6 +106,10 @@ def handle_tap(led, cfg: Config, *, callback_data: str, from_id, chat_id, messag
     if (str(prop.get("tg_chat_id")) != str(chat_id) or prop.get("tg_message_id") is None
             or int(prop["tg_message_id"]) != int(message_id) or prop["nonce"] != nonce):
         return _result("This button is not valid.")
+    if prop["state"] == "approved" and prop["kind"] == "trade":
+        held = _held_tap(led, prop, action, from_id, now_dt)
+        if held is not None:
+            return held
     if prop["state"] != "pending":
         return _state_answer(prop)
     if now_dt >= store.parse_ts(prop["expires_at"]):
@@ -111,10 +119,11 @@ def handle_tap(led, cfg: Config, *, callback_data: str, from_id, chat_id, messag
     if action == "r":
         return _reject(led, prop, from_id, now)
     if prop["kind"] == "trade":
-        why = trade_gate(led, cfg, prop, now_dt)
+        held = held_send_et(now_dt)
+        why = trade_gate(led, cfg, prop, now_dt, held)
         if why:
             return _result(why, label=None, proposal_id=pid)
-        return _approve_trade(led, cfg, prop, from_id, now)
+        return _approve_trade(led, cfg, prop, from_id, now, now_dt=now_dt, held=held)
     return _confirm_change(led, cfg, prop, from_id, now_dt, yf_price_fn)
 
 
@@ -129,13 +138,19 @@ def _current(led, pid: int) -> dict:
         return _state_answer(proposals.get_proposal(conn, pid))
 
 
-def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str) -> dict:
+def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str, *, now_dt=None, held=None) -> dict:
     """Claim the trade, approve its legs and queue the execute job in one transaction. A
     sized owner trade's plan move is checked here (§10.6); the plan moves only for the
     orders that fill (``proposals.close_from_legs``), so a card that sends nothing leaves the
-    plan as it was."""
+    plan as it was.
+
+    ``held`` is ``(send_dt, close_dt)`` when the market cannot take the order now. The job
+    then gets ``not_before = send_dt``, and ``expires_at`` moves to that session's close
+    when it is earlier. The bridge wakes the broker at the send time. The exec-check of
+    that run compares the live quote with the card, so a price move still makes a requote."""
     pid = prop["id"]
     error, claimed = None, False
+    not_before = store.iso(held[0]) if held else None
     try:
         with led.transaction() as conn:
             if not _claim(conn, pid, prop["nonce"], str(from_id), now):
@@ -146,7 +161,10 @@ def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str) -> dict:
                 conn.execute("UPDATE orders SET state='approved' WHERE proposal_id=? AND state='proposed'",
                              (pid,))
                 conn.execute("INSERT INTO broker_jobs (kind, proposal_id, recovery, status, requested_by, "
-                             "created_at) VALUES ('execute', ?, 0, 'queued', 'tap', ?)", (pid, now))
+                             "created_at, not_before) VALUES ('execute', ?, 0, 'queued', 'tap', ?, ?)",
+                             (pid, now, not_before))
+                if held and store.parse_ts(prop["expires_at"]) < held[1]:
+                    conn.execute("UPDATE proposals SET expires_at=? WHERE id=?", (store.iso(held[1]), pid))
     except proposals.ProposalError as e:
         error = str(e)
     if error is not None:
@@ -164,8 +182,82 @@ def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str) -> dict:
                                  f"({error}). Nothing was bought or sold. Ask me and I'll make a fresh one."])
     if not claimed:
         return _current(led, pid)
+    if held:
+        from lib.desk import outbox
+        now_dt = now_dt or store.parse_ts(now)
+        when = market.fmt_when_et(held[0], now_dt)
+        why = ("The market closes in a few minutes" if market.is_open_at(now_dt)
+               else "The market is closed now")
+        return _result(f"Approved. I send it at {when}.", label=None, ok=True, proposal_id=pid,
+                       held=not_before, buttons=outbox.held_buttons(pid, prop["nonce"], held_label(held[0], now_dt)),
+                       messages=[f"Approved. {why}, so I send #{pid} at {when}. Until then, tap Cancel "
+                                 "on the card to stop it. If the price moves more than the requote limit "
+                                 "before then, I send you fresh numbers instead."])
     return _result("Approved", label="Approved", ok=True, proposal_id=pid, touch=["broker"],
                    messages=["On it. Checking the price now."])
+
+
+def held_label(send_dt, now_dt) -> str:
+    """The label button of a held card: 'Approved, sends 9:40 AM ET' (with the weekday on
+    another day)."""
+    t, n = send_dt.astimezone(market.ET), now_dt.astimezone(market.ET)
+    day = "" if t.date() == n.date() else t.strftime("%a ")
+    return f"Approved, sends {day}{market.fmt_et(t)} ET"
+
+
+def _held_tap(led, prop: dict, action: str, from_id, now_dt) -> Optional[dict]:
+    """A tap on a held trade. Before the send time: Approve answers with the send time and
+    keeps the buttons (the label and Cancel); Reject cancels. At or after the send time:
+    Reject answers that it is too late, in a popup. None when the trade was not held, or
+    for an Approve once the send time came (the caller answers with the state)."""
+    pid = prop["id"]
+    with led.connect() as conn:
+        row = conn.execute("SELECT status, not_before FROM broker_jobs WHERE kind='execute' AND proposal_id=? "
+                           "AND recovery=0 AND not_before IS NOT NULL ORDER BY id DESC LIMIT 1", (pid,)).fetchone()
+    if row is None or row[0] not in ("queued", "running"):
+        return None
+    send = store.parse_ts(row[1])
+    if row[0] == "queued" and now_dt < send:
+        if action == "r":
+            return _cancel_held(led, prop, from_id, store.iso(now_dt))
+        from lib.desk import outbox
+        return _result(f"Already approved. I send it at {market.fmt_when_et(send, now_dt)}.", label=None,
+                       proposal_id=pid, buttons=outbox.held_buttons(pid, prop["nonce"], held_label(send, now_dt)))
+    if action == "r":
+        return _result("Too late to cancel: it is going to Robinhood now.", label="Approved", proposal_id=pid,
+                       alert=True)
+    return None
+
+
+class _NotHeld(Exception):
+    """No held job to cancel: the transaction rolls back."""
+
+
+def _cancel_held(led, prop: dict, from_id, now: str) -> Optional[dict]:
+    """Reject on a held trade before its send time: the job, the proposal and the legs end
+    in one transaction. Returns None when no held job waits (an approval that goes at once
+    is never cancelled: §10.5 check 5 keeps an approved row as it is)."""
+    pid = prop["id"]
+    try:
+        with led.transaction() as conn:
+            job = conn.execute("UPDATE broker_jobs SET status='failed', error='cancelled by the owner', "
+                               "finished_at=? WHERE kind='execute' AND proposal_id=? AND recovery=0 AND "
+                               "status='queued' AND not_before IS NOT NULL AND not_before > ?", (now, pid, now))
+            if job.rowcount != 1:
+                raise _NotHeld
+            res = store.canonical_json({**(store.loads(prop.get("result_json"), {}) or {}),
+                                        "cancelled_at": now, "approved_at": prop.get("decided_at")})
+            cur = conn.execute("UPDATE proposals SET state='rejected', decided_at=?, decided_by=?, result_json=? "
+                               "WHERE id=? AND state='approved' AND nonce=?",
+                               (now, str(from_id), res, pid, prop["nonce"]))
+            if cur.rowcount != 1:
+                raise _NotHeld
+            conn.execute("UPDATE orders SET state='skipped', finalized=1, skip_reason='cancelled' "
+                         "WHERE proposal_id=? AND state='approved'", (pid,))
+    except _NotHeld:
+        return None
+    return _result("Cancelled", label="Cancelled", ok=True, proposal_id=pid,
+                   messages=[f"You cancelled #{pid}. I sent nothing to Robinhood."])
 
 
 def _reject(led, prop: dict, from_id, now: str) -> dict:
