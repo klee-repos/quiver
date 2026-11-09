@@ -30,8 +30,8 @@ Run `.venv/bin/python tick.py exec-check --proposal N --phase sells --input stat
 
 For each returned leg, in order:
 1. Call `review_equity_order` with exactly the leg's fields except `ref_id`
-   (`account_number`, `symbol`, `side`, `type`, `quantity` or `dollar_amount`, `market_hours`,
-   `time_in_force`).
+   (`account_number`, `symbol`, `side`, `type`, `quantity` or `dollar_amount`, `limit_price` and
+   `stop_price` when the leg has them, `market_hours`, `time_in_force`).
 2. Call `place_equity_order` with exactly the leg's fields, `ref_id` included. If the hook denies
    it, go on with the next leg.
 

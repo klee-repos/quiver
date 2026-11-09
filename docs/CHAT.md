@@ -485,3 +485,17 @@ sudo -u quiver sqlite3 -readonly /opt/quiver/state/ledger.db \
 
 Do not stop the chat for long. It is the only path for taps. Taps that arrive while it is
 down act as old taps when it starts (see "What happens on a tap").
+
+
+## Orders, cancels and Robinhood from the chat (2026-11-09)
+
+- **Approve in words.** Reply "yes, approve", "do it" or "approve 51". Python reads the
+  words and decides the card; the buttons still work. "cancel" stops an order held for the
+  open. A message with a question or a "but" goes to the desk.
+- **Limit and stop orders.** "Buy 2 VRT at 195 or less, good till cancelled" or "put a stop on
+  CEG at 240". The card shows the shares, the price and GTC.
+- **Cancel an open order.** "Cancel my VRT order". The desk reads the open orders, then sends
+  a cancel card; say yes.
+- **Ask Robinhood anything it can answer.** Open orders, realized profit, tax lots, price
+  history, analyst ratings, earnings dates, option chains, watchlists, alerts, scans. The
+  answer takes about a minute (one broker run). Watchlist and alert changes run at once.

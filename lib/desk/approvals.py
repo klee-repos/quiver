@@ -304,6 +304,12 @@ def _confirm_change(led, cfg: Config, prop: dict, from_id, now_dt, yf_price_fn) 
         return _current(led, pid)
     out = _result("Confirmed", label="Confirmed", ok=True, proposal_id=pid)
     out["superseded"] = applied.get("superseded", [])
+    if applied.get("touch"):
+        # A cancel card: one cancel call is queued for the broker. No follow-up trade.
+        ch = applied.get("change") or {}
+        out["touch"] = list(applied["touch"])
+        out["messages"] = [f"Cancelling the {ch.get('ticker', '')} order now. I'll tell you when Robinhood confirms."]
+        return out
     # The follow-up trade (§10.4): built pending with its own buttons. Never approved here.
     with led.connect() as conn:
         fresh = proposals.get_proposal(conn, pid)

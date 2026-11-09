@@ -236,12 +236,30 @@ def _fmt_dollars(d: float) -> str:
     return f"{float(d):.2f}"
 
 
+def _fmt_price(p: float) -> str:
+    return f"{float(p):.2f}" if float(p) >= 1 else f"{float(p):.4f}"
+
+
+def is_styled(leg: dict) -> bool:
+    """A limit or stop leg (owner, 2026-11-09): whole shares, the owner's prices, no requote."""
+    return (leg.get("type") or "market") != "market"
+
+
 def leg_fields(cfg: Config, leg: dict) -> dict:
-    """The exact fields of the review and place calls for one leg."""
+    """The exact fields of the review and place calls for one leg. A market leg sells a
+    quantity or buys a dollar amount, good for the day. A limit or stop leg trades whole
+    shares at the owner's prices, good for the day or till cancelled."""
+    typ = leg.get("type") or "market"
     out = {"ref_id": leg["ref_id"], "account_number": cfg.account_number, "symbol": leg["ticker"],
-           "side": leg["side"], "type": "market", "market_hours": cfg.market_hours,
-           "time_in_force": cfg.time_in_force}
-    if leg["side"] == "sell":
+           "side": leg["side"], "type": typ, "market_hours": cfg.market_hours,
+           "time_in_force": cfg.time_in_force if typ == "market" else (leg.get("time_in_force") or "gfd")}
+    if typ != "market":
+        out["quantity"] = str(int(round(float(leg["quantity"]))))
+        if leg.get("limit_price") is not None:
+            out["limit_price"] = _fmt_price(leg["limit_price"])
+        if leg.get("stop_price") is not None:
+            out["stop_price"] = _fmt_price(leg["stop_price"])
+    elif leg["side"] == "sell":
         out["quantity"] = _fmt_qty(leg["quantity"])
     else:
         out["dollar_amount"] = _fmt_dollars(leg["dollar_amount"])
@@ -473,6 +491,8 @@ def _check_sells(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> di
     tol = _job_tolerance(conn, sett, pid)
     moves = []
     for l in legs:
+        if is_styled(l):
+            continue   # the owner's limit or stop price is the price protection
         old = float(l["quote_at_proposal"] or 0.0)
         new = prices[l["ref_id"]]
         if old > 0 and quotes.moved_pct(new, old) > tol:
@@ -513,8 +533,10 @@ def _check_sells(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> di
             T = float((row or {}).get("target_weight") or 0.0) / 100.0 * deployable
             target_qty = sizing.resolve_target_sell_quantity(held, price, held * price, T)
         qty = round(min(float(l["quantity"] or 0.0), target_qty, free), 6)
+        if is_styled(l):
+            qty = float(int(qty + 1e-9))      # whole shares only
         full_exit = exit_leg and qty >= round(held, 6) - 1e-9
-        if qty <= 0 or (not full_exit and qty * price < min_notional):
+        if qty <= 0 or (not full_exit and not is_styled(l) and qty * price < min_notional):
             conn.execute("UPDATE orders SET state='skipped', finalized=1, skip_reason=? WHERE ref_id=? "
                          "AND state='approved'", ("below_min" if qty > 0 else "nothing_to_sell", l["ref_id"]))
             continue
@@ -592,6 +614,23 @@ def _check_buys(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> dic
                          "AND state='approved'", (f"quote_{why}", l["ref_id"]))
             _add_message(conn, pid, f"I could not get a fresh {l['ticker']} price, so I did not buy it.")
             continue
+        if is_styled(l):
+            # A limit or stop buy: the owner's price protects it, and its whole shares stay.
+            # The money must cover shares x the most a share may cost.
+            reserve = float(l["limit_price"]) if l.get("limit_price") is not None else \
+                max(float(l.get("stop_price") or 0.0), price)
+            cost = round(float(l["quantity"] or 0.0) * reserve, 2)
+            if cost > money + 0.005:
+                conn.execute("UPDATE orders SET state='skipped', finalized=1, skip_reason='not_enough_cash' "
+                             "WHERE ref_id=? AND state='approved'", (l["ref_id"],))
+                _add_message(conn, pid, f"I did not send the {l['ticker']} order: it needs up to ${cost:,.2f}, "
+                                        f"and ${max(0.0, money):,.2f} can be spent.")
+                continue
+            money -= cost
+            conn.execute("UPDATE orders SET state='checked', check_quote=?, checked_at=?, review_ok=0, "
+                         "review_json=NULL WHERE ref_id=? AND state='approved'", (price, now, l["ref_id"]))
+            out.append(leg_fields(cfg, l))
+            continue
         old = float(l["quote_at_proposal"] or 0.0)
         if old > 0 and quotes.moved_pct(price, old) > tol:
             conn.execute("UPDATE orders SET state='requoted', finalized=1 WHERE ref_id=? AND state='approved'",
@@ -638,7 +677,7 @@ def _fill_leg_state(broker_state: str) -> str:
 
 
 def _amount_matches(leg: dict, o: dict) -> bool:
-    if leg["side"] == "buy":
+    if leg["side"] == "buy" and not is_styled(leg):
         dba = o.get("dollar_based_amount")
         amt = _num((dba or {}).get("amount")) if isinstance(dba, dict) else None
         return amt is not None and abs(amt - float(leg["dollar_amount"] or 0.0)) < 0.005

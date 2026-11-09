@@ -12,7 +12,8 @@ If a Robinhood tool returns a 401 or an authentication error, run
    `cursor` until `next` is empty), `get_equity_quotes` for the `tickers` of "This job" (in calls of
    at most 20 symbols), and `get_trade_approval_setting` (account `<acct>`).
 3. If "This job" lists `reconcile` legs, call `get_equity_orders` (account `<acct>`,
-   `agent_initiated` true, `created_at_gte` = `fills_created_at_gte`).
+   `agent_initiated` true, `created_at_gte` = `fills_created_at_gte`). Page with `cursor` until
+   `next` is empty: an order good till cancelled can be days old. Keep the pages as a list.
 4. Write all of them to `state/tmp/snapshot_J.json`, each value the raw result unchanged:
    `{"get_portfolio": ..., "get_equity_positions": ..., "get_equity_quotes": ..., "get_trade_approval_setting": ..., "get_equity_orders": ...}`.
    Run `.venv/bin/python tick.py snapshot-commit --input state/tmp/snapshot_J.json`. Then stop.

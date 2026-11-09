@@ -306,6 +306,17 @@ def _card_row(leg: dict, plan_moves: bool) -> str:
     """One order on one line: side, ticker, size, and the share of the account before and
     after. 'Buy  VRT     $59.57  5.8% → 9.0%'."""
     buy = leg["side"] == "buy"
+    typ = leg.get("type") or "market"
+    if typ != "market":
+        # A limit or stop order: whole shares at the owner's prices (owner, 2026-11-09).
+        style = {"limit": f"limit {_fmt_money(leg.get('limit_price'))}",
+                 "stop_market": f"stop {_fmt_money(leg.get('stop_price'))}",
+                 "stop_limit": f"stop {_fmt_money(leg.get('stop_price'))} limit {_fmt_money(leg.get('limit_price'))}",
+                 }.get(typ, typ)
+        if leg.get("time_in_force") == "gtc":
+            style += " GTC"
+        row = f"{'Buy ' if buy else 'Sell'} {str(leg['ticker']):<5} {_qty(leg['quantity']):>3} sh {style}"
+        return _te(row)
     if buy:
         size = _fmt_money(leg["dollars"])
     elif leg.get("quote"):
@@ -405,8 +416,13 @@ def render_change_card(model: dict) -> list:
     pid = model["id"]
     ch = model["change"]
     kind = ch["kind"]
-    parts = [f"<b>#{pid} · Plan change</b>" + _PARA]
-    if kind == "add_company":
+    title = {"cancel_order": "Cancel an order", "set_risk": "Safety setting",
+             "resume_trading": "Resume trading"}.get(kind, "Plan change")
+    parts = [f"<b>#{pid} · {title}</b>" + _PARA]
+    if kind == "cancel_order":
+        what = f"Cancel the open {_te(ch['ticker'])} order" + (f": {_te(ch['about'])}" if ch.get("about") else "")
+        parts.append(what.rstrip(".") + f" (Robinhood id …{_te(str(ch['order_id'])[-8:])})." + _PARA)
+    elif kind == "add_company":
         entry = ch["entry"]
         e = ("The first buy is now." if entry["mode"] == "now"
              else f"The first buy waits until the price is at or below {_fmt_money(entry['price'])}.")

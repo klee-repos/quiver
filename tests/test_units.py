@@ -706,6 +706,11 @@ _WALL_GRANTS = {
                               "get_equity_positions", "get_equity_quotes", "get_equity_orders",
                               "place_equity_order", "get_trade_approval_setting"},
     "lib/desk/approvals.py": {"lib.config", "handle_tap", "apply_change"},
+    # 2026-11-09: the list of Robinhood reads the desk may ask quiver-broker for. It names
+    # read tools only; the guard holds its own copy and denies every place and cancel there.
+    # It also names cancel_equity_order: only a confirmed cancel_order card queues it.
+    "lib/desk/brokerq.py":   {"get_portfolio", "get_equity_positions", "get_equity_quotes", "get_equity_orders",
+                              "get_trade_approval_setting", "cancel_equity_order"},
     "lib/desk/settings.py":  {"lib.config"},
     # The snapshot field (the desk tool is portfolio_view). tools.py also loads the config
     # (load_config) for the runtime; the plan list lacks lib.config.
@@ -1733,7 +1738,7 @@ check("healthcheck: the runner import list", list(_hc.RUNNERS),
       ["run_monitor", "run_worker", "run_broker", "broker_guard", "chat_bridge"])
 check("healthcheck: the runbook list (§15.5 step 8)", list(_hc.RUNBOOKS),
       ["prompts/desk.md", "prompts/analyst.md", "prompts/news_classifier.md", "prompts/broker.md",
-       "prompts/reflector.md", "EXECUTE.md", "SNAPSHOT.md"])
+       "prompts/reflector.md", "EXECUTE.md", "SNAPSHOT.md", "QUERY.md"])
 check_true("healthcheck: the eve_install check is deleted", not hasattr(_hc, "check_eve_install")
            and not hasattr(_hc, "_eve_install"))
 check_true("healthcheck: every lib/desk module is in the import list",
@@ -2396,9 +2401,10 @@ check_true("attribution: every unpriced name carries a stated reason",
 # --- ISOLATION: attribution must not be reachable from the sizing path (§14.10) ------
 check_true("attribution: lib/attribution.py is inside the wall roster (zero grants)",
            "lib/attribution.py" in _WALL_ROSTER and "lib/attribution.py" not in _WALL_GRANTS)
-# §14.10 says 8 grants. The code needs 9: lib/desk/agent.py and lib/universe.py add one
-# each and lib/sizing.py drops its dead grant (see the _WALL_GRANTS comments).
-check("attribution: _WALL_GRANTS has exactly 9 entries", len(_WALL_GRANTS), 9)
+# §14.10 says 8 grants. The code needs 10: lib/desk/agent.py and lib/universe.py add one
+# each, lib/sizing.py drops its dead grant, and lib/desk/brokerq.py (2026-11-09, the
+# Robinhood reads from the chat) adds one (see the _WALL_GRANTS comments).
+check("attribution: _WALL_GRANTS has exactly 10 entries", len(_WALL_GRANTS), 10)
 check_true("attribution: reaches zero ungranted wall items",
            not _wall_violations((_REPO / "lib" / "attribution.py").read_text(encoding="utf-8"),
                                 "lib/attribution.py"))

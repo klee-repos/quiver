@@ -34,7 +34,7 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
            "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
-           "add_rule", "retire_rule", "retire_lesson", "plan_trade", "approve_card"]
+           "add_rule", "retire_rule", "retire_lesson", "plan_trade", "approve_card", "broker_read"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
 # The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.
@@ -304,7 +304,12 @@ def case_jobs_kind():
     r.ok("jobs_kind: the graph reaches proposals.build_trade (the scan is not empty)",
          "lib.desk.proposals:build_trade" in reached)
     found, bad = [], []
+    # The schema migration copies every row of the old table into the widened one (store
+    # opens it on each ledger connect); it makes no job.
+    copy_only = {"lib.desk.store:_migrate_broker_jobs_kind"}
     for node in sorted(reached):
+        if node in copy_only:
+            continue
         for s in strings_of(g.funcs[node]):
             if re.search(r"INTO\s+broker_jobs", s, re.I):
                 m = _INS.search(s)
@@ -315,10 +320,13 @@ def case_jobs_kind():
                 vals = [v.strip() for v in m.group(2).split(",")]
                 kind = vals[cols.index("kind")] if "kind" in cols and len(vals) == len(cols) else None
                 found.append((node, kind))
-                if kind != "'snapshot'":
+                if kind not in ("'snapshot'", "'query'"):
                     bad.append((node, s[:120], kind))
-    r.eq("jobs_kind: each broker_jobs INSERT a tool can reach uses kind 'snapshot'", bad, [])
-    r.eq("jobs_kind: the reachable broker_jobs INSERTs", found, [("lib.desk.store:enqueue_snapshot_job", "'snapshot'")])
+    # A query job (2026-11-09) runs one Robinhood read or no-money action: the guard allows no
+    # place in it, and brokerq.validate refuses a cancel (only a confirmed card queues one).
+    r.eq("jobs_kind: each broker_jobs INSERT a tool can reach uses kind 'snapshot' or 'query'", bad, [])
+    r.eq("jobs_kind: the reachable broker_jobs INSERTs", sorted(found),
+         [("lib.desk.brokerq:enqueue", "'query'"), ("lib.desk.store:enqueue_snapshot_job", "'snapshot'")])
     # The textual rule of W3 on tools.py itself.
     src = TOOLS_PY.read_text(encoding="utf-8")
     r.ok("jobs_kind: tools.py itself holds no INSERT INTO broker_jobs with another kind",
@@ -340,7 +348,7 @@ GUARDED = {
 }
 # The INSERT value that each guarded table must get for its state column.
 INSERT_STATE = {"proposals": ("state", "'pending'"), "orders": ("state", "'proposed'"),
-                "broker_jobs": ("kind", "'snapshot'")}
+                "broker_jobs": ("kind", ("'snapshot'", "'query'"))}
 # The state writes a tool may reach, item by item, checked both ways: a new one fails, and
 # a grant that no reachable function holds fails too, so the list cannot rot.
 STATE_WRITE_GRANTS = {
@@ -451,7 +459,8 @@ def write_verdict(node: str, w: tuple):
     if (node, stmt) in STATE_WRITE_GRANTS:
         return None
     col, want = INSERT_STATE[table]
-    if cols is None or cols.get(col) != want:
+    want = want if isinstance(want, tuple) else (want,)
+    if cols is None or cols.get(col) not in want:
         return f"INSERT into {table} with {col} {cols.get(col) if cols else 'unnamed'}"
     if table == "broker_jobs" and cols.get("status") != "'queued'":
         return "INSERT into broker_jobs with a status other than 'queued'"
@@ -587,6 +596,7 @@ ARGS = {
     "bring_up_next": {}, "close_item": {"item_id": 1}, "defer_item": {"item_id": 1, "hours": 2},
     "hold_agenda": {"hours": 1}, "show_card": {"proposal_id": 1}, "promise_read": {"ticker": "ANET"},
     "approve_card": {"proposal_id": 1, "owner_message_id": 1},
+    "broker_read": {"tool": "get_realized_pnl", "args": {}, "wait_seconds": 0},
     "fetch_document": {"url": "http://127.0.0.1/x"},
     "record_finding": {"ticker": "ANET", "kind": "growth", "claim": "x", "quote": "y", "document_id": 1},
     "add_note": {"text": "The owner prefers short messages."},
@@ -671,7 +681,9 @@ def case_smoke():
     r.eq("smoke: no tool crashes on an empty ledger", crashes, [])
     r.eq("smoke: every successful result is a JSON object", non_json, [])
     r.eq("smoke: no result holds a secret value", leaks, [])
-    r.ok("smoke: a tool queues only snapshot broker jobs", all(k == "snapshot" for _n, k in kinds), kinds)
+    r.ok("smoke: a tool queues only snapshot or query broker jobs", all(k in ("snapshot", "query") for _n, k in kinds),
+         kinds)
+    r.ok("smoke: broker_read queued one query job", ("broker_read", "query") in kinds, kinds)
     r.ok("smoke: refresh_portfolio queued one snapshot job", ("refresh_portfolio", "snapshot") in kinds, kinds)
 
 

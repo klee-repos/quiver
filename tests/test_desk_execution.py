@@ -311,7 +311,7 @@ class Ctx:
 
     def tick(self, *args, env=None):
         """``tick.main`` in process with this root, the pinned clock and ``env``."""
-        keys = ("QUIVER_BROKER_JOB", "QUIVER_BROKER_PROPOSAL")
+        keys = ("QUIVER_BROKER_JOB", "QUIVER_BROKER_PROPOSAL", "QUIVER_BROKER_QUERY")
         saved = {k: os.environ.get(k) for k in keys}
         for k in keys:
             os.environ.pop(k, None)
@@ -654,6 +654,21 @@ def snapshot_runbook(bot, values, opts):
     bot.bash("snapshot-commit", "--input", rel)
 
 
+def query_runbook(bot, values, opts):
+    """QUERY.md: load the one tool, call it with the job's args (and the account), file it."""
+    name = f"mcp__robinhood-trading__{values['tool']}"
+    ok, why = bot._hook("ToolSearch", {"query": f"select:{name}"})
+    assert ok, why
+    bot.s.call("ToolSearch", {"query": f"select:{name}"}, "loaded", False)
+    if opts.get("no_commit"):
+        return
+    inp = {**values["args"], "account_number": values["account_number"]}
+    answer = opts.get("answer", {"data": {"account": values["account_number"], "ok": True}})
+    bot.rh(values["tool"], inp, answer)
+    rel = bot.write(f"query_{values['job_id']}.json", {values["tool"]: answer})
+    bot.bash("query-commit", "--job", values["job_id"], "--input", rel)
+
+
 class Runner:
     """The injected process runner of ``Broker``: ``claude --version``, the two canary
     runs (the captured real streams), and the jobs (the scripted ``Bot``)."""
@@ -688,7 +703,9 @@ class Runner:
         opts = self.opts(values) if callable(self.opts) else self.opts
         if opts.get("script") != "none":
             bot = Bot(self.ctx, env, stream, values["job_id"])
-            if "proposal_id" in values:
+            if "tool" in values:
+                query_runbook(bot, values, opts)
+            elif "proposal_id" in values:
                 (recovery_runbook if values.get("recovery") else execute_runbook)(bot, values, opts)
             else:
                 snapshot_runbook(bot, values, opts)
@@ -2707,10 +2724,73 @@ def t_held():
              (c.prop(pid)["state"], c.legs(pid)[0]["state"]), ("approved", "approved"))
 
 
+# =============================================================================================
+# query jobs (2026-11-09): a Robinhood read, and a cancel from a confirmed card
+# =============================================================================================
+
+
+def t_query():
+    from lib.desk import brokerq
+    with case("query read") as c:
+        with c.led.transaction() as conn:
+            jid = brokerq.enqueue(conn, brokerq.validate("get_realized_pnl", {"span": "year"}), requested_by="desk",
+                                  now=c.now())
+        runner = Runner(c, opts={"answer": {"data": {"account": "TEST1234", "realized": "41.20"}}})
+        n = c.broker(runner).drain()
+        r.eq("query: the broker runs the read job", (n, len(runner.jobs)), (1, 1))
+        r.eq("query: the job env names the query job and no proposal",
+             {k: runner.jobs[0]["env"].get(k) for k in ("QUIVER_BROKER_QUERY", "QUIVER_BROKER_PROPOSAL")},
+             {"QUIVER_BROKER_QUERY": str(jid), "QUIVER_BROKER_PROPOSAL": None})
+        with c.led.connect() as conn:
+            got = brokerq.result_of(conn, jid)
+        r.eq("query: done, with the raw answer and the account number redacted",
+             (got["status"], got["result"]["data"]), ("done", {"data": {"account": "[account]", "realized": "41.20"}}))
+        r.eq("query: the owner gets no message for a read", c.tg.texts(), [])
+    with case("query no commit") as c:
+        with c.led.transaction() as conn:
+            jid = brokerq.enqueue(conn, brokerq.validate("get_watchlists", {}), requested_by="desk", now=c.now())
+        c.broker(Runner(c, opts={"no_commit": True})).drain()
+        with c.led.connect() as conn:
+            got = brokerq.result_of(conn, jid)
+        r.ok("query: a run that files nothing fails the job", got["status"] == "failed" and "no result" in got["error"],
+             got)
+    with case("query commit guard") as c:
+        with c.led.transaction() as conn:
+            jid = brokerq.enqueue(conn, brokerq.validate("get_watchlists", {}), requested_by="desk", now=c.now())
+        rel = c.write("q.json", {"get_watchlists": {"data": []}})
+        code, out = c.tick("query-commit", "--job", jid, "--input", rel, env={"QUIVER_BROKER_QUERY": str(jid)})
+        r.ok("query-commit: a job that is not running is refused", code == 1 and "not running" in out.get("error", ""),
+             out)
+        c.broker().mark(jid, "running")
+        code, out = c.tick("query-commit", "--job", jid, "--input", rel, env={})
+        r.ok("query-commit: outside the job's broker run is refused", code == 1, out)
+        rel2 = c.write("q2.json", {"get_realized_pnl": {"data": "x"}})
+        code, out = c.tick("query-commit", "--job", jid, "--input", rel2, env={"QUIVER_BROKER_QUERY": str(jid)})
+        r.ok("query-commit: another tool's answer is refused", code == 1, out)
+    with case("cancel card") as c:
+        oid = "6a8e4b1c-0000-4b1c-9d2e-1a2b3c4d5e6f"
+        with c.led.transaction() as conn:
+            b = proposals.build_change(conn, c.cfg, change={"kind": "cancel_order", "order_id": oid, "ticker": "ANET",
+                                                            "about": "buy 2 at $148.50"},
+                                       rationale="You asked.", created_by="desk", now_dt=c.clk.now)
+        outbox.send_change_card(c.led, c.box, c.cfg, b["proposal_id"], now_dt=c.clk.now)
+        p = c.prop(b["proposal_id"])
+        res = approvals.handle_tap(c.led, c.cfg, callback_data=f"p:{p['id']}:{p['nonce']}:a", from_id=OWNER,
+                                   chat_id=CHAT, message_id=p["tg_message_id"], owner_ids=[OWNER], now_dt=c.clk.now)
+        r.eq("cancel: Confirm applies the card and says so", (res["ok"], c.prop(p["id"])["state"], res["messages"]),
+             (True, "applied", ["Cancelling the ANET order now. I'll tell you when Robinhood confirms."]))
+        runner = Runner(c, opts={"answer": {"data": {"id": oid, "state": "cancelled"}}})
+        c.broker(runner).drain()
+        r.eq("cancel: the broker ran one cancel_equity_order with the card's order id",
+             [x["values"]["tool"] for x in runner.jobs], ["cancel_equity_order"])
+        r.ok("cancel: the owner hears the outcome",
+             f"Cancelled the ANET order (#{p['id']})." in c.tg.texts(), c.tg.texts())
+
+
 CASES = [t_prepare, t_check_gate, t_check_gate_jobs, t_requote_buys, t_stopped, t_canary, t_audit,
          t_requote_edge, t_requote, t_no_quote, t_fields, t_buy_clamp, t_owner_money, t_input_path, t_commit,
          t_review_gate,
-         t_fills, t_recovery, t_snapshot, t_child, t_wait, t_main, t_gate_b, t_held]
+         t_fills, t_recovery, t_snapshot, t_child, t_wait, t_main, t_gate_b, t_held, t_query]
 
 if __name__ == "__main__":
     only = set(sys.argv[1:])

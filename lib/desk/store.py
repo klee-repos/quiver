@@ -176,11 +176,11 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE TABLE IF NOT EXISTS broker_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  kind TEXT NOT NULL CHECK (kind IN ('snapshot','execute')),
+  kind TEXT NOT NULL CHECK (kind IN ('snapshot','execute','query')),
   proposal_id INTEGER, recovery INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')),
   requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT,
-  not_before TEXT
+  not_before TEXT, payload_json TEXT, result_json TEXT
 );
 CREATE TABLE IF NOT EXISTS broker_snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT, captured_at TEXT NOT NULL,
@@ -357,6 +357,7 @@ def ensure_desk_schema(conn) -> None:
     conn.executescript(DESK_SCHEMA)
     conn.executescript(_fts_triggers())
     _migrate_broker_jobs(conn)
+    _migrate_broker_jobs_kind(conn)
 
 
 def _migrate_broker_jobs(conn) -> None:
@@ -371,6 +372,47 @@ def _migrate_broker_jobs(conn) -> None:
     except sqlite3.OperationalError as e:
         if "duplicate column" not in str(e).lower():
             raise
+
+
+BROKER_JOB_COLUMNS = ("id", "kind", "proposal_id", "recovery", "status", "requested_by", "created_at",
+                      "started_at", "finished_at", "error", "not_before", "payload_json", "result_json")
+
+
+def _migrate_broker_jobs_kind(conn) -> None:
+    """Widen ``broker_jobs.kind`` to ``query`` and add ``payload_json`` and ``result_json``
+    (owner, 2026-11-09: Robinhood reads from the chat). A ``query`` job runs one Robinhood
+    read or no-money action (``lib.desk.brokerq``); it can place nothing. SQLite cannot change
+    a CHECK in place, so this rebuilds the table and keeps every row and id. It does nothing
+    on a fresh or a widened ledger. The check runs again inside the write lock, so two
+    processes that start together rebuild the table once."""
+    def old_sql():
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='broker_jobs'").fetchone()
+        sql = row[0] if row else None
+        return sql if sql and "'query'" not in sql else None
+
+    if old_sql() is None:
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if old_sql() is not None:
+            have = {r[1] for r in conn.execute("PRAGMA table_info(broker_jobs)").fetchall()}
+            cols = [c for c in BROKER_JOB_COLUMNS if c in have]
+            conn.execute("ALTER TABLE broker_jobs RENAME TO broker_jobs_old")
+            conn.execute(
+                "CREATE TABLE broker_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "kind TEXT NOT NULL CHECK (kind IN ('snapshot','execute','query')), "
+                "proposal_id INTEGER, recovery INTEGER NOT NULL DEFAULT 0, "
+                "status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed')), "
+                "requested_by TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, "
+                "error TEXT, not_before TEXT, payload_json TEXT, result_json TEXT)")
+            names = ", ".join(cols)
+            conn.execute(f"INSERT INTO broker_jobs ({names}) SELECT {names} FROM broker_jobs_old")
+            conn.execute("DROP TABLE broker_jobs_old")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 JOB_KINDS = ("analyze_event", "deep_dive", "classify_news", "reflect")

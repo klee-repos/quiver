@@ -59,7 +59,7 @@ PLAN_TABLES = {
     "jobs": ('id', 'kind', 'payload_json', 'status', 'requested_by', 'created_at', 'started_at', 'finished_at',
              'attempts', 'error'),
     "broker_jobs": ('id', 'kind', 'proposal_id', 'recovery', 'status', 'requested_by', 'created_at',
-                    'started_at', 'finished_at', 'error', 'not_before'),
+                    'started_at', 'finished_at', 'error', 'not_before', 'payload_json', 'result_json'),
     "broker_snapshots": ('id', 'captured_at', 'equity', 'cash', 'buying_power', 'positions_json',
                          'quotes_json', 'approval_setting', 'raw_json'),
     "proposals": ('id', 'kind', 'origin', 'event_id', 'owner_message_id', 'parent_change_id', 'payload_json',
@@ -148,7 +148,8 @@ ORDERS_NEW = {"proposal_id": ("INTEGER", 0, None), "leg_seq": ("INTEGER", 0, Non
               "quote_at_proposal": ("REAL", 0, None), "clamped_from": ("REAL", 0, None),
               "check_quote": ("REAL", 0, None), "checked_at": ("TEXT", 0, None),
               "reconcile_attempts": ("INTEGER", 1, "0"), "skip_reason": ("TEXT", 0, None),
-              "review_ok": ("INTEGER", 1, "0"), "review_json": ("TEXT", 0, None), "reviewed_at": ("TEXT", 0, None)}
+              "review_ok": ("INTEGER", 1, "0"), "review_json": ("TEXT", 0, None), "reviewed_at": ("TEXT", 0, None),
+              "time_in_force": ("TEXT", 0, None)}
 ORDER_STATES = ("proposed", "approved", "checked", "placing", "placed", "filled", "partially_filled", "cancelled",
                 "broker_rejected", "expired", "requoted", "skipped", "outcome_unknown")
 
@@ -416,7 +417,7 @@ def case_migrate():
         info = {x[1]: (x[2].upper(), x[3], x[4]) for x in c.execute("PRAGMA table_info(orders)")}
         for col, want in ORDERS_NEW.items():
             r.eq(f"migrate orders gains {col}", info.get(col), want)
-        r.eq("migrate orders gains exactly 11 columns", len(cols(c, "orders")) - len(old_cols), 11)
+        r.eq("migrate orders gains exactly 12 columns", len(cols(c, "orders")) - len(old_cols), 12)
         r.eq("migrate orders keeps the old values",
              [tuple(x)[:len(old_cols)] for x in c.execute(f"SELECT {', '.join(old_cols)} FROM orders ORDER BY ref_id")],
              old_orders)
@@ -488,6 +489,40 @@ def case_migrate():
         r.eq("migrate broker_jobs gains not_before TEXT (NULL: run at once)", bj.get("not_before"), ("TEXT", 0, None))
         r.eq("migrate broker_jobs keeps its rows",
              [tuple(x) for x in c.execute("SELECT kind, status, not_before FROM broker_jobs")], [("snapshot", "done", None)])
+        c.close()
+    # The box's broker_jobs (2026-11-09): the old kind CHECK, not_before, no payload. The rebuild
+    # widens kind to 'query', adds payload_json and result_json, and keeps every row and id.
+    with temp_root() as root:
+        root.led()
+        c = raw(root.db)
+        c.execute("DROP TABLE broker_jobs")
+        c.execute("CREATE TABLE broker_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                  "kind TEXT NOT NULL CHECK (kind IN ('snapshot','execute')), proposal_id INTEGER, "
+                  "recovery INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL CHECK (status IN "
+                  "('queued','running','done','failed')), requested_by TEXT NOT NULL, created_at TEXT NOT NULL, "
+                  "started_at TEXT, finished_at TEXT, error TEXT, not_before TEXT)")
+        c.execute("INSERT INTO broker_jobs (id, kind, proposal_id, status, requested_by, created_at, not_before) "
+                  "VALUES (69, 'execute', 51, 'queued', 'tap', ?, '2026-11-10T14:40:00Z')", (T0,))
+        c.commit()
+        try:
+            c.execute("INSERT INTO broker_jobs (kind, status, requested_by, created_at) VALUES ('query','queued','t',?)",
+                      (T0,))
+            r.ok("migrate the old broker_jobs refuses kind 'query'", False)
+        except sqlite3.IntegrityError:
+            r.ok("migrate the old broker_jobs refuses kind 'query'", True)
+        c.close()
+        Ledger(root.db)
+        Ledger(root.db)
+        c = raw(root.db)
+        r.eq("migrate broker_jobs keeps the held execute job, its id and its send time",
+             [tuple(x) for x in c.execute("SELECT id, kind, proposal_id, status, not_before FROM broker_jobs")],
+             [(69, "execute", 51, "queued", "2026-11-10T14:40:00Z")])
+        r.ok("migrate broker_jobs gains payload_json and result_json",
+             {"payload_json", "result_json"} <= set(cols(c, "broker_jobs")))
+        c.execute("INSERT INTO broker_jobs (kind, status, requested_by, created_at, payload_json) "
+                  "VALUES ('query','queued','t',?, '{}')", (T0,))
+        r.eq("migrate broker_jobs takes a query job after the old max id",
+             c.execute("SELECT MAX(id) FROM broker_jobs WHERE kind='query'").fetchone()[0], 70)
         c.close()
 
 

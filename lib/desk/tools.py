@@ -27,8 +27,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from lib import market, memory, notify
-from lib.desk import (agenda, documents, edgar, etf, events, findings, learning, news, outbox, proposals, quotes,
-                      reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
+from lib.desk import (agenda, brokerq, documents, edgar, etf, events, findings, learning, news, outbox, proposals,
+                      quotes, reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
 
 SAY_LIMIT = 500
 REPORT_LIMIT = 3000
@@ -50,7 +50,7 @@ READ_TOOLS = (
 )
 DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
              "defer_item", "hold_agenda", "show_card", "promise_read", "add_rule", "retire_rule",
-             "retire_lesson", "plan_trade", "approve_card")
+             "retire_lesson", "plan_trade", "approve_card", "broker_read")
 ANALYST_ONLY = ("report", "record_verdict", "record_forecast")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
@@ -880,6 +880,43 @@ def t_show_card(ctx: ToolContext, args: dict) -> dict:
             "note": "The card is now the newest message with buttons. The older copy says Moved down."}
 
 
+BROKER_READ_WAIT_S = 150
+
+
+def t_broker_read(ctx: ToolContext, args: dict) -> dict:
+    """One Robinhood read or no-money action, run by ``quiver-broker`` (``lib.desk.brokerq``,
+    QUERY.md). The tool queues a ``query`` broker job and waits for its result; with
+    ``job_id`` it fetches the result of an earlier call. A query job can place nothing."""
+    jid = args.get("job_id")
+    if jid is None:
+        try:
+            payload = brokerq.validate(args.get("tool"), args.get("args"), args.get("pages"))
+        except brokerq.QueryError as e:
+            raise ToolError(str(e))
+        with ctx.conn() as c:
+            jid = brokerq.enqueue(c, payload, requested_by=ctx.role, now=store.now_iso())
+        ctx.trigger("broker")
+    wait = args.get("wait_seconds")
+    wait = BROKER_READ_WAIT_S if wait is None else int(wait)
+    if wait < 0 or wait > 240:
+        raise ToolError("wait_seconds must be 0 to 240")
+    waited = 0
+    while True:
+        with ctx.conn() as c:
+            got = brokerq.result_of(c, int(jid))
+        if got is None:
+            raise ToolError(f"there is no Robinhood query {jid}")
+        if got["status"] == "done" and got.get("result") is not None:
+            return {"job_id": int(jid), **got["result"]}
+        if got["status"] == "failed":
+            raise ToolError(f"Robinhood did not answer ({got.get('error')}). Say so in one line; offer to try again")
+        if waited >= wait:
+            return {"job_id": int(jid), "pending": True,
+                    "note": "Robinhood has not answered yet. Call broker_read with this job_id to get the result."}
+        ctx.sleep(2)
+        waited += 2
+
+
 def t_approve_card(ctx: ToolContext, args: dict) -> dict:
     """The owner said yes (or no, or cancel) to a card in words. The bridge's approver checks
     that the message is the owner's, in this turn, and says so plainly; then it decides the
@@ -1398,7 +1435,9 @@ P_BEAT = {"type": "number", "minimum": 0.01, "maximum": 0.99}
 LESSONS_USED = {"type": "array", "items": I, "maxItems": 12}
 ORDERS = {"type": "array", "maxItems": 10, "items": {"type": "object", "properties": {
     "ticker": S, "buy_dollars": N, "sell_dollars": N, "sell_fraction": N, "target_weight": N,
-    "sell_all": {"type": "boolean"}},
+    "sell_all": {"type": "boolean"}, "buy_shares": N, "sell_shares": N,
+    "type": {"type": "string", "enum": ["market", "limit", "stop", "stop_limit"]},
+    "limit_price": N, "stop_price": N, "good_till": {"type": "string", "enum": ["day", "cancelled"]}},
     "required": ["ticker"], "additionalProperties": False}}
 FUND_FROM = {"type": "array", "items": S, "maxItems": 5}
 
@@ -1465,6 +1504,15 @@ SPECS = {
                     _obj({"hours": N}, ["hours"])),
     "show_card": ("Send a pending card again as the newest message, so the owner need not scroll. The old copy "
                   "loses its buttons.", _obj({"proposal_id": I}, ["proposal_id"])),
+    "broker_read": ("Call one Robinhood tool through the broker and get its raw answer (about 30 to 90 s). "
+                    "Reads: the account, orders and fills, tax lots, realized profit (get_realized_pnl), profit "
+                    "per trade, price history, fundamentals, analyst ratings, earnings dates and results, "
+                    "financials, option chains, crypto quotes, index levels, Congress trades, watchlists, alerts, "
+                    "scans. No-money actions the owner asks for run at once: add_to_watchlist, "
+                    "remove_from_watchlist, create_watchlist, create_alert, update_alert, delete_alert, run_scan. "
+                    "An unknown name returns the full list. Orders and cancels never go here: use propose_trade. "
+                    "Do not pass account_number. With job_id, fetch the answer of an earlier call.",
+                    _obj({"tool": S, "args": {"type": "object"}, "pages": I, "job_id": I, "wait_seconds": I}, [])),
     "approve_card": ("The owner said yes, do it, no, or cancel to a card in their message of this turn: decide "
                      "that card now, as their tap would. Name the card and the owner's message id. Python reads "
                      "the owner's own words and refuses a message that does not plainly say yes or no. Never use "
@@ -1509,13 +1557,17 @@ SPECS = {
     "retire_lesson": ("Retire a lesson when the owner disagrees with it.",
                       _obj({"lesson_id": I, "reason": S}, ["lesson_id"])),
     "withdraw_proposal": ("Withdraw a pending proposal the desk made.", _obj({"proposal_id": I}, ["proposal_id"])),
-    "propose_trade": ("Propose a trade. Python sizes it and sends the card; the owner taps Approve. origin is "
+    "propose_trade": ("Propose a trade. Python sizes it and sends the card; the owner approves it (a tap or a "
+                      "yes). origin is "
                       '{"event_id": n} or {"owner_message_id": n}. An owner trade takes either tickers with '
                       "fraction (0.25, 0.5 or 1.0 of the way to the plan), or orders: [{ticker, buy_dollars | "
                       "sell_dollars | sell_fraction (0.5 = half the holding) | target_weight (percent of the "
-                      'account) | sell_all: true}] with fund_from (holdings to sell to pay for the buys; default '
-                      '["cash"]). With orders, Python moves the plan to fit the trade when the order fills, so the '
-                      "plan never blocks a trade the owner asks for. "
+                      'account) | sell_all: true | buy_shares | sell_shares}] with fund_from (holdings to sell to pay '
+                      'for the buys; default ["cash"]). An order may also carry type (market, limit, stop, '
+                      "stop_limit), limit_price, stop_price and good_till (day or cancelled): a limit or stop order "
+                      "trades whole shares at the owner's prices and is never requoted. With orders, Python moves "
+                      "the plan to fit the trade when the order fills, so the plan never blocks a trade the owner "
+                      "asks for. "
                       "p_beat_benchmark (optional, one name only): your chance the name beats SPY over 90 days.",
                       _obj({"tickers": TICKERS, "origin": {"type": "object"}, "fraction": N, "orders": ORDERS,
                             "fund_from": FUND_FROM, "rationale": S, "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT,
@@ -1529,15 +1581,17 @@ SPECS = {
                          "fund_from": FUND_FROM}, ["origin"])),
     "propose_change": ("Change the plan. With origin {\"owner_message_id\": n} (the owner's message in this turn "
                        "that asks for it), a plan change applies at once with no card: Python sends the owner a "
-                       "short note and the trade card that follows, if any. set_risk and resume_trading always "
-                       "send a Confirm card. Without origin, a card with Confirm and Reject goes to the owner. "
+                       "short note and the trade card that follows, if any. set_risk, resume_trading and "
+                       "cancel_order always send a card. Without origin, a card with Confirm and Reject goes to the owner. "
                        "Leave the cash sleeve out and Python balances the plan on it. `change.kind` is one of: "
                        "add_company {ticker, sleeve, target_weight, band, entry {mode: now|at_or_below, price}, "
                        "funding [{ticker, target_weight}]}; drop_company {ticker, exit {mode: now|at_or_above, price}, "
                        "redistribute [{ticker, target_weight}]}; set_weights {changes [{ticker, target_weight, band}]}; "
                        "set_risk {key, value}; set_premise {text, goal {target_return_pct, horizon_months, benchmark}}; "
                        "set_thesis {ticker, premise_link, summary, drivers [], falsifiers [], "
-                       "valuation {method, scenarios}, buy_below, trim_above}; resume_trading {}. "
+                       "valuation {method, scenarios}, buy_below, trim_above}; resume_trading {}; "
+                       "cancel_order {order_id (the Robinhood id, from broker_read), ticker, about (one line: what the "
+                       "order is), advanced (true for a stop-loss and take-profit pair)}: always a card. "
                        "Use exactly these field names.",
                        _obj({"change": {"type": "object"}, "origin": {"type": "object"}, "rationale": S,
                              "evidence": EVIDENCE, "p_beat_benchmark": P_BEAT, "lessons_used": LESSONS_USED},

@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS orders (
     limit_price     REAL,
     stop_price      REAL,
     parent_ref_id   TEXT,                        -- links a protective stop to its entry
+    time_in_force   TEXT,                        -- gfd | gtc (a desk leg; NULL reads as gfd)
     -- Desk leg states: proposed|approved|checked|placing|placed|filled|partially_filled|
     -- cancelled|broker_rejected|expired|requoted|skipped|outcome_unknown (older rows keep
     -- the retired values reserved|partial|unfilled|stop_placed|triggered).
@@ -432,6 +433,8 @@ class Ledger:
             "review_ok": "INTEGER NOT NULL DEFAULT 0",
             "review_json": "TEXT",
             "reviewed_at": "TEXT",
+            # 2026-11-09: an owner's limit or stop order may be good till cancelled.
+            "time_in_force": "TEXT",
         }
         for col, decl in additions.items():
             if col not in existing:
@@ -686,7 +689,7 @@ class Ledger:
         stop_price: Optional[float] = None, parent_ref_id: Optional[str] = None,
         state: str = "proposed", proposal_id: Optional[int] = None,
         leg_seq: Optional[int] = None, quote_at_proposal: Optional[float] = None,
-        conn=None,
+        time_in_force: Optional[str] = None, conn=None,
     ) -> None:
         """Persist the order row BEFORE any broker call (crash safety).
 
@@ -700,11 +703,11 @@ class Ledger:
                 "INSERT OR IGNORE INTO orders "
                 "(ref_id, trade_date, ticker, side, type, dollar_amount, quantity, "
                 "submitted_at, order_kind, limit_price, stop_price, parent_ref_id, state, "
-                "proposal_id, leg_seq, quote_at_proposal) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "proposal_id, leg_seq, quote_at_proposal, time_in_force) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (ref_id, trade_date, ticker, side, type, dollar_amount, quantity, submitted_at,
                  order_kind, limit_price, stop_price, parent_ref_id, state,
-                 proposal_id, leg_seq, quote_at_proposal),
+                 proposal_id, leg_seq, quote_at_proposal, time_in_force),
             )
 
     def get_order(self, ref_id: str) -> Optional[dict]:

@@ -3,7 +3,8 @@
 
 ``quiver-broker.path`` starts this unit while ``state/triggers/broker`` exists. The runner
 deletes the trigger, takes the ``broker`` run lock, and drains ``broker_jobs``: ``execute``
-jobs first, then ``snapshot`` jobs. A held ``execute`` job (``not_before`` in the future)
+jobs first, then ``query`` jobs (one Robinhood read or no-money action the desk asked for,
+``QUERY.md``), then ``snapshot`` jobs. A held ``execute`` job (``not_before`` in the future)
 waits; the bridge touches the trigger at its send time. For each job it runs one ``claude -p`` with the Robinhood
 MCP, a runbook (EXECUTE.md or SNAPSHOT.md) in its system prompt, and ``broker_guard`` as
 the hook on every tool call. Python sizes and checks every order; the model only calls the
@@ -65,14 +66,17 @@ def default_runner(argv, env, timeout, cwd):
         return 124, out, f"timeout after {timeout}s"
 
 
-def child_env(*, job_id=None, proposal_id=None) -> dict:
+def child_env(*, job_id=None, proposal_id=None, query=False) -> dict:
     """The explicit environment of ``claude -p``: the 7 keys of §11.1 step 7, plus the job
-    and proposal ids for an execute job only (a snapshot job can place nothing)."""
+    and proposal ids for an execute job only (a snapshot or query job can place nothing). A
+    query job gets ``QUIVER_BROKER_QUERY``: the guard allows its one no-money action by it."""
     env = {k: os.environ[k] for k in _CHILD_KEYS if os.environ.get(k)}
     env["DISABLE_AUTOUPDATER"] = "1"
     if proposal_id is not None:
         env["QUIVER_BROKER_JOB"] = str(job_id)
         env["QUIVER_BROKER_PROPOSAL"] = str(proposal_id)
+    elif query:
+        env["QUIVER_BROKER_QUERY"] = str(job_id)
     return env
 
 
@@ -262,7 +266,7 @@ class Broker:
         with self.led.connect() as conn:
             row = conn.execute("SELECT * FROM broker_jobs WHERE status='queued' AND "
                                "(not_before IS NULL OR not_before <= ?) ORDER BY "
-                               "CASE kind WHEN 'execute' THEN 0 ELSE 1 END, id LIMIT 1",
+                               "CASE kind WHEN 'execute' THEN 0 WHEN 'query' THEN 1 ELSE 2 END, id LIMIT 1",
                                (store.iso(self.now_fn()),)).fetchone()
             return dict(row) if row else None
 
@@ -287,7 +291,7 @@ class Broker:
         return str(p)
 
     def spawn(self, job, prompt_file, *, max_turns, proposal_id=None):
-        env = child_env(job_id=job["id"], proposal_id=proposal_id)
+        env = child_env(job_id=job["id"], proposal_id=proposal_id, query=job.get("kind") == "query")
         code, out, err = self.runner(claude_argv(prompt_file, max_turns=max_turns), env, JOB_TIMEOUT_S, str(_REPO))
         try:
             log = ROOT / "logs" / "desk" / "broker.log"
@@ -468,6 +472,42 @@ class Broker:
         self.halt_check(was_halted)
         self.follow_ups()
 
+    def run_query(self, job):
+        """One Robinhood read or no-money action for the desk (``lib.desk.brokerq``). The
+        guard allows the reads, and the action only when it matches this job's payload; it
+        allows no place or cancel here. ``tick.py query-commit`` files the raw result."""
+        from lib.desk import brokerq
+        ok, why = guard_selftest(self.runner)
+        if not ok:
+            self.mark(job["id"], "failed", why)
+            self.page("error", "broker", f"order guard check failed: {why}")
+            return
+        payload = store.loads(job.get("payload_json"), {}) or {}
+        try:
+            payload = brokerq.validate_job(payload, job.get("requested_by") or "")
+        except brokerq.QueryError as e:
+            self.mark(job["id"], "failed", str(e))
+            return
+        values = {"job_id": job["id"], "account_number": self.cfg.account_number, "tool": payload["tool"],
+                  "args": payload["args"], "pages": payload["pages"]}
+        prompt = self.write_prompt(job, values, "QUERY.md")
+        code, out, err = self.spawn(job, prompt, max_turns=8 + 2 * payload["pages"])
+        auth = self.auth_stopped(out)
+        self.audit(out)
+        with self.led.connect() as conn:
+            got = brokerq.result_of(conn, job["id"])
+        filed = bool(got and got.get("result") is not None)
+        if auth:
+            self.mark(job["id"], "failed", "the Robinhood login expired")
+        elif not filed:
+            self.mark(job["id"], "failed", f"the runbook filed no result (exit {code})")
+        else:
+            self.mark(job["id"], "done")
+        if payload.get("proposal_id"):
+            # A confirmed cancel card: the owner hears the outcome, in one line.
+            self.say(brokerq.cancel_outcome(self.led, payload, got if filed else None,
+                                            "the Robinhood login expired" if auth else None))
+
     def drain(self):
         n = 0
         while True:
@@ -479,6 +519,8 @@ class Broker:
             try:
                 if job["kind"] == "execute":
                     self.run_execute(job)
+                elif job["kind"] == "query":
+                    self.run_query(job)
                 else:
                     self.run_snapshot(job)
             except Exception as e:  # noqa: BLE001 — one bad job must not stop the drain

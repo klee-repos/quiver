@@ -10,8 +10,15 @@ The rules:
     that ``exec-check`` passed less than 120 s ago, whose review passed, whose fields match
     the call exactly, with no KILL, no halt, and more than 120 s to the close. On allow it
     first commits the leg to ``placing`` (and its first ``submitted_at``), then prints allow.
-  * It allows the Robinhood read tools, a ``ToolSearch`` ``select:`` of those names, a
-    ``Write`` of ``state/tmp/*.json``, and the ``tick.py`` commands of one pattern.
+  * It allows the Robinhood read tools (its own list plus ``lib.desk.brokerq.READS``), a
+    ``ToolSearch`` ``select:`` of those names, a ``Write`` of ``state/tmp/*.json``, and the
+    ``tick.py`` commands of one pattern.
+  * It allows one no-money action (``brokerq.ACTIONS``: a watchlist, an alert, a scan) only
+    in a ``query`` job (``QUIVER_BROKER_QUERY``) whose payload names that tool with exactly
+    those arguments.
+  * It allows a cancel (``brokerq.CARD_ACTIONS``) only in such a query job that a confirmed
+    ``cancel_order`` card queued: ``requested_by='approval'``, its proposal ``applied``, and
+    the same order id.
   * It denies everything else, including ``Read`` and every other broker write.
 
 It denies ONLY with exit code 2 (the reason on stderr): Claude Code does not block a hook
@@ -43,7 +50,7 @@ READ_TOOLS = frozenset({
 PLACE = "place_equity_order"
 SEARCHABLE = READ_TOOLS | {PLACE}
 BASH_RE = re.compile(
-    r"\.venv/bin/python tick\.py (exec-check|exec-commit|fills|snapshot-commit|auth-stop|wait)"
+    r"\.venv/bin/python tick\.py (exec-check|exec-commit|fills|snapshot-commit|auth-stop|wait|query-commit)"
     r"( --(proposal|job|seconds) [0-9]+| --phase (sells|buys|recover)| --input state/tmp/[A-Za-z0-9_.-]+\.json)+")
 CHECK_MAX_AGE_S = 120.0
 CLOSE_MARGIN_S = 120.0
@@ -110,16 +117,70 @@ def _under(path: str, base: Path) -> bool:
 
 # --- the pre-call decision -----------------------------------------------------------
 
-def _tool_search(tool_input: dict) -> tuple:
+def _desk_lists() -> tuple:
+    """(reads, actions, card actions) from ``lib.desk.brokerq``. A failed import raises, so
+    the guard denies."""
+    from lib.desk import brokerq
+    return frozenset(brokerq.READS), frozenset(brokerq.ACTIONS), frozenset(brokerq.CARD_ACTIONS)
+
+
+def _canon(args: dict) -> str:
+    return json.dumps({k: v for k, v in (args or {}).items() if k != "account_number"}, sort_keys=True,
+                      separators=(",", ":"), default=str)
+
+
+def check_action(conn, base: str, tool_input: dict, *, env: dict) -> tuple:
+    """(allow, reason) for a no-money action: only in the running query job that names it,
+    with exactly its arguments and the configured account."""
+    job_env = str(env.get("QUIVER_BROKER_QUERY") or "")
+    if not job_env.isdigit():
+        return False, f"{base} runs only in a query job"
+    job = conn.execute("SELECT kind, status, payload_json, requested_by FROM broker_jobs WHERE id=?",
+                       (int(job_env),)).fetchone()
+    if job is None or job["kind"] != "query" or job["status"] != "running":
+        return False, "the query job is not running"
+    try:
+        payload = json.loads(job["payload_json"] or "{}")
+    except ValueError:
+        return False, "the query job has no payload"
+    if payload.get("tool") != base:
+        return False, f"the query job asks for {payload.get('tool')}, not {base}"
+    if base in _desk_lists()[2]:
+        # A cancel: only from a confirmed cancel_order card, for that card's order id.
+        if job["requested_by"] != "approval" or not str(payload.get("proposal_id") or "").isdigit():
+            return False, f"{base} runs only from a confirmed card"
+        prop = conn.execute("SELECT kind, state, payload_json FROM proposals WHERE id=?",
+                            (int(payload["proposal_id"]),)).fetchone()
+        try:
+            ch = (json.loads(prop["payload_json"] or "{}").get("change") or {}) if prop else {}
+        except ValueError:
+            ch = {}
+        if prop is None or prop["kind"] != "change" or prop["state"] != "applied" or ch.get("kind") != "cancel_order":
+            return False, "the cancel card is not confirmed"
+        if str((tool_input or {}).get("order_id") or "") != str(ch.get("order_id") or "-"):
+            return False, "order_id differs from the confirmed card"
+    acct = str(env.get("RH_ACCOUNT_NUMBER") or "")
+    if (tool_input or {}).get("account_number") not in (None, "") and str(tool_input["account_number"]) != acct:
+        return False, "account_number does not match"
+    if _canon(tool_input) != _canon(payload.get("args") or {}):
+        return False, "the arguments differ from the query job's"
+    return True, f"{base} matches the query job"
+
+
+def _tool_search(tool_input: dict, env=None) -> tuple:
     q = str((tool_input or {}).get("query") or "")
     if not q.startswith("select:"):
         return False, "ToolSearch allows only a select: query of the broker read tools"
     names = [n.strip() for n in q[len("select:"):].split(",") if n.strip()]
     if not names:
         return False, "ToolSearch select: names no tool"
+    reads, actions, cards = _desk_lists()
+    # An action or a cancel loads only in a query job (its call has its own gate).
+    in_query = str((env or {}).get("QUIVER_BROKER_QUERY") or "").isdigit()
+    allowed = SEARCHABLE | reads | ((actions | cards) if in_query else frozenset())
     for n in names:
         server, base = _base(n)
-        if server not in (None, SERVER) or base not in SEARCHABLE:
+        if server not in (None, SERVER) or base not in allowed:
             return False, f"ToolSearch may not load {n}"
     return True, "ToolSearch select: of allowed broker tools"
 
@@ -129,6 +190,27 @@ def _dec(v, places: int):
         return Decimal(str(v)).quantize(Decimal(1).scaleb(-places))
     except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+def _styled(leg) -> bool:
+    """A limit or stop leg (owner, 2026-11-09). A leg with no type is a market leg."""
+    try:
+        typ = leg["type"]
+    except (KeyError, IndexError):
+        typ = None
+    return str(typ or "market") != "market"
+
+
+def _prices_match(ti: dict, leg) -> bool:
+    """The call's limit and stop prices equal the leg's (both absent, or equal to the cent)."""
+    for f in ("limit_price", "stop_price"):
+        want, got = leg[f], ti.get(f)
+        if want is None:
+            if got not in (None, ""):
+                return False
+        elif got in (None, "") or _dec(got, 4) != _dec(want, 4):
+            return False
+    return True
 
 
 def check_place(conn, tool_input: dict, *, env: dict, now: datetime, kill_path: Path) -> tuple:
@@ -192,6 +274,19 @@ def check_place(conn, tool_input: dict, *, env: dict, now: datetime, kill_path: 
     has_q, has_d = ti.get("quantity") not in (None, ""), ti.get("dollar_amount") not in (None, "")
     if has_q and has_d:
         return False, "give quantity or dollar_amount, not both"
+    if _styled(leg):
+        # A limit or stop leg: whole shares, the leg's prices, the leg's time in force.
+        if not has_q or leg["quantity"] is None or _dec(ti["quantity"], 6) != _dec(leg["quantity"], 6):
+            return False, "quantity does not match the leg"
+        if not _prices_match(ti, leg):
+            return False, "limit_price or stop_price does not match the leg"
+        if ti.get("market_hours") != "regular_hours":
+            return False, "market_hours must be regular_hours"
+        if ti.get("time_in_force") != (leg["time_in_force"] or "gfd"):
+            return False, "time_in_force does not match the leg"
+        if ti.get("tax_lots") not in (None, [], ""):
+            return False, "tax_lots is not allowed"
+        return True, f"leg {ref} matches its checked and reviewed row"
     if leg["side"] == "sell":
         if not has_q or leg["quantity"] is None or _dec(ti["quantity"], 6) != _dec(leg["quantity"], 6):
             return False, "quantity does not match the leg"
@@ -218,7 +313,7 @@ def evaluate(tool_name: str, tool_input: dict, *, env=None, now=None, conn=None,
     ti = tool_input or {}
     if server is None:
         if base == "ToolSearch":
-            return _tool_search(ti)
+            return _tool_search(ti, env)
         if base == "Write":
             path = str(ti.get("file_path") or "")
             if path.endswith(".json") and _under(path, ROOT / "state" / "tmp") and \
@@ -236,8 +331,19 @@ def evaluate(tool_name: str, tool_input: dict, *, env=None, now=None, conn=None,
         return False, f"{base} is not allowed for the broker model"
     if server != SERVER:
         return False, f"tools of {server} are not allowed"
-    if base in READ_TOOLS:
+    reads, actions, cards = _desk_lists()
+    if base in READ_TOOLS or base in reads:
         return True, f"{base} is a broker read"
+    if base in actions or base in cards:
+        if not str(env.get("QUIVER_BROKER_QUERY") or "").isdigit():
+            return False, f"{base} runs only in a query job"
+        own_q = conn is None
+        cq = conn or _connect()
+        try:
+            return check_action(cq, base, ti, env=env)
+        finally:
+            if own_q:
+                cq.close()
     if base != PLACE:
         return False, f"{base} is not allowed"
     now = now or _now()
@@ -294,6 +400,8 @@ def _review_quote_move(leg, data: dict, now, tolerance_pct) -> "str | None":
     times = [quotes.parse_venue_time(q.get(k)) for k in ("venue_last_trade_time", "venue_bid_time", "venue_ask_time")]
     if any(t is not None and (t - now).total_seconds() > 5 for t in times):
         return None   # a venue time ahead of our clock: not a quote we can age
+    if _styled(leg):
+        return None   # the owner's limit or stop price protects a limit or stop leg
     price, _why = quotes.leg_price(q, now)
     ref = float(leg["check_quote"] or leg["quote_at_proposal"] or 0.0)
     if price is None or ref <= 0:
@@ -354,7 +462,12 @@ def record_review(payload: dict, *, env=None, now=None, conn=None) -> tuple:
             if str(ti.get("symbol") or "") != leg["ticker"] or str(ti.get("side") or "") != leg["side"] \
                     or str(ti.get("type") or "") != str(leg["type"] or ""):
                 continue
-            if leg["side"] == "sell":
+            if _styled(leg):
+                if ti.get("quantity") in (None, "") or ti.get("dollar_amount") not in (None, ""):
+                    continue
+                if _dec(ti.get("quantity"), 6) != _dec(leg["quantity"], 6) or not _prices_match(ti, leg):
+                    continue
+            elif leg["side"] == "sell":
                 if ti.get("quantity") in (None, "") or ti.get("dollar_amount") not in (None, ""):
                     continue
                 if _dec(ti.get("quantity"), 6) != _dec(leg["quantity"], 6):

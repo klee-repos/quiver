@@ -10,6 +10,7 @@ in a model's judgment.
 Subcommands:
   exec-prepare / exec-check / exec-commit   the execute job (plan §11)
   snapshot-prepare / snapshot-commit        the snapshot job (plan §11.4)
+  query-commit                              a query job: one Robinhood read for the desk (QUERY.md)
   fills / wait / auth-stop                  runbook helpers
   reflect / benchmark-fetch / benchmark-backfill / goal-track / prune   after the close
   learn-grade                               grade the forecasts of the journal (plan §6.5)
@@ -816,6 +817,20 @@ def cmd_exec_commit(args) -> dict:
     return execution.exec_commit(led, cfg, int(args.proposal), d)
 
 
+def cmd_query_commit(args) -> dict:
+    """Store the raw result of a ``query`` job (QUERY.md step 3): one Robinhood read or
+    no-money action the desk asked for. The job id must be the running query job of this
+    broker run (``QUIVER_BROKER_QUERY``). The account number is redacted."""
+    from lib.desk import brokerq
+    cfg, led = _cfg_and_ledger()
+    env_job = os.environ.get("QUIVER_BROKER_QUERY", "").strip()
+    if not env_job.isdigit() or int(env_job) != int(args.job):
+        raise ValueError("query-commit acts only on the query job of this broker run")
+    d = _execution().read_input(args.input, root=REPO, now_dt=store.utc_now(), max_age_s=None)
+    with led.transaction() as conn:
+        return brokerq.commit(conn, int(args.job), d, secret=cfg.account_number or "", now=store.now_iso())
+
+
 def cmd_snapshot_prepare(_args) -> dict:
     execution = _execution()
     cfg, led = _cfg_and_ledger()
@@ -986,6 +1001,9 @@ def main(argv) -> int:
     sub.add_parser("snapshot-prepare")
     p_sc = sub.add_parser("snapshot-commit")
     p_sc.add_argument("--input", required=True)
+    p_qc = sub.add_parser("query-commit")
+    p_qc.add_argument("--job", required=True, type=int)
+    p_qc.add_argument("--input", required=True)
     p_ds = sub.add_parser("desk-seed")
     p_ds.add_argument("--skip-load", dest="skip_load", action="store_true")
     p_ds.add_argument("--skip-intro", dest="skip_intro", action="store_true")
@@ -1003,7 +1021,7 @@ def main(argv) -> int:
         "decision-proof": cmd_decision_proof, "auth-stop": cmd_auth_stop,
         "exec-prepare": cmd_exec_prepare, "exec-check": cmd_exec_check, "exec-commit": cmd_exec_commit,
         "snapshot-prepare": cmd_snapshot_prepare, "snapshot-commit": cmd_snapshot_commit,
-        "desk-seed": cmd_desk_seed, "desk-review": cmd_desk_review, "learn-grade": cmd_learn_grade,
+        "query-commit": cmd_query_commit, "desk-seed": cmd_desk_seed, "desk-review": cmd_desk_review, "learn-grade": cmd_learn_grade,
     }
     try:
         out = handlers[args.cmd](args)

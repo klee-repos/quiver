@@ -18,6 +18,7 @@ setting or the halt.
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import uuid
@@ -38,13 +39,62 @@ OPEN_AT_BROKER = ("placing", "placed", "partially_filled")
 END_FILL_STATES = ("filled", "cancelled", "broker_rejected", "outcome_unknown")
 EVENT_TRADE_TYPES = ("filing", "earnings", "price_level", "news", "lookthrough")
 CHANGE_KINDS = ("add_company", "drop_company", "set_weights", "set_risk", "set_premise",
-                "set_thesis", "resume_trading")
+                "set_thesis", "resume_trading", "cancel_order")
 # The plan kinds: a desk turn applies one at once from the owner's own message (§10.6).
 PLAN_KINDS = ("add_company", "drop_company", "set_weights", "set_premise", "set_thesis")
-# A risk setting and the halt change only by a Confirm tap.
-TAP_ONLY_KINDS = ("set_risk", "resume_trading")
+# A risk setting, the halt and a cancel change only on a card: the owner's Confirm tap or
+# typed "yes" (2026-11-09: a cancel of an open order is approved like an order).
+TAP_ONLY_KINDS = ("set_risk", "resume_trading", "cancel_order")
 # The keys of one sized owner order (§10.6). Exactly one per order.
-ORDER_KEYS = ("buy_dollars", "sell_dollars", "sell_fraction", "target_weight", "sell_all")
+ORDER_KEYS = ("buy_dollars", "sell_dollars", "sell_fraction", "target_weight", "sell_all", "buy_shares", "sell_shares")
+# The order types the owner may ask for (owner, 2026-11-09: "I want to be able to put limit
+# orders"). A type other than market trades whole shares only (Robinhood places fractional
+# shares only as a market order in regular hours).
+ORDER_TYPES = {"market": "market", "limit": "limit", "stop": "stop_market", "stop_market": "stop_market",
+               "stop_loss": "stop_market", "stop_limit": "stop_limit"}
+GOOD_TILL = {None: "gfd", "": "gfd", "day": "gfd", "gfd": "gfd", "today": "gfd",
+             "cancelled": "gtc", "canceled": "gtc", "gtc": "gtc"}
+
+
+def _order_style(o: dict, t: str) -> dict:
+    """The type, prices and time in force of one owner order, checked. A market order keeps
+    the defaults (gfd, no price)."""
+    raw = str(o.get("type") or "market").lower().strip()
+    typ = ORDER_TYPES.get(raw)
+    if typ is None:
+        raise ProposalError(f"{t}: type is market, limit, stop or stop_limit")
+    tif = GOOD_TILL.get(str(o.get("good_till") or "").lower().strip() or None)
+    if tif is None:
+        raise ProposalError(f"{t}: good_till is day or cancelled")
+
+    def price(key):
+        v = _f(o.get(key))
+        if v is None:
+            return None
+        if v <= 0:
+            raise ProposalError(f"{t}: {key} is a price above 0")
+        return round(v, 2) if v >= 1 else round(v, 4)
+
+    lim, stp = price("limit_price"), price("stop_price")
+    if typ == "market":
+        if lim is not None or stp is not None:
+            raise ProposalError(f"{t}: a market order takes no price; say type limit or stop")
+        if tif != "gfd":
+            raise ProposalError(f"{t}: a market order is good for the day only")
+    elif typ == "limit" and (lim is None or stp is not None):
+        raise ProposalError(f"{t}: a limit order needs limit_price (and no stop_price)")
+    elif typ == "stop_market" and (stp is None or lim is not None):
+        raise ProposalError(f"{t}: a stop order needs stop_price (and no limit_price)")
+    elif typ == "stop_limit" and (stp is None or lim is None):
+        raise ProposalError(f"{t}: a stop-limit order needs stop_price and limit_price")
+    return {"type": typ, "limit_price": lim, "stop_price": stp, "time_in_force": tif}
+
+
+def _reserve_price(style: dict, quote: float) -> float:
+    """The most one share of a buy may cost: the limit, else the stop or the quote."""
+    if style.get("limit_price") is not None:
+        return float(style["limit_price"])
+    return max(float(style.get("stop_price") or 0.0), float(quote))
 
 
 class ProposalError(ValueError):
@@ -379,6 +429,69 @@ def _fund_names(fund_from, cash_ticker) -> list:
     return out
 
 
+def _styled_leg(t, key, o, style, row, price, src, held, v, w_now, dep, cap) -> dict:
+    """One limit or stop order of the owner: whole shares, the owner's prices, day or GTC.
+    A buy reserves shares x its most a share may cost. A sale sells whole shares only."""
+    base_leg = {"ticker": t, "quote": price, "quote_source": src, "weight_now": w_now,
+                "target_weight": float(row["target_weight"] or 0.0), "band": row.get("band"), **style}
+    reserve = _reserve_price(style, price)
+    if key in ("buy_dollars", "buy_shares", "target_weight") and not (key == "target_weight" and
+                                                                       (_f(o["target_weight"]) or 0) * dep / 100.0 <= v):
+        if row["status"] != "active":
+            raise ProposalError(f"{t} is on its way out of the plan. Add it back with propose_change add_company first")
+        if key == "buy_shares":
+            n = _f(o["buy_shares"])
+        elif key == "buy_dollars":
+            d = _f(o["buy_dollars"])
+            if d is None or d <= 0:
+                raise ProposalError(f"{t}: buy_dollars is a dollar amount above 0")
+            n = math.floor(d / reserve + 1e-9)
+        else:
+            w = _f(o["target_weight"])
+            if w is None or w < 0 or w > cap + 1e-9:
+                raise ProposalError(f"{t}: target_weight is 0 to the {cap:g}% limit per name")
+            n = math.floor((w / 100.0 * dep - v) / reserve + 1e-9)
+        if n is None or n < 1 or abs(n - round(n)) > 1e-9:
+            raise ProposalError(f"{t}: a {style['type'].replace('_', ' ')} order buys whole shares; at "
+                                f"${reserve:,.2f} a share that size buys {math.floor(n or 0)}. Give buy_shares "
+                                "of 1 or more, or a market order")
+        n = int(round(n))
+        if style.get("limit_price") is not None and style["type"] == "limit" and style["limit_price"] > price * 1.1:
+            raise ProposalError(f"{t}: a buy limit of ${style['limit_price']:,.2f} is more than 10% over the "
+                                f"price (${price:,.2f}); check the number with the owner")
+        return {**base_leg, "side": "buy", "quantity": float(n), "dollars": round(n * reserve, 2),
+                "want": round(n * reserve, 2), "gap": round(n * reserve, 2)}
+    if held <= 0:
+        raise ProposalError(f"{t}: nothing is held, so there is nothing to sell")
+    whole = math.floor(held + 1e-9)
+    if key == "sell_shares":
+        n = _f(o["sell_shares"])
+        if n is None or n <= 0 or abs(n - round(n)) > 1e-9:
+            raise ProposalError(f"{t}: a {style['type'].replace('_', ' ')} order sells whole shares")
+        n = int(round(n))
+    elif key == "sell_all":
+        n = whole
+    elif key == "sell_fraction":
+        frac = _f(o["sell_fraction"])
+        if frac is None or not 0 < frac <= 1:
+            raise ProposalError(f"{t}: sell_fraction is above 0 and at most 1")
+        n = math.floor(held * frac + 1e-9)
+    elif key == "sell_dollars":
+        d = _f(o["sell_dollars"])
+        if d is None or d <= 0:
+            raise ProposalError(f"{t}: sell_dollars is a dollar amount above 0")
+        n = math.floor(d / price + 1e-9)
+    else:
+        w = _f(o["target_weight"])
+        n = math.floor((v - (w or 0.0) / 100.0 * dep) / price + 1e-9)
+    if n > whole:
+        raise ProposalError(f"{t}: {n} shares is more than the {whole} whole shares held ({held:g} in all)")
+    if n < 1:
+        raise ProposalError(f"{t}: a {style['type'].replace('_', ' ')} order sells whole shares, and {held:g} "
+                            "held gives none for this size. Use a market order to sell part of a share")
+    return {**base_leg, "side": "sell", "quantity": float(n), "exit": n >= held - 1e-9}
+
+
 def _size_orders(rows: dict, base: dict, orders: list, fund_from, *, cash_ticker, price_of, min_notional,
                  money: float, money_text: str, cap: float) -> tuple:
     """The legs of a sized owner request (§10.6): each order buys or sells the dollars the
@@ -419,7 +532,8 @@ def _size_orders(rows: dict, base: dict, orders: list, fund_from, *, cash_ticker
         given = [k for k in ORDER_KEYS if o.get(k) is not None and not (k == "sell_all" and o.get(k) is False)]
         if not t or len(given) != 1:
             raise ProposalError(f"{t or 'each order'}: give the ticker and exactly one of buy_dollars, sell_dollars, "
-                                "sell_fraction, target_weight or sell_all")
+                                "buy_shares, sell_shares, sell_fraction, target_weight or sell_all")
+        style = _order_style(o, t)
         if "sell_all" in given and o.get("sell_all") is not True:
             raise ProposalError(f"{t}: sell_all is true or left out")
         if t == cash_ticker:
@@ -433,6 +547,25 @@ def _size_orders(rows: dict, base: dict, orders: list, fund_from, *, cash_ticker
         price, src = quote(t)
         held, v = held_of(t), value_of(t)
         key = given[0]
+        if style["type"] != "market":
+            legs[t] = _styled_leg(t, key, o, style, rows[t], price, src, held, v, weight_now(t), dep, cap)
+            continue
+        if key == "buy_shares":
+            n = _f(o["buy_shares"])
+            if n is None or n <= 0:
+                raise ProposalError(f"{t}: buy_shares is a number of shares above 0")
+            key, o = "buy_dollars", {**o, "buy_dollars": round(n * price, 2)}
+        elif key == "sell_shares":
+            n = _f(o["sell_shares"])
+            if n is None or n <= 0:
+                raise ProposalError(f"{t}: sell_shares is a number of shares above 0")
+            if n > held + 1e-9:
+                raise ProposalError(f"{t}: {n:g} shares is more than the {held:g} held")
+            if n >= held - 1e-9:
+                key = "sell_all"
+            else:
+                legs[t] = sell_leg(t, round(n, 6), price, src, False)
+                continue
         if key == "sell_all":
             side, dollars = "sell", v
         elif key == "sell_fraction":
@@ -491,8 +624,10 @@ def _size_orders(rows: dict, base: dict, orders: list, fund_from, *, cash_ticker
         legs[t] = sell_leg(t, qty, price, src, False)
 
     def totals():
+        # A limit or stop sale may never fill, so only a market sale pays for the buys.
         b = sum(l["dollars"] for l in legs.values() if l["side"] == "buy")
-        s = sum(l["quantity"] * l["quote"] for l in legs.values() if l["side"] == "sell")
+        s = sum(l["quantity"] * l["quote"] for l in legs.values()
+                if l["side"] == "sell" and (l.get("type") or "market") == "market")
         return b, s
 
     buys_total, proceeds = totals()
@@ -580,6 +715,14 @@ def _orders_from_legs(old_payload: dict, tickers, base: dict) -> list:
     for leg in old_payload.get("legs") or []:
         t = str(leg["ticker"]).upper()
         if t not in tickers:
+            continue
+        typ = leg.get("type") or "market"
+        if typ != "market":
+            # A limit or stop order keeps its shares and its prices.
+            style = {"type": typ, "limit_price": leg.get("limit_price"), "stop_price": leg.get("stop_price"),
+                     "good_till": "cancelled" if leg.get("time_in_force") == "gtc" else "day"}
+            key = "buy_shares" if leg["side"] == "buy" else "sell_shares"
+            out.append({"ticker": t, key: float(leg["quantity"]), **style})
             continue
         if leg["side"] == "buy":
             out.append({"ticker": t, "buy_dollars": float(leg["dollar_amount"])})
@@ -903,7 +1046,9 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
         leg["ref_id"] = str(uuid.uuid4())
         payload_legs.append({"seq": seq, "ref_id": leg["ref_id"], "ticker": leg["ticker"],
                              "side": leg["side"], "dollar_amount": leg.get("dollars"),
-                             "quantity": leg.get("quantity"), "quote": leg["quote"]})
+                             "quantity": leg.get("quantity"), "quote": leg["quote"],
+                             "type": leg.get("type") or "market", "limit_price": leg.get("limit_price"),
+                             "stop_price": leg.get("stop_price"), "time_in_force": leg.get("time_in_force") or "gfd"})
     payload = {"kind": "trade", "fraction": fraction, "tickers": tickers, "snapshot_id": snap["id"],
                "deployable": round(deployable, 2), "legs": payload_legs, "scaled": scaled,
                "skipped": skipped, "side_rule": side_rule, "money_rule": money_rule, "cash": cash_info,
@@ -922,8 +1067,10 @@ def build_trade(led, conn, *, cfg: Config, tickers, origin: dict, fraction=None,
          secrets.token_hex(5)))
     pid = int(cur.lastrowid)
     for leg in legs:
-        led.reserve_order(leg["ref_id"], session_date, leg["ticker"], side=leg["side"], type="market",
-                          dollar_amount=leg.get("dollars"), quantity=leg.get("quantity"),
+        led.reserve_order(leg["ref_id"], session_date, leg["ticker"], side=leg["side"],
+                          type=leg.get("type") or "market", dollar_amount=leg.get("dollars"),
+                          quantity=leg.get("quantity"), limit_price=leg.get("limit_price"),
+                          stop_price=leg.get("stop_price"), time_in_force=leg.get("time_in_force") or "gfd",
                           now_iso=now, state="proposed", proposal_id=pid, leg_seq=leg["seq"],
                           quote_at_proposal=leg["quote"], conn=conn)
 
@@ -1228,11 +1375,25 @@ def validate_change(conn, cfg: Config, change: dict, *, now_dt=None) -> dict:
     sett = desk_settings.effective(conn, cfg)
     cash_ticker = cfg.risk.cash_sleeve_ticker
     goal = active_goal(conn)
-    if goal is None and kind not in ("set_premise",):
+    if goal is None and kind not in ("set_premise", "cancel_order"):
         raise ProposalError("no active book; run desk-seed")
     rows = book_rows(conn, goal["id"], statuses=("active", "exiting", "removed")) if goal else []
     by = {r["ticker"]: r for r in rows}
     out = {"kind": kind}
+    if kind == "cancel_order":
+        from lib.desk import brokerq
+        oid = str(change.get("order_id") or "").strip()
+        if not brokerq.ORDER_ID_RE.match(oid):
+            raise ProposalError("cancel_order needs order_id: the Robinhood id of the open order (read it with "
+                                "broker_read)")
+        t = str(change.get("ticker") or "").upper().strip()
+        if not t:
+            raise ProposalError("cancel_order needs the ticker of the order")
+        about = str(change.get("about") or "").strip()
+        if len(about) > 120:
+            raise ProposalError("about is one short line (120 characters at most)")
+        out.update(order_id=oid, ticker=t, about=about, advanced=bool(change.get("advanced")))
+        return out
     if kind == "add_company":
         t = str(change.get("ticker", "")).upper()
         comp = store.get_company(conn, t)
@@ -1406,6 +1567,8 @@ def _change_subject(conn, norm: dict) -> set:
         return (names - cash) or names
     if kind == "set_risk":
         return {norm.get("key")}
+    if kind == "cancel_order":
+        return {norm.get("order_id")}
     return {kind}
 
 
@@ -1520,6 +1683,16 @@ def apply_change(led, conn, cfg: Config, proposal: dict, *, now_dt=None) -> dict
                                    from_value=frm, to_value=to, trigger="owner_confirm", reason=reason,
                                    proof_json=proof, conn=conn)
 
+    if kind == "cancel_order":
+        # One cancel call, queued for quiver-broker. The guard allows it only for this card's
+        # order id (a query job with requested_by 'approval' and this proposal id).
+        from lib.desk import brokerq
+        try:
+            payload = brokerq.cancel_payload(norm["order_id"], advanced=norm.get("advanced", False), proposal_id=pid)
+        except brokerq.QueryError as e:
+            raise ProposalError(str(e))
+        brokerq.enqueue(conn, payload, requested_by="approval", now=now)
+        return {"change": norm, "superseded": [], "touch": ["broker"]}
     if kind == "set_risk":
         desk_settings.write(conn, norm["key"], norm["value"], now, pid)
         log("risk", norm.get("old"), norm["value"], f"set_risk {norm['key']}")

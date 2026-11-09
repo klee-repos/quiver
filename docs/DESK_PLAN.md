@@ -1806,6 +1806,44 @@ the account and the plan kept 18%, so no money was left, and no message said so.
 9. **`plan_trade`** runs the same build in a transaction that rolls back, so the desk can
    settle a size with the owner on Python's numbers and send nothing.
 
+### 10.7 One thing at a time, "yes" approves, and Robinhood from the chat (2026-11-09)
+
+The owner's words: "Do not present me a wall of text", "If I say yes, approve, it's
+approved", "I want to be able to put limit orders", and "everything we have API or MCP
+access to, I want as a command I can call from chat".
+
+1. **One short message per turn.** `say` sends one message of at most 500 characters per
+   turn and refuses a second. The desk says the most important thing, asks the one
+   question, and waits. A card is a short table: one line per order, the cash, when it sends.
+2. **A typed reply decides a card.** `approvals.handle_words` reads the owner's stored
+   message in Python. A plain reply ("yes, approve", "do it", "cancel 51") decides the card
+   with no desk turn. A weak word ("yes", "no") decides only when the card is the desk's last
+   message; a strong word ("approve", "cancel") or the card number always does. A message
+   with a question, "but", "wait" or a change in it decides nothing. A reply with more in it
+   goes to the desk, whose `approve_card` names the card and the owner message; Python still
+   reads the words. After that, the tap's checks 2 to 6 run as for a tap.
+3. **A held order sends at the open.** A held order (§10.5 check 4) compares the open price
+   with the card's price against `held_requote_tolerance_pct` (8), not the 1.5% of an order
+   that goes at once. Each leg is still sized to the plan at the open price. Before this,
+   every held order requoted on the gap (#44, #49) and nothing traded.
+4. **Limit and stop orders.** An owner order may carry `type` (market, limit, stop,
+   stop_limit), `limit_price`, `stop_price` and `good_till` (day or cancelled). A limit or stop
+   order trades whole shares (`buy_shares`, `sell_shares`, or dollars rounded down to whole
+   shares at the limit). A buy reserves shares x the most a share may cost. `exec-check` never
+   requotes it: the owner's price is the price protection. The guard matches the type, the
+   share count, each price and the time in force exactly.
+5. **Cancel an open order.** The change kind `cancel_order` {order_id, ticker, about} always
+   goes on a card. Its Confirm (a tap or a "yes") queues one `query` broker job with
+   `requested_by='approval'`. The guard allows `cancel_equity_order` only in that job, for that
+   card's order id, with the card `applied`. The owner gets the outcome in one line.
+6. **Robinhood reads and no-money actions.** The desk's `broker_read` names one tool from
+   `lib/desk/brokerq.py` (`READS`: orders, P&L, tax lots, history, ratings, earnings, option
+   chains, watchlists, alerts, scans; `ACTIONS`: watchlist, alert and scan changes) and queues a
+   `query` broker job. `quiver-broker` runs `QUERY.md`: one call, the raw answer filed by
+   `tick.py query-commit` with the account number redacted. The guard allows an action only in
+   the query job that names it with exactly its arguments, and no place call in any query job.
+   Options, crypto trades, banking and cards are in no list.
+
 ## 11. Execution (`quiver-broker`)
 
 ### 11.1 `run_broker.py`

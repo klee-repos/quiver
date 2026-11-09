@@ -1333,10 +1333,59 @@ def case_owner_sized_requote():
             r.ok("owner_sized_requote: the 3.3% move requotes the sized card", False, (chk, res))
 
 
+def case_order_types():
+    """Limit and stop orders the owner names (2026-11-09): whole shares, the owner's prices,
+    day or till cancelled. ANET $150, CEG $300; ANET 1 and CEG 1.1 shares, $1,160 cash, so ANET
+    has room under the 30% limit per name."""
+    with case() as c:
+        c.snap(positions={"ANET": 1.0, "CEG": 1.1}, buying_power=1160.0, equity=1640.0)
+        b = sized(c, [{"ticker": "ANET", "buy_dollars": 300, "type": "limit", "limit_price": 145}])
+        lg = leg(b, "ANET")
+        r.eq("order_types: $300 at a $145 limit buys 2 whole shares, reserving $290, good for the day",
+             (lg["quantity"], lg["dollars"], lg["type"], lg["limit_price"], lg["time_in_force"]),
+             (2.0, 290.0, "limit", 145.0, "gfd"))
+        r.eq("order_types: the order row holds the type, the price and the time in force",
+             c.one("SELECT type, quantity, limit_price, time_in_force FROM orders WHERE proposal_id=?",
+                   (b["proposal_id"],)), {"type": "limit", "quantity": 2.0, "limit_price": 145.0, "time_in_force": "gfd"})
+        txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, b)))
+        r.ok("order_types: the card names the shares and the limit", "Buy  ANET    2 sh limit $145.00" in txt, txt)
+        b = sized(c, [{"ticker": "CEG", "sell_all": True, "type": "stop", "stop_price": 270, "good_till": "cancelled"}])
+        lg = leg(b, "CEG")
+        r.eq("order_types: a stop on all of CEG sells the 1 whole share, GTC",
+             (lg["side"], lg["quantity"], lg["type"], lg["stop_price"], lg["time_in_force"], lg["exit"]),
+             ("sell", 1.0, "stop_market", 270.0, "gtc", False))
+        b = sized(c, [{"ticker": "ANET", "buy_shares": 1, "type": "stop_limit", "stop_price": 155,
+                       "limit_price": 157}])
+        r.eq("order_types: a stop-limit buy keeps both prices",
+             {k: leg(b, "ANET")[k] for k in ("type", "stop_price", "limit_price", "quantity", "dollars")},
+             {"type": "stop_limit", "stop_price": 155.0, "limit_price": 157.0, "quantity": 1.0, "dollars": 157.0})
+        b = sized(c, [{"ticker": "ANET", "buy_shares": 0.5}])
+        r.eq("order_types: a market buy_shares becomes a dollar buy at the quote", leg(b, "ANET")["dollars"], 75.0)
+        for label, order, want in (
+                ("a limit buy under one share", {"ticker": "ANET", "buy_dollars": 100, "type": "limit",
+                                                 "limit_price": 145}, "whole shares"),
+                ("a limit with no price", {"ticker": "ANET", "buy_shares": 1, "type": "limit"}, "needs limit_price"),
+                ("a stop with a limit price only", {"ticker": "ANET", "buy_shares": 1, "type": "stop",
+                                                   "limit_price": 150}, "needs stop_price"),
+                ("a market order with a price", {"ticker": "ANET", "buy_dollars": 50, "limit_price": 150},
+                 "takes no price"),
+                ("a market order till cancelled", {"ticker": "ANET", "buy_dollars": 50, "good_till": "cancelled"},
+                 "good for the day only"),
+                ("a fractional limit buy", {"ticker": "ANET", "buy_shares": 1.5, "type": "limit",
+                                            "limit_price": 145}, "whole shares"),
+                ("a limit sale of more than the whole shares", {"ticker": "CEG", "sell_shares": 2, "type": "limit",
+                                                                "limit_price": 310}, "whole shares held"),
+                ("a limit buy far over the price", {"ticker": "ANET", "buy_shares": 1, "type": "limit",
+                                                    "limit_price": 200}, "more than 10% over"),
+                ("an unknown type", {"ticker": "ANET", "buy_shares": 1, "type": "trailing"}, "type is market")):
+            e = refusal(lambda: sized(c, [order]))
+            r.ok(f"order_types: {label} is refused", e is not None and want in e, e)
+
+
 CASES = [case_refuse, case_buy, case_sell, case_entry_max, case_order_scale, case_reserve, case_origin_event,
          case_anti_flip, case_origin_owner, case_supersede, case_expiry, case_card, case_drift, case_quote_source,
          case_verdict_table, case_desk_news, case_owner_quote, case_leg_end, case_requote_copy, case_owner_sized,
-         case_owner_sized_requote]
+         case_owner_sized_requote, case_order_types]
 
 if __name__ == "__main__":
     for fn in CASES:

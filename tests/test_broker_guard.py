@@ -34,7 +34,7 @@ from desk_fakes import (REPO, FakeClock, FakePrices, Results, fx, rh_snap_file, 
 sys.path.insert(0, str(REPO / "deploy" / "runner"))
 import broker_guard  # noqa: E402
 import run_broker  # noqa: E402
-from lib.desk import approvals, execution, proposals, store  # noqa: E402
+from lib.desk import approvals, brokerq, execution, proposals, store  # noqa: E402
 
 r = Results("broker-guard")
 PY = str(REPO / ".venv" / "bin" / "python")
@@ -251,9 +251,18 @@ def case_reads(root, clock):
     r.eq("reads: rh_tools holds the 91 Robinhood tool names", len(names), 91)
     r.ok("reads: the 8 read tools are real Robinhood tools", set(READS) <= set(names), sorted(set(READS) - set(names)))
     allowed = [n for n in names if n != "place_equity_order" and broker_guard.evaluate(RH + n, {}, env={})[0]]
-    r.eq("reads: exactly the 8 read tools pass", sorted(allowed), sorted(READS))
+    # 2026-11-09: the desk may read every Robinhood read tool through a query job (brokerq.READS).
+    want = sorted((set(READS) | set(brokerq.READS)) & set(names))
+    r.eq("reads: exactly the runbook reads and the desk's read list pass", sorted(allowed), want)
+    r.eq("reads: every name of the desk's read list is a real Robinhood tool", sorted(set(brokerq.READS) - set(names)), [])
+    r.eq("reads: every desk action and card action is a real Robinhood tool",
+         sorted((set(brokerq.ACTIONS) | set(brokerq.CARD_ACTIONS)) - set(names)), [])
+    for n in ("place_option_order", "place_crypto_order", "exercise_option", "get_bank_accounts",
+              "get_credit_card_account", "get_banking_transactions"):
+        r.ok(f"reads: {n} is in no desk list", n not in brokerq.READS and n not in brokerq.ACTIONS
+             and n not in brokerq.CARD_ACTIONS)
     r.ok("reads: place_equity_order is in rh_tools (it has its own gate)", "place_equity_order" in names)
-    others = [n for n in names if n not in READS and n != "place_equity_order"]
+    others = [n for n in names if n not in allowed and n != "place_equity_order"]
     denied = [n for n in others if not broker_guard.evaluate(RH + n, {"ref_id": "x"}, env={})[0]]
     r.eq("reads: every other rh_tools name is denied", len(denied), len(others))
     for n in ("cancel_equity_order", "place_advanced_order", "place_crypto_order", "place_option_order",
@@ -724,11 +733,169 @@ def case_fail_closed(root, clock):
     r.ok("fail_closed: the run_broker self-test payload -> exit 2", code == 2, (code, out, err))
 
 
+# --- query jobs: no-money actions and cancels (2026-11-09) ------------------------------
+
+def _query_job(led, payload, requested_by="desk", status="running"):
+    with led.connect() as c:
+        cur = c.execute("INSERT INTO broker_jobs (kind, status, requested_by, created_at, payload_json) "
+                        "VALUES ('query', ?, ?, ?, ?)", (status, requested_by, store.now_iso(), json.dumps(payload)))
+        return int(cur.lastrowid)
+
+
+def case_query_actions(root, clock):
+    seed_desk(root, load=False)
+    led = root.led()
+    args = {"symbol": "VRT", "price": "180.00", "direction": "below"}
+    jid = _query_job(led, brokerq.validate("create_alert", args))
+    env = {"QUIVER_BROKER_QUERY": str(jid), "RH_ACCOUNT_NUMBER": ACCT}
+    ok, why = broker_guard.evaluate(RH + "create_alert", {**args, "account_number": ACCT}, env=env)
+    r.ok("query: the job's own action with its exact arguments -> allow", ok, why)
+    for label, ti, e in (("other arguments", {**args, "price": "150.00"}, env),
+                         ("another account", {**args, "account_number": "OTHER"}, env),
+                         ("no query job in the env", args, {"RH_ACCOUNT_NUMBER": ACCT}),
+                         ("an execute job's env", args, {"QUIVER_BROKER_JOB": str(jid), "QUIVER_BROKER_PROPOSAL": "1"})):
+        ok, why = broker_guard.evaluate(RH + "create_alert", ti, env=e)
+        r.ok(f"query: {label} -> deny", not ok, why)
+    ok, why = broker_guard.evaluate(RH + "delete_alert", {"alert_id": "x"}, env=env)
+    r.ok("query: an action the job does not name -> deny", not ok, why)
+    ok, why = broker_guard.evaluate(PLACE, {"ref_id": "x", "symbol": "VRT", "side": "buy", "type": "market"}, env=env)
+    r.ok("query: a place call in a query job -> deny", not ok, why)
+    with led.connect() as c:
+        c.execute("UPDATE broker_jobs SET status='done' WHERE id=?", (jid,))
+    ok, why = broker_guard.evaluate(RH + "create_alert", args, env=env)
+    r.ok("query: the same action after the job ended -> deny", not ok, why)
+    # brokerq refuses an order, a cancel, options and banking for broker_read.
+    for name in ("place_equity_order", "cancel_equity_order", "place_option_order", "get_bank_accounts"):
+        try:
+            brokerq.validate(name, {})
+            r.ok(f"query: brokerq.validate refuses {name}", False)
+        except brokerq.QueryError:
+            r.ok(f"query: brokerq.validate refuses {name}", True)
+    v = brokerq.validate("get_equity_tax_lots", {"symbol": "CEG", "account_number": "SPOOF"})
+    r.eq("query: the model's account_number is dropped", v["args"], {"symbol": "CEG"})
+
+
+def case_cancel_card(root, clock):
+    seed_desk(root, load=False)
+    led, cfg = root.led(), root.cfg()
+    oid = "6a8e4b1c-0000-4b1c-9d2e-1a2b3c4d5e6f"
+    with led.transaction() as c:
+        b = proposals.build_change(c, cfg, change={"kind": "cancel_order", "order_id": oid, "ticker": "VRT",
+                                                   "about": "buy 2 at $195"}, rationale="You asked.",
+                                   created_by="desk", now_dt=clock.now)
+    pid = b["proposal_id"]
+    with led.connect() as c:
+        c.execute("UPDATE proposals SET tg_chat_id=?, tg_message_id=? WHERE id=?", (OWNER, CARD_MSG, pid))
+        nonce = c.execute("SELECT nonce FROM proposals WHERE id=?", (pid,)).fetchone()[0]
+        n_jobs = c.execute("SELECT COUNT(*) FROM broker_jobs").fetchone()[0]
+    r.eq("cancel: a pending cancel card queues nothing", n_jobs, 0)
+    # A query job the desk could make for a cancel is refused before the guard ever sees it.
+    try:
+        brokerq.validate_job({"tool": "cancel_equity_order", "args": {"order_id": oid}}, "desk")
+        r.ok("cancel: validate_job refuses a cancel not from a card", False)
+    except brokerq.QueryError:
+        r.ok("cancel: validate_job refuses a cancel not from a card", True)
+    forged = _query_job(led, {"tool": "cancel_equity_order", "args": {"order_id": oid}, "proposal_id": pid},
+                        requested_by="approval")
+    ok, why = broker_guard.evaluate(RH + "cancel_equity_order", {"order_id": oid, "account_number": ACCT},
+                                    env={"QUIVER_BROKER_QUERY": str(forged), "RH_ACCOUNT_NUMBER": ACCT})
+    r.ok("cancel: a cancel job for a card that is not confirmed -> deny", not ok and "not confirmed" in why, why)
+    with led.connect() as c:
+        c.execute("UPDATE broker_jobs SET status='failed' WHERE id=?", (forged,))
+    clock.advance(10)
+    res = approvals.handle_tap(led, cfg, callback_data=f"p:{pid}:{nonce}:a", from_id=OWNER, chat_id=OWNER,
+                               message_id=CARD_MSG, owner_ids=[OWNER], now_dt=clock.now)
+    r.eq("cancel: Confirm applies the card and wakes the broker", (res["ok"], res["touch"]), (True, ["broker"]))
+    with led.connect() as c:
+        job = dict(c.execute("SELECT * FROM broker_jobs WHERE kind='query' AND status='queued'").fetchone())
+    r.eq("cancel: one query job from the approval, for this order id",
+         (job["requested_by"], json.loads(job["payload_json"])["args"]), ("approval", {"order_id": oid}))
+    run_broker.Broker(led=led, cfg=cfg, box=FakeBox()).mark(job["id"], "running")
+    env = {"QUIVER_BROKER_QUERY": str(job["id"]), "RH_ACCOUNT_NUMBER": ACCT}
+    ok, why = broker_guard.evaluate(RH + "cancel_equity_order", {"order_id": oid, "account_number": ACCT}, env=env)
+    r.ok("cancel: the confirmed card's order id -> allow", ok, why)
+    ok, why = broker_guard.evaluate(RH + "cancel_equity_order", {"order_id": "ffffffff-0000-0000-0000-000000000000",
+                                                                "account_number": ACCT}, env=env)
+    r.ok("cancel: another order id -> deny", not ok, why)
+    ok, why = broker_guard.evaluate(RH + "cancel_advanced_order", {"order_id": oid}, env=env)
+    r.ok("cancel: another cancel tool -> deny", not ok, why)
+    ok, why = broker_guard.evaluate(RH + "cancel_equity_order", {"order_id": oid}, env={"RH_ACCOUNT_NUMBER": ACCT})
+    r.ok("cancel: outside the query job -> deny", not ok, why)
+
+
+def case_styled_place(root, clock):
+    """A limit buy the owner asked for (2026-11-09): whole shares, the owner's price, GTC."""
+    sh = SHAPES["buy"]
+    seed_desk(root, load=False)
+    snapshot(root, at=store.iso(clock.now - timedelta(minutes=1)), positions=sh["positions"],
+             buying_power=sh["buying_power"], equity=sh["equity"], quotes=QUOTES)
+    led, cfg = root.led(), root.cfg()
+    with led.transaction() as c:
+        built = proposals.build_trade(led, c, cfg=cfg, tickers=None, origin={"owner_message_id": 101},
+                                      orders=[{"ticker": "ANET", "buy_shares": 2, "type": "limit",
+                                               "limit_price": 148.5, "good_till": "cancelled"}],
+                                      rationale="limit test", evidence=[], created_by="desk", role="desk",
+                                      turn_owner_ids=[101], yf_price_fn=FakePrices(), now_dt=clock.now)
+    pid = built["proposal_id"]
+    leg0 = built["legs"][0]
+    r.eq("styled: the leg is 2 whole shares, limit $148.50, GTC, reserving $297",
+         (leg0["quantity"], leg0["type"], leg0["limit_price"], leg0["time_in_force"], leg0["dollars"]),
+         (2.0, "limit", 148.5, "gtc", 297.0))
+    with led.connect() as c:
+        c.execute("UPDATE proposals SET tg_chat_id=?, tg_message_id=? WHERE id=?", (OWNER, CARD_MSG, pid))
+        nonce = c.execute("SELECT nonce FROM proposals WHERE id=?", (pid,)).fetchone()[0]
+    clock.advance(10)
+    approvals.handle_tap(led, cfg, callback_data=f"p:{pid}:{nonce}:a", from_id=OWNER, chat_id=OWNER,
+                         message_id=CARD_MSG, owner_ids=[OWNER], now_dt=clock.now)
+    clock.advance(10)
+    execution.exec_prepare(led, cfg, pid, now_dt=clock.now)
+    with led.connect() as c:
+        job = c.execute("SELECT id FROM broker_jobs WHERE proposal_id=? AND kind='execute'", (pid,)).fetchone()[0]
+    run_broker.Broker(led=led, cfg=cfg, box=FakeBox()).mark(job, "running")
+    env = {"QUIVER_BROKER_PROPOSAL": str(pid), "QUIVER_BROKER_JOB": str(job), "RH_ACCOUNT_NUMBER": ACCT}
+    prev = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        # ANET is 9% above the card's price: a market leg would requote; the limit protects this one.
+        moved = {**QUOTES, "ANET": 163.5}
+        f = rh_snap_file(positions=sh["positions"], quotes=moved, buying_power=sh["buying_power"],
+                         equity=sh["equity"], at=store.iso(clock.now))
+        s1 = execution.exec_check(led, cfg, pid, "sells", f, now_dt=clock.now)
+        s2 = execution.exec_check(led, cfg, pid, "buys", f, now_dt=clock.now)
+    finally:
+        for k, v in prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    r.eq("styled: a 9% move does not requote a limit order", (s1.get("action"), s2.get("action")), ("none", "place"))
+    pi = dict(s2["legs"][0])
+    r.eq("styled: the exact place fields", {k: pi.get(k) for k in ("type", "quantity", "limit_price", "time_in_force",
+                                                                   "dollar_amount", "stop_price")},
+         {"type": "limit", "quantity": "2", "limit_price": "148.50", "time_in_force": "gtc", "dollar_amount": None,
+          "stop_price": None})
+    cap = copy.deepcopy(fx("rh_review_buy"))
+    ti = {k: v for k, v in pi.items() if k != "ref_id"}
+    cap["tool_input"] = ti
+    cap["tool_response"]["data"].update({"symbol": "ANET", "type": "limit", "quantity": "2"})
+    cap["tool_response"]["data"].pop("dollar_amount", None)
+    cap["tool_response"]["data"]["quote_data"]["symbol"] = "ANET"
+    clock.advance(2)
+    rv = broker_guard.record_review(cap, env=env, now=clock.now)
+    r.eq("styled: the review matches the limit leg and passes", rv[0], 1)
+    clock.advance(2)
+    for label, mod in (("another limit price", {"limit_price": "149.00"}), ("day instead of GTC", {"time_in_force": "gfd"}),
+                       ("3 shares", {"quantity": "3"}), ("a dollar amount", {"dollar_amount": "297.00"}),
+                       ("no limit price", {"limit_price": None}), ("a market order", {"type": "market"})):
+        bad = {k: v for k, v in {**pi, **mod}.items() if v is not None}
+        ok, why = broker_guard.evaluate(PLACE, bad, env=env, now=clock.now)
+        r.ok(f"styled: {label} -> deny", not ok, why)
+    ok, why = broker_guard.evaluate(PLACE, pi, env=env, now=clock.now)
+    r.ok("styled: the exact limit leg -> allow", ok, why)
+
+
 def main() -> int:
     for case in (case_reads, case_place_ok, case_place_failed_write, case_place_gate, case_place_gate_approved,
                  case_place_gate_job_done, case_place_gate_close, case_place_gate_review, case_review_crash,
                  case_tool_search, case_settings, case_place_row, case_place_body, case_write, case_bash,
-                 case_fail_closed):
+                 case_fail_closed, case_query_actions, case_cancel_card, case_styled_place):
         with_root(case)
     return r.done()
 

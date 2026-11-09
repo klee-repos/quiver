@@ -227,7 +227,9 @@ def label_superseded(led, box: Outbox, superseded, new_id: int) -> None:
 def legs_for_card(led, proposal_id: int) -> list:
     """The card inputs of a trade's legs, rebuilt from its ``orders`` rows (no weights)."""
     return [{"ticker": l["ticker"], "side": l["side"], "dollars": l["dollar_amount"], "quantity": l["quantity"],
-             "quote": l["quote_at_proposal"]} for l in led.legs(proposal_id)]
+             "quote": l["quote_at_proposal"], "type": l.get("type") or "market", "limit_price": l.get("limit_price"),
+             "stop_price": l.get("stop_price"), "time_in_force": l.get("time_in_force")}
+            for l in led.legs(proposal_id)]
 
 
 def send_card(led, box: Outbox, cfg, proposal_id: int, *, card=None, now_dt=None) -> dict:
