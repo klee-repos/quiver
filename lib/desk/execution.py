@@ -376,6 +376,19 @@ def exec_prepare(led, cfg: Config, proposal_id: int, *, recovery: bool = False, 
                 "requote_tolerance_pct": sett["requote_tolerance_pct"]}
 
 
+def _job_tolerance(conn, sett: dict, proposal_id) -> float:
+    """The requote limit for a proposal's execute job, in %. An order held to the open (its
+    execute job has ``not_before``) waited hours or days since its card, so the gap is wider:
+    it uses ``held_requote_tolerance_pct``. The sells and buys re-size each leg to the plan at
+    the fresh prices, so a move inside that limit sends the right size. An order that goes
+    at once uses ``requote_tolerance_pct``. A recovery job follows its proposal's first job."""
+    row = conn.execute("SELECT 1 FROM broker_jobs WHERE kind='execute' AND proposal_id=? AND recovery=0 "
+                       "AND not_before IS NOT NULL LIMIT 1", (proposal_id,)).fetchone()
+    if row is not None:
+        return float(sett["held_requote_tolerance_pct"])
+    return float(sett["requote_tolerance_pct"])
+
+
 # --- exec-check (§11.2 steps 2 and 5, recovery step 2) ----------------------------------
 
 def exec_check(led, cfg: Config, proposal_id: int, phase: str, file_obj: dict, *, now_dt=None,
@@ -457,7 +470,7 @@ def _check_sells(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> di
     if proposals.kill_active(cfg):
         _fail_proposal(conn, pid, "kill", f"Trading is stopped on the box, so I placed nothing for #{pid}.")
         return {"action": "none", "reason": "kill"}
-    tol = float(sett["requote_tolerance_pct"])
+    tol = _job_tolerance(conn, sett, pid)
     moves = []
     for l in legs:
         old = float(l["quote_at_proposal"] or 0.0)
@@ -548,7 +561,7 @@ def _check_buys(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> dic
         return out
     if proposals.kill_active(cfg):
         return skip_all("kill")
-    tol = float(sett["requote_tolerance_pct"])
+    tol = _job_tolerance(conn, sett, pid)
     goal = proposals.active_goal(conn)
     rows = {r["ticker"]: r for r in proposals.book_rows(conn, goal["id"], ("active", "exiting", "removed"))}
     snap = proposals.snapshot_view(dict(conn.execute("SELECT * FROM broker_snapshots WHERE id=?", (snap_id,)).fetchone()))
@@ -741,7 +754,7 @@ def _check_recover(led, conn, cfg, prop, legs, file_obj, now_dt, file_error) -> 
         if block is None and attempts == 0 and approval == "off":
             price, _why = quotes.leg_price(qts.get(l["ticker"]), now_dt)
             old = float(l["quote_at_proposal"] or 0.0)
-            if price is None or (old > 0 and quotes.moved_pct(price, old) > float(sett["requote_tolerance_pct"])):
+            if price is None or (old > 0 and quotes.moved_pct(price, old) > _job_tolerance(conn, sett, pid)):
                 conn.execute("UPDATE orders SET state='outcome_unknown', finalized=1, reconcile_attempts=? "
                              "WHERE ref_id=? AND state='placing'", (attempts + 1, l["ref_id"]))
                 _add_message(conn, pid, f"I can't confirm the {l['ticker']} order, and the price moved, so I did "

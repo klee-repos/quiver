@@ -830,7 +830,7 @@ def case_tap_held():
              [e["params"]["reply_markup"]["inline_keyboard"] for e in edits],
              [outbox.held_buttons(prop["id"], prop["nonce"], "Approved, sends Thu 9:40 AM ET")])
         r.ok("held: the chat says when it goes and how to cancel",
-             any(f"so I send #{prop['id']} at 9:40 AM ET on Thursday, August 6. Until then, tap Cancel" in t
+             any(f"Approved #{prop['id']}. It sends at 9:40 AM ET on Thursday, August 6. Say cancel" in t
                  for t in w.tg.texts()), w.tg.texts())
         r.eq("held: the proposal is approved", prop_state(w, prop["id"]), "approved")
         r.ok("held: no broker trigger at the tap", not trig.exists())
@@ -1178,8 +1178,8 @@ def case_say():
         br = w.bridge
         w.asleep.block = {chat_bridge.TYPING_EVERY_S}   # one typing from the loop, then none
         out = {}
-        long_ok = "x" * 1200
-        long_bad = "y" * 1201
+        long_ok = "x" * tools.SAY_LIMIT
+        long_bad = "y" * (tools.SAY_LIMIT + 1)
         closing = "A different closing line."
 
         async def turn(sdk, prompt):
@@ -1205,18 +1205,21 @@ def case_say():
             await settle()
         asyncio.run(go())
         b = out.get("bad", {})
-        r.ok("say: 1,201 chars refused", is_err(b), b)
-        r.ok("say: the refusal says split it", "split it" in tool_text(b) if b else False, b)
+        r.ok("say: over the limit refused", is_err(b), b)
+        r.ok("say: the refusal says to say only the first point", "only the first point" in tool_text(b) if b else False, b)
         r.eq("say: a refused say sends nothing", out.get("bad_sent"), 0)
         lb = out.get("label", {})
         r.ok("say: a line that starts with a label is refused", is_err(lb) and "Good:" in tool_text(lb), lb)
         r.eq("say: the refused label sends nothing", out.get("label_sent"), 0)
-        r.ok("say: 1,200 chars pass", not is_err(out.get("ok", {"is_error": True})), out.get("ok"))
+        r.ok("say: the limit itself passes", not is_err(out.get("ok", {"is_error": True})), out.get("ok"))
+        # Owner, 2026-11-09: one thing at a time. A second say in the same turn is refused.
+        r.ok("say: a second say in a turn is refused", is_err(out.get("two", {})) and
+             "already sent" in tool_text(out["two"]), out.get("two"))
         sends = w.tg.of("sendMessage")
-        r.eq("say: the say messages in order, the trailing text dropped (D-live-1)",
-             [s["params"]["text"] for s in sends], [long_ok, "Second message."])
-        r.eq("say: the first replies to the newest owner message",
-             [(s["params"].get("reply_parameters") or {}).get("message_id") for s in sends], [5002, None])
+        r.eq("say: one message, the trailing text dropped (D-live-1)",
+             [s["params"]["text"] for s in sends], [long_ok])
+        r.eq("say: it replies to the newest owner message",
+             [(s["params"].get("reply_parameters") or {}).get("message_id") for s in sends], [5002])
         r.eq("say: typing before each say message", _typing_before(w, sends), ["sendChatAction"] * len(sends))
         g = _gaps(sends)
         r.ok("say: the messages are >= 0.8 s apart", all(x >= 0.8 - 1e-9 for x in g), g)
@@ -1255,12 +1258,12 @@ def case_say():
         asyncio.run(go())
         sends = w.tg.of("sendMessage")
         t = [s["params"]["text"] for s in sends]
-        r.ok("say: a no-say turn sends its trailing text", len(t) >= 2, [len(x) for x in t])
-        r.ok("say: each trailing part passes the 1,200 limit", all(len(x) <= 1200 for x in t), [len(x) for x in t])
-        r.eq("say: the parts hold the whole text", "\n".join(t).replace("\n", ""), para.replace("\n", ""))
-        r.eq("say: the first trailing part replies to the newest owner message",
-             [(s["params"].get("reply_parameters") or {}).get("message_id") for s in sends],
-             [5002] + [None] * (len(sends) - 1))
+        r.eq("say: a no-say turn sends one message of its trailing text", len(t), 1)
+        r.ok("say: it passes the say limit", all(len(x) <= tools.SAY_LIMIT for x in t), [len(x) for x in t])
+        r.ok("say: it is the start of the text", para.replace("\n", "").startswith(t[0].replace("\n", "")), t)
+        r.eq("say: the cut is logged", [x.get("parts", 0) > 1 for x in _log_events(w, "trailing_cut")], [True])
+        r.eq("say: the trailing message replies to the newest owner message",
+             [(s["params"].get("reply_parameters") or {}).get("message_id") for s in sends], [5002])
         r.eq("say: typing before each trailing part", _typing_before(w, sends), ["sendChatAction"] * len(sends))
         g = _gaps(sends)
         r.ok("say: the trailing parts are >= 0.8 s apart", all(x >= 0.8 - 1e-9 for x in g), g)
@@ -1721,7 +1724,7 @@ def case_agenda_one_at_a_time():
         r.eq("agenda: two messages: the desk's words, then the card", len(sends), 2)
         r.ok("agenda: the card comes last, with its buttons",
              len(sends) == 2 and not sends[0]["params"].get("reply_markup") and sends[1]["params"].get("reply_markup")
-             and f"Proposal #{pa}." in sends[1]["params"]["text"], [x["params"].get("text", "")[:50] for x in sends])
+             and f"#{pa} · " in sends[1]["params"]["text"], [x["params"].get("text", "")[:50] for x in sends])
         r.eq("agenda: A open, B waiting, the fyi item never brought up",
              [item(w, x)["status"] for x in (a, b, fyi)], ["open", "waiting", "waiting"])
         r.ok("agenda: A's card has its Telegram message id", prop_row(w, pa)["tg_message_id"] is not None)
@@ -1742,7 +1745,7 @@ def case_agenda_one_at_a_time():
         w.mono.advance(chat_bridge.AGENDA_AFTER_TAP_S + 0.5)
         asyncio.run(turns(br))
         r.eq("agenda: after the settle time B comes up", (len(w.sdk.prompts), item(w, b)["status"]), (2, "open"))
-        r.ok("agenda: B's card follows the desk's words", card_sends(w) and f"Proposal #{pb}." in
+        r.ok("agenda: B's card follows the desk's words", card_sends(w) and f"#{pb} · " in
              card_sends(w)[-1]["params"]["text"], [c["params"]["text"][:40] for c in card_sends(w)])
         with w.root.led().connect() as c:
             r.eq("/status counts the agenda", "Agenda: 1 open, 0 waiting, 1 fyi." in br.status_text(), True)
@@ -1780,7 +1783,7 @@ def case_agenda_owner_turn():
         r.ok("agenda: A's card is still pending (closing an item does not touch its card)",
              prop_row(w, pa)["state"] == "pending")
         last = w.tg.of("sendMessage")[-1]["params"]
-        r.ok("agenda: B's card is sent after the turn", last.get("reply_markup") and f"Proposal #{pb}." in last["text"],
+        r.ok("agenda: B's card is sent after the turn", last.get("reply_markup") and f"#{pb} · " in last["text"],
              last.get("text", "")[:80])
         # show_card: the card again at the bottom; the old copy loses its buttons; only the new one taps.
         old_mid = prop_row(w, pb)["tg_message_id"]
@@ -1860,7 +1863,7 @@ def case_agenda_fallback():
         r.ok("fallback: no 'I hit an error' text in an agenda turn", not any("I hit an error" in t for t in texts), texts)
         r.ok("fallback: model HTML reaches the owner as text, with its URL", texts and "&lt;a href=" in texts[0]
              and "https://evil.example" in texts[0] and "&lt;40%" in texts[0], texts[:1])
-        r.ok("fallback: the card follows", card_sends(w) and f"Proposal #{pa}." in card_sends(w)[-1]["params"]["text"])
+        r.ok("fallback: the card follows", card_sends(w) and f"#{pa} · " in card_sends(w)[-1]["params"]["text"])
         r.eq("fallback: the item stays open for the owner", item(w, a)["status"], "open")
         rows_ = rows(w, "SELECT source, delivered_to_session FROM chat_messages WHERE role='desk' ORDER BY id")
         r.eq("fallback: the report is mirrored as analyst, the card as proposal, both for the next turn",
@@ -1951,7 +1954,7 @@ def case_agenda_review_fixes():
             await asyncio.gather(br.send_card_once(pa), br.send_card_once(pa))
         asyncio.run(twice())
         r.eq("send_once: two sends at once make one card", len([x for x in card_sends(w)
-                                                               if f"Proposal #{pa}." in x["params"]["text"]]), 1)
+                                                               if f"#{pa} · " in x["params"]["text"]]), 1)
         asyncio.run(br.send_card_once(pa))
         r.eq("send_once: a card already in the chat is not sent again", len(card_sends(w)), 1)
         r.eq("card_hold: a fresh card in the chat holds the line", br.agenda_next(), None)
@@ -2063,6 +2066,115 @@ def case_card_last():
              second)
 
 
+# --- words: "yes, approve" in the chat (owner, 2026-11-09) -------------------------------
+
+def case_words():
+    # A plain reply decides the card in Python, with no desk turn and no card sent again.
+    with world(seeded=True) as w:
+        prop = make_card(w)
+        br = w.bridge
+        fresh_poll_mark(w)
+        n_prompts, n_sends = len(w.sdk.prompts), len(w.tg.of("sendMessage"))
+        msg_update(w, int(prop["tg_message_id"]) + 5, "yes, approve")
+
+        async def go():
+            await poll_and_turn(br)
+            await settle()
+        asyncio.run(go())
+        r.eq("words: 'yes, approve' in the chat approves the card", prop_state(w, prop["id"]), "approved")
+        r.eq("words: one execute job", len(rows(w, "SELECT id FROM broker_jobs WHERE kind='execute'")), 1)
+        r.eq("words: no desk turn for a plain decision", len(w.sdk.prompts), n_prompts)
+        ed = w.tg.of("editMessageReplyMarkup")
+        r.eq("words: the card's buttons show the result",
+             [(e["params"]["message_id"], e["params"]["reply_markup"]["inline_keyboard"][0][0]["text"]) for e in ed],
+             [(int(prop["tg_message_id"]), "Approved")])
+        # (No broker runs in this test, so the 180 s broker watch also speaks; it is not the decision.)
+        new = [c["params"] for c in w.tg.of("sendMessage")[n_sends:]
+               if not c["params"]["text"].startswith("The broker has not started")]
+        r.eq("words: the owner gets one short note and no card again",
+             [(t["text"], bool(t.get("reply_markup"))) for t in new], [(f"Approved #{prop['id']}. Sending it now.", False)])
+        r.eq("words: the message gets a reaction", len(w.tg.of("setMessageReaction")), 1)
+        r.ok("words: the broker is woken", (w.root.path / "state" / "triggers" / "broker").exists(), None)
+
+    # A decision with more in it: decided, and the desk answers the rest.
+    with world(seeded=True) as w:
+        prop = make_card(w)
+        br = w.bridge
+        fresh_poll_mark(w)
+        n_prompts = len(w.sdk.prompts)
+        msg_update(w, int(prop["tg_message_id"]) + 5, "approve it, and what about NVDA")
+
+        async def go():
+            await poll_and_turn(br)
+            await settle()
+        asyncio.run(go())
+        r.eq("words: 'approve it, and ...' approves the card", prop_state(w, prop["id"]), "approved")
+        r.eq("words: ... and the desk gets a turn for the rest", len(w.sdk.prompts), n_prompts + 1)
+
+    # The desk asked something after the card; the owner's "ok do it" goes to the desk, and its
+    # approve_card decides the card from the owner's own words. The note comes after its message.
+    with world(seeded=True) as w:
+        prop = make_card(w)
+        br = w.bridge
+        with w.root.led().connect() as c:
+            store.insert_desk_message(c, chat_id=OWNER, text="It trims CEG. Want to go ahead?", source="chat",
+                                      now=store.iso(w.fc.now), tg_message_id=int(prop["tg_message_id"]) + 1)
+        mid = int(prop["tg_message_id"]) + 5
+        out = {}
+
+        async def turn(sdk, prompt):
+            yield init_msg(sdk.sid())
+            await react_all(sdk)
+            out["bad"] = await sdk.tool("approve_card", {"proposal_id": prop["id"], "owner_message_id": mid + 99})
+            out["ok"] = await sdk.tool("approve_card", {"proposal_id": prop["id"], "owner_message_id": mid})
+            await sdk.tool("say", {"text": "Done, it goes now."})
+            yield text_msg("Done, it goes now.")
+            yield result_msg(sdk.sid())
+        w.sdk.turns = [turn]
+        fresh_poll_mark(w)
+        n_sends = len(w.tg.of("sendMessage"))
+        msg_update(w, mid, "ok do it")
+
+        async def go():
+            await poll_and_turn(br)
+            await settle()
+        asyncio.run(go())
+        r.ok("words: approve_card refuses a message that is not the owner's in this turn",
+             is_err(out.get("bad", {})), out.get("bad"))
+        r.ok("words: approve_card decides the card from 'ok do it'", not is_err(out.get("ok", {"is_error": True})),
+             out.get("ok"))
+        r.eq("words: ... the card is approved", prop_state(w, prop["id"]), "approved")
+        r.eq("words: the desk's message, then Python's note",
+             [c["params"]["text"] for c in w.tg.of("sendMessage")[n_sends:]
+              if not c["params"]["text"].startswith("The broker has not started")],
+             ["Done, it goes now.", f"Approved #{prop['id']}. Sending it now."])
+
+    # Talk is never a decision: the desk's approve_card on "what do you think?" is refused.
+    with world(seeded=True) as w:
+        prop = make_card(w)
+        br = w.bridge
+        mid = int(prop["tg_message_id"]) + 5
+        out = {}
+
+        async def turn(sdk, prompt):
+            yield init_msg(sdk.sid())
+            await react_all(sdk)
+            out["r"] = await sdk.tool("approve_card", {"proposal_id": prop["id"], "owner_message_id": mid})
+            await sdk.tool("say", {"text": "It trims CEG and tops up six names."})
+            yield text_msg("x")
+            yield result_msg(sdk.sid())
+        w.sdk.turns = [turn]
+        fresh_poll_mark(w)
+        msg_update(w, mid, "what do you think of it")
+
+        async def go():
+            await poll_and_turn(br)
+            await settle()
+        asyncio.run(go())
+        r.ok("words: approve_card on talk is refused", is_err(out.get("r", {})), out.get("r"))
+        r.eq("words: ... the card stays pending", prop_state(w, prop["id"]), "pending")
+
+
 CASES = [
     ("allowlist", case_allowlist),
     ("offset_crash", case_offset_crash),
@@ -2094,6 +2206,7 @@ CASES = [
     ("agenda_follow_up", case_agenda_follow_up),
     ("agenda_review_fixes", case_agenda_review_fixes),
     ("card_last", case_card_last),
+    ("words", case_words),
 ]
 
 

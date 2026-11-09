@@ -155,6 +155,8 @@ class Bridge:
         self.agenda_task = None
         self.released = set()              # held execute jobs whose send time came (one wake each)
         self.stopping = False
+        self.loop = None                   # the event loop of the turns (a tool thread posts to it)
+        self.turn.approver = self.approve_by_words
 
     # --- plumbing -----------------------------------------------------------------
     async def tg(self, method, params):
@@ -233,6 +235,11 @@ class Bridge:
                           (str(chat["id"]), int(msg["message_id"])))
             await self.command(low, chat["id"])
             return
+        # "yes, approve" decides the card like a tap (owner, 2026-11-09). Python reads the words.
+        reply_to = (msg.get("reply_to_message") or {}).get("message_id")
+        if await self.decide_words(chat["id"], int(msg["message_id"]), (msg.get("from") or {}).get("id"),
+                                   reply_to=reply_to):
+            return
         if self.turn_task is not None and not self.turn_task.done():
             asyncio.create_task(self.quick_react(int(msg["message_id"]), text))
 
@@ -266,7 +273,7 @@ class Bridge:
             await self.send_text(self.status_text(), source="system")
         else:
             await self.send_text("I'm your desk. Ask me about the book, a company, a filing, or a trade. "
-                                 "Nothing trades unless you tap Approve. /status, /clear, /stop.",
+                                 "Nothing trades unless you approve it: tap Approve or say yes. /status, /clear, /stop.",
                                  source="system")
 
     def status_text(self) -> str:
@@ -441,6 +448,7 @@ class Bridge:
         owners = [] if item is not None else self.pending_owner()
         if not owners and item is None:
             return
+        self.loop = asyncio.get_running_loop()
         updates = self.desk_updates()
         reacted = [o["tg_message_id"] for o in owners if o.get("reaction")]
         self.turn.start(chat_id=self.chat_id, owner_message_ids=[o["tg_message_id"] for o in owners],
@@ -492,8 +500,11 @@ class Bridge:
                 text = next((o["text"] for o in owners if o["tg_message_id"] == mid), "")
                 await self.quick_react(mid, text)
             if not self.turn.unreacted():
-                for part in _chunks(last_text, tools.SAY_LIMIT):
-                    # §4.4 step 2: the typing action goes before each message.
+                # One message per turn, as with `say`: the first part only (owner, 2026-11-09).
+                parts = _chunks(last_text, tools.SAY_LIMIT)
+                if len(parts) > 1:
+                    self.log({"event": "trailing_cut", "chars": len(last_text), "parts": len(parts)})
+                for part in parts[:1]:
                     await self.tg("sendChatAction", {"chat_id": self.chat_id, "action": "typing"})
                     await self.send_text(_to_telegram_html(part), source="chat",
                                          reply_to=self.turn.first_reply_to if not self.turn.said else None)
@@ -781,15 +792,27 @@ class Bridge:
         if res.get("alert") or (not res.get("label") and not res.get("buttons")):
             answer["show_alert"] = True
         await self.tg("answerCallbackQuery", answer)
-        if res.get("buttons") and msg.get("message_id"):
-            await asyncio.to_thread(self.box.set_buttons, msg["message_id"], res["buttons"])
-        elif res.get("label") and msg.get("message_id"):
-            await asyncio.to_thread(self.box.set_label, msg["message_id"], res["label"])
+        await self._after_decision(res, msg.get("message_id"))
+        self.log({"event": "tap", "result": {k: res.get(k) for k in ("answer", "label", "ok", "proposal_id")}})
+        return res
+
+    async def _after_decision(self, res, card_message_id, *, hold_messages=False):
+        """What a decision (a tap or the owner's words) names: the card's new buttons or
+        label, the triggers, the messages, the relabels and the follow-up cards. With
+        ``hold_messages`` (a decision from the desk's tool) the notes wait for the end of the
+        turn, after the desk's message."""
+        from lib.desk import agenda, store
+        if res.get("buttons") and card_message_id:
+            await asyncio.to_thread(self.box.set_buttons, card_message_id, res["buttons"])
+        elif res.get("label") and card_message_id:
+            await asyncio.to_thread(self.box.set_label, card_message_id, res["label"])
         for t in res.get("touch", []):
-            from lib.desk import store
             store.touch_trigger(self.runtime.root, t)
         for m in res.get("messages", []):
-            await self.send_text(m, source="proposal")
+            if hold_messages:
+                self.turn.after.append(("text", m, None))
+            else:
+                await self.send_text(m, source="proposal")
         for old in res.get("superseded", []) or []:
             await self._relabel(old)
         if res.get("cards") and res.get("proposal_id"):
@@ -801,15 +824,77 @@ class Bridge:
                     if it is not None:
                         agenda.attach(c, it["id"], pid)
         for pid in res.get("cards", []):
-            await self.send_card_once(pid)
+            if hold_messages:
+                self.turn.after.append(("card", pid, None))
+            else:
+                await self.send_card_once(pid)
         with self.led.connect() as c:
             closed = agenda.refresh(c, store.now_iso())
         if closed:
             self.log({"event": "agenda_closed", "items": closed})
         if res.get("ok") and "broker" in res.get("touch", []) and res.get("proposal_id"):
             asyncio.create_task(self.broker_watch(res["proposal_id"]))
-        self.log({"event": "tap", "result": {k: res.get(k) for k in ("answer", "label", "ok", "proposal_id")}})
-        return res
+
+    # --- decisions in words (owner, 2026-11-09) -------------------------------------
+    async def decide_words(self, chat_id, message_id, from_id, *, reply_to=None) -> bool:
+        """A typed "yes, approve" or "cancel" on a card. Python reads the words
+        (``approvals.handle_words``). A message that is only the decision ends here: it gets a
+        reaction and no desk turn. A message with more in it ("approve it, and what about
+        NVDA") is decided here, then the desk answers the rest. Returns True when the desk
+        has nothing left to answer."""
+        from lib.desk import approvals, store
+        res = await asyncio.to_thread(
+            approvals.handle_words, self.led, self.runtime.cfg, chat_id=chat_id, owner_message_id=message_id,
+            from_id=from_id, owner_ids=self.owner_ids, reply_to=reply_to)
+        if res is None:
+            return False
+        self.last_owner_wall = store.now_iso()
+        self.taps_busy += 1
+        self.last_tap_at = self.clock()
+        try:
+            await self._after_decision(res, res.get("card_message_id"))
+        finally:
+            self.taps_busy -= 1
+            self.last_tap_at = self.clock()
+        with self.led.connect() as c:
+            row = c.execute("SELECT text FROM chat_messages WHERE role='owner' AND chat_id=? AND tg_message_id=?",
+                            (str(chat_id), int(message_id))).fetchone()
+        pure = approvals.words_intent(row[0] if row else "").get("pure")
+        self.log({"event": "words_decision", "pure": pure,
+                  "result": {k: res.get(k) for k in ("answer", "ok", "proposal_id", "intent")}})
+        if not pure:
+            return False
+        emoji = "👍" if res.get("ok") else "🤔"
+        await self.tg("setMessageReaction", {"chat_id": chat_id, "message_id": message_id,
+                                             "reaction": [{"type": "emoji", "emoji": emoji}]})
+        with self.led.connect() as c:
+            c.execute("UPDATE chat_messages SET delivered_to_session=1, reaction=?, reacted_at=? "
+                      "WHERE chat_id=? AND tg_message_id=?",
+                      (emoji, store.now_iso(), str(chat_id), int(message_id)))
+        return True
+
+    def approve_by_words(self, proposal_id, owner_message_id) -> dict:
+        """The desk's ``approve_card`` tool, run in the tool's worker thread. The desk names the
+        card and the owner message; Python checks that the message is the owner's, in this
+        turn, and says yes (or no) in its own words. Returns what the tool tells the desk."""
+        from lib.desk import approvals
+        if int(owner_message_id) not in (self.turn.owner_message_ids or []):
+            return {"ok": False, "error": f"message {owner_message_id} is not an owner message of this turn"}
+        # A private chat with the owner: its chat id is the owner's user id (``accepted``).
+        res = approvals.handle_words(self.led, self.runtime.cfg, chat_id=self.chat_id,
+                                     owner_message_id=int(owner_message_id), from_id=self.chat_id,
+                                     owner_ids=self.owner_ids, proposal_id=int(proposal_id), from_desk=True)
+        if res is None:
+            return {"ok": False, "error": "the owner's message does not say yes or no to a card in plain words; "
+                                          "ask them in one short line"}
+        fut = asyncio.run_coroutine_threadsafe(self._after_decision(res, res.get("card_message_id"),
+                                                                    hold_messages=True), self.loop)
+        fut.result(timeout=60)
+        self.log({"event": "words_decision", "via": "desk",
+                  "result": {k: res.get(k) for k in ("answer", "ok", "proposal_id", "intent")}})
+        return {"ok": bool(res.get("ok")), "proposal_id": res.get("proposal_id"), "intent": res.get("intent"),
+                "result": res.get("answer"),
+                "note": "Python sends the owner the exact result after your message. Do not repeat it."}
 
     async def _relabel(self, pid):
         from lib.desk import proposals

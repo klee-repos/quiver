@@ -208,7 +208,7 @@ part = notify.render_execution_result({"id": 41, "legs": [
     {"ticker": "SMH", "side": "sell", "state": "cancelled", "quantity": 1.0, "fill_quantity": 0.4,
      "fill_avg_price": 300.0, "submitted_at": "2026-08-05T14:00:00Z"}]})
 r.ok("M8: a cancelled order with a fill reads as a partial sale",
-     "Sold 0.400 of 1.000 shares of SMH" in part and "cancelled the rest" in part, part)
+     "Sold SMH: 0.400 of 1.000 sh" in part and "cancelled the rest" in part, part)
 r.ok("M8: it never says 'I placed nothing'", "I placed nothing" not in part, part)
 unk = notify.render_execution_result({"id": 42, "legs": [
     {"ticker": "CEG", "side": "buy", "state": "outcome_unknown", "dollar_amount": 100.0,

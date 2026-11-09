@@ -43,7 +43,7 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
            "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
-           "add_rule", "retire_rule", "retire_lesson", "plan_trade"]
+           "add_rule", "retire_rule", "retire_lesson", "plan_trade", "approve_card"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
 # The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.

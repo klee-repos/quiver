@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from lib.desk import guard
 
@@ -122,6 +122,9 @@ class TurnState:
     # ``after`` and go out after the desk's last message, so a card is the newest message.
     hold_cards: bool = False
     after: list = field(default_factory=list)
+    # The bridge sets approver: ``approve_card`` asks it to decide a card from the owner's own
+    # words (``Bridge.approve_by_words``). Python reads the words; the tool only names them.
+    approver: Optional[Callable] = None
 
     def start(self, *, chat_id, owner_message_ids, started_at, reacted=()):
         self.chat_id = str(chat_id)

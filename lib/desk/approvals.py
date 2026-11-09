@@ -27,6 +27,7 @@ messages, the follow-up cards, and the broker trigger.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from lib import market
@@ -186,13 +187,9 @@ def _approve_trade(led, cfg: Config, prop: dict, from_id, now: str, *, now_dt=No
         from lib.desk import outbox
         now_dt = now_dt or store.parse_ts(now)
         when = market.fmt_when_et(held[0], now_dt)
-        why = ("The market closes in a few minutes" if market.is_open_at(now_dt)
-               else "The market is closed now")
         return _result(f"Approved. I send it at {when}.", label=None, ok=True, proposal_id=pid,
                        held=not_before, buttons=outbox.held_buttons(pid, prop["nonce"], held_label(held[0], now_dt)),
-                       messages=[f"Approved. {why}, so I send #{pid} at {when}. Until then, tap Cancel "
-                                 "on the card to stop it. If the price moves more than the requote limit "
-                                 "before then, I send you fresh numbers instead."])
+                       messages=[f"Approved #{pid}. It sends at {when}. Say cancel before then to stop it."])
     return _result("Approved", label="Approved", ok=True, proposal_id=pid, touch=["broker"],
                    messages=["On it. Checking the price now."])
 
@@ -331,3 +328,185 @@ def _confirm_change(led, cfg: Config, prop: dict, from_id, now_dt, yf_price_fn) 
         # The plan changed and no trade follows. Say why, so the owner never waits for a card.
         out["messages"].append(f"The plan is changed. No trade follows now: {fu['why']}.")
     return out
+
+
+# --- a decision in the owner's own words (owner, 2026-11-09) ---------------------------
+#
+# "If I say 'yes, approve', it's approved." A typed reply decides a card like a tap does.
+# Python reads the owner's stored message and decides the intent; a model never does. The
+# bridge runs ``handle_words`` on each owner message before the desk turn, and the desk's
+# ``approve_card`` tool reaches it only through ``Bridge.approve_by_words``, with the id of
+# an owner message of the current turn. Either way the owner's own text must say yes (or
+# no), with no "but", "wait" or question in it, and the card must be in the chat before
+# that message. The checks after that are the tap's checks 2 to 6.
+
+_YES = {"yes", "yeah", "yea", "yep", "yup", "y", "ok", "okay", "k", "kk", "sure", "go", "do", "send", "place",
+        "lgtm", "approve", "approved", "confirm", "confirmed", "execute", "👍", "✅", "👌"}
+_STRONG_YES = {"approve", "approved", "confirm", "confirmed", "execute"}
+# "ok" or "sure" alone often means "I hear you". The bridge decides on it only when another
+# yes word comes with it ("ok send it"); the desk's approve_card may still use it.
+_SOFT_YES = {"ok", "okay", "k", "kk", "sure", "👌"}
+_NO = {"no", "nope", "nah", "n", "reject", "rejected", "cancel", "cancelled", "canceled", "kill", "❌", "👎"}
+_STRONG_NO = {"reject", "rejected", "cancel", "cancelled", "canceled", "kill"}
+# A word that turns a yes into a condition or a change: the desk reads such a message.
+_HEDGE = {"not", "dont", "don't", "never", "wait", "hold", "but", "except", "without", "drop", "instead", "change",
+          "less", "more", "only", "if", "unless", "first", "after", "before", "later", "tomorrow", "maybe",
+          "half", "smaller", "bigger", "skip", "remove", "keep"}
+_FILLER = {"it", "that", "this", "one", "the", "card", "trade", "order", "orders", "please", "pls", "plz", "now",
+           "ahead", "lets", "let's", "sounds", "good", "great", "perfect", "fine", "thanks", "thank", "you", "ty",
+           "and", "all", "them", "both", "on", "for", "me", "i", "is", "a", "just", "go", "do", "send", "it's",
+           "its", "fucking", "fuckin", "fuck", "rebalance", "buy", "sell", "sure", "hell", "yes", "already", "man",
+           "dude", "bro", "sir", "so", "then", "right", "away", "asap", "everything", "whole", "thing", "lol",
+           "cool", "nice", "alright", "aight", "got", "with", "to", "go-ahead"}
+_TOKEN = re.compile(r"#?\d+|[a-z']+|[^\w\s#]", re.UNICODE)
+
+
+def words_intent(text: str) -> dict:
+    """Read a decision from the owner's own words. Returns ``{"intent": "approve"|"reject"|
+    None, "strong": bool, "pure": bool, "numbers": [int]}``. ``pure`` is True when the message
+    holds only decision words, filler and card numbers. A question, a hedge word, or a yes
+    and a no together give no intent."""
+    raw = str(text or "").strip().lower()
+    toks = [t for t in _TOKEN.findall(raw) if t.strip() and t not in {".", ",", "!", ":", ";", "-", "—"}]
+    nums = [int(t.lstrip("#")) for t in toks if t.lstrip("#").isdigit()]
+    words = [t for t in toks if not t.lstrip("#").isdigit()]
+    out = {"intent": None, "strong": False, "pure": False, "numbers": nums}
+    if not words or "?" in raw or len(words) > 14:
+        return out
+    yes = {w for w in words if w in _YES}
+    no = {w for w in words if w in _NO}
+    if bool(yes) == bool(no) or any(w in _HEDGE for w in words):
+        return out
+    extra = [w for w in words if w not in _YES and w not in _NO and w not in _FILLER]
+    out["pure"] = not extra
+    if yes:
+        out["intent"], out["strong"] = "approve", bool(yes & _STRONG_YES)
+    else:
+        out["intent"], out["strong"] = "reject", bool(no & _STRONG_NO)
+    if not out["pure"] and not out["strong"]:
+        out["intent"] = None
+    return out
+
+
+def _owner_message(conn, chat_id, message_id) -> Optional[dict]:
+    row = conn.execute("SELECT * FROM chat_messages WHERE role='owner' AND chat_id=? AND tg_message_id=? "
+                       "ORDER BY id DESC LIMIT 1", (str(chat_id), int(message_id))).fetchone()
+    return dict(row) if row else None
+
+
+def _held_job(conn, pid: int, now: str):
+    return conn.execute("SELECT not_before FROM broker_jobs WHERE kind='execute' AND proposal_id=? AND recovery=0 "
+                        "AND status='queued' AND not_before IS NOT NULL AND not_before > ? ORDER BY id DESC LIMIT 1",
+                        (pid, now)).fetchone()
+
+
+def _word_targets(conn, intent: str, owner_mid: int, now: str) -> list:
+    """The cards a decision can mean: pending cards in the chat before the owner's message,
+    and for a no, also approved trades still held for the open."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM proposals WHERE state='pending' AND tg_message_id IS NOT NULL AND tg_message_id < ? "
+        "ORDER BY tg_message_id", (int(owner_mid),)).fetchall()]
+    if intent == "reject":
+        for r in conn.execute("SELECT * FROM proposals WHERE state='approved' AND kind='trade' AND "
+                              "tg_message_id IS NOT NULL AND tg_message_id < ? ORDER BY tg_message_id",
+                              (int(owner_mid),)).fetchall():
+            if _held_job(conn, r["id"], now):
+                rows.append(dict(r))
+    return rows
+
+
+def handle_words(led, cfg: Config, *, chat_id, owner_message_id, from_id, owner_ids, proposal_id=None,
+                 reply_to=None, from_desk: bool = False, now_dt=None, yf_price_fn=None) -> Optional[dict]:
+    """Decide a card from the owner's typed reply. Returns None when the message is not a
+    decision Python can read (the desk reads it as talk), else a result like ``handle_tap``
+    with ``card_message_id`` (the card to relabel) and ``by_words`` set.
+
+    From the bridge (``from_desk`` False) a weak word ("yes", "ok", "no") decides only when
+    the card is the last thing the desk sent: a desk message after the card may have asked
+    something else. From the desk's ``approve_card`` the desk names the card, so the weak
+    word counts; Python still needs the yes in the owner's own text."""
+    now_dt = now_dt or store.utc_now()
+    now = store.iso(now_dt)
+    if str(from_id) not in {str(x) for x in (owner_ids or ())}:
+        return None
+    with led.connect() as conn:
+        msg = _owner_message(conn, chat_id, owner_message_id)
+        if msg is None:
+            return None
+        intent = words_intent(msg["text"])
+        if intent["intent"] is None:
+            return None
+        cands = _word_targets(conn, intent["intent"], owner_message_id, now)
+        by_id = {c["id"]: c for c in cands}
+        target = None
+        named = [n for n in intent["numbers"] if n in by_id]
+        if proposal_id is not None:
+            target = by_id.get(int(proposal_id))
+            if target is None:
+                return _result(f"#{proposal_id} is not a card open in the chat before that message.",
+                               proposal_id=int(proposal_id), by_words=True, refused=True)
+        elif len(set(named)) == 1:
+            target = by_id[named[0]]
+        elif intent["numbers"]:
+            return None
+        elif reply_to is not None:
+            target = next((c for c in cands if int(c["tg_message_id"]) == int(reply_to)), None)
+        elif len(cands) == 1:
+            target = cands[0]
+        if target is None:
+            return None
+        if not from_desk and not intent["strong"] and not named:
+            # A weak word: the card must be the desk's last word in the chat.
+            later = conn.execute("SELECT 1 FROM chat_messages WHERE role='desk' AND source='chat' AND chat_id=? "
+                                 "AND tg_message_id > ? AND tg_message_id < ? LIMIT 1",
+                                 (str(chat_id), int(target["tg_message_id"]), int(owner_message_id))).fetchone()
+            if later:
+                return None
+        if not from_desk and not intent["pure"] and not intent["strong"]:
+            return None
+        if not from_desk and intent["intent"] == "approve" and not intent["strong"]:
+            words_ = set(_TOKEN.findall(str(msg["text"] or "").lower()))
+            if not (words_ & (_YES - _SOFT_YES)):
+                return None
+    pid = target["id"]
+    card_mid = target["tg_message_id"]
+    if intent["intent"] == "reject":
+        if target["state"] == "approved":
+            res = _cancel_held(led, target, from_id, now)
+            if res is None:
+                res = _result("Too late to cancel: it is going to Robinhood now.", proposal_id=pid)
+        elif now_dt >= store.parse_ts(target["expires_at"]):
+            with led.transaction() as conn:
+                proposals.end_pending(conn, pid, "expired", now)
+            res = _result("Expired", label="Expired", proposal_id=pid,
+                          messages=[f"#{pid} expired before your reply, so nothing changed."])
+        else:
+            res = _reject(led, target, from_id, now)
+            if res.get("ok"):
+                res["messages"] = [f"Rejected #{pid}. Nothing was sent."]
+    else:
+        if now_dt >= store.parse_ts(target["expires_at"]):
+            with led.transaction() as conn:
+                proposals.end_pending(conn, pid, "expired", now)
+            res = _result("Expired", label="Expired", proposal_id=pid,
+                          messages=[f"#{pid} expired before your reply. Ask me for fresh numbers."])
+        elif target["kind"] == "trade":
+            held = held_send_et(now_dt)
+            why = trade_gate(led, cfg, target, now_dt, held)
+            if why:
+                res = _result(why, proposal_id=pid, messages=[why])
+            else:
+                res = _approve_trade(led, cfg, target, from_id, now, now_dt=now_dt, held=held)
+                if res.get("ok") and not held:
+                    res["messages"] = [f"Approved #{pid}. Sending it now."]
+        else:
+            res = _confirm_change(led, cfg, target, from_id, now_dt, yf_price_fn)
+            if res.get("ok") and not res.get("messages"):
+                res["messages"] = [f"Done, #{pid} is applied."]
+        if not res.get("ok") and not res.get("messages"):
+            # Already decided, replaced or failed: say so in words, since no popup shows.
+            res["messages"] = [f"#{pid}: {res.get('answer')}."]
+    res["card_message_id"] = card_mid
+    res["by_words"] = True
+    res["intent"] = intent["intent"]
+    return res

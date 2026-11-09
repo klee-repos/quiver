@@ -1161,7 +1161,7 @@ def t_check_gate_jobs():
         leg = c.legs(pid)[0]
         r.eq("gate buys only: the buy placed and filled", (leg["state"], leg["broker_order_id"] is not None), ("filled", True))
         r.eq("gate buys only: executed", c.prop(pid)["state"], "executed")
-        r.ok("gate buys only: the owner gets the result", any(t.startswith("Done. Bought $200.00 of ANET") for t in c.tg.texts()), c.tg.texts())
+        r.ok("gate buys only: the owner gets the result", any(t.startswith("Done.\nBought ANET: $200.00") for t in c.tg.texts()), c.tg.texts())
 
 
 # =============================================================================================
@@ -1207,7 +1207,7 @@ def t_requote_buys():
                  (c.prop(pid)["origin"], c.prop(pid)["owner_message_id"]))
         msg = next((t for t in c.tg.texts() if "moved" in t), "")
         r.ok("requote_buys: the message names the sells first",
-             msg.startswith("The sells went out:") and msg.index("ANET") < msg.index("CEG moved 1.6%"), msg)
+             msg.startswith("The sells went out (") and msg.index("ANET") < msg.index("CEG +1.6%"), msg)
         r.ok("requote_buys: the new card has buttons", any(m == "sendMessage" and "reply_markup" in p and f"p:{new[0]['id'] if new else 0}:" in json.dumps(p)
                                                            for m, p in c.tg.calls), None)
         with c.led.connect() as conn:
@@ -1548,7 +1548,7 @@ def t_requote():
             r.eq("requote (G29): the new leg is priced from the exec-check quote", nl[0]["quote_at_proposal"], 152.40)
             r.eq("requote (G29): and sized from that snapshot", nl[0]["dollar_amount"], want)
         r.ok("requote: the exact text (G29)",
-             "ANET moved 1.6% since I proposed this ($150.00 to $152.40). Here are the new numbers." in c.tg.texts(), c.tg.texts())
+             "Prices moved (ANET +1.6%), so I placed nothing. New numbers below." in c.tg.texts(), c.tg.texts())
 
     with case("requote flat sell", positions=POS_SB, quotes=Q_SB, equity=2150.0) as c:
         built = two_leg(c)
@@ -1925,7 +1925,7 @@ def t_fills():
         r.eq("fills: the buy clamped to 410.00", legs["CEG"]["dollar_amount"], 410.00)
         r.eq("fills: FILLED -> filled (both legs)", (legs["SMH"]["state"], legs["CEG"]["state"]), ("filled", "filled"))
         r.eq("fills: all filled -> executed", c.prop(pid)["state"], "executed")
-        want = "Done. Sold 1.603 shares of SMH at $301.10 ($482.66). Bought $410.00 of CEG: 1.595 shares at $257.05."
+        want = "Done.\nSold SMH: 1.603 sh at $301.10 ($482.66)\nBought CEG: $410.00, 1.595 sh at $257.05"
         r.ok("fills: the result text", want in c.tg.texts(), c.tg.texts())
         r.eq("fills: the result goes through outbox (source execution)",
              c.q("SELECT COUNT(*) n FROM chat_messages WHERE source='execution' AND text=?", (want,))[0]["n"], 1)
@@ -1996,7 +1996,7 @@ def t_fills():
         r.eq("fills queued: the fill at the next snapshot-commit -> executed", c.prop(pid)["state"], "executed")
         new = c.tg.texts()[n_before:]
         r.eq("fills queued: one result message", [t for t in new if t.startswith("Done.")],
-             ["Done. Bought $200.00 of ANET: 1.333 shares at $150.00."])
+             ["Done.\nBought ANET: $200.00, 1.333 sh at $150.00"])
 
     # the open-leg text without step 7 (so the close of run_broker reports it)
     with case("fills queued text") as c:
@@ -2023,7 +2023,7 @@ def t_fills():
         gets = [x for x in run_broker.tool_calls(runner.last_bot.s.text()) if x["name"].endswith("get_equity_orders")]
         r.eq("fills sells only: filled at the second call", len(gets), 2)
         r.eq("fills sells only: executed in the same job", c.prop(pid)["state"], "executed")
-        r.ok("fills sells only: one result message", sum(t.startswith("Done. Sold") for t in c.tg.texts()) == 1, c.tg.texts())
+        r.ok("fills sells only: one result message", sum(t.startswith("Done.\nSold") for t in c.tg.texts()) == 1, c.tg.texts())
 
 
 # =============================================================================================
@@ -2597,7 +2597,7 @@ def t_held():
         r.eq("held: at the send time the broker runs it", len(runner.jobs), 1)
         r.eq("held: the order fills and the proposal ends executed", c.prop(pid)["state"], "executed")
         r.eq("held: the leg trades in the send session", c.legs(pid)[0]["trade_date"], "2026-08-06")
-        r.ok("held: the owner gets the result", any(t.startswith("Done. Bought $200.00 of ANET") for t in c.tg.texts()),
+        r.ok("held: the owner gets the result", any(t.startswith("Done.\nBought ANET: $200.00") for t in c.tg.texts()),
              c.tg.texts())
 
     # 4 minutes before the close: held to the next session; the expiry moves to that close.
@@ -2616,6 +2616,32 @@ def t_held():
         c.rh.fill = {"ANET": (1.333333, 150.0)}
         run_job(c, pid, {"sells": std(), "after": std(positions={"ANET": 3.333333, "CEG": 1, "SGOV": 11}, bp=100.0)})
         r.eq("held near the close: the next session executes it", c.prop(pid)["state"], "executed")
+
+    # The live case of 2026-11-09 (#49, and #44 on 11-06): a held order met a gap at the open
+    # (ANET +6%). It used the 1.5% limit, so every held order requoted and none traded. A held
+    # order sends, re-sized to the plan at the open price; only a gap over
+    # held_requote_tolerance_pct (8) requotes. An order that goes at once keeps the 1.5%.
+    for move, sells_action, buys_action in ((1.06, "none", "place"), (1.09, "requote", None)):
+        with case(f"held gap {move}", at="2026-08-05T20:35:00Z") as c:
+            c.at("2026-08-05T20:40:00Z")
+            built = c.build(["ANET"])
+            pid = built["proposal_id"]
+            c.approve(built)
+            c.at("2026-08-06T13:41:00Z")
+            prep, env = c.start(pid)
+            q = {**STD_Q, "ANET": round(150.0 * move, 2)}
+            out = c.check(pid, "sells", c.write("s.json", c.snapfile(**std(quotes=q))), env)
+            r.eq(f"held gap: ANET {move:.2f}x at the open -> sells {sells_action}", out.get("action"), sells_action)
+            if buys_action:
+                out = c.check(pid, "buys", c.write("b.json", c.snapfile(**std(quotes=q))), env)
+                r.eq(f"held gap: ANET {move:.2f}x -> the buy goes", (out.get("action"), [l["symbol"] for l in out["legs"]]),
+                     (buys_action, ["ANET"]))
+            else:
+                r.eq(f"held gap: ANET {move:.2f}x -> requoted", c.prop(pid)["state"], "requoted")
+    with case("not held keeps 1.5") as c:
+        pid, env = c.ready(["ANET"])
+        out = c.check(pid, "sells", c.write("s.json", c.snapfile(**std(quotes={**STD_Q, "ANET": 153.0}))), env)
+        r.eq("not held: a 2% move on an order that goes at once still requotes", out.get("action"), "requote")
 
     # A held job may start up to 30 minutes after its send time: held jobs share one send
     # time and the broker runs them one at a time.

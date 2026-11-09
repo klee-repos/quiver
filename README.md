@@ -150,8 +150,9 @@ The seven change kinds are `add_company`, `drop_company`, `set_weights`, `set_ri
    call fields must match the leg. The guard also needs no `KILL`, no halt, and more than
    120 s to the close. It denies every other broker write. A broken guard blocks.
    `run_broker.py` self-tests the guard before each job.
-3. **Approval only by a tap.** `approvals.handle_tap` is the only code that sets
-   `approved`. No tool can reach it.
+3. **Approval only by the owner.** `approvals.handle_tap` (a tap) and
+   `approvals.handle_words` (the owner's typed "yes") are the only code that sets `approved`.
+   Python reads the owner's words; no model decides them.
 4. **No shell and no file writes for the desk or the analyst.** They have typed tools,
    read-only file tools confined to the repo, and web search. A `PreToolUse` hook enforces
    the allowlist. If the hook fails, it denies.

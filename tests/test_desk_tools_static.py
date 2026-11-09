@@ -34,7 +34,7 @@ READ = ["portfolio_view", "refresh_portfolio", "get_quotes", "get_book", "list_c
 D_WRITE = ["react", "say", "load_company", "fetch_document", "record_finding", "add_note", "set_research_status",
            "log_news_event", "start_deep_dive", "withdraw_proposal", "propose_trade", "propose_change",
            "bring_up_next", "close_item", "defer_item", "hold_agenda", "show_card", "promise_read",
-           "add_rule", "retire_rule", "retire_lesson", "plan_trade"]
+           "add_rule", "retire_rule", "retire_lesson", "plan_trade", "approve_card"]
 A_WRITE = ["report", "load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
            "record_verdict", "record_forecast", "withdraw_proposal", "propose_trade", "propose_change"]
 # The reflect job (§6.5): a read subset, the report, and the lesson curator. No card, no write to research.
@@ -586,6 +586,7 @@ ARGS = {
     "report": {"text": "The ANET 10-Q is in."}, "load_company": {"ticker": "ZZZZQ"},
     "bring_up_next": {}, "close_item": {"item_id": 1}, "defer_item": {"item_id": 1, "hours": 2},
     "hold_agenda": {"hours": 1}, "show_card": {"proposal_id": 1}, "promise_read": {"ticker": "ANET"},
+    "approve_card": {"proposal_id": 1, "owner_message_id": 1},
     "fetch_document": {"url": "http://127.0.0.1/x"},
     "record_finding": {"ticker": "ANET", "kind": "growth", "claim": "x", "quote": "y", "document_id": 1},
     "add_note": {"text": "The owner prefers short messages."},

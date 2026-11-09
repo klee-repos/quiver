@@ -53,6 +53,7 @@ class StorageConfig:
 # (key, default, low, high). ``None`` as low/high means no bound on that side.
 DESK_RANGES = {
     "requote_tolerance_pct": (1.5, 0.25, 5.0),
+    "held_requote_tolerance_pct": (8.0, 2.0, 25.0),
     "margin_of_safety_pct": (15.0, 0.0, 50.0),
     "valuation_discount_rate": (0.09, 0.05, 0.15),
     "valuation_terminal_growth": (0.03, 0.0, 0.04),
@@ -65,6 +66,7 @@ class DeskDefaults:
     """The ``desk:`` block: start values for the §10.3 settings that the older
     ``risk:`` block lacks. Each value is checked against its §10.3 range."""
     requote_tolerance_pct: float = 1.5
+    held_requote_tolerance_pct: float = 8.0
     margin_of_safety_pct: float = 15.0
     valuation_discount_rate: float = 0.09
     valuation_terminal_growth: float = 0.03

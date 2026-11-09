@@ -5,9 +5,11 @@ A = the analyst (worker). The tool server is built per process with closures ove
 ``ToolContext``, which holds the role, the per-turn ``TurnState`` or per-job ``JobState``,
 the ledger, the outbox, and the network seams.
 
-No tool approves, executes, places or cancels an order. No tool edits a file, runs a shell
-command, or changes code. A tool may queue a broker ``snapshot`` job, which can place
-nothing. The W3 test parses this file and enforces these rules.
+No tool approves, executes, places or cancels an order by itself. ``approve_card`` names a
+card and an owner message of the turn; the bridge's ``TurnState.approver`` then reads the
+owner's own words in Python (``approvals.handle_words``) and decides, as a tap does. No tool
+edits a file, runs a shell command, or changes code. A tool may queue a broker ``snapshot``
+job, which can place nothing. The W3 test parses this file and enforces these rules.
 
 Blocking work (SQLite, EDGAR, yfinance, a page fetch) runs in a worker thread, so a tool
 never blocks the chat bridge's event loop: a button tap is answered while a turn runs.
@@ -28,7 +30,7 @@ from lib import market, memory, notify
 from lib.desk import (agenda, documents, edgar, etf, events, findings, learning, news, outbox, proposals, quotes,
                       reactions, settings as desk_settings, store, transcripts, valuation, xbrl)
 
-SAY_LIMIT = 1200
+SAY_LIMIT = 500
 REPORT_LIMIT = 3000
 # A report-style label at the start of a line or a sentence (prompts/desk.md "How you talk").
 # say and report refuse it.
@@ -48,7 +50,7 @@ READ_TOOLS = (
 )
 DESK_ONLY = ("react", "say", "set_research_status", "start_deep_dive", "bring_up_next", "close_item",
              "defer_item", "hold_agenda", "show_card", "promise_read", "add_rule", "retire_rule",
-             "retire_lesson", "plan_trade")
+             "retire_lesson", "plan_trade", "approve_card")
 ANALYST_ONLY = ("report", "record_verdict", "record_forecast")
 SHARED_WRITE = ("load_company", "fetch_document", "record_finding", "add_note", "log_news_event",
                 "withdraw_proposal", "propose_trade", "propose_change")
@@ -207,7 +209,8 @@ def t_portfolio_view(ctx: ToolContext, args: dict) -> dict:
 
 
 def t_refresh_portfolio(ctx: ToolContext, args: dict) -> dict:
-    wait = int(args.get("wait_seconds") or 60)
+    # 0 means "do not wait"; only a missing value takes the 60 s default.
+    wait = int(args["wait_seconds"]) if args.get("wait_seconds") is not None else 60
     if wait < 0 or wait > REFRESH_MAX_WAIT_S:
         raise ToolError("wait_seconds must be 0 to 120")
     with ctx.conn() as c:
@@ -621,12 +624,18 @@ def check_labels(text: str) -> None:
 
 
 def check_say(turn, text: str) -> None:
-    """The ``say`` rules (§4.4 step 1, §4.2 step 3): at most 1,200 characters, no report-style
-    label, and a reaction on every owner message of the turn first."""
+    """The ``say`` rules (§4.4 step 1, §4.2 step 3): one message per turn, at most
+    ``SAY_LIMIT`` characters, no report-style label, and a reaction on every owner message of
+    the turn first. One short message, then the owner answers (owner, 2026-11-09: "present
+    me one at a time ... do not send it in one wall")."""
     if not str(text or "").strip():
         raise ToolError("say needs text")
+    if turn.said:
+        raise ToolError("you already sent this turn's one message. Stop here and wait for the owner; "
+                        "say the next thing in your next turn, after they answer")
     if len(text) > SAY_LIMIT:
-        raise ToolError(f"that message is {len(text)} characters; the limit is 1200, so split it")
+        raise ToolError(f"that message is {len(text)} characters; the limit is {SAY_LIMIT}. Say only the "
+                        "first point, in a few short sentences, and keep the rest for after the owner answers")
     check_labels(text)
     missing = turn.unreacted()
     if missing:
@@ -869,6 +878,24 @@ def t_show_card(ctx: ToolContext, args: dict) -> dict:
     res = outbox.send_card(ctx.led, ctx.box, ctx.cfg, pid, card=card)
     return {"proposal_id": pid, "sent": bool(res.get("ok")),
             "note": "The card is now the newest message with buttons. The older copy says Moved down."}
+
+
+def t_approve_card(ctx: ToolContext, args: dict) -> dict:
+    """The owner said yes (or no, or cancel) to a card in words. The bridge's approver checks
+    that the message is the owner's, in this turn, and says so plainly; then it decides the
+    card as a tap does. The tool decides nothing itself."""
+    turn = ctx.turn
+    approver = getattr(turn, "approver", None) if turn is not None else None
+    if approver is None:
+        raise ToolError("approve_card works only in a chat turn")
+    try:
+        pid, mid = int(args.get("proposal_id")), int(args.get("owner_message_id"))
+    except (TypeError, ValueError):
+        raise ToolError("approve_card needs proposal_id and owner_message_id")
+    res = approver(pid, mid)
+    if not res.get("ok") and res.get("error"):
+        raise ToolError(res["error"])
+    return res
 
 
 def t_record_verdict(ctx: ToolContext, args: dict) -> dict:
@@ -1168,9 +1195,8 @@ def _held_note() -> str:
     held = market.held_send_et()
     if held is None:
         return ""
-    return (f" The market cannot take the order now. The owner can tap Approve at any time: Python then holds "
-            f"the order and sends it at {market.fmt_when_et(held[0])}, and the card shows Cancel until then. "
-            "Tell the owner this in plain words.")
+    return (f" The market cannot take the order now. The owner can approve at any time (a tap or a yes): Python "
+            f"then holds the order and sends it at {market.fmt_when_et(held[0])}. The card says so; do not repeat it.")
 
 
 def _owner_follow_up(ctx: ToolContext, pid: int) -> dict:
@@ -1439,6 +1465,11 @@ SPECS = {
                     _obj({"hours": N}, ["hours"])),
     "show_card": ("Send a pending card again as the newest message, so the owner need not scroll. The old copy "
                   "loses its buttons.", _obj({"proposal_id": I}, ["proposal_id"])),
+    "approve_card": ("The owner said yes, do it, no, or cancel to a card in their message of this turn: decide "
+                     "that card now, as their tap would. Name the card and the owner's message id. Python reads "
+                     "the owner's own words and refuses a message that does not plainly say yes or no. Never use "
+                     "it without the owner's words.", _obj({"proposal_id": I, "owner_message_id": I},
+                                                            ["proposal_id", "owner_message_id"])),
     "promise_read": ("Before you tell the owner you will come back with the analyst's read on a ticker, call this: "
                   "its next report then comes up first, even when nothing changed. Refused when no analysis of "
                   "the ticker is queued or running.", _obj({"ticker": S}, ["ticker"])),

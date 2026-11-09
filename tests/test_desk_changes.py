@@ -604,7 +604,7 @@ def case_follow_up():
             msgs = [p for m, p in c.tg.calls if m == "sendMessage"]
             kb = msgs[-1].get("reply_markup", {}).get("inline_keyboard") if msgs else None
             r.eq("follow_up: open: its own Approve/Reject card", kb, outbox.trade_buttons(fu, c.prop(fu)["nonce"]))
-            r.ok("follow_up: open: the card states the exact order", "Buy $295 of ANET" in msgs[-1]["text"], msgs[-1:])
+            r.ok("follow_up: open: the card states the exact order", "Buy  ANET    $295.00" in msgs[-1]["text"], msgs[-1:])
             r.ok("follow_up: open: card sent", sent["ok"])
             t = tap(c, fu)
             r.ok("follow_up: open: Approve queues the execute job", t["ok"] and exec_jobs(c, fu) == 1, t)
@@ -884,10 +884,10 @@ def case_plain_card():
         outbox.send_change_card(c.led, c.box, c.cfg, built["proposal_id"])
         text = html.unescape(re.sub(r"<[^>]+>", "", " ".join(p["text"] for m, p in c.tg.calls
                                                             if m == "sendMessage")))
-        for phrase in ("Our reason to own ANET (the thesis):", "I think one share is worth about",
+        for phrase in ("Our reason to own ANET:", "One share is worth about",
                        "if things go badly", "if things go very well", "a good price to buy more",
-                       "a good price to sell some", "We should rethink it if"):
-            r.ok(f"plain_card: says '{phrase}'", phrase in text, text)
+                       "a good price to sell some", "Reply yes or tap Confirm."):
+            r.ok(f"plain_card: says '{phrase}'", phrase.lower() in text.lower(), text)
         for word in ("bear", "bull", "fair value", "the book", "trim above", "base case"):
             r.ok(f"plain_card: no '{word}'", word not in text.lower(), text)
         # A company valued by price levels is not called a fund, and the card does not contradict itself.

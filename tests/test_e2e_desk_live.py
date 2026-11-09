@@ -48,8 +48,7 @@ from desk_fakes import REPO, Results, fx, seed_desk, temp_root  # noqa: E402
 sys.path.insert(0, str(REPO / "deploy" / "runner"))
 
 OWNER = 111
-QUESTION = ("What did ANET say about AI networking in its last 10-Q? "
-            "Two or three short messages.")
+QUESTION = "What did ANET say about AI networking in its last 10-Q?"
 
 
 class FakeTelegram:
@@ -155,6 +154,7 @@ def case_desk_turn(R):
         return
     import chat_bridge
     from lib.desk import agent, reactions
+    from lib.desk import tools as tools_mod
     with temp_root() as root:
         seed_desk(root)
         runtime, secrets = build_runtime(root)
@@ -190,10 +190,13 @@ def case_desk_turn(R):
              emoji)
         R.ok("desk_turn: the reaction is on the owner's message",
              bool(reacts) and int(reacts[0].get("message_id", 0)) == 7001, reacts[:1])
-        R.ok("desk_turn: one to three say calls (the voice rule)", 1 <= tools.count("mcp__desk__say") <= 3, tools)
+        # Owner, 2026-11-09: one thing at a time. One short message per turn, then wait.
+        R.eq("desk_turn: one say call (one thing at a time)", tools.count("mcp__desk__say"), 1)
         R.ok("desk_turn: one or more search_research calls", "mcp__desk__search_research" in tools, tools)
         sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
-        R.ok("desk_turn: one or more messages reach the owner chat", len(sent) >= 1, len(sent))
+        R.eq("desk_turn: one message reaches the owner chat", len(sent), 1)
+        R.ok("desk_turn: the message is short", all(len(str(p.get("text"))) <= tools_mod.SAY_LIMIT + 200 for p in sent),
+             [len(str(p.get("text"))) for p in sent])
         R.eq("desk_turn: no report labels or counters", labels(p.get("text") for p in sent), [])
         R.eq("desk_turn: one message per say (no recap after the last say)", len(sent),
              tools.count("mcp__desk__say"))
@@ -272,7 +275,7 @@ def case_ladder(R):
         print(f"  ladder: {secs}s, tools={tools}")
         R.ok("ladder: the desk calls price_ladder", "mcp__desk__price_ladder" in tools, tools)
         sent = [str(p.get("text")) for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
-        R.ok("ladder: one to four messages", 1 <= len(sent) <= 4, len(sent))
+        R.eq("ladder: one message (one thing at a time)", len(sent), 1)
         allowed = ladder_numbers(c.outputs if c else [])
         said = [float(m) for t in sent for m in MULTIPLE.findall(t)]
         R.ok("ladder: the desk states multiples", len(said) >= 2, said)
@@ -520,11 +523,11 @@ def case_research(R):
         with led.connect() as c:
             status = c.execute("SELECT status FROM agenda WHERE id=?", (it.get("id"),)).fetchone()
         R.eq("research: the item is open", status and status[0], "open")
-        R.ok("research: one to three messages from the desk, then the card",
-             1 <= len(words) <= 3 and up and up[-1].get("reply_markup"), [str(p.get("text"))[:60] for p in up])
+        R.ok("research: one message from the desk, then the card",
+             len(words) == 1 and up and up[-1].get("reply_markup"), [str(p.get("text"))[:60] for p in up])
         R.eq("research: the desk's words use no report labels", labels(words), [])
         R.eq("research: the desk's words use no finance jargon", jargon(words), [])
-        R.ok("research: the desk does not paste the report", not any(len(w) > 1200 for w in words),
+        R.ok("research: the desk does not paste the report", not any(len(w) > 700 for w in words),
              [len(w) for w in words])
 
 
@@ -569,7 +572,7 @@ def case_rule(R):
         R.ok("rule: one active rule about SGOV, citing the owner's message",
              len(rules) == 1 and "SGOV" in rules[0]["text"].upper() and rules[0]["owner_message_id"] == 7002, rules)
         sent = [p for p in tg.sent() if str(p.get("chat_id")) == str(OWNER)]
-        R.ok("rule: one to three short messages confirm it", 1 <= len(sent) <= 3, len(sent))
+        R.ok("rule: one short message confirms it (plus Python's rule notice)", 1 <= len(sent) <= 2, len(sent))
         R.eq("rule: no report labels", labels(p.get("text") for p in sent), [])
         for p in sent:
             print("    say>", str(p.get("text"))[:300].replace("\n", " "))

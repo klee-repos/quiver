@@ -710,7 +710,7 @@ def flow(r: Results, root, clk: FakeClock) -> None:
     card = [p for p in tp.sends() if p.get("reply_markup")]
     r.eq("5 one card with buttons", len(card), 1)
     c1 = card[0] if card else {"text": "", "reply_markup": {"inline_keyboard": [[{}]]}}
-    r.ok("5 card text", "Buy $100 of ANET, about 0.7 shares at $150.00." in c1["text"], c1["text"])
+    r.ok("5 card text", re.search(r"Buy  ANET +\$100\.00", c1["text"]) is not None, c1["text"])
     btn = c1["reply_markup"]["inline_keyboard"][0][0]
     r.eq("5 callback_data", btn.get("callback_data"), f"p:1:{prop1['nonce']}:a")
     r.ok("5 nonce 10 hex", re.fullmatch(r"[0-9a-f]{10}", prop1["nonce"] or ""), prop1["nonce"])
@@ -770,9 +770,9 @@ def flow(r: Results, root, clk: FakeClock) -> None:
                                           prop2.get("evidence_json")),
          (prop1["origin"], prop1["event_id"], prop1["rationale"], prop1["evidence_json"]))
     sent7 = [p["text"] for p in tp.sends(before7)]
-    r.ok("7 the requote message", "ANET moved 1.6% since I proposed this ($150.00 to $152.40). Here are the new "
-                                  "numbers." in sent7, sent7)
-    r.ok("7 the new card", any("Buy $98.20 of ANET" in t for t in sent7), sent7)
+    r.ok("7 the requote message", "Prices moved (ANET +1.6%), so I placed nothing. New numbers "
+                                  "below." in sent7, sent7)
+    r.ok("7 the new card", any(re.search(r"Buy  ANET +\$98\.20", t) for t in sent7), sent7)
     r.eq("7 #1 legs requoted", [l["state"] for l in led.legs(1)], ["requoted"])
     snap_env, exec_env = script.envs[0], script.envs[-1]
     r.eq("7 the execute child env names job and proposal", (exec_env.get("QUIVER_BROKER_PROPOSAL"),
@@ -859,7 +859,7 @@ def flow(r: Results, root, clk: FakeClock) -> None:
         for cmd, out in script.log:
             print("DEBUG tick", cmd, json.dumps(out, default=str)[:600])
         print("DEBUG guard", script.guard_log)
-    r.ok("11 the result message", "Done. Bought $98.20 of ANET: 0.643 shares at $152.80." in sent9, sent9)
+    r.ok("11 the result message", "Done.\nBought ANET: $98.20, 0.643 sh at $152.80" in sent9, sent9)
     r.eq("11 one decisions row", [(d["ticker"], d["signal"], d["decision_price"]) for d in
                                   rows(led, "SELECT * FROM decisions")], [("ANET", "buy", 152.8)])
 

@@ -558,7 +558,9 @@ then asserts that `os.environ` holds only the allowlist before the first SDK cli
    owner asks for a trade, pass `origin={"owner_message_id": <the id of that message>}`.
 6. A trade moves a holding toward its target. To own more or less of a name, propose a
    weight change.
-7. A "yes" in chat is not an approval. Only the button approves. Point the owner to it.
+7. A "yes" in chat approves a card (2026-11-09). Python reads a plain reply by itself. For a
+   reply with more in it, call `approve_card` with the owner's message id; Python reads the
+   owner's own words. Never point the owner to a button.
 8. Before you say you do not know, run `search_research`. Record each new fact with
    `record_finding` and its exact quote. Record the owner's preferences with `add_note`.
 9. `<desk_updates>` lists what the desk already sent or did. Do not repeat it unless asked.
@@ -2190,9 +2192,13 @@ report` / `report-send`). The `halt`, `auth_error` and `error` pages stay as the
    `state/tmp`, and `Read`. Its hook uses `onFailure: "block"`, so a broken guard blocks
    instead of opening, and `run_broker.py` self-tests it before each job. The price check is
    structural: no leg is placeable until Python has checked its fresh quote.
-3. **Approval only by a tap.** `approvals.handle_tap` is the only code that sets `approved`.
-   It checks `from.id`, the chat, the message, the nonce, the state, and the expiry, and it
-   claims in one conditional `UPDATE`. A test proves that no tool can reach it. Since
+3. **Approval only by the owner.** `lib/desk/approvals.py` is the only code that sets
+   `approved`. `handle_tap` checks `from.id`, the chat, the message, the nonce, the state,
+   and the expiry, and it claims in one conditional `UPDATE`. Since 2026-11-09 the owner's
+   typed reply approves too: `handle_words` reads the owner's stored message in Python (a
+   plain yes or no, no hedge, no question, the card in the chat before it) and then runs the
+   tap's checks 2 to 6. The desk's `approve_card` names a card and an owner message of the
+   turn; Python reads the words. A test proves that no tool imports the approval code. Since
    2026-11-04 (§10.6) a plan change from the owner's own message applies without a tap; a
    risk setting and lifting a halt still need the Confirm tap, and a test proves that no tool
    reaches the code that writes them.

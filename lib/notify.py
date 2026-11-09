@@ -252,6 +252,16 @@ def _when(ts, now) -> str:
     return f"{_clock(ts)} ET on {t.strftime('%A, %B')} {t.day}"
 
 
+def _short_when(ts, now) -> str:
+    """'9:40 AM ET', or 'Tue 9:40 AM ET' when it is not today (ET)."""
+    t, n = _et(ts), _et(now)
+    if t is None:
+        return ""
+    if n is not None and t.date() == n.date():
+        return f"{_clock(ts)} ET"
+    return f"{t.strftime('%a')} {_clock(ts)} ET"
+
+
 # --- proposal cards (§10.1 rule 5) -------------------------------------------------
 
 def _leg_sentence(leg: dict, first: bool, plan_moves: bool = False) -> str:
@@ -288,73 +298,77 @@ def _sentence(text) -> str:
     return t if not t or t[-1] in ".!?" else t + "."
 
 
-def _evidence_sentence(items) -> str:
-    parts = []
-    for e in items or []:
-        kind, _, val = str(e).partition(":")
-        if kind == "finding":
-            parts.append(f"finding #{val}")
-        elif kind == "document":
-            parts.append(f"document #{val}")
-        elif kind == "metric":
-            parts.append(f"the metric {val}")
-    return f"Evidence: {_te(_plain_join(parts))}." if parts else ""
+_CARD_TITLE = {"drift": "Rebalance to the plan", "owner": "Your order", "event": "Trade idea",
+               "change": "Trades for the plan change"}
+
+
+def _card_row(leg: dict, plan_moves: bool) -> str:
+    """One order on one line: side, ticker, size, and the share of the account before and
+    after. 'Buy  VRT     $59.57  5.8% → 9.0%'."""
+    buy = leg["side"] == "buy"
+    if buy:
+        size = _fmt_money(leg["dollars"])
+    elif leg.get("quote"):
+        # A sell is a share count; the card shows what it is worth at the card's quote.
+        size = "≈" + _fmt_money(round(float(leg["quantity"]) * float(leg["quote"]), 2))
+    else:
+        size = f"{_qty(leg['quantity'])} sh"
+    row = f"{'Buy ' if buy else 'Sell'} {str(leg['ticker']):<5} {size:>9}"
+    now_w, after_w, target_w = leg.get("weight_now"), leg.get("weight_after"), leg.get("target_weight")
+    if now_w is not None and after_w is not None and target_w is not None:
+        if plan_moves or abs(after_w - target_w) < 0.05:
+            row += f"  {now_w:.1f}% → {target_w:.1f}%"
+        else:
+            row += f"  {now_w:.1f}% → {after_w:.1f}%"
+            if not leg.get("exit"):
+                row += f" (plan {target_w:.1f}%)"
+    return _te(row)
 
 
 def render_trade_card(model: dict) -> list:
-    """A trade card as a list of messages (one, or more for a long card). The buttons sit
-    on the last one. Prose only."""
+    """A trade card: a title, one line per order, the cash, and when it sends. The owner
+    reads it on a phone, so it is a short table, not prose (owner, 2026-11-09). The desk
+    talks the owner through it in the chat. The buttons sit on the last message; a typed
+    "yes" approves it too."""
     pid = model["id"]
-    parts = [f"<b>Proposal #{pid}.</b>"]
+    title = _CARD_TITLE.get(model.get("origin"), "Trade")
+    if model.get("drift"):
+        title = _CARD_TITLE["drift"]
+    out = [f"<b>#{pid} · {title}</b>"]
     legs = model.get("legs") or []
     moved = {str(c.get("ticker")) for c in ((model.get("plan") or {}).get("changes") or [])}
-    for i, leg in enumerate(legs):
-        parts.append(_leg_sentence(leg, i == 0, plan_moves=str(leg.get("ticker")) in moved))
-    if model.get("drift"):
-        for leg in legs:
-            band = leg.get("band")
-            band_txt = (f", more than the {float(band):.1f} points it may drift" if band is not None else "")
-            side = "above" if (leg.get("weight_now") or 0) > (leg.get("target_weight") or 0) else "below"
-            parts.append(f"{_te(leg['ticker'])} is {float(leg.get('weight_now') or 0):.1f}% of the account, "
-                         f"{side} the {float(leg.get('target_weight') or 0):.1f}% we planned{band_txt}.")
+    if legs:
+        out.append("<pre>" + "\n".join(_card_row(l, str(l.get("ticker")) in moved) for l in legs) + "</pre>")
+    cash_now = model.get("cash")
+    if cash_now and any(l.get("side") == "buy" for l in legs) and cash_now.get("after") is not None:
+        out.append(f"Cash {_fmt_money(cash_now['before'])} → {_fmt_money(cash_now['after'])}")
     plan = model.get("plan")
     if plan:
-        moves = [f"{_te(c['ticker'])} leaves the plan" if c.get("exit") else
-                 f"{_te(c['ticker'])} goes from {float(c['from']):.1f}% to {float(c['target_weight']):.1f}% of the account"
+        moves = [f"{_te(c['ticker'])} leaves it" if c.get("exit") else
+                 f"{_te(c['ticker'])} {float(c['from']):.1f}% → {float(c['target_weight']):.1f}%"
                  for c in plan.get("changes") or []]
         cash = plan.get("cash")
         if cash and abs(float(cash["target_weight"]) - float(cash["from"])) >= 0.05:
-            moves.append(f"cash goes from {float(cash['from']):.1f}% to {float(cash['target_weight']):.1f}%")
+            moves.append(f"cash {float(cash['from']):.1f}% → {float(cash['target_weight']):.1f}%")
         if moves:
-            parts.append("When the order fills, the plan moves with it: " + _plain_join(moves) + ".")
+            out.append("When it fills, the plan moves: " + ", ".join(moves) + ".")
     if model.get("scaled"):
-        parts.append("Cash covers only part of the buys, so I scaled each buy down by the same share.")
-    cash_now = model.get("cash")
-    if cash_now and any(l.get("side") == "buy" for l in legs) and cash_now.get("after") is not None:
-        parts.append(f"Cash goes from {_fmt_money(cash_now['before'])} to {_fmt_money(cash_now['after'])}.")
+        out.append("Cash covers only part, so each buy is scaled down.")
     for s in model.get("skipped") or []:
-        parts.append(f"I left out {_te(s['ticker'])}: {_te(s['reason'])}.")
+        out.append(f"Left out {_te(s['ticker'])}: {_te(s['reason'])}.")
     oq = model.get("owner_quote")
     if oq:
-        parts.append(f"You asked: '{_te(oq['text'])}' ({_clock(oq.get('at'))}).")
-    if model.get("rationale"):
-        parts.append(f"Why: {_te(_sentence(model['rationale']))}")
+        out.append(f"You asked: '{_te(oq['text'])}' ({_clock(oq.get('at'))}).")
+    if model.get("rationale") and not model.get("drift") and model.get("origin") != "owner":
+        out.append(f"Why: {_te(_sentence(model['rationale']))}")
     dn = model.get("desk_news")
     if dn:
-        parts.append(f"This rests on news found by the desk: {_te(dn.get('url') or 'no link')}.")
-    ev = _evidence_sentence(model.get("evidence"))
-    if ev:
-        parts.append(ev)
+        out.append(f"Source: {_te(dn.get('url') or 'no link')}")
     if model.get("send_at"):
-        when = _when(model["send_at"], model.get("now"))
-        if model.get("closing"):
-            parts.append(f"The market closes in a few minutes. If you tap Approve now, I hold the order and send "
-                         f"it at {when}.")
-        else:
-            parts.append(f"The market is closed now. If you tap Approve before it opens, I hold the order and "
-                         f"send it at {when}.")
-    parts.append(_until(model["expires_at"], model.get("now")))
-    return _pack(" ".join(p for p in parts if p))
+        out.append(f"Sends {_short_when(model['send_at'], model.get('now'))}. Reply yes or tap Approve.")
+    else:
+        out.append("Reply yes or tap Approve. " + _until(model["expires_at"], model.get("now")))
+    return _pack("\n".join(p for p in out if p))
 
 
 def _pack(text: str, limit: int = 3500, max_messages: int = 3) -> list:
@@ -379,18 +393,10 @@ def _pack(text: str, limit: int = 3500, max_messages: int = 3) -> list:
 _PARA = "\x00"  # a paragraph break inside a card; _join_parts turns it into a blank line
 
 
-def _semi_join(items) -> str:
-    """'a; b; and c': long clauses that may hold commas of their own."""
-    items = [str(x).strip().rstrip(".;") for x in items or [] if str(x).strip()]
-    if len(items) <= 2:
-        return " and ".join(items)
-    return "; ".join(items[:-1]) + "; and " + items[-1]
-
-
 def _join_parts(parts) -> str:
     """Join card sentences with a space; a part that ends in ``_PARA`` ends a paragraph."""
     text = " ".join(p for p in parts if p)
-    return re.sub(r"\s*\x00\s*", "\n\n", text).strip()
+    return re.sub(r"(?:\s*\x00\s*)+", "\n\n", text).strip()
 
 
 def render_change_card(model: dict) -> list:
@@ -399,7 +405,7 @@ def render_change_card(model: dict) -> list:
     pid = model["id"]
     ch = model["change"]
     kind = ch["kind"]
-    parts = [f"<b>Proposal #{pid}.</b>"]
+    parts = [f"<b>#{pid} · Plan change</b>" + _PARA]
     if kind == "add_company":
         entry = ch["entry"]
         e = ("The first buy is now." if entry["mode"] == "now"
@@ -420,9 +426,9 @@ def render_change_card(model: dict) -> list:
             parts.append("Its share goes to " + _te(_plain_join(
                 f"{f['ticker']} (to {f['target_weight']:.1f}%)" for f in ch["redistribute"])) + ".")
     elif kind == "set_weights":
-        parts.append("New planned shares of the account: " + _te(_plain_join(
-            f"{c['ticker']} to {c['target_weight']:.1f}%" + (f", with {c['band']:.1f} points of drift allowed" if c.get("band") is not None else "")
-            for c in ch["changes"])) + ".")
+        parts.append("New planned shares:" + _PARA)
+        parts.append("<pre>" + "\n".join(_te(f"{c['ticker']:<5} {float(c['target_weight']):5.1f}%")
+                                         for c in ch["changes"]) + "</pre>" + _PARA)
     elif kind == "set_risk":
         parts.append(f"Change the setting {_te(ch['key'])} from {_te(ch.get('old'))} to {_te(ch['value'])}.")
     elif kind == "set_premise":
@@ -433,24 +439,23 @@ def render_change_card(model: dict) -> list:
     elif kind == "set_thesis":
         # Short paragraphs: the reason, what it depends on, what would make us rethink it,
         # and the prices. A long list joined into one sentence is hard to read on a phone.
-        parts.append(f"Our reason to own {_te(ch['ticker'])} (the thesis): {_te(_sentence(ch['summary']))}{_PARA}")
-        if ch.get("drivers"):
-            parts.append("It depends on " + _te(_semi_join(ch["drivers"])) + "." + _PARA)
-        if ch.get("falsifiers"):
-            parts.append("We should rethink it if " + _te(_semi_join(ch["falsifiers"])) + "." + _PARA)
+        # The reason and the prices only. The desk talks the owner through what it depends on
+        # and what would make us rethink it (owner, 2026-11-09: no wall of text).
+        parts.append(f"Our reason to own {_te(ch['ticker'])}: {_te(_sentence(ch['summary']))}{_PARA}")
         fv = [ch.get("fair_value_low"), ch.get("fair_value_base"), ch.get("fair_value_high")]
         if all(v is not None for v in fv):
-            parts.append(f"I think one share is worth about {_fmt_money(fv[1])}. It is {_fmt_money(fv[0])} if "
-                         f"things go badly and {_fmt_money(fv[2])} if things go very well.")
+            parts.append(f"One share is worth about {_fmt_money(fv[1])}: {_fmt_money(fv[0])} if things go badly, "
+                         f"{_fmt_money(fv[2])} if things go very well.")
         else:
             parts.append("I give it no single worth per share.")
+        prices = []
         if ch.get("buy_below") is not None:
-            parts.append(f"If the price falls below {_fmt_money(ch['buy_below'])}, I'll tell you: that is a good "
-                         "price to buy more.")
+            prices.append(f"a good price to buy more is below {_fmt_money(ch['buy_below'])}")
         if ch.get("trim_above") is not None:
-            parts.append(f"If the price rises above {_fmt_money(ch['trim_above'])}, I'll tell you: that is a good "
-                         "price to sell some.")
-        if ch.get("buy_below") is None and ch.get("trim_above") is None:
+            prices.append(f"a good price to sell some is above {_fmt_money(ch['trim_above'])}")
+        if prices:
+            parts.append(_sentence(("; ".join(prices))[:1].upper() + ("; ".join(prices))[1:]))
+        else:
             parts.append("It sets no alert prices.")
         parts[-1] += _PARA
     elif kind == "resume_trading":
@@ -461,10 +466,7 @@ def render_change_card(model: dict) -> list:
         parts.append(_te(model["preview"]))
     if model.get("rationale"):
         parts.append(f"Why: {_te(_sentence(model['rationale']))}")
-    ev = _evidence_sentence(model.get("evidence"))
-    if ev:
-        parts.append(ev)
-    parts.append("Tap Confirm to apply it. " + _until(model["expires_at"], model.get("now")))
+    parts.append(_PARA + "Reply yes or tap Confirm. " + _until(model["expires_at"], model.get("now")))
     return _pack(_join_parts(parts))
 
 
@@ -526,8 +528,11 @@ _SKIP_TEXT = {
 
 
 def render_execution_result(model: dict) -> str:
-    """'Done. Sold 1.603 shares of SMH at $301.10 ($482.66). Bought $410.00 of CEG: 1.595
-    shares at $257.05.' plus a sentence for each leg that did not go out or is still open."""
+    """One line per order (owner, 2026-11-09: no wall of text):
+    'Done.
+    Sold SMH: 1.603 sh at $301.10 ($482.66)
+    Bought CEG: $410.00, 1.595 sh at $257.05'
+    then one line for each order that did not go out or is still open."""
     pid = model["id"]
     legs = model.get("legs") or []
     done, notes, open_legs = [], [], []
@@ -538,10 +543,10 @@ def render_execution_result(model: dict) -> str:
         px = l.get("fill_avg_price")
         if st in ("filled", "partially_filled") and qty and px:
             if l["side"] == "sell":
-                done.append(f"Sold {float(qty):,.3f} shares of {t} at {_fmt_money(px)} ({_fmt_money(float(qty) * float(px))}).")
+                done.append(f"Sold {t}: {float(qty):,.3f} sh at {_fmt_money(px)} ({_fmt_money(float(qty) * float(px))})")
             else:
-                done.append(f"Bought {_fmt_money(l.get('dollar_amount') or float(qty) * float(px))} of {t}: "
-                            f"{float(qty):,.3f} shares at {_fmt_money(px)}.")
+                done.append(f"Bought {t}: {_fmt_money(l.get('dollar_amount') or float(qty) * float(px))}, "
+                            f"{float(qty):,.3f} sh at {_fmt_money(px)}")
             if st == "partially_filled":
                 open_legs.append((t, "partially filled"))
         elif st in ("placing", "placed"):
@@ -556,18 +561,19 @@ def render_execution_result(model: dict) -> str:
             notes.append(f"Robinhood rejected the {t} order.")
         elif st == "cancelled" and qty and px and float(qty) > 0:
             if l["side"] == "sell":
-                done.append(f"Sold {float(qty):,.3f} of {float(l.get('quantity') or qty):,.3f} shares of {t} at "
-                            f"{_fmt_money(px)} ({_fmt_money(float(qty) * float(px))}); Robinhood cancelled the rest.")
+                done.append(f"Sold {t}: {float(qty):,.3f} of {float(l.get('quantity') or qty):,.3f} sh at "
+                            f"{_fmt_money(px)} ({_fmt_money(float(qty) * float(px))}); Robinhood cancelled the rest")
             else:
-                done.append(f"Bought {_fmt_money(float(qty) * float(px))} of {t}: {float(qty):,.3f} shares at "
-                            f"{_fmt_money(px)}; Robinhood cancelled the rest.")
+                done.append(f"Bought {t}: {_fmt_money(float(qty) * float(px))}, {float(qty):,.3f} sh at "
+                            f"{_fmt_money(px)}; Robinhood cancelled the rest")
         elif st == "cancelled":
             notes.append(f"The {t} order was cancelled.")
         elif st == "outcome_unknown":
             notes.append(f"I can't confirm the {t} order. Check the Robinhood app.")
     text = []
     if done:
-        text.append("Done. " + " ".join(done))
+        text.append("Done.")
+        text.extend(done)
     for t, st in open_legs:
         where = f" ({_te(st)})" if st else ""
         text.append(f"The {t} order is open at Robinhood{where}. I'll tell you when it fills.")
@@ -576,21 +582,17 @@ def render_execution_result(model: dict) -> str:
     if not done and not open_legs and not any(l.get("submitted_at") for l in legs):
         reason = model.get("reason")
         text.insert(0, f"I placed nothing for #{pid}: {_te(reason)}." if reason else f"I placed nothing for #{pid}.")
-    return " ".join(text)
+    return "\n".join(text)
 
 
 def render_requote(moves: list, *, phase: str = "sells", sells=None) -> str:
-    """'ANET moved 1.6% since I proposed this ($150.00 to $152.40). Here are the new
-    numbers.' A buys-phase requote names the sells first."""
-    parts = []
+    """'Prices moved, so I placed nothing: ANET +6.1%, VRT +5.8%. New numbers below.' A
+    buys-phase requote names the sells that went out first."""
+    moved = ", ".join(f"{_te(m['ticker'])} {float(m['pct']):+.1f}%" for m in moves)
     if phase == "buys" and sells:
-        parts.append("The sells went out: " + _te(_plain_join(
-            f"{_qty(s['quantity'])} shares of {s['ticker']}" for s in sells)) + ".")
-    for m in moves:
-        parts.append(f"{_te(m['ticker'])} moved {abs(float(m['pct'])):.1f}% since I proposed this "
-                     f"({_fmt_money(m['old'])} to {_fmt_money(m['new'])}).")
-    parts.append("Here are the new numbers.")
-    return " ".join(parts)
+        done = _te(_plain_join(f"{_qty(s['quantity'])} shares of {s['ticker']}" for s in sells))
+        return f"The sells went out ({done}). Then prices moved ({moved}), so I held the buys. New numbers below."
+    return f"Prices moved ({moved}), so I placed nothing. New numbers below."
 
 
 # --- the close brief (§12) ----------------------------------------------------------

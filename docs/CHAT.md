@@ -337,7 +337,13 @@ after your tap, the desk tells you: "The broker has not started #41 yet."
 updates, each tap in that batch changes nothing. The bridge answers "I was offline when you
 tapped. Tap again." and keeps the buttons.
 
-**A "yes" in chat is not an approval.** Only the button approves.
+**A "yes" in chat approves the card** (owner, 2026-11-09). Python reads a plain reply ("yes",
+"approve", "do it", "cancel 51") and decides the card as a tap does, with no desk turn
+(`approvals.handle_words`). A weak word ("yes", "ok", "no") decides only when the card is the
+desk's last message; a strong word ("approve", "cancel") or the card number always does. A
+reply with more in it, or a yes to a question after the card, goes to the desk, which calls
+`approve_card` with the owner's message id. Python still reads the owner's own words. A
+question, a "but" or a "wait" is never a decision.
 
 ## The research memory
 
@@ -409,8 +415,10 @@ off the order path. [README.md](../README.md#the-nine-walls) lists all nine.
 3. **No secrets in the model process.** At start, the bridge reads its secrets into a
    `Secrets` object. Then `scrub_process_env()` deletes every `os.environ` key outside a
    short allowlist, before the first SDK client starts. No tool returns a secret.
-4. **Approval only by a tap.** `approvals.handle_tap` is the only code that approves. No
-   tool reaches it.
+4. **Approval only by the owner.** `lib/desk/approvals.py` is the only code that approves:
+   `handle_tap` for a tap, `handle_words` for the owner's typed "yes" (2026-11-09). Python
+   reads the owner's stored message; a model never decides the intent. The desk's
+   `approve_card` only names a card and an owner message of the turn.
 5. **Owner allowlist by user id.** A message or a tap counts only from an owner `from.id`,
    in a private chat with that id.
 6. **SSRF-safe fetch.** `fetch_document` refuses private and metadata addresses and pins

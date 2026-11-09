@@ -488,8 +488,7 @@ def _held_case(label, *, snap, build_at, tap_at, send_at, expires_at, answer, bu
          [[{"text": button, "callback_data": "noop"}],
           [{"text": "Cancel", "callback_data": f"p:{p['id']}:{p['nonce']}:r", "style": "danger"}]])
     when = answer.split("send it at ", 1)[1].rstrip(".")
-    want = (f"Approved. {why}, so I send #{p['id']} at {when}. Until then, tap Cancel on the card to stop it. "
-            "If the price moves more than the requote limit before then, I send you fresh numbers instead.")
+    want = f"Approved #{p['id']}. It sends at {when}. Say cancel before then to stop it."
     r.eq(f"held: {label} the message names the reason, the send time and Cancel", res.get("messages"),
          [want] if why else res.get("messages"))
     return root_cm, root, p, fc
@@ -614,8 +613,7 @@ def case_held():
     # The card names the send time when the market is closed, and not in the session.
     for label, snap, build_at, want in (
             ("after the close", "2026-08-05T20:40:00Z", "2026-08-05T20:44:00Z",
-             "The market is closed now. If you tap Approve before it opens, I hold the order and send it at "
-             "9:40 AM ET on Thursday, August 6."),
+             "Sends Thu 9:40 AM ET. Reply yes or tap Approve."),
             ("in the session", "2026-08-05T13:35:00Z", "2026-08-05T14:00:00Z", None)):
         with fresh_root() as root:
             fc = FakeClock(snap).pin_market()
@@ -626,7 +624,7 @@ def case_held():
                 if want:
                     r.ok(f"held: the card {label} names the send time", want in text, text)
                 else:
-                    r.ok(f"held: the card {label} has no hold sentence", "I hold the order" not in text, text)
+                    r.ok(f"held: the card {label} has no hold sentence", "Sends " not in text, text)
             finally:
                 fc.unpin()
 
@@ -944,9 +942,173 @@ def case_only_caller():
     r.eq("only_caller: the scan finds every import form", found, [True] * len(forms))
 
 
+# --- words: a decision typed in the chat (owner, 2026-11-09) ---------------------------
+
+def _owner_says(root, text, mid, when="2026-08-05T14:01:00Z"):
+    with root.led().connect() as conn:
+        store.insert_owner_message(conn, chat_id=CHAT, tg_message_id=mid, text=text, created_at=when)
+
+
+def _desk_says(root, text, mid, when="2026-08-05T14:00:30Z"):
+    with root.led().connect() as conn:
+        store.insert_desk_message(conn, chat_id=CHAT, text=text, source="chat", now=when, tg_message_id=mid)
+
+
+def words(root, mid, now_dt, **kw):
+    kw.setdefault("from_id", OWNER)
+    return approvals.handle_words(root.led(), root.cfg(), chat_id=CHAT, owner_message_id=mid,
+                                  owner_ids=[OWNER], now_dt=now_dt, **kw)
+
+
+def case_words():
+    # The parser: Python, not a model, reads the owner's words.
+    for text, intent, pure in (("yes, approve", "approve", True), ("Yes", "approve", True),
+                               ("approve #51", "approve", True), ("do it", "approve", True),
+                               ("ok send it", "approve", True), ("yes, approve, fucking do it", "approve", True),
+                               ("approve it and what about NVDA", "approve", False), ("no", "reject", True),
+                               ("cancel 51", "reject", True), ("yes but drop CEG", None, False),
+                               ("yes?", None, False), ("no wait", None, False), ("don't approve", None, False),
+                               ("Show it to me", None, False), ("Do you need me to review something", None, False),
+                               ("yes and no", None, False), ("sure, tell me more about it", None, False)):
+        got = approvals.words_intent(text)
+        r.eq(f"words: {text!r} -> {intent}", (got["intent"], got["pure"] if intent else pure), (intent, pure))
+
+    # The live ask: "If I say 'yes, approve,' it's approved." The same claim as a tap.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc)
+            mid = p["tg_message_id"] + 1
+            _owner_says(root, "yes, approve", mid)
+            res = words(root, mid, at("2026-08-05T14:01:00Z"))
+            r.eq("words: 'yes, approve' approves the card as a tap does",
+                 (res["ok"], prop(root, p["id"])["state"], [l["state"] for l in legs(root, p["id"])],
+                  [j["kind"] for j in jobs(root, p["id"])], res["touch"]),
+                 (True, "approved", ["approved"], ["execute"], ["broker"]))
+            r.eq("words: the result names the card to relabel and says so in words",
+                 (res["card_message_id"], res["label"], res["messages"]),
+                 (p["tg_message_id"], "Approved", [f"Approved #{p['id']}. Sending it now."]))
+            _owner_says(root, "approve", mid + 1)
+            r.eq("words: a second yes finds no pending card and changes nothing",
+                 (words(root, mid + 1, at("2026-08-05T14:01:30Z")), len(jobs(root, p["id"]))), (None, 1))
+        finally:
+            fc.unpin()
+
+    # A weak word after the desk asked something else is not a decision for Python; the desk
+    # reads it, and its approve_card (from_desk) may decide the named card.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc)
+            _desk_says(root, "Want me to look into NVDA too?", p["tg_message_id"] + 1)
+            mid = p["tg_message_id"] + 2
+            _owner_says(root, "yes", mid)
+            r.eq("words: a weak yes after a desk question -> no decision", words(root, mid, at("2026-08-05T14:01:00Z")),
+                 None)
+            r.eq("words: ... the card stays pending", prop(root, p["id"])["state"], "pending")
+            _owner_says(root, "yes approve", mid + 1)
+            res = words(root, mid + 1, at("2026-08-05T14:01:10Z"))
+            r.eq("words: a strong word decides even after a desk question", (res["ok"], prop(root, p["id"])["state"]),
+                 (True, "approved"))
+        finally:
+            fc.unpin()
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc)
+            _desk_says(root, "It trims CEG. Want to go ahead?", p["tg_message_id"] + 1)
+            mid = p["tg_message_id"] + 2
+            _owner_says(root, "ok do it", mid)
+            res = words(root, mid, at("2026-08-05T14:01:00Z"), proposal_id=p["id"], from_desk=True)
+            r.eq("words: the desk's approve_card decides the named card from the owner's 'ok do it'",
+                 (res["ok"], prop(root, p["id"])["state"]), (True, "approved"))
+        finally:
+            fc.unpin()
+
+    # Refusals: a hedge, a question, a stranger, a card sent after the message, a card the desk
+    # names that is not in the chat, and the owner's words that say nothing about a card.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc)
+            base = p["tg_message_id"]
+            for i, text in enumerate(("yes but drop CEG", "approve?", "show me the card")):
+                _owner_says(root, text, base + 1 + i)
+                r.eq(f"words: {text!r} decides nothing", words(root, base + 1 + i, at("2026-08-05T14:01:00Z")), None)
+            _owner_says(root, "yes approve", base + 10)
+            r.eq("words: a stranger's id decides nothing",
+                 words(root, base + 10, at("2026-08-05T14:01:00Z"), from_id=123), None)
+            _owner_says(root, "yes approve", base - 1, when="2026-08-05T13:59:00Z")
+            r.eq("words: a yes from before the card decides nothing", words(root, base - 1, at("2026-08-05T14:01:00Z")),
+                 None)
+            res = words(root, base + 10, at("2026-08-05T14:01:00Z"), proposal_id=p["id"] + 7, from_desk=True)
+            r.eq("words: the desk names a card that is not in the chat -> refused",
+                 (res.get("ok"), res.get("refused")), (False, True))
+            _owner_says(root, "what do you think of NVDA", base + 11)
+            r.eq("words: the desk's approve_card on talk -> no decision",
+                 words(root, base + 11, at("2026-08-05T14:01:00Z"), proposal_id=p["id"], from_desk=True), None)
+            r.eq("words: after every refusal the card is still pending", prop(root, p["id"])["state"], "pending")
+        finally:
+            fc.unpin()
+
+    # Two cards in the chat: a bare yes is not Python's to pick; the card number is.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, tg = trade(root, fc)
+            ch = _change(root, fc, "2026-08-05T14:00:10Z")
+            mid = max(p["tg_message_id"], ch["tg_message_id"]) + 1
+            _owner_says(root, "yes approve", mid)
+            r.eq("words: two cards + a bare yes -> no decision", words(root, mid, at("2026-08-05T14:01:00Z")), None)
+            _owner_says(root, f"approve {p['id']}", mid + 1)
+            res = words(root, mid + 1, at("2026-08-05T14:01:05Z"))
+            r.eq("words: 'approve <n>' picks that card", (res["ok"], prop(root, p["id"])["state"],
+                                                          prop(root, ch["id"])["state"]), (True, "approved", "pending"))
+            _owner_says(root, "yes", mid + 2)
+            res = words(root, mid + 2, at("2026-08-05T14:01:10Z"))
+            r.eq("words: a yes on the one change card left confirms it",
+                 (res["ok"], prop(root, ch["id"])["state"], _setting(root, "min_trade_notional")[0]),
+                 (True, "applied", 10.0))
+        finally:
+            fc.unpin()
+
+    # "no" rejects; KILL refuses a yes as it refuses a tap.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T13:35:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc)
+            _kill(root)
+            _owner_says(root, "yes, approve", p["tg_message_id"] + 1)
+            res = words(root, p["tg_message_id"] + 1, at("2026-08-05T14:01:00Z"))
+            r.eq("words: KILL refuses a yes and keeps the card pending",
+                 (res["ok"], prop(root, p["id"])["state"], jobs(root, p["id"])), (False, "pending", []))
+            r.ok("words: ... and says why in words", res["messages"] and "stopped" in res["messages"][0], res)
+            _owner_says(root, "no", p["tg_message_id"] + 2)
+            res = words(root, p["tg_message_id"] + 2, at("2026-08-05T14:01:10Z"))
+            r.eq("words: 'no' rejects the card", (res["ok"], prop(root, p["id"])["state"], res["messages"]),
+                 (True, "rejected", [f"Rejected #{p['id']}. Nothing was sent."]))
+        finally:
+            fc.unpin()
+
+    # "cancel" stops a held order before its send time, as Cancel does.
+    with fresh_root() as root:
+        fc = FakeClock("2026-08-05T20:40:00Z").pin_market()
+        try:
+            p, _tg = trade(root, fc, snap="2026-08-05T20:40:00Z", at="2026-08-05T20:44:00Z")
+            res = tap(root.led(), root.cfg(), cb(p), at("2026-08-05T20:46:00Z"))
+            r.eq("words: the tap holds the order", (res["ok"], res.get("held")), (True, "2026-08-06T13:40:00Z"))
+            _owner_says(root, "cancel it", p["tg_message_id"] + 2, when="2026-08-05T21:00:00Z")
+            res = words(root, p["tg_message_id"] + 2, at("2026-08-05T21:00:00Z"))
+            r.eq("words: 'cancel it' cancels the held order",
+                 (res["ok"], prop(root, p["id"])["state"], [j["status"] for j in jobs(root, p["id"])]),
+                 (True, "rejected", ["failed"]))
+        finally:
+            fc.unpin()
+
+
 def main() -> int:
     for case in (case_identity, case_state, case_gate, case_held, case_claim_once, case_txn, case_reject,
-                 case_only_caller):
+                 case_only_caller, case_words):
         try:
             case()
         except Exception as e:  # noqa: BLE001

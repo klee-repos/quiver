@@ -399,7 +399,7 @@ def case_entry_max():
         r.ok("entry_max: the skip names the price and the limit", sk and "150.01" in sk[0]["reason"]
              and "150.00" in sk[0]["reason"], b["skipped"])
         txt = card_text(c, b)
-        r.ok("entry_max: the card names the skipped leg", "I left out ANET" in txt and "$150.01" in txt, txt)
+        r.ok("entry_max: the card names the skipped leg", "Left out ANET" in txt and "$150.01" in txt, txt)
         r.eq("entry_max: no ANET order row", c.one("SELECT COUNT(*) n FROM orders WHERE proposal_id=? AND ticker='ANET'",
                                                   (b["proposal_id"],))["n"], 0)
         c.at("2026-08-05T14:10:00Z")
@@ -717,11 +717,10 @@ def case_card():
             msgs = notify.render_trade_card(proposals.trade_card_model(conn, b))
         txt = " ".join(msgs)
         plain = html.unescape(re.sub(r"<[^>]+>", "", txt))
-        r.ok("card: one message of prose", len(msgs) == 1 and "\n" not in txt, msgs)
-        r.ok("card: no bullet", not re.search(r"(^|\s)[•·\-\*]\s", plain) and not re.search(r"^\s*\d+[.)]\s", plain), plain)
-        r.ok("card: no ' / '", " / " not in plain, plain)
-        for s in ("Buy $200 of ANET, about 1.3 shares at $150.00.", "from 15.0% of the account to the 25.0% we planned",
-                  "Open until 4:00 PM ET."):
+        # Owner, 2026-11-09: a short table, one line per order, no wall of text.
+        r.ok("card: one short message", len(msgs) == 1 and len(plain) < 400, msgs)
+        r.ok("card: the orders sit in a <pre> table", "<pre>" in txt, txt)
+        for s in ("Buy  ANET    $200.00  15.0% → 25.0%", "Reply yes or tap Approve.", "Open until 4:00 PM ET."):
             r.ok(f"card: says {s!r}", s in plain, plain)
         btn = outbox.trade_buttons(p["id"], p["nonce"])[0]
         r.eq("card: Approve is style success", (btn[0]["text"], btn[0]["style"]), ("Approve", "success"))
@@ -759,8 +758,8 @@ def case_drift():
              (c.prop(first["proposal_id"])["state"], c.prop(first["proposal_id"])["superseded_by"]),
              ("superseded", second["proposal_id"]))
         txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, second)))
-        r.ok("drift: the card names weight, target and band per leg",
-             "ANET is 17.6% of the account, below the 25.0% we planned, more than the 5.0 points it may drift." in txt, txt)
+        r.ok("drift: the card is a rebalance with the weight now and the plan per leg",
+             "Rebalance to the plan" in txt and "17.6% → 25.0%" in txt, txt)
 
 
 # --- quote_source ---------------------------------------------------------------------------
@@ -911,7 +910,7 @@ def case_desk_news():
         b = event_trade(c, eid, evidence=["document:%d" % doc])
         r.ok("desk_news: a 1-day-old feed date backs a trade", b["legs"], b)
         txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, b)))
-        r.ok("desk_news: the card says 'found by the desk' with the URL", "found by the desk" in txt and url in txt, txt)
+        r.ok("desk_news: the card names the desk's source URL", "Source: " + url in txt, txt)
     with case(at="2026-08-05T15:00:00Z") as c:
         c.snap()
         eid, doc, _ = _desk_news_event(c, timedelta(days=6, hours=23))
@@ -1134,11 +1133,11 @@ def case_owner_sized():
         r.eq("owner_sized: the cash before and after", b["cash"], {"before": 1160.0, "after": 1080.0})
         r.eq("owner_sized: the plan does not move before the tap", book_of(c)["ANET"], (25.0, "active"))
         txt = html.unescape(re.sub(r"<[^>]+>", "", card_text(c, b)))
-        for want in ("Buy $80 of ANET", "That takes ANET from 25.5% of the account to 29.5%.",
-                     "When the order fills, the plan moves with it: ANET goes from 25.0% to 29.5% of the "
-                     "account and cash goes from 60.0% to 55.5%.", "Cash goes from $1,160.00 to $1,080.00."):
+        for want in ("Buy  ANET     $80.00  25.5% → 29.5%",
+                     "When it fills, the plan moves: ANET 25.0% → 29.5%, cash 60.0% → 55.5%.",
+                     "Cash $1,160.00 → $1,080.00"):
             r.ok(f"owner_sized: the card says {want!r}", want in txt, txt)
-        r.ok("owner_sized: the card does not call 29.5% the plan before the tap", "29.5% we planned" not in txt, txt)
+        r.ok("owner_sized: the card does not call 29.5% the plan before the tap", "(plan 29.5%)" not in txt, txt)
         res = tap(c, b["proposal_id"])
         r.ok("owner_sized: Approve is ok", res["ok"] and c.prop(b["proposal_id"])["state"] == "approved", res)
         r.eq("owner_sized: Approve alone does not move the plan (nothing is placed yet)",

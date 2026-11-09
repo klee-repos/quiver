@@ -27,6 +27,7 @@ order:
 # --- Desk start values (plan §10.3) -----------------------------------------
 desk:
   requote_tolerance_pct: 1.5           # a tap re-quotes; a move over this sends new numbers
+  held_requote_tolerance_pct: 8        # an order held to the open: a move over this sends new numbers
   margin_of_safety_pct: 15             # default buy-below = fair value base x (1 - this/100)
   valuation_discount_rate: 0.09        # r in the DCF and the reverse DCF
   valuation_terminal_growth: 0.03      # gt in the terminal value
